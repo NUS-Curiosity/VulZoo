@@ -10,4 +10,5 @@
 - [ZDI Advisory](https://github.com/delikely/ZDI_Advisories.git)
 - [GitHub Advisory](https://github.com/github/advisory-database)
 - [ATT&CK](https://github.com/mitre-attack/attack-stix-data.git)
+- [D3FEND](https://d3fend.mitre.org/)
 
