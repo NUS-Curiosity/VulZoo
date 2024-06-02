@@ -4,7 +4,7 @@
 git pull --recurse-submodules
 
 # cisa-kev
-wget https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json -O ../cisa-kev-database/known_exploited_vulnerabilities.json
+wget https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json -O cisa-kev-database/known_exploited_vulnerabilities.json
 
 # cwe
 wget https://cwe.mitre.org/data/xml/cwec_latest.xml.zip -O cwe-database/cwec_latest.xml.zip
@@ -19,6 +19,10 @@ cd capec-database/
 unzip -o capec_latest.zip
 rm capec_latest.zip
 cd -
+
+# d3fend
+wget https://d3fend.mitre.org/ontologies/d3fend.json -O d3fend-database/d3fend_ontology.json
+wget https://d3fend.mitre.org/ontologies/d3fend.csv -O d3fend-database/d3fend.csv
 
 echo "database update | ts: `date '+%s'`" >> CHANGELOG
 
