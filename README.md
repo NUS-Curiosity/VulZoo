@@ -11,4 +11,5 @@
 - [GitHub Advisory](https://github.com/github/advisory-database)
 - [ATT&CK](https://github.com/mitre-attack/attack-stix-data.git)
 - [D3FEND](https://d3fend.mitre.org/)
+- [Exploit-DB](https://gitlab.com/exploit-database/exploitdb)
 

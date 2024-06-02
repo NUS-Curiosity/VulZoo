@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# cve, nvd, zdi, github, att&ck
+# cve, nvd, zdi, github, att&ck, exploit-db
 git pull --recurse-submodules
 
 # cisa-kev
