@@ -12,4 +12,5 @@
 - [ATT&CK](https://github.com/mitre-attack/attack-stix-data.git)
 - [D3FEND](https://d3fend.mitre.org/)
 - [Exploit-DB](https://gitlab.com/exploit-database/exploitdb)
+- [Linux Kernel Vulns](https://git.kernel.org/pub/scm/linux/security/vulns.git)
 
