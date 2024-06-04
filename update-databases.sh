@@ -1,6 +1,8 @@
 #!/bin/bash
 
-# cve, nvd, zdi, github, att&ck, exploit-db
+# Vulnerabilities: cve, nvd, zdi, github, att&ck, 
+# Exploits: exploit-db,
+# Mail lists: Linux vulns,
 git pull --recurse-submodules
 
 # cisa-kev
