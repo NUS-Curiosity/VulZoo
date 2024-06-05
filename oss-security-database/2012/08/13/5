@@ -1,0 +1,221 @@
+
+Date: Mon, 13 Aug 2012 14:34:17 +0200
+From: "Jason A. Donenfeld" <Jason@...c4.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: Tunnel Blick: Multiple Vulnerabilities to Local
+ Root and DoS (OS X)
+
+Hi Kurt,
+
+Sure, I'll trace each one, and include line numbers with the code.
+This code comes from:
+http://code.google.com/p/tunnelblick/source/browse/trunk/tunnelblick/openvpnstart.m?r=2095
+
+
+1. A race condition in file permissions checking can lead to local root.
+PoC: http://git.zx2c4.com/Pwnnel-Blicker/tree/pwnnel-blicker.c
+
+   927	int runScript(NSString * scriptName,
+   928	               int        argc,
+   929	               char     * cfgName,
+   930	               char     * cfgLoc)
+   931	{
+ * 964	                if (  checkOwnerAndPermissions(scriptPath, 0,
+0, @"744")  ) {
+   965	
+   966	                    fprintf(stderr, "'%s' executing...\n",
+[scriptName UTF8String]);
+ * 967	                    returnValue = runAsRoot(scriptPath, [NSArray array]);
+   968	                    fprintf(stderr, "'%s' returned with status
+%d\n", [scriptName UTF8String], returnValue);
+   969	                }
+
+Here, there's a race condition between the two stared lines.
+
+
+2. Insufficient checking of merely 0:0 744 can lead to local root on
+systems with particular configurations.
+
+   964	                if (  checkOwnerAndPermissions(scriptPath, 0,
+0, @"744")  ) {
+and
+   801	            if (  ! checkOwnerAndPermissions(preConnectPath, 0,
+0, @"744")  ) {
+and
+   847	            if (  ! checkOwnerAndPermissions(postTunTapPath, 0,
+0, @"744")  ) {
+and
+  1675	                if (  ! checkOwnerAndPermissions(filePath, 0,
+0, @"744")  ) {       // shell scripts are 744
+
+Testing a file for whether or not it's 744 and owned by root:root is
+not sufficient for deciding whether a unprivileged should be able to
+run it as root. This not only makes every 744 root:root file on the
+file system a potential vector, but destroys the nosuid mount flag OS
+X uses for all user mountable images and network shares.
+
+
+3. Insufficient validation of path names can allow for arbitrary
+kernel module loading, which can lead to local root.
+
+     86	    execPath = [[NSString stringWithUTF8String:argv[0]]
+stringByDeletingLastPathComponent];
+  1355	void loadKexts(unsigned int bitMask)
+  1356	{
+  1357	    if (  ( bitMask & (OPENVPNSTART_OUR_TAP_KEXT |
+OPENVPNSTART_OUR_TUN_KEXT) ) == 0  ) {
+  1358	        return;
+  1359	    }
+  1360	
+  1361	    NSMutableArray*	arguments = [NSMutableArray arrayWithCapacity: 2];
+  1362	    if (  (bitMask & OPENVPNSTART_OUR_TAP_KEXT) != 0  ) {
+  1363	        NSString * tapkext = [@"tap" stringByAppendingString:
+TunTapSuffixToUse([execPath stringByAppendingPathComponent: @"tap"])];
+  1364	        [arguments addObject: [execPath
+stringByAppendingPathComponent: tapkext]];
+  1365	        fprintf(stderr, "Loading %s\n", [tapkext UTF8String]);
+  1366	    }
+  1367	    if (  (bitMask & OPENVPNSTART_OUR_TUN_KEXT) != 0  ) {
+  1368	        NSString * tunkext = [@"tun" stringByAppendingString:
+TunTapSuffixToUse([execPath stringByAppendingPathComponent: @"tun"])];
+  1369	        [arguments addObject: [execPath
+stringByAppendingPathComponent: tunkext]];
+  1370	        fprintf(stderr, "Loading %s\n", [tunkext UTF8String]);
+  1371	    }
+  1372	
+  1373	    becomeRoot();
+
+  1374	    int status;
+  1375	    int i;
+  1376	    for (i=0; i < 5; i++) {
+  1377	        NSTask * task = [[[NSTask alloc] init] autorelease];
+  1378	
+  1379	        [task setLaunchPath:@"/sbin/kextload"];
+  1380	
+  1381	        [task setArguments:arguments];
+  1382	
+  1383	        [task launch];
+
+As you can see, the file name of the kernel extension being loaded is
+derived from argv[0], which can be trivially bypassed ( execl(...,
+"/attacker/controlled/argv/zero", ...) ).
+
+
+4. Insufficient validation of path names can allow execution of
+arbitrary scripts as root, leading to local root.
+PoC: http://git.zx2c4.com/Pwnnel-Blicker/tree/pwnnel-blicker-for-kids.sh
+
+     86	    execPath = [[NSString stringWithUTF8String:argv[0]]
+stringByDeletingLastPathComponent];
+   919	void runOpenVpnToGetVersion(NSString * openvpnVersion)
+   920	{
+   921	    NSString * openvpnPath = openvpnToUsePath([execPath
+stringByAppendingPathComponent: @"openvpn"], openvpnVersion);
+   922	    runAsRoot(openvpnPath, [NSArray arrayWithObject: @"--version"]);
+   923	}
+
+This basically amounts to this being run as root:  $(dirname
+argv[0])/openvpn --version.
+
+
+
+5. Insufficient path validation in errorExitIfAttackViaString can lead
+to deletion of files as root, leading to DoS.
+   164	        } else if( strcmp(command, "deleteLogs") == 0 ) {
+   165				if (argc == 4) {
+   166					NSString* configFile = [NSString stringWithUTF8String:argv[2]];
+   167	                errorExitIfAttackViaString(configFile);
+   168	                unsigned cfgLocCode = atoi(argv[3]);
+   169	                deleteLogFiles(configFile, cfgLocCode);
+   170	                syntaxError = FALSE;
+   171	            }
+  1735	void errorExitIfAttackViaString(NSString * string)
+  1736	{
+  1737	    BOOL startsWithDot = [string hasPrefix: @"."];
+  1738	    NSRange r = [string rangeOfString: @"/.."];
+  1739	    if (   startsWithDot
+  1740	        || (r.length != 0)  ) {
+  1741	        fprintf(stderr, "Tunnelblick openvpnstart: Apparent
+attack detected; string being tested is %s\n", [string UTF8String]);
+  1742	        [pool drain];
+  1743	        exit(EXIT_FAILURE);
+  1744	    }
+  1745	}
+
+The "exit if attack string" function doesn't check for links of any
+kind, symbolic or hard, so this validation is not sufficient.
+
+
+6. Allowing OpenVPN to run with user given configurations can lead to
+local root.
+   939	        if (  [configFile hasSuffix: @"tblk"]  ) {
+   940	            unsigned  cfgLocCode = atoi(cfgLoc);
+   941	            switch (cfgLocCode) {
+   942	                case 0:
+   943	                    configPrefix = [NSHomeDirectory()
+stringByAppendingPathComponent:@"/Library/Application
+Support/Tunnelblick/Configurations"];
+   944	                    break;
+   945	                case 1:
+   946	                    configPrefix = [NSString
+stringWithFormat:@"/Library/Application Support/Tunnelblick/Users/%@",
+NSUserName()];
+   947	                    break;
+   948	                case 2:
+   949	                    configPrefix = [execPath
+stringByAppendingPathComponent: @"Deploy"];
+   950	                    break;
+   951	                case 3:
+   952	                    configPrefix = [NSString stringWithString:
+@"/Library/Application Support/Tunnelblick/Shared"];
+   953	                    break;
+   954	                default:
+   955	                    break;
+   956	            }
+   957	        }
+The purpose of this SUID helper is so that users can run OpenVPN with
+their own provided configuration files as root. OpenVPN configuration
+files can run scripts based on various OpenVPN events.
+
+
+7. Race condition in process killing.
+  1496	BOOL isOpenvpn(pid_t pid)
+  1497	{
+  1498		BOOL				is_openvpn	= FALSE;
+  1499		int					count		= 0,
+  1500		i			= 0;
+  1501		struct kinfo_proc*	info		= NULL;
+  1502		
+  1503		getProcesses(&info, &count);
+  1504	    for (i = 0; i < count; i++) {
+  1505	        char* process_name = info[i].kp_proc.p_comm;
+  1506	        pid_t thisPid = info[i].kp_proc.p_pid;
+  1507	        if (pid == thisPid) {
+  1508				if (strcmp(process_name, "openvpn")==0) {
+  1509					is_openvpn = TRUE;
+  1510				} else {
+  1511					is_openvpn = FALSE;
+  1512				}
+  1513				break;
+  1514			}
+  1515	    }
+  1516	    free(info);
+  1517		return is_openvpn;
+  1518	}
+
+   991		if(isOpenvpn(pid)) {
+   992			becomeRoot();
+   993			didnotKill = kill(pid, SIGTERM);
+and
+  1022			if(strcmp(process_name, "openvpn") == 0) {
+  1023				becomeRoot();
+  1024				didnotKill = kill(pid, SIGTERM);
+
+There's a race between checking the name of the process and killing
+that PID. Since PIDs are cycled, eventually that PID could point to a
+different process the user shouldn't have permission to kill.
+
+
+Hope this clarifies things. Let me know if you have more questions.
+
+Jason

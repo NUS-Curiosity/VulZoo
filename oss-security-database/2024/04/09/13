@@ -1,0 +1,118 @@
+
+Date: Tue, 09 Apr 2024 15:03:54 +0000
+From: Michael Knap <oss-sec@...ap.com>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: CWE-121, CWE-122: libfreeimage 3.40-3.18/19+ buffer overflow
+
+Hello,
+
+I have identified two buffer overflow vulnerabilities in
+libfreeimage -> PluginXPM.cpp module, Load function.
+
+Issue reported on 2024-03-28 but not acknowledged by maintainer yet:
+https://sourceforge.net/p/freeimage/bugs/355/
+
+CWE-121: Stack-based Buffer Overflow
+CWE-122: Heap-based Buffer Overflow (consequence of the first bug)
+
+Technical Details:
+The vulnerability is present in the code responsible for parsing color
+names from XPM files. Specifically, the buffer char msg[256];
+is susceptible to overflow in Load function:
+
+static FIBITMAP * DLL_CALLCONV
+Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
+  char msg[256]; // This is overflown.
+  FIBITMAP *dib = NULL;
+
+  ...// redacted for brevity
+
+  if (!FreeImage_LookupX11Color(clr,  &rgba.r, &rgba.g, &rgba.b)) {
+    // Arbitrary length buffer write.
+    sprintf(msg, "Unknown color name '%s'", str);
+    free(str);
+    throw msg;
+  }
+
+    ...// redacted for brevity
+
+    return dib;
+  } catch(const char *text) {
+    // 512-byte buffer allocated on the heap in following function.
+    FreeImage_OutputMessageProc(s_format_id, text);
+
+    if( dib != NULL )
+      FreeImage_Unload(dib);
+    return NULL;
+  }
+}
+
+A doctored XPM file ("trigger.xpm" attached) with an excessively
+long color name can trigger this buffer overflow. Moreover, when msg is thrown
+and passed to FreeImage_OutputMessageProc (FreeImage.cpp), there exists another critical
+vulnerability:
+This function handles the error message with a dynamically allocated 512-byte buffer,
+which could also overflow if the error message is too long.
+The latter depends on accurately overflown free argument which would lead to
+freeing arbitrary memory and subsequently lead to Heap Buffer Overflow when
+the msg is thrown and written to a message buffer in FreeImage_OutputMessageProc.
+
+
+void DLL_CALLCONV
+FreeImage_OutputMessageProc(int fif, const char *fmt, ...) {
+  // Developer assumes the message is short (my comment).
+  const int MSG_SIZE = 512; // 512 bytes should be more than enough for a short message
+  // redacted for brevity...
+  int str_length = (int)( (strlen(fmt) > MSG_SIZE) ? MSG_SIZE : strlen(fmt) );
+
+  // redacted for brevity...
+  for (int i = 0, j = 0; i < str_length; ++i) {
+    if (fmt[i] == '%') {
+      if (i + 1 < str_length) {
+        switch(tolower(fmt[i + 1])) {
+          case '%' :
+            message[j++] = '%';
+            break;
+          case 'o' : // octal numbers
+          {
+            char tmp[16];
+            _itoa(va_arg(arg, int), tmp, 8);
+            strcat(message, tmp);
+            j += (int)strlen(tmp);
+            ++i;
+            break;
+          }
+          // other cases redacted for brevity...
+        };
+        } else {
+          message[j++] = fmt[i];
+    }} else {
+      message[j++] = fmt[i];
+    };
+  }
+  // redacted for brevity...
+}
+
+strcat is used to write to message buffer without validating if the message content
+exceeds the buffer length.
+
+Impact Analysis:
+This vulnerability could allow an attacker to execute arbitrary code or
+cause a Denial of Service (DoS) by crashing the application.
+
+Suggested Mitigations:
+To address this vulnerability, developers are encouraged to undertake following actions:
+ - Implement proper bounds checking for all input data, particularly for strings
+   derived from file content or user input, to prevent overflow.
+ - Replace sprintf with safer string handling functions that enforce buffer size limits,
+   such as snprintf, or consider using higher-level string processing mechanisms provided
+   by modern C++ standards, which inherently manage memory more safely.
+
+Best Regards,
+Michael Knap
+
+Download attachment "trigger.xpm" of type "image/x-xpixmap" (634 bytes)
+
+Download attachment "publickey - oss-sec@...ap.com - 0xDF4CFAF0.asc" of type "application/pgp-keys" (641 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (250 bytes)

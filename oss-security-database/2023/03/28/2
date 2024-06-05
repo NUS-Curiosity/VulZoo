@@ -1,0 +1,95 @@
+
+Date: Tue, 28 Mar 2023 08:00:00 +0800
+From: Zhenghan Wang <wzhmmmmm@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2023-28464: Linux: Bluetooth: hci_conn_cleanup function has double free
+
+Hi,
+
+In the Bluetooth subsystem, a double free vulnerability was found in the
+hci_conn_cleanup function of net/bluetooth/hci_conn.c, which may cause DOS
+or privilege escalation.
+
+Version: Linux kernel 6.2 (this problem also exists in 6.3-rc1)
+
+
+At the end of the hci_conn_del_sysfs(conn) function in the hci_conn_cleanup
+function, hci_dev_put(hdev) will be called. The hci_dev_put function will
+eventually call kfree to release the space used by name:
+
+```
+hci_dev_put
+put_device
+kobject_put
+kref_put
+kobject_release
+kobject_cleanup
+kfree_const
+kfree
+```
+
+After the hci_conn_del_sysfs function ends, the hci_dev_put function is
+called again in the hci_conn_cleanup function, and their parameters hdev
+are the same, so double free will be caused when the name is released.
+
+In addition, at the end of hci_conn_cleanup, the hci_conn_put function is
+called again, which will call the put_device function to release conn->dev.
+Obviously conn->dev has been released, so there will also be a double free
+problem here.
+
+Call Trace from syzbot,
+https://syzkaller.appspot.com/bug?id=1bb51491ca5df96a5f724899d1dbb87afda61419
+
+Here's a simplified flow:
+
+hci_conn_del_sysfs:
+  hci_dev_put
+    put_device
+      kobject_put
+        kref_put
+          kobject_release
+            kobject_cleanup
+              kfree_const
+                kfree(name)
+
+hci_dev_put:
+  ...
+    kfree(name)
+
+hci_conn_put:
+  put_device
+    ...
+      kfree(name)
+
+This patch drop the hci_dev_put and hci_conn_put function call in
+hci_conn_cleanup function, because the object isfreed in hci_conn_del_sysfs
+function.
+https://lore.kernel.org/lkml/20230309074645.74309-1-wzhmmmmm@gmail.com/
+
+Signed-off-by: ZhengHan Wang <wzhmmmmm@...il.com>
+---
+ net/bluetooth/hci_conn.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/net/bluetooth/hci_conn.c b/net/bluetooth/hci_conn.c
+index acf563fbdfd9..a0ccbef34bc2 100644
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -152,10 +152,6 @@ static void hci_conn_cleanup(struct hci_conn *conn)
+    hci_conn_del_sysfs(conn);
+
+    debugfs_remove_recursive(conn->debugfs);
+-
+-   hci_dev_put(hdev);
+-
+-   hci_conn_put(conn);
+ }
+
+ static void le_scan_cleanup(struct work_struct *work)
+--
+2.25.1
+
+Regards,
+
+Zhenghan Wang
+

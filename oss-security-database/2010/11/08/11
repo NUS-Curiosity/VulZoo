@@ -1,0 +1,162 @@
+
+Date: Mon, 8 Nov 2010 12:01:29 -0500
+From: Steve Grubb <sgrubb@...hat.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: filesystem capabilities
+
+>While in general this is a good idea, there are issues with it, 
+>in arbitrary order:
+>
+>- Some currently-SUID programs are aware of them being (potentially) SUID, and 
+>will drop the "more privileged" euid when it is no longer needed, but they will
+>probably not be aware of them possessing capabilities.
+
+This is an artifact of having a capabilities library that takes several lines of code 
+to do anything. It is more correct to check for capabilities that trusting that euid 
+means that you have certain powers. In my opinion, a lot of this code should be 
+cleaned up so that its correct.
+
+
+>Let's consider ping, which appears to be the classical example of "where filesystem
+>capabilities will help" (or so it is claimed).  IIRC, it starts by acquiring a raw
+>socket (NB: of a certain somewhat-limited type), then drops root privs (if it was
+>installed SUID root and run by non-root), then proceeds to parse the command-line,
+>resolve the provided hostname, and so on.  If the SUID bit is replaced with
+>cap_net_raw+ep, as seen in Kees' example above, will ping know to drop this
+>capability?  Hardly.  Not without a source code patch.
+
+Correct. Testing for euid 0 as a sign of having capabilities is incorrect.
+
+
+>Besides, dropping the capability might [need to] require privileges beyond
+>CAP_NET_RAW itself (recall the capability-dropping attack on sendmail from a decade
+>ago).  So does moving from SUID root to cap_net_raw+ep improve security?
+
+Not all applications drop capabilities very quickly. They may call localization 
+libraries, parse user input, and other things before they get around to getting into a 
+reasonable state. I think that this can be used as a way to ultimately make things 
+more secure. But it does take effort and code review.
+
+
+>Most likely not.  On the contrary, it results in hundreds of lines of ping's code and
+>thousands of lines of ibrary code (DNS resolver) running with elevated privileges,
+>as compared to just a few lines of ping.c, which was the case with simple
+>SUID root.
+
+But we would want the code to drop privs. 
+
+
+>Granted, those "elevated privileges" are a lot less than
+>root privileges, but they're a lot more than having a single raw socket
+>of a specific type.
+
+There is nothing that says apps cannot further drop privs.
+
+
+>- In some cases, the capability sets being granted are (almost)
+>equivalent (or expandable to) full root powers.  This is seen in:
+>
+>http://people.fedoraproject.org/~dwalsh/policycoreutils_setuid.patch
+>
+>-%attr(4755,root,root) %{_bindir}/newrole
+>+%attr(0755,root,root) %caps(cap_audit_write,cap_setuid) %{_bindir}/newrole
+>
+>-%{_sbindir}/seunshare
+>+%attr(0755,root,root) %caps(cap_setuid,cap_dac_override,cap_sys_admin,cap_sys_nice) 
+>%{_sbindir}/seunshare
+
+The code does in fact need work. The first phase of the project is testing out rpm's 
+machinery for setting the capabilities and working out the process in the packaging 
+guidelines. This work is in rawhide which would be a released OS until next spring, 
+iow, this is a long project and will require code reviews.
+
+
+>This mostly just sweeps the SUID root under the rug, where the 
+>sysadmin will hopefully not see it and thus feel safer.  However, it may 
+>expose more problems in the programs if they knew to drop root, but 
+>wouldn't know to drop the capabilities (same issue I described above for ping).
+
+The admin can use filecap to find programs with elevated privs. The ls program has 
+colored file system based capability programs for a while now. Nothing is hidden.
+
+
+>Granted, vulnerabilities of certain classes might become unexploitable
+>or be partially mitigated.  For example, if no direct code execution is
+>possible (not a buffer overflow, etc.), but "only" privileged access to
+>an attacker-provided arbitrary pathname is possible, then "newrole"
+>above would be protected, but "seunshare" above would not (because of
+>cap_dac_override).
+
+Those privs ultimately get dropped. But the file system based approach means it runs 
+with lower capabilities until it hits the code that does the final drop.
+
+
+>- Completely getting rid of SUID root programs in the default install, like we did 
+>in Owl-current (but without filesystem capabilities!), is a great idea.  It mitigates
+>the impact of possible vulnerabilities in certain code paths in the dynamic linker,
+>libc, and the kernel.However, if you have even a single SUID root program left, 
+>you do not achieve this goal.
+
+There are a few places that seem to require one. su, sudo, cron.
+
+>Thus, switching from SUID root to CAP_NET_RAW for ping, with its tiny and obviously-
+>correct code that used to run as root, gives you absolutely nothing as long as you
+>keep su and/or sudo available for invocation (not necessarily actual use) by all
+>users.
+
+But even access to those can be controlled.
+
+
+>For servers, I think people need to reconsider and, in most cases, disallow
+>invocation of su and sudo by the users.  There's no added security from the old
+>"login as non-root, then su or sudo to root" sysadmin "wisdom", as compared to
+>logging in as non-root and as root directly (two separate sessions). On the contrary,
+>the latter approach is the only correct one, from a security standpoint:
+>
+>http://www.openwall.com/lists/owl-users/2004/10/20/6
+
+Well, that would defeat the purpose of the audit system. In such a system how can you 
+tell who logged in as root? Or even what they did? If you consider the needs of an 
+audit trail to tell who was abusing privilege or what an admin was doing, then you 
+need people to log in as their account so that the loginuid gets set.
+
+
+>(For accountability of multiple sysadmins, the system needs to support
+>having multiple root-privileged accounts, like Owl does.)
+
+Does this correctly set the loginuid?
+
+
+>(For desktops with X, this gets trickier.)
+>
+>You also absolutely have to deal with passwd, which would be another SUID root
+>program.  Like we did:
+>
+>http://www.openwall.com/tcb/
+>
+>And with all others (e.g., our crontab/at and crond changes). :-)
+
+Yes, these are the special cases that need attention...as does X.
+
+>- Support for filesystem capabilities and extended attributes is still not mature. 
+>Many userspace tools (such as for backup/restore) lack it.
+
+Modern tar/star support extended attributes. Also the aide program can tell if any 
+extended attribute has changed.
+
+
+>Thus, if you must, it might make sense to use a poor man's replacement,
+>which will be more reliable.  Introduce a sysctl to configure a groups
+>range to map onto capabilities.  With 32 or 64 group IDs allocated for
+>the purpose, you can have any one capability set.
+>
+><gettingold>I briefly experimented with just that on a Slackware 3.1
+>system with capabilities support patched into the 2.0.x kernel, with the
+>caps-by-gid changes hacked into the kernel on top of the capabilities
+>patch on my own.  That was in 1998 or so.  The conclusion was that
+>without userspace patches this would achieve too little.</gettingold>
+
+The intent of this project is to get the patches and user space work done. We know 
+that just setting the bit is not all that has to be done.
+
+-Steve

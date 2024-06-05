@@ -1,0 +1,159 @@
+
+Date: Tue, 27 Jan 2015 21:29:16 +0000
+From: Simon McVittie <simon.mcvittie@...labora.co.uk>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2014-8156: freesmartphone.org stack configures D-Bus system bus
+ to be insecure
+
+Type of vulnerability: CWE-284 Improper Access Control
+Exploitable by: local users
+Impact: unknown, dependent on installed D-Bus system services; at least
+local denial of service
+Reporter: Simon McVittie, Collabora Ltd.
+Reported to vendor: 2015-01-13
+
+While checking Debian for incorrect/dangerous D-Bus security policy
+files (found in /etc/dbus-1/system.d/*.conf) I found that the
+freesmartphone.org (fso) stack contains several problematic rules.
+
+Summary of modules confirmed to be affected:
+
+Debian package fso-gsmd version 0.12.0-3
+Debian package fso-usaged version 0.12.0-2
+Upstream cornucopia.git (fsoaudiod, fsodatad, fsodeviced, fsogsmd,
+fsonetworkd, fsotdld, fsousaged) git master on 2015-01-19
+
+Debian package fso-frameworkd version 0.9.5.9+git20110512-4
+Upstream framework.git version 0.10.1 and git master on 2015-01-19
+
+In addition, Debian packaging for one fso-related package, also
+available in Ubuntu and possibly other derivatives, has a similar flaw:
+
+Debian package phonefsod version 0.1+git20121018-1
+(Upstream code for phonefsod
+<http://git.shr-project.org/git/?p=phonefsod.git> was not vulnerable as
+of 2015-01-19)
+
+Other fso modules might be affected, I only scanned the ones available
+in Debian.
+
+Please see below for further technical details of the faulty security
+policies, and some advice on fixing them, which is applicable to any
+project with D-Bus security policy files. For further advice, please
+contact dbus@...ts.freedesktop.org (public mailing list) or
+dbus-security@...ts.freedesktop.org (non-public list for embargoed
+security vulnerabilities), and explain what security policy you intend
+your service to have.
+
+Category 1: send_path != "/"
+----------------------------
+
+This refers to configurations like this:
+
+    <policy context="default">
+        ...
+        <allow send_path="/org/freesmartphone/Framework"/>
+
+This allows every local user to send arbitrary D-Bus messages to the
+path /org/freesmartphone/Framework on *any* D-Bus system service (rough
+HTTP analogy: send a POST to http://server/org/freesmartphone/Framework
+on any server).
+
+At first glance, this might seem harmless, because why would a non-fso
+service have any functionality at that path? However, services that use
+a low-level binding like libdbus and implement their functionality via a
+message filter do not necessarily differentiate between paths.
+
+Notably, org.freedesktop.DBus, the pseudo-service provided by
+dbus-daemon, provides the same API at every object path (and is
+constrained to do so by backwards compatibility). dbus releases 1.8.14
+and 1.9.6 mitigate this by locking down functionality that is not
+intended to be public, so that it can only be accessed at the canonical
+path /org/freedesktop/DBus. However, in earlier dbus releases, this can
+be used to make the dbus-daemon consume arbitrary amounts of memory.
+
+It is possible that other system services have similar behaviour; the
+worst-case impact is arbitrary root code execution, although I do not
+know of a specific service where this would happen.
+
+Example files: etc/dbus-1/system.d/frameworkd.conf in fso-frameworkd,
+data/fsogsmd.conf in fso-gsmd, data/fsousaged.conf in fso-usaged
+
+In addition, while data/dbus-1/phonefsod.conf in
+phonefsod/0.1+git20121018-1 is not vulnerable, the Debian-specific
+version in debian/phonefsod.conf has the same issue.
+
+Category 2: send_path = "/"
+---------------------------
+
+This is a variation of category 1 where the affected path is "/":
+
+    <policy context="default">
+        ...
+        <allow send_path="/"/>
+
+This is potentially more serious than category 1, because it affects any
+system service that either provides the same API on every object path,
+or specifically provides API at "/". Older versions of BlueZ are one
+example of a service that specifically uses "/".
+
+etc/dbus-1/system.d/frameworkd.conf in
+fso-frameworkd/0.9.5.9+git20110512-4 has this pattern.
+
+Fixing these vulnerabilities
+----------------------------
+
+Where possible, the recommended pattern is for the only <allow> rules to
+be <allow own="x.y.z"/> and/or <allow send_destination="x.y.z"/>.
+
+If it is necessary to control different object paths differently, either
+use Polkit/PolicyKit, or specify both in the same <allow> rule:
+
+    <allow send_destination="x.y.z" send_path="/a/b/c"/>
+
+This is treated as an "logical and" operation: the rule will only match
+sending messages that meet all the criteria. Similarly, you can combine
+send_destination with send_interface and/or send_member in the same
+<allow> or <deny> rule.
+
+The best practice is that every rule with <allow send_something> should
+have a send_destination attribute.
+
+If the destination will not own a well-known bus name (e.g. the "agent"
+pattern in which BlueZ calls out to agent processes running as GUI
+users) and so send_destination cannot be used, prefer <allow
+send_interface> instead of <allow send_path>, and only allow root (or a
+specific daemon user, if not root) to do this. For instance, this is
+acceptable:
+
+    <policy user="root">
+        <allow send_interface="com.example.MyAgent"/>
+    </policy>
+
+Parts of the fso D-Bus policy files indicate a misunderstanding of these
+files' syntax. If you write multiple <allow send_*> rules in the same
+<policy> block, that is effectively an "logical or" operation: each rule
+separately allows sending messages that match it.
+
+In particular, there is no functional difference between
+
+    <policy context="default">
+        <allow send_path="/x/y/z"/>
+        <allow send_destination="x.y.z"/>
+    </policy>
+
+and
+
+    <policy context="default">
+        <allow send_path="/x/y/z"/>
+    </policy>
+    <policy context="default">
+        <allow send_destination="x.y.z"/>
+    </policy>
+
+and the send_path rule is equally problematic in both spellings. The
+<policy> only controls who the rules apply to (everyone/a specific
+user/a specific group); it does not provide "logical and" semantics.
+
+    S
+

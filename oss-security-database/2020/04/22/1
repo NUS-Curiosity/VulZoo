@@ -1,0 +1,158 @@
+
+Date: Tue, 21 Apr 2020 16:40:05 -0400
+From: Eli Schwartz <eschwartz@...hlinux.org>
+To: Simon McVittie <smcv@...ian.org>, oss-security@...ts.openwall.com
+Subject: Re: Pacman package manager - taking untrusted input
+
+On 4/21/20 2:47 PM, Simon McVittie wrote:
+> On Tue, 21 Apr 2020 at 21:51:56 +0430, Amin Vakil wrote:
+>> On 4/21/20 8:57 PM, jellicent@...tonmail.com wrote:
+>>> The code supports database signatures, so the real issue is the distro
+>>> infrastructure.
+> 
+> I interpret this as: pacman can accept either signed or unsigned
+> databases, but the various distros that use pacman (such as Arch Linux)
+> currently only publish unsigned databases in practice. Is that correct?
+
+Correct.
+
+However, some people publish thirdparty repositories. I do. My
+thirdparty repo is generated wholly on my laptop by exactly one person
+(me) and has database signatures, so the instructions for its use
+include "set the per-repository SigLevel to DatabaseRequired". I would
+generally encourage anyone who doesn't have to juggle security for
+online signing keys, to do so. This is only a problem if you are for
+example a distro and need to have an intake mechanism for built packages
+by either packaging team members or buildbots, then sign the databases
+with an online signing agent and securely manage that signing key.
+
+> Can pacman be configured to *only* accept signed databases, so that a
+> mirror containing an unverifiable database (unsigned, signed with a key
+> that is not explicitly trusted, or with an invalid signature) is treated
+> as an error? If it cannot, then there's an obvious downgrade attack:
+> a malicious mirror could substitute an unsigned database and the pacman
+> client would happily use that.
+
+https://www.archlinux.org/pacman/pacman.conf.5.html#_package_and_database_signature_checking_a_id_sc_a
+
+pacman supports a tristate setting here (SigLevel):
+
+Required | Optional | Never
+
+In the optional case, a bad signature is an error, but a missing
+signature is skipped over and ignored as though Never was specified.
+
+It can be set for package files, database files, or both. The
+distribution default is to set it Required for package files, and
+Optional for database files; every archlinux user is therefore checking
+for database signatures, discovering they are not available, and making
+use of the configured grace setting to proceed anyway. You could DoS all
+arch users by hacking the mirror network and adding an invalid
+signature, though if you have that level of access, there are easier ways...
+
+> On Tue, 21 Apr 2020 at 17:41:42 +0000, jellicent@...tonmail.com wrote:
+>> An attacker need only find a bug in how Pacman does
+>> parsing/reading of the database file to potentially get code execution
+>> on the box as root.
+> 
+> My understanding is that this is a risk, and at least arguably a design
+> flaw, but not generally considered to be a vulnerability (CVE IDs,
+> etc.) unless/until an unfixed parser bug with the necessary severity
+> is found.
+
+And indeed we have had two such bugs applicable to unsigned databases,
+both fixed in current versions:
+
+https://security.archlinux.org/package/pacman
+
+Both of them required enabling non-default options in /etc/pacman.conf
+and then downloading a maliciously forged database containing filenames
+which were passed, unsanitized, into system(3). This isn't even a parser
+bug, it's a bit more fundamental... also, of course, fixed as long as
+you are using pacman >= 5.2 which we hope you are.
+
+https://repology.org/project/pacman/versions
+
+Arch is, as are most others. You can still get a vulnerable version of
+pacman if you use:
+
+- the unmaintained bootstrap package on Gentoo,
+- the bootstrap package on *old releases* of Alpine or Fedora
+- the unmaintained FreeBSD port
+- Hyperbola (https://www.hyperbola.info/), an Arch Linux derivative
+
+Disregard the incorrect NixOS information on repology, since yesterday's
+NixOS 20.03 tag has the latest version of pacman:
+https://github.com/NixOS/nixpkgs/commit/20605f8fedde0eb60bb7c79896981523d523ded1
+
+> Of course, that doesn't mean it wouldn't be a good idea to authenticate
+> the database before parsing it: that would mitigate a lot of potential
+> vulnerabilities.
+> 
+> Something that might be considered to be a vulnerability already (or not,
+> depending on the pacman and distro maintainers' threat models) is that
+> an attacker could substitute a database that lists obsolete packages
+> with known vulnerabilities. Those packages will presumably be validly
+> signed by distro developers (because at one time they were considered
+> to be the best version available). Presumably pacman won't normally
+> downgrade from the version it has installed to a strictly older version
+> from a mirror, but if a user installs a new (not currently installed)
+> package using that mirror/database, they'll unknowingly be installing
+> an older package that has known vulnerabilities.
+
+Packages, once installed, are never downgraded via a sysupgrade unless
+the --sysupgrade flag is specified twice. This is actually fairly common
+since there's a lot of bad advice on the internet: https://xkcd.com/386/
+
+We continue to try to educate users that you don't try downgrading
+packages in order to force updates to happen faster, in much the same
+way you don't run everything with sudo because it failed with, I dunno,
+a missing shared library error. It's a work in progress.
+
+It's possible to manually specify a package to reinstall it even if it
+is a downgrade, but doing so will log a yellow:
+"warning: downgrading package XXX (currentversion => reinstall-version)"
+
+(the same warning is logged for a double sysupgrade)
+
+Installing packages for the first time is of course impossible to detect
+and requires general downgrade-attack protection as discussed later.
+
+> That form of attack is difficult to address in general, because it needs
+> a revocation or expiry mechanism. apt-based distros are starting to
+> address equivalent issues by setting a Valid-Until field on their archive
+> metadata, so that clients will warn their user if presented with outdated
+> archive metadata (the equivalent of pacman's database) - although this is
+> somewhat awkward to deploy, because it requires a signing key to be
+> made available on a regular basis, which conflicts with the idea that
+> high-value signing keys should be kept offline when not in use.
+Database signing would prevent package downgrade attacks, but not
+database downgrade attacks.
+
+As a rolling-release distro, we are recreating the database with updated
+or new packages, many many times per day, so we will automatically do
+Valid-Until equivalents (if implemented) without any explicit refresh task.
+
+We have intentions and some preliminary code to add a similar timestamp
+to pacman databases. Most likely it would then be up to the user to
+configure how long after the timestamp they would like to continue to
+trust the database (with a suitable vendor default).
+
+This would ensure that even database downgrade attacks cannot be
+performed. Note that if database signing were activated by policy but
+timestamps were not yet implemented in code, users can still engage
+their sense of suspicion to observe that a rolling release distro is
+unlikely to go more than a day or two without updates to at least one of
+the packages installed on the system. This is obviously non-ideal when
+we can use timestamps, but the savvy user can nevertheless have DIY
+protection.
+
+(Again, this is irrelevant since databases are not signed.)
+
+-- 
+Eli Schwartz
+Arch Linux Bug Wrangler, Trusted User, pacman developer
+
+
+
+Download attachment "signature.asc" of type "application/pgp-signature" (1602 bytes)

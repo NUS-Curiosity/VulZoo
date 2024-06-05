@@ -1,0 +1,99 @@
+
+Date: Thu, 27 Jan 2022 21:05:31 +0100
+From: Mathias Krause <minipli@...ecurity.net>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: Linux kernel: erroneous error handling after fd_install()
+
+Hi again!
+
+As requested by Alexander, here's the disclosure of two more issues and
+a description of the general bug pattern behind all of them.
+
+# The Bug Pattern
+
+During the work on the vmwgfx issue[1], it was noticed, that there are
+more code constructs in the kernel falling prone to the error pattern of
+calling fd_install(fd, file) and trying to make sense of either 'fd' or
+'file' afterwards. This is generally not safe, as the fd_install(...)
+call will make them reachable by userland.
+
+For example, a concurrent thread calling close(fd) in a tight loop
+(remember that file descriptors are allocated in a predictable manner,
+so the value of fd is known in advance) will release the associated
+'file', likely leading to use-after-free bugs in kernel code, still
+making use of it.
+
+That should make it clear, that it's generally unsafe to reason about
+'fd' or 'file' after a call to fd_install(). Now, in the vmwgfx case the
+code tried to clean up by itself, by closing the (assumed unused) fd and
+releasing the file using put_unused_fd(fd) and fput(file) respectively,
+basically like this:
+
+    fd_install(fd, file);
+    ...
+    if (copy_to_user(...)) {
+        put_unused_fd(fd);
+        fput(file);
+        return -EFAULT;
+    }
+
+If copy_to_user() fails (returns a non-zero value), the code tries to
+recover by releasing the allocated resources.
+
+Now, this is an even worse bug, as 'fd' isn't "unused". It was populated
+by fd_install(). What the error handling code instead allows is having a
+valid file descriptor 'fd' for an already released 'file'. A typical
+use-after-free scenario. It's just that an attacker doesn't have to look
+for an KASLR leak, SMEP / SMAP bypass or other memory corruption aiding
+bugs. One just has to sit and wait and look every now and then at the
+file descriptor to see what actual file is currently attached to that
+memory. That's because such an exploit doesn't try to introduce some
+type confusion bug. It simply wants (and relies on) the memory to get
+reallocated for a new 'file' object to gain access to other newly opened
+files in the system, e.g. /etc/shadow. And that's very likely, as 'file'
+objects use a dedicated slab cache.
+
+# Additional Bugs
+
+The following additional two code paths failing prone to the above bug
+pattern have been identified in the Linux kernel:
+
+1/ fanotify
+
+If the copy_info_records_to_user() call in copy_event_to_user() fails,
+it'll erroneously call put_unused_fd(fd) + fput(f) on a file that was
+already populated by fd_install(). The erroneous code path, however, is
+only reachable by privileged users, as one needs to pass the
+"!FAN_GROUP_FLAG(group, FANOTIFY_UNPRIV)" test which won't if one isn't
+already capable(CAP_SYS_ADMIN), i.e. has the CAP_SYS_ADMIN capability in
+the _init_ user namespace, which basically means root.
+
+The bug was introduced by commit f644bc449b37 ("fanotify: fix
+copy_event_to_user() fid error clean up"), which is Linux v5.13.
+
+A patch for the issue is pending and to be submitted by Dan Carpenter
+anytime soon.
+
+2/ fastrpc
+
+The fastrpc driver is prone to an additional fput() after having called
+fd_install() if the copy_to_user() fails in the fastrpc_dmabuf_alloc()
+function. This is similar to the above described bug pattern. It's just
+missing the put_unused_fd() which isn't needed to exploit the bug. In
+fact, the lack of calling put_unused_fd() even avoids a warning in
+alloc_fd() in case new file descriptors get allocated in the exploiting
+process.
+
+This bug was introduced by commit 6cffd79504ce ("misc: fastrpc: Add
+support for dmabuf exporter"), which is Linux v5.1.
+
+A patch for this issue can be found here:
+https://patchwork.kernel.org/project/linux-arm-msm/patch/20220127130218.809261-1-minipli@grsecurity.net/
+
+Thanks,
+Mathias
+
+[1] https://www.openwall.com/lists/oss-security/2022/01/27/4
+
+
+Download attachment "OpenPGP_signature" of type "application/pgp-signature" (666 bytes)

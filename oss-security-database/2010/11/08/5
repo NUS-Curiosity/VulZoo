@@ -1,0 +1,91 @@
+
+Date: Mon, 8 Nov 2010 08:48:01 +0300
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: Linux kernel proactive security hardening
+
+Dan, Vasiliy -
+
+On Mon, Nov 08, 2010 at 06:07:38AM +0300, Solar Designer wrote:
+> On a more relevant issue (to us), any ideas on dealing with kernel stack
+> infoleaks in a general manner (not just plugging the bugs one by one)?
+> I guess it could be addressed in gcc (an option to wipe stack frames) or
+> in the kernel (wipe even more of the stack, beyond the stack pointer, on
+> syscall entry).  Unfortunately, either has likely measurable performance
+> impact.  (BTW, has some of this been implemented somewhere already?)
+> Any other ideas?
+
+OK, here are some lower-overhead ideas of my own:
+
+1. Perhaps the majority of infoleaks (maybe over 90% of those being
+discovered these days?) are triggerable via only a handful of syscalls,
+and perhaps only in certain easy-to-check-for circumstances.  I am
+thinking ioctl(2), as well as maybe read(2) (and other read syscalls,
+yes...) from device files (not from other file types).  I haven't
+checked whether this matches the statistics so far or not - we need to
+check and come up with a short list of typical "patterns" like this.
+Then we may implement stack wiping (say, to 1 KB below the stack
+pointer) invoked from top-level functions for these syscalls and only
+when the circumstances are present (e.g., check file type for the
+provided fd).  Do it before calling the deeper layers, indeed.
+
+2. We could turn all function-local non-static definitions of:
+
+struct x y;
+
+into:
+
+struct x y = {};
+
+We could do this by pre-processing the source files or with a patch to
+gcc (introduce a command-line option to assume empty initializers for
+all on-stack structs).
+
+I've just checked - this often produces efficient code: where it is
+obvious enough for gcc that most fields are explicitly initialized by
+the function, then only the few actually uninitialized ones are zeroed.
+Moreover, in cases where the struct or its fields are then copied to
+other variables, the struct itself may get eliminated (and the
+assignments/zeroing are made right to the target variables).  Indeed,
+copy_to_user() should prevent the latter optimization, but I am also
+considering cases where the above change would happen to be applied to
+structs never exported to userspace (if we apply it universally).
+
+Unfortunately, there will be plenty of cases where gcc would not be able
+to tell that the struct is not used until a certain point, so it'd have
+to needlessly initialize it... which will result in performance impact.
+
+Please note that either of the ideas above will take care both of
+uninitialized fields and of alignment gaps.  With the second approach
+this was not obvious to me, so I tested (with gcc 3.4.5 only so far):
+
+struct x {
+	int a;
+	char b;
+	int c;
+};
+
+void f(struct x *y) {
+	struct x x = {};
+
+	x.a = 1;
+	x.b = 2;
+	x.c = 3;
+	*y = x;
+}
+
+The produced code is inefficient, but safe - it zeroizes the entire
+struct (12 bytes), then proceeds to set the three fields (4+1+4).
+
+3. I also briefly thought of post-processing gcc-generated assembly
+files, but I like the above approaches better.
+
+Perhaps #1 above should be it (wipe the stack in _some_ cases only) -
+simple and likely without measurable slowdown for real-world use.
+#2 is more difficult and likely slower (albeit not as slow as wiping
+entire stack frames would be).  Maybe #2 will prevent a larger
+percentage of vulnerabilities and in an easier to confirm way, though.
+
+Comments and other ideas are welcome.
+
+Alexander

@@ -1,0 +1,114 @@
+
+Date: Mon, 21 Feb 2022 16:16:37 +0100
+From: Szymon Heidrich <szymon.heidrich@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2022-25375 : Linux RNDIS USB Gadget memory extraction via packet
+ filter
+
+The RNDIS USB Gadget may be exploited to dump contents
+of kernel memory space via packet filter update mechanism.
+
+The RNDIS_MSG_SET handler - rndis_set_response - calls gen_ndis_set_resp
+passing a buffer pointer offset by BufOffset + 8. The BufOffset variable
+is retrieved from the RNDIS message and not validated to respect buffer
+boundaries. Consequently by manipulating the four byte InformationBufferOffset
+member of rndis_set_msg_type an attacker may offset the actual buffer by up
+to 0xffffffff bytes.
+
+rndis.c - rndis_msg_parser
+>	case RNDIS_MSG_QUERY:
+>		return rndis_query_response(params,
+>					(rndis_query_msg_type *)buf);
+>
+>	case RNDIS_MSG_SET:
+>		return rndis_set_response(params, (rndis_set_msg_type *)buf);
+
+rndis.c - rndis_set_response
+> static int rndis_set_response(struct rndis_params *params,
+>			      rndis_set_msg_type *buf)
+>{
+>	u32 BufLength, BufOffset;
+>	rndis_set_cmplt_type *resp;
+>	rndis_resp_t *r;
+>
+>	r = rndis_add_response(params, sizeof(rndis_set_cmplt_type));
+>	if (!r)
+>		return -ENOMEM;
+>	resp = (rndis_set_cmplt_type *)r->buf;
+>
+>	BufLength = le32_to_cpu(buf->InformationBufferLength);
+>	BufOffset = le32_to_cpu(buf->InformationBufferOffset);
+>
+>#ifdef	VERBOSE_DEBUG
+>	pr_debug("%s: Length: %d\n", __func__, BufLength);
+>	pr_debug("%s: Offset: %d\n", __func__, BufOffset);
+>	pr_debug("%s: InfoBuffer: ", __func__);
+>
+>	for (i = 0; i < BufLength; i++) {
+>		pr_debug("%02x ", *(((u8 *) buf) + i + 8 + BufOffset));
+>	}
+>
+>	pr_debug("\n");
+>#endif
+>
+>	resp->MessageType = cpu_to_le32(RNDIS_MSG_SET_C);
+>	resp->MessageLength = cpu_to_le32(16);
+>	resp->RequestID = buf->RequestID; /* Still LE in msg buffer */
+>	if (gen_ndis_set_resp(params, le32_to_cpu(buf->OID),
+>			((u8 *)buf) + 8 + BufOffset, BufLength, r))
+>		resp->Status = cpu_to_le32(RNDIS_STATUS_NOT_SUPPORTED);
+>	else
+>		resp->Status = cpu_to_le32(RNDIS_STATUS_SUCCESS);
+>
+>	params->resp_avail(params->v);
+>	return 0;
+>}
+
+Next the code responsible for handling RNDIS_OID_GEN_CURRENT_PACKET_FILTER
+OID sets the current packet filter to the value pointed by the buf pointer.
+With the offset applied this allows one to retrieve two bytes at a specified
+address and store the value in the packet filter.
+
+rndis.c - gen_ndis_set_resp
+>	switch (OID) {
+>	case RNDIS_OID_GEN_CURRENT_PACKET_FILTER:
+>
+>		/* these NDIS_PACKET_TYPE_* bitflags are shared with
+>		 * cdc_filter; it's not RNDIS-specific
+>		 * NDIS_PACKET_TYPE_x == USB_CDC_PACKET_TYPE_x for x in:
+>		 *	PROMISCUOUS, DIRECTED,
+>		 *	MULTICAST, ALL_MULTICAST, BROADCAST
+>		 */
+>		*params->filter = (u16)get_unaligned_le32(buf);
+>		pr_debug("%s: RNDIS_OID_GEN_CURRENT_PACKET_FILTER %08x\n",
+>			__func__, *params->filter);
+>
+
+Further step is to retrieve the packet filter value by utilizing a combination
+of USB_CDC_SEND_ENCAPSULATED_COMMAND with RNDIS_MSG_QUERY for the
+RNDIS_OID_GEN_CURRENT_PACKET_FILTER OID and USB_CDC_GET_ENCAPSULATED_RESPONSE
+control transfer requests.
+
+Repeating the set/get packet filter with incremented InformationBufferOffset
+in the RNDIS request allows extraction of up to 0xffffffff bytes of kernel
+space memory by two bytes at a time. For large amounts of data the process is
+rather slow but still effective.
+
+> $ sudo python3 rndisco.py -v 0x1b67 -p 0x400c -l 0x3fffc > /tmp/rpi_rndis.dmp
+> strings /tmp/rpi_rndis.dmp -n8 | tail -n 6
+> stp_proto_unregister
+> <30>Jan 27 14:39:48 dhcpcd[486]: usb0: IAID be:53:70:24
+> <30>Jan 27 14:39:46 dhcpcd[486]: usb0: IAID be:53:70:24
+> <30>Jan 27 14:39:46 dhcpcd[486]: usb0: adding address fe80::6f70:c737:89e:697a
+> <30>Jan 27 14:39:40 dhcpcd[486]: usb0: carrier lost
+> <30>Jan 27 14:39:48 dhcpcd[486]: usb0: adding address fe80::6f70:c737:89e:697a
+
+References
+- https://github.com/torvalds/linux/commit/38ea1eac7d88072bbffb630e2b3db83ca649b826
+- https://cdn.kernel.org/pub/linux/kernel/v5.x/ChangeLog-5.16.10
+- https://github.com/szymonh/rndis-co
+- https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2022-25375
+
+
+Best regards,
+Szymon

@@ -1,0 +1,166 @@
+
+Date: Thu, 7 May 2015 12:36:39 +0300
+From: Vasily Kulikov <segoon@...nwall.com>
+To: Solar Designer <solar@...nwall.com>
+Cc: Wen Xu <hotdog3645@...il.com>, oss-security@...ts.openwall.com,
+	kernel-hardening@...ts.openwall.com
+Subject: Linux kernel pointer poisoning (was: CVE request for a fixed bug
+ existed in all versions of linux kernel from KeenTeam)
+
+[cc'ed kernel-hardening@]
+
+On Sat, May 02, 2015 at 15:53 +0300, Solar Designer wrote:
+> Then, perhaps we should harden the poison pointers to be either below
+> typical mmap_min_addr or in an unmapped portion of kernel space?  Do I
+> understand correctly that, short of possible mmap_min_addr bypasses in
+> general (if relevant), this would mitigate the issue?
+> 
+> Right now, they are:
+> 
+> /*
+>  * These are non-NULL pointers that will result in page faults
+>  * under normal circumstances, used to verify that nobody uses
+>  * non-initialized list entries.
+>  */
+> #define LIST_POISON1  ((void *) 0x00100100 + POISON_POINTER_DELTA)
+> #define LIST_POISON2  ((void *) 0x00200200 + POISON_POINTER_DELTA)
+> 
+> I'd change them to e.g.:
+> 
+> #define LIST_POISON1  ((void *) 0x00000100 + POISON_POINTER_DELTA)
+> #define LIST_POISON2  ((void *) 0x00000200 + POISON_POINTER_DELTA)
+> 
+> where POISON_POINTER_DELTA would normally be 0 on 32-bit x86, so they'd
+> be below mmap_min_addr on that arch.  Meanwhile, a mitigation appears to
+> be to set mmap_min_addr higher than 0x00200200 (slightly over 2 MB), but
+> that's not great as it leaves significantly less ASCII-armored space for
+> libraries.
+> 
+> BTW, it appears that on x86_64 POISON_POINTER_DELTA is
+> 0xdead000000000000 by default, which I guess would hit an unmapped page
+> even with the current LIST_POISON2 value?  If so, is the bug at worst a
+> kernel Oops on x86_64 unless someone changed POISON_POINTER_DELTA in
+> their build?
+> 
+> config ILLEGAL_POINTER_VALUE
+> 	hex
+> 	default 0 if X86_32
+> 	default 0xdead000000000000 if X86_64
+> 
+> Regardless, as a supporter of that kernel patch, I am embarrassed!
+
+Besides setting current poison pointer constant to sane values we should
+also think of API clearness and usability.  I'd want to also slightly
+change the macros in question to ease common kernel developer to
+introduce new poison pointer constants for new subsystems.
+
+What do we want from the API?
+
+1) poisoned pointer base must be non-mmap'able
+2) all poisoned pointers (i.e. base+offset) must be non-mmap'able
+3) a small offset relative to poisoned pointers must be non-mmap'able
+4) poisoned pointers from different subsystems should be different
+
+A kernel developer might want to pass a subsystem id to a macro instead
+of explicit math, like in the following patch:
+
+diff --git a/include/linux/poison.h b/include/linux/poison.h
+index 7b2a7fc..5cdff6b 100644
+--- a/include/linux/poison.h
++++ b/include/linux/poison.h
+@@ -1,40 +1,54 @@
+ #ifndef _LINUX_POISON_H
+ #define _LINUX_POISON_H
++#include <linux/bug.h>
+ 
+ /********** include/linux/list.h **********/
+ 
+ /*
+  * Architectures might want to move the poison pointer offset
+  * into some well-recognized area such as 0xdead000000000000,
+- * that is also not mappable by user-space exploits:
++ * that is also not mappable by user-space exploits,
++ * by adjusting CONFIG_ILLEGAL_POINTER_VALUE:
+  */
+ #ifdef CONFIG_ILLEGAL_POINTER_VALUE
+ # define POISON_POINTER_DELTA _AC(CONFIG_ILLEGAL_POINTER_VALUE, UL)
+ #else
+ # define POISON_POINTER_DELTA 0
+ #endif
++/* 
++ * Poisoned pointers of different subsystems should be different
++ * but must not move far away from POISON_POINTER_DELTA.
++ * Otherwise poisoned pointer might be mmap'able on some architectures.
++ */
++#define POISON_AREA_SIZE 0x1000
++#define POISON_POINTER(x) \
++	({ \
++		BUILD_BUG_ON(x >= POISON_AREA_SIZE); \
++       	((void *)(x) + POISON_POINTER_DELTA);})
+ 
+ /*
+  * These are non-NULL pointers that will result in page faults
+  * under normal circumstances, used to verify that nobody uses
+  * non-initialized list entries.
+  */
+-#define LIST_POISON1  ((void *) 0x00100100 + POISON_POINTER_DELTA)
+-#define LIST_POISON2  ((void *) 0x00200200 + POISON_POINTER_DELTA)
++#define LIST_POISON1  POISON_POINTER(0x0100)
++#define LIST_POISON2  POISON_POINTER(0x0200)
+ 
+ /********** include/linux/timer.h **********/
+ /*
+  * Magic number "tsta" to indicate a static timer initializer
+  * for the object debugging code.
+  */
+-#define TIMER_ENTRY_STATIC	((void *) 0x74737461)
++#define TIMER_ENTRY_STATIC	((void*)0x0300 + POISON_POINTER_DELTA)
++// FIXME
++//#define TIMER_ENTRY_STATIC	POISON_POINTER(0x0300)
+ 
+ /********** mm/debug-pagealloc.c **********/
+ #define PAGE_POISON 0xaa
+ 
+ /********** mm/page_alloc.c ************/
+ 
+-#define TAIL_MAPPING	((void *) 0x01014A11 + POISON_POINTER_DELTA)
++#define TAIL_MAPPING	POISON_POINTER(0x0400)
+ 
+ /********** mm/slab.c **********/
+ /*
+
+
+
+POISON_POINTER() checks whether an offset argument is sane.  If it is
+not, it leads to a build failure:
+
+  CC      mm/page_alloc.o
+  mm/page_alloc.c: In function 'free_pages_prepare':
+  mm/page_alloc.c:840:23: error: call to '__compiletime_assert_840' declared with attribute error: BUILD_BUG_ON failed: 0x0111400 >= POISON_AREA_SIZE
+  mm/page_alloc.c: In function 'prep_compound_page':
+  mm/page_alloc.c:447:16: error: call to '__compiletime_assert_447' declared with attribute error: BUILD_BUG_ON failed: 0x0111400 >= POISON_AREA_SIZE
+  make[1]: *** [mm/page_alloc.o] Error 1
+  make: *** [mm] Error 2
+
+
+Two questions here:
+
+a) how to fairy use arch-specific non-mmap'able zone to resolve (2) and
+(3)?  Current 0x1000 is a hardcoded copy-pasted default value of
+DEFAULT_MMAP_MIN_ADDR.  Using DEFAULT_MMAP_MIN_ADDR instead of 0x1000
+might not be a solution -- we don't want a build to fail in this case,
+user must be able to use DEFAULT_MMAP_MIN_ADDR=0 too.
+
+b) how to check for an insane POISON_POINTER() arg in case of
+TIMER_ENTRY_STATIC (and such)?  The current implementation of
+POISON_POINTER() fails as following:
+
+mm/page_alloc.c: In function 'free_pages_prepare':
+mm/page_alloc.c:840:23: error: call to '__compiletime_assert_840' declared with attribute error: BUILD_BUG_ON failed: 0x0111400 >= POISON_AREA_SIZE
+
+
+Thanks,
+
+-- 
+Vasily Kulikov
+http://www.openwall.com - bringing security into open computing environments

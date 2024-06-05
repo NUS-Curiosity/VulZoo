@@ -1,0 +1,137 @@
+
+Date: Wed, 9 Oct 2019 10:14:30 -0400
+From: Michael Orlitzky <michael@...itzky.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2019-17365: Nix per-user profile directory hijack
+
+Product: Nix
+Versions affected: 2.3 and earlier
+Author: Michael Orlitzky
+Bug report: Reported privately to the NixOS security team on 2019-08-19.
+
+
+== Summary ==
+
+Out of the box, Nix creates an empty, world-writable, per-user profile
+directory. After Nix is installed but before a victim has (re)logged in,
+the victim's personal profile directory can be hijacked by an attacker
+on on the system who has no other special privileges. Thenceforth, the
+attacker controls that profile directory and can take over the target
+account.
+
+
+== Details ==
+
+Nix is a package manager that can install software both globally (for
+the system) and locally (for each user). One critical aspect of the
+per-user support is that each user has a unique local "Nix profile"
+directory. After installing Nix, the intent is that the next time a
+user logs in, her per-user profile directory is created automatically
+and some tweaks are made to allow her to use Nix right away.
+
+The automatic profile-directory creation involves two key things.
+First, the Nix installation script (scripts/install-multi-user.sh)
+modifies /etc/bashrc, /etc/zshrc, and /etc/profile.d/nix.sh to include
+the upstream file scripts/nix-profile-daemon.sh.in every time a user
+logs in. That script, in turn, is supposed to create the user's Nix
+profile directory if it does not exist:
+
+  # Set up the per-user profile.
+  mkdir -m 0755 -p $NIX_USER_PROFILE_DIR
+  if ! test -O "$NIX_USER_PROFILE_DIR"; then
+    echo "WARNING: bad ownership on $NIX_USER_PROFILE_DIR" >&2
+  fi
+
+If the directory does not exist, then when the user creates it, he
+will own it and everything is fine.
+
+However the second key aspect of this process is that, for the user to
+be able to create $NIX_USER_PROFILE_DIR, he must be able to write to
+its parent directory. That parent directory is shared by all users on
+the system, and as a result, is world-writable (so that everyone can
+create his own subdirectory thereof). This is enforced by the
+installation script scripts/install-multi-user.sh...
+
+  _sudo "to make the basic directory structure of Nix (part 2)" \
+    mkdir -pv -m 1777 /nix/var/nix/{gcroots,profiles}/per-user
+
+by the RPM spec file nix.spec.in...
+
+  # make per-user directories
+  for d in profiles gcroots;
+  do
+    mkdir -p $RPM_BUILD_ROOT/nix/var/nix/$d/per-user
+    chmod 1777 $RPM_BUILD_ROOT/nix/var/nix/$d/per-user
+  done
+
+and even in one place by the Nix "LocalStore" class in
+src/libstore/local-store.cc,
+
+  Path perUserDir = profilesDir + "/per-user";
+  createDirs(perUserDir);
+  if (chmod(perUserDir.c_str(), 01777) == -1) ...
+
+The sticky bit here is better than nothing, but is ultimately
+insufficient. The problem with this approach is that after Nix is
+installed, _any_ user on the system can create and thereafter own
+_any_ local profile directory. I can't overwrite an existing one, but
+I can create your profile directory before you have ever logged in.
+Since the global hacks above load code from your Nix profile
+directory, this lets me run code when you log in.
+
+To make the situation a bit worse, the very last thing that gets
+executed by scripts/nix-profile-daemon.sh.in when you log in is,
+
+  export PATH="$HOME/.nix-profile/bin:...:$PATH"
+
+where $HOME/.nix-profile is a symlink to your Nix local profile directory,
+
+  if test "$USER" != root; then
+    ln -s $NIX_USER_PROFILE_DIR/profile $HOME/.nix-profile
+  else
+
+Since I can write to your local profile directory, and since that
+location is prepended to your path, I can override all of your system
+executables with my own copies. Putting everything together, this
+allows any user on the system to escalate his privileges to that of
+any other non-root user. The root user is probably safe since he does
+not use a local profile directory; however, on many systems, "root" is
+not the only super-user account.
+
+
+== Exploitation ==
+
+The following example takes over the "toor" account using an
+unprivileged "user" account.
+
+  1. Install Nix as root.
+
+  2. As "user", create the directory that "toor" would like to use for
+     his per-user profile:
+
+       user $ cd /nix/var/nix/profiles/per-user
+       user $ mkdir toor
+
+     At this point, "user" owns toor's profile directory; the end is
+     nigh.
+
+  3. To make matters worse, the unprivileged "user" can inject programs
+     into toor's PATH:
+
+       user $ mkdir -p toor/profile/bin
+       user $ cp /path/to/exploit toor/profile/bin/cd
+       user $ cp /path/to/exploit toor/profile/bin/cp
+       user $ cp /path/to/exploit toor/profile/bin/ls
+       user $ cp /path/to/exploit toor/profile/bin/exit
+       user $ ...
+
+  4. Log in as toor; a warning is issued:
+
+       Nix: WARNING: bad ownership on /nix/var/nix/profiles/per-
+       user/toor, should be toor
+       toor $
+
+     This is better than nothing, but it's too late.
+
+  5. Anything "toor" does (cd, cp, ls, exit,...) gives the unprivileged
+     user control of his account.

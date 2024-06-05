@@ -1,0 +1,76 @@
+
+Date: Mon, 1 May 2017 19:12:05 +0200
+From: "Jason A. Donenfeld" <Jason@...c4.com>
+To: oss-security <oss-security@...ts.openwall.com>
+Subject: Integer Overflow in rxvt
+
+Hello,
+
+A CVE for this in the process of being assigned, and I'll follow up on this
+thread once one has been given.
+
+There exists an integer overflow in rxvt. As the upstream project is dead,
+there is no non-vulnerable version. Thus, I'd recommend distributions use
+the attached patch. Do note that rxvt is different from rxvt-unicode (urxvt),
+which is still maintained by an upstream and is not vulnerable to this bug.
+
+Using the following escape code will segfault rxvt:
+
+        $ printf '\033[-2147483648L'
+
+The crash occurs here in screen.c:
+
+    for (; i--; j++) {
+        r->screen.tlen[j] = 0;
+        r->screen.text[j] = r->buf_text[i];
+        r->screen.rend[j] = r->buf_rend[i];
+
+We appear to be segfaulting on the read to r->buf_text[i], where i is
+2147483647 -- 0x7fffffff. Slightly earlier in that function we have this
+block:
+
+    if (count < 0)
+        count = -count;
+
+Before this block is run, count is -2147483648 -- 0x80000000. After the block
+is run, count should be 2147483648, right? Not so fast. It turns out that
+there's no complement of -2147483648 within 32-bits, because the maximum
+positive integer is 2147483647, one less. Probably if you read the C spec it
+will tell you that this operation is undefined, but what's for certain is that
+on my architecture, the integer remains negative -- -2147483648. We then
+bypass the next few blocks, since count is negative, until we get to this
+line:
+
+        j = row2 - count + 1, i = count;
+
+Thus, by the time we get to the crashing block, i has become -2147483648 - 1,
+which is our crashing value of 2147483647, and so we segfault.
+
+It comes from a call to rxvt_scroll_text from inside rxvt_scr_insdel_lines. Here
+we have the following multiplication:
+
+    rxvt_scroll_text(r, r->screen.cur.row, r->screen.bscroll, insdel * count,
+
+In this case insdel is -1, for the INSERT operation, and count is our
+-2147483648. Predictably, we still don't become positive. Backtracing a step
+further reveals that this comes from a call inside of rxvt_process_csi_seq,
+where the actual escape code is converted from a string.
+
+The attached patch simply bounds the size of input values, so that they don't
+overflow on multiplication or a few small additions and then a multiplication.
+
+I've also attached a similar patch for rxvt-unicode. While it is not
+vulnerable to this particular attack, the attached patch may be
+"best practice". I've also sent this upstream and am awaiting their
+response.
+
+While this particular bug is in rxvt, I suspect that other terminal emulators,
+such as rxvt-unicode, xterm, libvte, konsole, tmux, screen, mosh, etc, may
+indeed suffer from similar types of bugs. Thus, research into this domain could
+prove useful.
+
+Jason
+
+View attachment "rxvt-integer-overflow-fix.patch" of type "text/x-patch" (364 bytes)
+
+View attachment "rxvt-unicode-integer-bounding.patch" of type "text/x-patch" (447 bytes)

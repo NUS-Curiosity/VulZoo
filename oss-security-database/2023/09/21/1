@@ -1,0 +1,78 @@
+
+Date: Thu, 21 Sep 2023 07:21:21 -0700
+From: Tavis Ormandy <taviso@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: MOV{H,L}PS instructions can fail on Genoa (Zen 4)
+
+Hey, when fuzzing Genoa (AMD Zen 4) I noticed that sometimes the
+MOV{H,L}PS instructions don't seem to work? I asked AMD if they consider
+this a vulnerability, and they didn't.. so I'll just document it here
+for reference...
+
+Quick background, these instructions load two 32-bit packed singles from the
+source operand into the low (movlps) or high (movhps) 64-bits of a vector
+register.
+
+Consider this minimal example:
+
+section .data
+    a: dq 0x1111111111111111
+    b: dq 0x2222222222222222
+
+section .text
+    movhps  xmm0, [rel a]
+    movlps  xmm0, [rel b]
+
+
+The result should be xmm0 has the value 0x11111111111111112222222222222222.
+
+Genoa added support for AVX512, which gives you a bunch more vector
+registers, so now you can do:
+
+    movhps  xmm28, [rel b]
+
+However, I've found that non-deterministically, when using any register
+above xmm15, previous (pipelined?) operations on other registers fail.
+
+Here is an example:
+
+section .data
+    data: dd 0x11111111, 0x22222222, 0x33333333, 0x44444444
+    zero: dd 0,0,0,0
+
+section .text
+    vmovdqu  xmm0, [rel data]
+    vmovlps  xmm1, xmm0, [rel zero]
+    vmovhps  xmm17, xmm0, [rel zero]
+
+I think the expected result would be:
+
+xmm0  = 0x44444444333333332222222211111111
+xmm1  = 0x44444444333333330000000000000000
+xmm17 = 0x00000000000000002222222211111111
+
+However, on genoa we non-deterministically get xmm1=0.
+
+I don't know the cause or where the bug is, any feedback welcome. I've
+attached a testcase (I ported it to C from a raw fuzzer generated
+testcase, hopefully it compiles consistently!).
+
+I can reproduce it with pure intrinsics too (no asm), but the output is
+not consistent across gcc versions. The attached version does use some
+inline asm.
+
+I think it should produce no output at all, but on Genoa it does sometimes
+produce output for me.
+
+Compile with:
+
+$ gcc -mavx512vl -o movhps movhps.c
+
+Tavis.
+
+-- 
+ _o)            $ lynx lock.cmpxchg8b.com
+ /\\  _o)  _o)  $ finger taviso@....org
+_\_V _( ) _( )  @taviso
+
+View attachment "movhps.c" of type "text/plain" (1293 bytes)

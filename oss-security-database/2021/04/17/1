@@ -1,0 +1,96 @@
+
+Date: Sat, 17 Apr 2021 07:31:05 -0700
+From: Tavis Ormandy <taviso@...il.com>
+To: oss-security@...ts.openwall.com
+Cc: security@...ian.org
+Subject: xscreensaver package caps gets raw socket
+
+Hello, I noticed that at least debian (maybe others) ship xscreensaver
+hack with cap_net_raw enabled:
+
+$ getcap /usr/libexec/xscreensaver/sonar
+/usr/libexec/xscreensaver/sonar cap_net_raw=p
+
+That seems like a bug, you can just load some driver and get a raw
+socket. I wrote a quick exploit, this script will run tcpdump without
+needing root.
+
+$ bash sock.sh
+17:43:55.000000 IP (tos 0x0, ttl 64, id 14541, offset 0, flags [DF], proto ICMP (1), length 84)
+    debian > sfo07s17-in-f78.1e100.net: ICMP echo request, id 59166, seq 1, length 64
+17:43:55.000000 IP (tos 0x0, ttl 128, id 42276, offset 0, flags [none], proto ICMP (1), length 84)
+    sfo07s17-in-f78.1e100.net > debian: ICMP echo reply, id 59166, seq 1, length 64
+
+I sent a report to debian, jwz and mesa. We concluded no embargo is
+necessary, so continuing the discussion here.
+
+Summary of discussion so far:
+
+- In theory, mesa support running in a privileged context, their
+  documentation says they disable dangerous features in setuid/setgid
+  binaries:
+
+    https://mesa-docs.readthedocs.io/en/latest/egl.html
+
+  In fact, this is broken because they only check if (geteuid() !=
+  getuid()) { ... }. That check doesn't even handle setgid, let alone file
+  caps. If mesa agree this is a bug, simply changing their checks to if
+  (getauxval(AT_SECURE)) { ... } might make this bug go away, and handle
+  file caps and setgid for free. I filed a bug for that, but there
+  hasn't been a response:
+  https://gitlab.freedesktop.org/mesa/mesa/-/issues/4549
+
+- The code could use ping sockets instead, but they're still rarely
+  enabled by default, and users have to set the ping_group_range sysctl.
+  I personally think it's time to enable them by default, but that's a
+  different discussion :-)
+
+- If neither of those two options work, then I guess we will have to
+  try to make using mesa safe...but it sounds really hard. The obvious
+  fix for right now is trying to clean up the environment, e.g.:
+
+  (Note: untested)
+
+    char *allowed[][2] = {
+        { "DISPLAY", 0 },
+        { "XAUTHORITY", 0 },
+        NULL,
+    };
+    for (int i = 0; allowed[i][0]; i++)  {
+        if (getenv(allowed[i][0])) {
+            allowed[i][1] = strdup(getenv(allowed[i][0]));
+        }
+    }
+    if (clearenv() != 0) {
+        abort();
+    }
+    for (int i = 0; allowed[i][0]; i++)  {
+        if (allowed[i][1]) {
+            setenv(allowed[i][0], allowed[i][1], 1);
+            free(allowed[i][1]);
+        }
+    }
+
+    // ...
+    MesaInitWhatever();
+
+I *think* this will work in main(), but it's possible there are some
+constructors somewhere that execute before main() I've missed. If that's
+the case, then I guess we will need a wrapper binary that does execve()
+and passes a non-cloexec fd with a sanitized environment?
+
+The problem is that even if we make cleaning up the environment work,
+you're always going to need $DISPLAY, and any code exec bug connecting
+to a malicious X server will be a security bug.... and that sounds super
+hard to get right?
+
+I dunno, thoughts on fixing this appreciated...
+
+Tavis.
+
+-- 
+ _o)            $ lynx lock.cmpxchg8b.com
+ /\\  _o)  _o)  $ finger taviso@....org
+_\_V _( ) _( )  @taviso
+
+View attachment "sonar-sock-demo.sh" of type "text/plain" (3253 bytes)

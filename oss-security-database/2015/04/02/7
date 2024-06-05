@@ -1,0 +1,116 @@
+
+Date: Thu, 02 Apr 2015 17:15:52 +0200
+From: Yann Droneaud <ydroneaud@...eya.com>
+To: Shachar Raindel <raindel@...lanox.com>
+Cc: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>, 
+	"<linux-rdma@...r.kernel.org> (linux-rdma@...r.kernel.org)"
+	 <linux-rdma@...r.kernel.org>, "linux-kernel@...r.kernel.org"
+	 <linux-kernel@...r.kernel.org>, "stable@...r.kernel.org"
+	 <stable@...r.kernel.org>
+Subject: Re: CVE-2014-8159 kernel: infiniband: uverbs: unprotected physical
+ memory access
+
+Hi,
+Le jeudi 02 avril 2015 à 10:52 +0000, Shachar Raindel a écrit :
+> > -----Original Message-----
+> > From: Yann Droneaud [mailto:ydroneaud@...eya.com]
+> > Sent: Thursday, April 02, 2015 1:05 PM
+> > Le mercredi 18 mars 2015 à 17:39 +0000, Shachar Raindel a écrit :
+...
+> > > +	/*
+> > > +	 * If the combination of the addr and size requested for this
+> > memory
+> > > +	 * region causes an integer overflow, return error.
+> > > +	 */
+> > > +	if ((PAGE_ALIGN(addr + size) <= size) ||
+> > > +	    (PAGE_ALIGN(addr + size) <= addr))
+> > > +		return ERR_PTR(-EINVAL);
+> > > +
+> > 
+> > Can access_ok() be used here ?
+> > 
+> >          if (!access_ok(writable ? VERIFY_WRITE : VERIFY_READ,
+> >                         addr, size))
+> >                   return ERR_PTR(-EINVAL);
+> > 
+> 
+> No, this will break the current ODP semantics.
+> 
+> ODP allows the user to register memory that is not accessible yet.
+> This is a critical design feature, as it allows avoiding holding
+> a registration cache. Adding this check will break the behavior,
+> forcing memory to be all accessible when registering an ODP MR.
+> 
+
+Failed to notice previously, but since this would break ODP, and ODP is 
+only available starting v3.19-rc1, my proposed fix might be applicable 
+for older kernel (if not better).
+
+>From 2a3beaeb4b35d968f127cb59cfda2f12dbd87e4b Mon Sep 17 00:00:00 2001
+From: Yann Droneaud <ydroneaud@...eya.com>
+Date: Thu, 2 Apr 2015 17:01:05 +0200
+Subject: [RFC PATCH] IB/core: reject invalid userspace memory range registration
+
+Signed-off-by: Yann Droneaud <ydroneaud@...eya.com>
+---
+ drivers/infiniband/core/umem.c | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
+index df0c4f605a21..6758b4ac56eb 100644
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@ -90,6 +90,7 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+ 	DEFINE_DMA_ATTRS(attrs);
+ 	struct scatterlist *sg, *sg_list_start;
+ 	int need_release = 0;
++	bool writable;
+ 
+ 	if (dmasync)
+ 		dma_set_attr(DMA_ATTR_WRITE_BARRIER, &attrs);
+@@ -97,6 +98,19 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+ 	if (!can_do_mlock())
+ 		return ERR_PTR(-EPERM);
+ 
++	/*
++	 * We ask for writable memory if any access flags other than
++	 * "remote read" are set.  "Local write" and "remote write"
++	 * obviously require write access.  "Remote atomic" can do
++	 * things like fetch and add, which will modify memory, and
++	 * "MW bind" can change permissions by binding a window.
++	 */
++	writable  = !!(access & ~IB_ACCESS_REMOTE_READ);
++
++	if (!access_ok(writable ? VERIFY_WRITE : VERIFY_READ,
++		       (void __user *)addr, size))
++		return ERR_PTR(-EFAULT);
++
+ 	umem = kzalloc(sizeof *umem, GFP_KERNEL);
+ 	if (!umem)
+ 		return ERR_PTR(-ENOMEM);
+@@ -106,14 +120,7 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+ 	umem->offset    = addr & ~PAGE_MASK;
+ 	umem->page_size = PAGE_SIZE;
+ 	umem->pid       = get_task_pid(current, PIDTYPE_PID);
+-	/*
+-	 * We ask for writable memory if any access flags other than
+-	 * "remote read" are set.  "Local write" and "remote write"
+-	 * obviously require write access.  "Remote atomic" can do
+-	 * things like fetch and add, which will modify memory, and
+-	 * "MW bind" can change permissions by binding a window.
+-	 */
+-	umem->writable  = !!(access & ~IB_ACCESS_REMOTE_READ);
++	umem->writable  = writable;
+ 
+ 	/* We assume the memory is from hugetlb until proved otherwise */
+ 	umem->hugetlb   = 1;
+-- 
+2.1.0
+
+Regards.
+
+-- 
+Yann Droneaud
+OPTEYA
+
+

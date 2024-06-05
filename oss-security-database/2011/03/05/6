@@ -1,0 +1,198 @@
+
+Date: Sat, 5 Mar 2011 23:48:07 +0300
+From: Solar Designer <solar@...nwall.com>
+To: Florian Zumbiehl <florz@...rz.de>
+Cc: oss-security@...ts.openwall.com,
+	"Steven M. Christey" <coley@...us.mitre.org>,
+	Stefan Fritsch <sf@...itsch.de>, Jan Kaluza <jkaluza@...hat.com>,
+	Paul Martin <pm@...ian.org>, Petr Uzel <petr.uzel@...e.cz>,
+	Thomas Biege <thomas@...e.de>
+Subject: Re: CVE Request -- logrotate -- nine issues
+
+Hi Florian and all,
+
+I'm sorry I ran out of time for this discussion yesterday.
+
+Here's a thought that I did not convey yet:
+
+If a log file directory is writable by the service pseudo-user, and you
+make both the service and patched logrotate work with it safely, there's
+still the problem of how the sysadmin can access those logs safely.
+
+Normally, the admin would run a command like "less -n" on one of the log
+files, as root.  However, this may allow for DoS attacks via symlinks or
+hard links to device files.  Say, the compromised service may replace
+its log file with a link to a tape device (rewinds tape on open) or to
+/dev/port (locks up some machines on read).
+
+The admin could "su" to the service pseudo-user, but that allows the
+compromised service to attack the admin's terminal, accessing the fd via
+/proc or ptrace of a process such as "less" running under the "su"
+session.  Only "su" itself is immune from such attacks (since it has its
+"dumpable" flag cleared); its child processes are not.  The attacker
+would be able to print control characters directly to the terminal fd,
+and to issue ioctl's on it, changing the terminal mode.  This might have
+a security impact worse than DoS.  Sebastian - you could want to comment
+on this (I recall your research).
+
+A solution could be to use group read permissions, and to view logs as
+neither root nor the service pseudo-user.  This is good, but we can
+hardly expect almost all sysadmins to do it in almost all cases,
+although having the group pre-created and group read permissions
+pre-configured in a distro would be of some help.
+
+A more reliable solution (in terms of being safe from the attacks being
+discussed here even when the sysadmins don't specifically try to access
+log files safely) is simply to have services create log files before
+they drop root (and indeed to have the directory only writable by root).
+This is the case for all services that we currently have in Owl.  By the
+way, our syslogd runs as non-root, but it starts up as root and it
+creates its log files in /var/log if necessary - before dropping to the
+syslogd pseudo-user.  In my opinion, that's how it should be done.
+
+If a service starts up as non-root right away (such as via "su" in its
+startup script), then there's also a problem with its pidfile.  It has
+to write the pidfile as non-root, and thus into a directory writable by
+the service pseudo-user (well, or rewrite a file in-place, which has
+its own issues).  However, the pidfile is likely to be accessed by other
+parts of the system - such as by startup scripts that use
+/etc/init.d/functions and by programs invoked from there (such as
+start-stop-daemon).  Such accesses are likely to be made as root, and
+the file contents are parsed by scripts/programs running as root.  If
+such parsing is not robust when faced with incorrectly formatted input,
+we may have a local root vulnerability.  And we almost certainly have
+DoS potential via spoofed PIDs (have another service killed) and via
+links to device files, like what I described above.
+
+Our policy so far has been to ensure that all pidfiles are only writable
+by root, and are in a directory only writable by root.  This implies
+that services are being started as root, create their pidfiles, and only
+then switch to their proper pseudo-users.
+
+On Fri, Mar 04, 2011 at 06:58:17PM +0100, Florian Zumbiehl wrote:
+[...]
+> it is planned to add a new config directive that allows to specify
+> the credentials to be used for manipulating specific sets of log files,
+> thus obviating the need for separate logrotate invocations but still
+> letting the kernel take care of separating privileges.
+
+This sounds good to me, but it does not solve other problems I pointed
+out above.  Would you also add a similar option to start-stop-daemon and
+to the daemon() function in /etc/init.d/functions (or whatever a given
+distro uses)?  Maybe.  But even if so, the problem with admin's read
+access to the logs remains.  Pre-create a log view group and pre-set
+permissions to 640?  Makes sense.  Yet this is still not as good as
+simply having the service start as root (and deal with log files and
+pidfile as root), whenever possible at all, which I think it is possible
+for system services provided in a distro.
+
+As to services that a non-root user may want to run on their own, the
+user would not be able to use the new user-switching feature of logrotate
+anyway (no root access).  So the user will run an instance of logrotate
+under their account, which is already possible.
+
+Don't get me wrong, I don't really object to logrotate being enhanced.
+I just want to point out a few things (some of this is my opinion rather
+than "the absolute truth"):
+
+1. Other service packages need to be fixed anyway.  Having logs and
+pidfiles in service pseudo-user writable directories is problematic in
+more ways.  Those packages are the vulnerable/guilty ones.
+
+2. Such an enhancement to logrotate is not as useful as it might appear
+at first.
+
+3. The current behavior of logrotate is not exactly a vulnerability in
+logrotate.  Lacking a potentially desirable security-relevant feature,
+sure.  Vulnerability in logrotate, no.
+
+> Now, I guess the major motivation for such an approach over executing
+> logrotate as the unprivileged user directly is backwards compatibility
+> and how much of a nightmare the transition will be, somehow implicitly
+> assuming that the similarity with the old mode of operation should
+> provide for an easier change.
+
+If you compare these two approaches - having logrotate switch
+credentials vs. starting multiple instances of logrotate with proper
+credentials right away - then I agree that the former approach might
+be cleaner (same config file for all, etc.)  However, neither solves
+other issues (admin's access to log files, and system scripts/programs'
+access to and parsing of pidfiles).
+
+> However, this implicit assumption may actually be just that and nothing
+> more. Namely, there are some ideas how logrotate could guess the
+> credentials for some common setups when none have been specified in the
+> config file so as to avoid having to security-patch dozens of packages,
+> at least as a transitional mechanism. But it's rather unclear whether
+> any of that will actually work to a sufficient degree to be useful (and
+> the security of the heuristics to be used is what most of the remaining
+> contention as to how to fix is about).
+
+Oh, you do need to patch those dozens of packages for other reasons as
+well.  So a possible change to logrotate is just a hardening measure.
+This may be fine if it's not used as an excuse not to fix those other
+packages at all.  But if we say that we're fixing vulnerabilities in
+logrotate, we're sort of making such an excuse.  It's better to say that
+we're hardening logrotate to be safer when faced with broken service
+packages, which are then to be fixed one by one.
+
+Yet another issue/risk I did not mention/explain explicitly so far:
+
+I've seen packages where the maintainer made the mistake of making the
+log files directory writable by the service pseudo-user even though the
+service did not depend on that in any way.  That is, the service created
+its log files before dropping root, as it should.  This was the case for
+the nginx package I mentioned in this thread.  A possible logrotate
+"fix" would not solve the problem to a significant degree: similar
+attacks would remain possible against service startup (replace the log
+file with a link, wait for service restart, enjoy the link target being
+written to by the service).  The fix, of course, is to change the log
+files directory ownership in the package.  Not to patch logrotate, which
+is only a workaround for some of the attack vectors.
+
+Package maintainers commonly make other mistakes of this nature as well,
+making the service pseudo-user the owner of any/all of the following:
+directory the service chroot's to, program binaries, config files, and
+indeed pidfiles as mentioned above.  Obviously, none of these are
+fixable in logrotate.  In my opinion, log file directories are just a
+special case of this problem, and this special case does not move
+responsibility from service packages to logrotate.
+
+> If that doesn't work out and you have to patch dozens of packages in
+> order to change their logrotate configs, you probably may just as well
+> patch packages to switch to using their own logrotate instance. Or to a
+> different strategy for logfile handling altogether.
+
+Right.  The latter.
+
+> In particular so,
+> given that quite a few of the affected packages in the case of debian
+> (and I guess it's similar for other distros) do a chown -R on the log
+> dir in their postinst scripts and thus will need a security patch for
+> that anyhow.
+
+Right.  They should simply keep that directory owned by root and have
+the service support that (if not already supported or even assumed,
+which is often/usually the case).
+
+> I guess I don't really have much of an opinion on that. The vulnerabilities
+> should be fixed, and probably in a way that breaks existing setups as
+> little as possible, I don't really care which side is declared defective
+> and subsequently fixed in order to achieve that ;-)
+
+I care because, in this case, I think that "which side is declared
+defective" affects whether the vulnerabilities are fixed for real or
+not.  Thus, one side (service packages) needs vulnerability fixes and
+the other (logrotate) may use some hardening (but that's tricky).
+
+Maybe logrotate should simply refuse to run when the target directory is
+writable by other than the user running logrotate (typically root), with
+an option to accept the risk and force logrotate to run anyway.  Sure,
+this would break existing security-broken setups, but it would also
+force package maintainers to fix their packages in this respect. ;-)
+
+I am sorry for the length of this message, yet I hope it helps.
+
+Thanks,
+
+Alexander

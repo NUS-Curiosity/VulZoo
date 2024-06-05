@@ -1,0 +1,301 @@
+
+Date: Sat, 16 Jun 2018 21:34:22 +0200
+From: Lionel Debroux <lionel_debroux@...oo.fr>
+To: oss-security@...ts.openwall.com
+Subject: Fun with DBM-type databases...
+
+Hi,
+
+TL;DR
+=====
+Many crashes upon offline data corruption in multiple database systems.
+Only two of these DB systems patched after 4+ months. Much work needed
+to backport fixes and move away from insecure & unmaintained DB systems.
+
+
+Summary
+=======
+In January, February and May 2018, I spent some of my free time fuzzing
+a set of DBs more or less loosely from the DBM family, which are
+packaged by Debian: LMDB, GDBM, freecdb, QDBM, Tokyocabinet,
+Kyotocabinet, TDB, NTDB. Offline data corruption is infrequent, but it
+can produce all kinds of trouble when it occurs.
+The results aren't good: only freecdb escaped unscathed from 4 wall
+clock days x 1 Sandy Bridge core of afl-fuzz in deterministic mode,
+spanning more than 1.1G execs. However, I expected no less from a code
+base made by DJB :)
+The other libraries display a variety of crashes of the usual kinds,
+even in standard, non-sanitizer builds, upon offline data corruption:
+some or all of SIG{FPE,SEGV,BUS,ABRT}, at various ratios ranging from <<
+1% to ~15% (!!), with excessive memory consumption and memory leaks.
+Sadly, the most popular library was the one which crashed the most.
+
+Only two of those libraries received a full set of patches for the
+crashing issues I reported: in chronological order, TDB and GDBM. Put
+another way: there's lots of unfixed DoS in the aforementioned
+databases, and/or the CLI programs for dealing with them...
+
+I have not tried to request dozens of CVE IDs, too much work for a free
+time project. The sets of crashing inputs are available on request,
+though some of them are easy to duplicate (and probably exceed) anyway.
+
+
+The motivation behind this work
+===============================
+It's our long-time collective problem with the Berkeley DB libraries:
+* many programs depend on libdb, including core distro components (in
+both the RPM and DEB ecosystems), which makes libdb an essential package
+of the main (and most) Linux distros;
+* libdb's reliability and security are horrible. What got me interested
+in libdb in late 2014 was an infinite loop (well, 1h of CPU time on 1
+core before I killed the process) parsing a BDB DB corrupted by a forced
+computer power down; libdb was shown to be able to corrupt a DB on its
+own, in such a way that salvaging it yields an infinite loop [1]. And of
+course, fuzzers can crash libdb in seconds;
+* the old 5.x versions of libdb, which everyone uses, have been
+unmaintained for years;
+* the newer versions are still maintained, and the latest one at the
+time of this writing contains fixes for more than 44 vulnerabilities
+with CVE numbers (Oracle CPU bulletins from July 2015, April 2016, April
+2017), nearly all of which are full DoS. The brand-new 18.1.25 release's
+changelog [2] mentions more fixes, e.g. #25920 and #26270, which
+correlate with reports I sent in April 2017, several days after 6.2.32
+was published. I guess a future CPU bulletin will tell us how many CVE
+IDs were fixed this time. However, the newer versions use the AGPLv3,
+which makes them unsuitable for most projects, and therefore, the newer
+versions are simply unpackaged by most distros...
+
+The Oracle security people who exchanged e-mails with me over the past
+few years are nice, but the sheer amount of issues and glacial pace of
+the fixes on Berkeley DB (like on other software more or less supposedly
+maintained by Oracle, anyway) aren't... At least as far as BDB is
+concerned, Oracle is purely reactive to vulnerability reports.
+
+If client programs are to replace the usage of BDB by the usage of
+another similar library, more or less close to the original DBM spirit -
+which they should do even for reliability reasons, per the above - then
+the replacement libraries had better be (relatively) robust against
+offline data corruption, as trading an unfixable security pig with an
+unfixed security pig is a weak improvement.
+
+
+Detailed description and timeline
+=================================
+* LMDB (2017/01/27-28, reported on the 28th)
+Description of database and issues
+----------------------------------
+LMDB is BDB's closest derivative, with a somewhat similar API. Its
+designers took years of usage feedback on BDB into account, to build a
+DB with high emphasis on reliability under normal conditions and
+performance. They did a great job at those, no doubt about that... but
+they didn't do a good job at robustness against offline corruption.
+
+Under Debian sid amd64:
+# apt install lmdb-utils zzuf
+$ rm -f input*
+$ echo -e "key\nvalue" | mdb_load -T -n input
+$ zzuf -qcs 0:1000 -C 10 -U 3 mdb_dump -n -l input
+$ zzuf -qcs 0:1000 -C 10 -U 3 mdb_dump -n -a input
+$ zzuf -qcs 0:1000 -C 10 -U 3 mdb_stat -n -e -fff -r -a input
+
+yields an assortment of SIGFPE, SIGABRT and SIGSEGV in seconds.
+afl-clang-fast + afl-fuzz produce more of them, as well as SIGBUS.
+The segfaults are of the read variety, but include reads to wild
+addresses (-4, 0x44, some RO mmap-ed areas).
+
+Communication with maintainer and partial fixes
+-----------------------------------------------
+The maintainer, Howard Chu, replied very quickly and fixed several
+issues (but not all of them) on his side. He published these fixes on a
+separate "fuzz" branch, after I pinged him. He doesn't consider
+malicious edits of on-disk data a valid threat. He wants to be shown
+"cases where in regular usage, and in the face of either application or
+OS crash, that LMDB has gotten corrupted". Maybe I could have
+communicated different / better points.
+
+
+* GDBM (early 2018/02, reported 2018/02/03)
+Description of database and issues
+----------------------------------
+GDBM's the most popular implementation of DBM on Linux distros (and
+elsewhere ?), its many and essential reverse dependencies make it an
+essential package.
+
+zzuf and afl produced SIGABRT, SIGSEGV and SIGFPE in a standard build of
+libgdbm + gdbm_dump 1.14.1 in less than a second. Excessive memory
+consumption (thrashing, OOM kill) was displayed by one of the samples
+produced by afl.
+The segfaults included allocations of 0-sized blocks followed by OOB
+writes to these 0-sized blocks, and OOB writes to unallocated parts of
+arenas. The crash rate was consistently ~15%, both over the first
+million execs and the ~100M total execs of the first round, which wasn't
+built using AFL_USE_ASAN=1 or even AFL_HARDEN=1...
+
+Communication with maintainer and fixes + improvements
+------------------------------------------------------
+GDBM's maintainer Sergey Poznyakoff is busy, but after a ping sent 92
+days after the initial report, he has been able to spend time fixing a
+significant number of issues found by multiple fuzzing rounds, in such a
+way that asan-enabled builds of libgdbm + gdbmtool now usually survive
+several sequences of commands mixing reads, writes, reorganize
+operations, with a sprinkling of recover on other instances.
+He also implemented command sequences passed through argc/argv to
+gdbmtool; I sent that feature request after seeing that tdbtool supports
+them and that they're more convenient than passing commands through
+stdin or an external file.
+GDBM 1.15 was published today; a number of issues are present in the
+still popular 1.8.x versions, and fixes will need to be backported
+downstream.
+
+
+* QDBM, Tokyo Cabinet, Kyoto Cabinet (late 2018/01 and early 2018/02,
+reported 2018/02/03 and 2018/02/10):
+Description of database and issues
+----------------------------------
+In the early 2000s, QDBM was originally made to be faster than DBM;
+Tokyo Cabinet and Kyoto Cabinet are its successors, which offer a
+variety of internal data structures. Some of the CLI front-ends for
+these libraries can't be fuzzed using afl (directly, I suppose I could
+have made a preprocessor or something along those lines) because they
+take a folder name as destination argument, and create / expect multiple
+files in these folders.
+
+Sample fuzzing invocations for TC and KC:
+$ kchashmgr create -ts -bnum 65536 input_hash/hash
+$ afl-fuzz -i input_hash -o output -S hash -m 1024 -- kchashmgr list -pv @@
+$ kctreemgr create input_tree/tree
+$ afl-fuzz -i input_tree -o output -S tree -m 1024 -- kctreemgr list -pv @@
+The afl-fuzz invocations for tcbmgr, tcfmgr, tchmgr, tctmgr are similar.
+
+All six invocations on standard (not even AFL_HARDEN=1 builds) quickly
+yield an assortment of SIGABRT, SIGSEGV, SIGBUS and/or SIGFPE.
+
+Likewise for QDBM, `vlmgr list` and `vlmgr repair` crash easily with
+SIGSEGV: OOB + wild memory reads.
+
+Communication with maintainer (or lack thereof)
+-----------------------------------------------
+I received no reply to either the original messages or two subsequent
+pings...
+
+
+* TDB (a couple weeks in February 2018 and early March 2018, reported
+2018/03/03)
+Description of database and issues
+----------------------------------
+TDB is currently the database underlying Samba.
+
+I used afl-fuzz and a bit of honggfuzz on tdbdump + tdbtool for a couple
+wall clock weeks and billions of execs. They produced OOB reads, wild
+reads, bus errors and excessive memory consumption. Valgrind reported a
+bit of UMR as well. Still, the crash rate was pretty low, so TDB's in a
+reasonable shape overall :)
+
+Communication with maintainers and fixes
+----------------------------------------
+Huge hat tip to Volker Lendecke, who managed to produce a full set of
+patches fixing all of the issues displayed by the batch of files I sent
+to Samba security on a late Saturday evening... in less than 12 hours,
+i.e. on a Sunday. I'm still impressed :)
+Without physical or network access to the fuzzing computer, I didn't get
+to restart the new fuzzing round on the patched version from the
+previous output directory until the next day. Over two wall clock weeks
+x 9 jobs on the fixed version produced zero crash.
+
+
+* NTDB (same original fuzzing period as TDB, reported 2018/03/03 at the
+same time as TDB)
+Description of database and issues
+----------------------------------
+At some point, NTDB was designed to replace TDB in Samba; this never
+happened.
+
+I used afl-fuzz on ntdbdump + ntdbtool.
+Despite a nullptr deref I accidentally found in the CLI front-end when
+invoking it the wrong way, afl-fuzz flagged only controlled asserts, so
+this database is in a decent shape as well.
+
+Communication with maintainers and fixes
+----------------------------------------
+Volker Lendecke was clear about it: Samba does no longer use NTDB, and
+probably doesn't have the capacity to fix the code.
+
+
+Several takeaways
+=================
+* in a couple dozen projects, it's the first time I deal with a
+maintainer who has time to, but is - so far at least - unwilling to fix
+issues found by fuzzers. I do understand the point that high reliability
+under normal conditions, and high performance, are paramount to LMDB's
+design and implementation, and that they did a (very) good job about it,
+which is a good thing.
+However, IMO, reliability against offline data corruption, be it
+malicious or not, should be considered higher priority. Even though it
+is infrequent, silent data corruption sometimes occurs in the real
+world, for instance because of faulty drivers / firmware / hardware (and
+ZFS is considered one of the technical solutions, if nothing else
+because it can detect them, unlike most traditional filesystems).
+Backup tapes are less popular nowadays, but I work at a place where
+they're used on a daily basis, which means that saving LMDBs to tapes is
+either already being done, or will soon be done. In the current state of
+things, salvaging LMDBs which became corrupted on backup tapes (if we're
+a bit unlucky) in case we have to restore them might prove less than fun
+for our sysadmins / customer sysadmins down the road.
+
+* that said: let's state explicitly that even in its current form, LMDB
+isn't just the most obvious replacement for BDB, it's also a security
+improvement over it, despite being far from perfect. LMDB is arguably
+what most BDB client programs should be switching to, all the more...
+
+* ... I'm told Samba's interested in (optionally ?) switching from TDB
+to LMDB for scalability and reliability reasons, which, again, makes
+complete sense. At the time of this writing, this move shall be a
+security regression (well, the bar is set quite high by TDB), though.
+
+* distros could well want to unpackage the obsolete, unmaintained NTDB
+from future releases - even if it's not in a terrible shape. The project
+is unpopular outside Samba: in Debian, the NTDB packages form an island.
+
+* QDBM, Tokyo Cabinet and Kyoto Cabinet don't seem to be actively
+maintained (no releases for a while, nobody responding at the specified
+e-mail addresses), and the code bases aren't in good shape. From a
+security point of view (I haven't examined functional requirements), it
+looks like it's not just Berkeley DB that projects could find wise to
+move away from... and that's work, since QDBM, TC and KC have more
+reverse dependencies than e.g. TDB.
+
+
+General notes
+=============
+Well, pretty much the same ones as in my earlier work on module / track
+handling libraries (
+http://www.openwall.com/lists/oss-security/2017/11/02/8 ): the usual
+FLOSS maintainership sustainability problem (noticeable on GDBM and
+probably QDBM / TC / KC, though Oracle does it more slowly), the need to
+backport fixes but the packager resources the process consumes, the
+still limited (though growing) amount of fuzzing resources spent on core
+FLOSS by upstream maintainers, professional security researchers and
+amateurs like me. The usefulness of sandboxing is probably less obvious
+on database systems than on media files, though the checking / recovery
+programs, especially, could benefit.
+
+
+Thanks
+======
+* Sam Hocevar and others for zzuf, Michal Zalewski for afl, Robert
+Święcki for honggfuzz;
+* the upstream maintainers of the libraries and programs I fuzzed;
+* security teams;
+* other persons who were aware of this journey :)
+
+
+Regards,
+Lionel Debroux.
+
+[1] https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=652036
+[2]
+http://download.oracle.com/otndocs/products/berkeleydb/html/changelog_18_1.html
+
+
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

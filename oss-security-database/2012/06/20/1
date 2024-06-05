@@ -1,0 +1,127 @@
+
+Date: Wed, 20 Jun 2012 11:45:07 +0200
+From: Marcus Meissner <meissner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: Re: Xen Security Advisory 9 (CVE-2012-2934) - PV guest host DoS (AMD erratum #121)
+
+On Fri, Jun 15, 2012 at 08:42:27PM +0100, John Haxby wrote:
+> 
+> On 15 Jun 2012, at 19:09, Florian Weimer wrote:
+> 
+> > * Giles Coochey:
+> > 
+> >> On 14/06/2012 19:20, Florian Weimer wrote:
+> >>> * Xen org security team:
+> >>> 
+> >>>> There is no software fix for this issue. The workaround suggested by
+> >>>> AMD in erratum #121 cannot be applied to Xen since the relevant address
+> >>>> is under guest control.
+> >>>> 
+> >>>> Applying the patch will cause Xen to detect vulnerable systems and
+> >>>> refuse to boot.
+> >>> This response puzzles me.  Isn't this changing a potential denial of
+> >>> service (a para-virtualized guest could attempt an exploit) to a
+> >>> definite one (the system won't boot)?  Why is this a good idea?
+> >> It ensures that the user of the system is aware of the risks.
+> >> 
+> >> This position will only occur when the patch to the vulnerability is
+> >> applied (i.e. during an out of service upgrade). The admins of the
+> >> system should always read the release notes to patches and upgrades - 
+> >> otherwise they wouldn't know what else might be broken, deprecated.
+> > 
+> > Sure, but why refuse to boot?  Wouldn't it be sufficient to refuse
+> > creating DomUs, and still create Dom0?  (Perhaps this suggestion
+> > doesn't make any sense—I'm not familiar with Xen.)
+> 
+> 
+> It still makes sense.   There's no easy mechanism to let the hypervisor pass the do-not-create-domU message to dom0 so that the person creating the guest will find out.   There's also a logical problem: dom0 is itself a PV guest.
+> 
+> The admin can take preventative action to disable untrusted PV guests and stopping the system booting is definitely the best way of attracting attention without having potentially difficult to diagnose problems.
+
+We actually adjusted our patch for XSA-9 so that dom0 boots, but refuses
+to boot domUs.
+
+Incremental patch attached below.
+
+Ciao, Marcus
+
+References: CVE-2012-2934, bnc#764077
+
+--- a/xen/arch/x86/cpu/amd.c
++++ b/xen/arch/x86/cpu/amd.c
+@@ -32,8 +32,11 @@
+ static char opt_famrev[14];
+ string_param("cpuid_mask_cpu", opt_famrev);
+ 
+-static int opt_allow_unsafe;
++#ifdef __x86_64__
++/* 1 = allow, 0 = don't allow guest creation, -1 = don't allow boot */
++int __read_mostly opt_allow_unsafe;
+ boolean_param("allow_unsafe", opt_allow_unsafe);
++#endif
+ 
+ static inline void wrmsr_amd(unsigned int index, unsigned int lo, 
+ 		unsigned int hi)
+@@ -623,10 +626,19 @@ static void __devinit init_amd(struct cp
+ 		clear_bit(X86_FEATURE_MCE, c->x86_capability);
+ 
+ #ifdef __x86_64__
+-	if (cpu_has_amd_erratum(c, AMD_ERRATUM_121) && !opt_allow_unsafe)
++	if (!cpu_has_amd_erratum(c, AMD_ERRATUM_121))
++		opt_allow_unsafe = 1;
++	else if (opt_allow_unsafe < 0)
+ 		panic("Xen will not boot on this CPU for security reasons.\n"
+ 		      "Pass \"allow_unsafe\" if you're trusting all your"
+ 		      " (PV) guest kernels.\n");
++	else if (!opt_allow_unsafe && c == &boot_cpu_data)
++		printk(KERN_WARNING
++		       "*** Xen will not allow creation of DomU-s on"
++		       " this CPU for security reasons. ***\n"
++		       KERN_WARNING
++		       "*** Pass \"allow_unsafe\" if you're trusting"
++		       " all your (PV) guest kernels. ***\n");
+ 
+ 	/* AMD CPUs do not support SYSENTER outside of legacy mode. */
+ 	clear_bit(X86_FEATURE_SEP, c->x86_capability);
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -52,6 +52,7 @@
+ #include <asm/traps.h>
+ #include <asm/nmi.h>
+ #include <asm/mce.h>
++#include <asm/amd.h>
+ #include <xen/numa.h>
+ #include <xen/iommu.h>
+ #ifdef CONFIG_COMPAT
+@@ -474,6 +475,20 @@ int arch_domain_create(struct domain *d,
+ 
+ #else /* __x86_64__ */
+ 
++    if ( d->domain_id && !is_idle_domain(d) &&
++         cpu_has_amd_erratum(&boot_cpu_data, AMD_ERRATUM_121) )
++    {
++        if ( !opt_allow_unsafe )
++        {
++            printk(XENLOG_G_ERR "Xen does not allow DomU creation on this CPU"
++                   " for security reasons.\n");
++            return -EPERM;
++        }
++        printk(XENLOG_G_WARNING
++               "Dom%d may compromise security on this CPU.\n",
++               d->domain_id);
++    }
++
+     BUILD_BUG_ON(PDPT_L2_ENTRIES * sizeof(*d->arch.mm_perdomain_pt_pages)
+                  != PAGE_SIZE);
+     pg = alloc_domheap_page(NULL, MEMF_node(domain_to_node(d)));
+--- a/xen/include/asm-x86/amd.h
++++ b/xen/include/asm-x86/amd.h
+@@ -151,6 +151,8 @@ struct cpuinfo_x86;
+ int cpu_has_amd_erratum(const struct cpuinfo_x86 *, int, ...);
+ 
+ #ifdef __x86_64__
++extern int opt_allow_unsafe;
++
+ void fam10h_check_enable_mmcfg(void);
+ void check_enable_amd_mmconf_dmi(void);
+ #endif

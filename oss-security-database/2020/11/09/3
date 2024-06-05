@@ -1,0 +1,189 @@
+
+Date: Mon, 9 Nov 2020 11:00:50 -0500
+From: "Demi M. Obenour" <demiobenour@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: The importance of mutual authentication: Local Privilege Escalation
+ in X11
+
+# The importance of mutual authentication: Local Privilege Escalation in X11
+
+While X11 servers authenticate their clients, X11 clients *do not*
+authenticate the server.  This can be exploited to take control of an X
+application by impersonating the server it is expecting to connect to.
+
+Exploiting this vulnerability is not trivial.  Typically, the X11
+socket is either in `/tmp/.X11-unix` (which is sticky) or in the
+abstract namespace.  Therefore, it is necessary to wait until
+the legitimate X server has exited and the socket is unlinked.
+Many graphical applications exit if their connection to the X
+server is lost, so a typical desktop session is either impossible
+or difficult to exploit.  If the socket has already been bound, X
+will fail to start.  If this prevents client programs from starting,
+planting a “poisoned” X socket won’t work either, although it
+will create a denial of service condition.
+
+It is, however, possible to exploit any X application that
+(erroneously) starts after the X server has already exited.  There are
+several potential ways this can happen:
+
+- On single-seat graphical workstations, the DISPLAY environment
+  variable is virtually always set to `:0`, as there is generally only
+  one X server running at a time.  Therefore, users may (erroneously)
+  write scripts that assume this to be the case, and start them from
+  outside of a graphical session (such as via cron or systemd).
+
+- There is a race condition during session exit: if the X server shuts
+  down and unlinks its socket, but another program has already started
+  to execute an X client application, there is a window during which
+  an attacker can bind to the previous X socket before the client
+  tries to connect to it.
+
+## Potential Fixes:
+
+Fixing this vulnerability requires that X clients authenticate the
+server, or that the X server socket is protected against spoofing.
+Three potential methods of doing so follow, but there may very well be
+others.  Only the first addresses the denial of service vulnerability,
+but all three prevent privilege escalation.
+
+### Placing the X socket in a secure directory
+
+X11 is usually used with AF_UNIX sockets.  In this case, performing
+the attack requires that either the directory containing the X socket
+be writable by an attacker, or that the abstract namespace is in use.
+If neither condition is met, the attack is thwarted.  In this case, the
+server is implicitly authenticated by being able to write to a location
+on the file system.  On systems other than macOS, placing the X socket
+in a non-default directory requires changes to X.  On Linux, this also
+requires that abstract sockets be disabled in the X client libraries.
+
+A user’s home directory is a safe location on virtually all systems.
+/run/user/$UID is a good choice when it is secure and available,
+such as on systemd-based Linux distributions.  /tmp/.X11-unix can
+be made safer by ensuring that it is created before any untrusted
+code runs and ensuring that untrusted code cannot write to it.
+For example, it could be owned by root and have 0755 permissions.
+For this to be effective, untrusted code must not be allowed to start
+if creating /tmp/.X11-unix fails; this can be enforced by dropping
+into single-user mode in this case.  Furthermore, if the standard
+location for lock files (/tmp/.X*-lock) is used, there is still a
+potential denial of service, as anyone can create a lock file and
+prevent the legitimate server from starting.
+
+I recommend using /run/user/$UID when it exists, is owned by the user,
+and has 0700 permissions.  Otherwise, a user’s home directory (or
+subfolder thereof) is an acceptable fallback.  I do not recommend
+continuing to use /tmp/.X11-unix, due to the risks outlined above.
+
+### Explicit checking of peer credentials
+
+When `AF_UNIX` sockets are used (the most common case), the
+client can check the server’s credentials using `SO_PEERCRED`,
+`SCM_CREDENTIALS`, or another platform-specific mechanism.  The X.org
+server already has the code to check a peer’s credentials, and can
+be configured to use this instead of `~/.Xauthority`.  The set of
+trusted user IDs is system-dependent.  Generally, it should include
+the superuser and the UID of the X client, but on some systems (such
+as OpenBSD), the X server runs as a dedicated non-privileged user,
+which may also need to be included in the trusted UID list.
+
+### Cryptographic authentication
+
+For both `AF_UNIX` and TCP transports, it is possible to use
+cryptographic authentication.  This must be designed carefully
+to prevent replay attacks.  One such protocol (which has not been
+audited) is as follows.  It uses the X11 cookie K, a MAC, and distinct,
+equal-length domain-separation strings S1 and S2.
+
+1. Client generates a 32-byte random token (CR) and sends it to
+   the server.
+
+2. The server generates a 32-byte random number (SR).  It computes
+   `Sauth := MAC(K, S1 || CR || SR || server_sockaddr || client_sockaddr)`
+   and sends `Sauth || SR` to the client.
+
+3. The client checks if Sauth was computed correctly.  If not,
+   it disconnects.  If it was, the client computes
+   `Cauth := MAC(K, S2 || CR || SR || server_sockaddr || client_sockaddr)`
+    and sends it to the server.
+
+4. The server checks that `Cauth` was computed correctly.  If it was,
+   the client is authenticated; otherwise, the server disconnects.
+
+Note that CR and SR must be generated randomly for every connection.
+Reasonable choices for the MAC include Blake2b, Blake3, and HMAC-SHA2.
+Length fields are omitted because the lengths of CR and SR are fixed,
+and the length of a `struct sockaddr_storage` can be determined from
+its address family.  `AF_UNIX` sockaddrs MUST be NUL-terminated.
+For `AF_UNIX` sockets, this is only safe if anonymous `AF_UNIX`
+sockets have unique addresses, which I believe to be the case on Linux.
+
+The X11 protocol does not provide any encryption or authentication
+of messages.  Therefore, users who can sniff network traffic can still
+read all X protocol traffic over TCP, and users who can inject packets
+can tamper with such traffic.  On OpenBSD, both require full root
+privileges, so this is not a problem in the default configuration.
+On Linux and illumos, packet sniffing and injection does not require
+full root privileges, although it requires privileges that ordinary
+users typically do not have.  X over TCP is usually used in the context
+of SSH forwarding, and switching SSH forwarding to use AF_UNIX would
+avoid this problem.
+
+## Timeline
+
+2019-10-25: Reported to openssh@...nssh.com as a vulnerability in
+            OpenSSH X11 forwarding.
+
+2019-10-31: The OpenSSH developers states that this is a bug in X11,
+            not in OpenSSH.
+
+2019-11-01: I report this bug to xorg-security@...ts.x.org
+
+2019-11-04: Reply stating that this scenario is possible, but unlikely,
+            and that fixing it would require major changes to the X
+            protocol.
+
+2019-11-04: I reply that SCM_CREDENTIALS and friends can be used for
+            AF_UNIX sockets.
+
+2019-11-23 through 2019-11-25: A new X authorization mechanism is
+            suggested by the X developers.  Private discussions about the
+            form this will take.
+
+2020-01-23: I ask for an update and mention that AF_UNIX sockets are
+            vulnerable as well.
+
+2020-02-02: I ask for an update and mention that over 90 days have
+            elapsed.
+
+2020-10-08: I write an advisory and state that I intend to publicly
+            disclose it.
+
+2020-10-08 through 2020-10-29: Discussion of the vulnerability leads to
+            changes in the advisory text.
+
+2020-11-02: Vulnerability sent to distros@...openwall.org
+
+2020-11-03: Marcus Meissner <meissner@...e.de> confirms that
+            distros@...openwall.org has received the message.
+
+2020-11-05: I email xorg-security@...ts.x.org asking if a fix will
+            be available.
+
+2020-11-06: Alan Coopersmith <alan.coopersmith@...cle.com> states
+            that there are too few people working on X for upstream
+            to create a fix prior to disclosure.
+
+2020-11-06: Red Hat Product Security assigns CVE-2020-25697 to this
+            issue.
+
+2020-11-09: Full disclosure
+
+Sincerely,
+
+Demi M. Obenour
+
+
+Download attachment "OpenPGP_0xB288B55FFF9C22C1.asc" of type "application/pgp-keys" (3987 bytes)
+
+Download attachment "OpenPGP_signature" of type "application/pgp-signature" (834 bytes)

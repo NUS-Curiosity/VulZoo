@@ -1,0 +1,100 @@
+
+Date: Sun, 24 Jan 2016 20:36:48 -0800
+From: Andy Lutomirski <luto@...nel.org>
+To: oss security list <oss-security@...ts.openwall.com>
+Subject: CVE Request: x86 Linux TLB flush bug
+
+Linux on x86 and x86_64 had a race condition in the TLB flush logic.
+I don't know how exploitable it is.
+
+On x86, when changing a paging structure [1], the OS needs to ensure
+that the processor's TLB is flushed to evict any stale cached copies
+of the old paging data.  On SMP systems, the TLB flush needs to be
+propagated to other CPUs that share the paging structures.
+
+x86 has no hardware cross-core TLB flush mechanism.  Instead, Linux
+does the following dance:
+
+CPU A:
+A1. Change the paging structure.
+A2. Flush local TLB, if applicable.
+A3. Check if other CPUs are sharing the paging structures; if so, send
+them IPIs to flush them.
+
+At this point, if a physical page was unmapped, it can be safely reused.
+
+The check in step 3 interacts with context switches on remote cpus.
+When CPU B starts to use the paging structure that A is modifying, it
+does:
+
+CPU B:
+
+B1. Set a bit indicating that CPU B is using the paging structures
+(LOCK-prefixed atomic insn).
+B2. Load the paging hierarchy root into CR3.
+B3. (implicit) Start filling the TLB.
+
+For this whole dance to work, Linux needs to avoid any outcome in
+which CPU B fills a TLB entry that CPU A modified if CPU A does not
+send an IPI to CPU B.  In a sequential consistency model, we're fine.
+CPU A will only fail to send the IPI if it sees the bit that CPU B
+sets being clear after modifying the paging structures and, if that
+happens, then CPU B hasn't filled its TLB yet.
+
+Real CPUs aren't sequentially consistent.  The work done by CPU B is
+well behaved.  B3 is a TLB fill, and it therefore does not follow the
+usual x86 memory ordering rules.  Fortunately, B2 is "serializing" and
+therefore orders everything.
+
+Unfortunately, the work done by CPU A may have been incorrect.  A1 is
+an ordinary store and A3 is an ordinary load.  Therefore, x86 CPUs are
+permitted to reverse their order such that CPU A checks whether the
+paging structures are shared prior to modifying them.
+
+As a mitigating factor, A2, *if it occurs*, is serializing and
+prevents this problem.
+
+The upshot is that, in principle, when Linux invalidates a paging
+structure that is not in use locally, it could, in principle, race
+against another CPU that is switching to a process that uses the
+paging structure in question.
+
+I have not tried to exploit this.  Doing so would involve finding a
+code path that unmaps a page *no in use by the current task* and
+requests a TLB flush without any intervening memory barriers, implied
+or otherwise.
+
+A successful exploit would result in a user thread running with a
+stale cached virtual -> physical translation.  If the translation in
+question were writable and the physical page got reused for something
+critical (e.g. a page table), then this would permit privilege
+escalation without any syscalls whatsoever.
+
+There are some mitigating factors.  Code paths that would do this are
+not that common.  Actually triggering the race would involve the CPU
+speculating a load before a prior store in a different function, and
+that load would have to be speculated across a branch for which the
+not-taken side lead to a serializing instruction.  I have no idea
+whether actual microarchitectures do this.
+
+
+
+commit 4eaffdd5a5fe6ff9f95e1ab4de1ac904d5e0fa8b
+Author: Andy Lutomirski <luto@...nel.org>
+Date:   Tue Jan 12 12:47:40 2016 -0800
+
+    x86/mm: Improve switch_mm() barrier comments
+
+commit 71b3c126e61177eb693423f2e18a1914205b165e
+Author: Andy Lutomirski <luto@...nel.org>
+Date:   Wed Jan 6 12:21:01 2016 -0800
+
+    x86/mm: Add barriers and document switch_mm()-vs-flush synchronization
+
+
+If any of you try analyze this further, please let me know.
+
+--Andy
+
+[1] There are some exceptions when adding entries for previously
+non-present pages.

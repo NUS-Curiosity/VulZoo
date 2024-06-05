@@ -1,0 +1,179 @@
+
+Date: Tue, 16 Jan 2024 01:52:16 +0300
+From: Maxim Suhanov <dfirblog@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2023-4001: a password bypass vulnerability in the downstream GRUB
+ boot manager
+
+References:
+
+https://dfir.ru/2024/01/15/cve-2023-4001-a-vulnerability-in-the-downstream-grub-boot-manager/
+https://access.redhat.com/security/cve/cve-2023-4001
+
+Plain-text details taken from the first reference:
+
+One can set a password to protect the boot menu entries and the 
+command-line shell of the GRUB boot manager (see the official manual and 
+the Red Hat manual). This is an additional security measure to be used 
+along with a BIOS/UEFI password (e.g., to protect corporate computers 
+from unprivileged users trying to leverage their physical access to boot 
+another operating system or to escalate the privileges in an installed 
+operating system).
+
+Under the hood, this feature is implemented as two GRUB commands: 
+“password” and “password_pbkdf2“. When one of these commands is issued 
+with a proper set of arguments, a user with a specified password (or its 
+hash) is created. And only those users listed in the “superusers” 
+environment variable (when it’s set by issuing the “set” command) are 
+allowed to edit boot menu entries and execute commands in the GRUB 
+shell. (A physically-present user is required to authenticate as a 
+superuser when trying to edit a menu entry or trying to enter the GRUB 
+shell.)
+
+In most cases, commands to set the “superusers” variable and to create 
+corresponding users are stored in the GRUB configuration file, 
+“grub.cfg” (which is more like a script, not a pure configuration file).
+
+There were some vulnerabilities affecting the GRUB password protection 
+feature, like weak permissions for the GRUB configuration file that 
+allowed unprivileged users to obtain plain-text passwords and/or 
+password hashes (for example: CVE-2012-2314, CVE-2013-4577, and 
+CVE-2021-3981), an integer underflow (CVE-2015-8370), and even an 
+improper string comparison (CVE-2009-4128).
+
+Now, there is one more: CVE-2023-4001.
+
+This vulnerability allows unprivileged users with physical access to a 
+computer to bypass the password protection feature of the GRUB boot 
+manager on many (but not all) UEFI-based computers. In some uncommon 
+setups, no unprivileged access is required (so, physical access without 
+an ability to log in into an operating system is enough).
+
+In theory, commands required to properly enable the password protection 
+feature (i.e., to create a user and to set a list of superusers) of the 
+GRUB boot manager can be stored in two locations: in the configuration 
+file embedded in the GRUB image (which is an EFI executable) and in the 
+“external” configuration file (which is most likely named “grub.cfg“).
+
+In the UEFI Secure Boot world, GRUB images are signed, so they can’t 
+contain anything other than a hard-coded (vendor-defined) password or 
+its hash (and, hopefully, there are none). So, the corresponding 
+commands have to be stored in the “external” configuration file, “grub.cfg“.
+
+Originally, on BIOS-based systems, this configuration was stored as a 
+single file in the same directory with the GRUB files.
+
+But on UEFI computers this configuration became split between two files: 
+the first one in the EFI System Partition volume 
+(“/boot/efi/EFI/<vendor>/grub.cfg“; it’s usually a FAT12/16/32 file 
+system) and the second one in the “/boot” volume (“/boot/grub/grub.cfg” 
+or “/boot/grub2/grub.cfg“; it’s usually a file system not supported by 
+the UEFI firmware: e.g., Ext2/4 or XFS). The latter will called “the 
+main configuration file” here.
+
+A thorough explanation of this new scheme can be found here: 
+https://fedoraproject.org/wiki/Changes/UnifyGrubConfig.
+
+When the GRUB password is set (e.g., using the “grub2-set-password” 
+tool), it’s written to the main configuration file. And the first 
+configuration file is just a simple script to locate and execute the 
+main configuration file (as shown on the screenshot below).
+
+<screenshot>
+
+A configuration file found in the EFI System Partition (CentOS Stream 9)
+
+If the password-related commands were stored in the first configuration 
+file, there would be no issue described in this post. But they are 
+stored in the main configuration file, which is found and then executed 
+by the first configuration file.
+
+What if the main configuration file isn’t found? The GRUB boot manager 
+will spawn its shell.
+
+Interestingly, we can force the main configuration file to “disappear” 
+(at least on some systems) when the first configuration file is 
+executed. So, there would be no password prompt (because no 
+password-related commands are ever executed after the power-on event) 
+and the GRUB shell will be immediately available to a physically-present 
+user.
+
+The UUID is the key! The main configuration file is located using a 
+predefined path: “<device>/grub2/grub.cfg” (as shown on the screenshot 
+above). Here, “<device>” is a volume found by its file system UUID using 
+the “search” command.
+
+And duplicate file system UUIDs pose a security problem…
+
+If there are two file systems sharing the same UUID, one of them is the 
+real “/boot” volume and another one is an empty volume, the GRUB boot 
+manager could, under some circumstances, pick a wrong device as 
+containing the main configuration file. And if there is no main 
+configuration file stored (that empty volume case), the GRUB shell is 
+spawned.
+
+Internally, the “search” command tries every partition on every block 
+device until a specified signature (a file system UUID in this case, but 
+the command also supports searching by a volume label and by a file) is 
+found.
+
+All block devices are tried in the same order as returned when 
+enumerating their EFI handles (“hd0”, “hd1”, “hd2” and so on, “hd0” 
+corresponds to the first EFI handle returned when enumerating EFI block 
+devices). Some UEFI implementations enumerate non-removable drives 
+before removable ones, while others do exactly the opposite (e.g., my 
+Lenovo laptop exposed this behavior; the UEFI implementation of 
+VirtualBox with USB3 support enabled enumerates USB sticks before 
+internal drives too).
+
+So, if an attached removable drive (like a USB stick) becomes “hd0” in 
+the GRUB boot manager (and the computer’s internal drive is “hd1” in 
+that case), it’s possible to bypass the GRUB password protection feature 
+by placing an empty file system with the same UUID as the real “/boot” 
+volume onto that removable drive and attaching it to the computer before 
+the boot. During the boot, the GRUB boot manager will simply spawn its 
+shell, without even asking for a password (and without changing the boot 
+order, of course).
+
+Unprivileged users can learn the UUID value of the “/boot” volume using 
+the “lsblk” tool (because file system UUIDs are exposed to unprivileged 
+users).
+
+Here is a video demonstrating the attack: 
+https://drive.google.com/file/d/1mMlEIgfnUKIgaOEBNmtWuRo7RUAqjDrT/view?usp=sharing.
+
+It should be noted that some Linux distributions provide enough debug 
+output in a separate console, so a necessary UUID can be obtained from 
+there (and no unprivileged access to the operating system is required in 
+this case).
+
+Timeline
+
+  2023-04-03: the vulnerability was discovered by me.
+  2023-07-17: the vulnerability was reported by me to Red Hat.
+  2023-10-17: an initial fix is available for testing.
+  2023-10-18: an issue was discovered by me in that fix (an attacker 
+could bypass an additional check implemented by the patch by attaching 
+10 removable drives to the computer, if that number of removable drives 
+is supported by the firmware).
+  2023-10-30: a new fix is available for testing.
+  2023-10-31: two issues were discovered in that fix (one issue is a 
+“huge” heap overflow introduced when working with strings in the patched 
+code, another issue is a minor out-of-bounds write of a null byte).
+  2023-10-31: a final fix is available.
+  2023-11-23: the disclosure date is agreed upon — 2024-01-15.
+  2024-01-12: the vulnerability is disclosed by Red Hat.
+  2024-01-15: this post has arrived.
+
+Fix
+
+A fix proposed by Red Hat implements a new argument to the “search” 
+command, which restricts the UUID scan to the block device used to 
+launch the GRUB boot manager. This means that the “/boot” volume must 
+reside on the same drive as the EFI System Partition.
+
+An alternative (but not implemented) approach would be to use something 
+that isn’t exposed to unprivileged users as a signature to locate the 
+“/boot” volume. This could be a file with a random name residing in a 
+directory with restricted permissions.
+

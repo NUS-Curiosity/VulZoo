@@ -1,0 +1,154 @@
+
+Date: Thu, 17 Oct 2013 09:28:41 -0700
+From: Dwayne Litzenberger <dlitz@...tz.net>
+To: pycrypto@...ts.dlitz.net, python-crypto@...hon.org,
+	oss-security@...ts.openwall.com
+Subject: CVE-2013-1445 python-crypto: PRNG not correctly reseeded in some
+ situations
+
+In PyCrypto before v2.6.1, the Crypto.Random pseudo-random number
+generator (PRNG) exhibits a race condition that may cause it to generate
+the same 'random' output in multiple processes that are forked from each
+other.  Depending on the application, this could reveal sensitive
+information or cryptographic keys to remote attackers.
+
+An application may be affected if, within 100 milliseconds, it performs
+the following steps (which may be summarized as "read-fork-read-read"):
+
+1. Read from the Crypto.Random PRNG, causing an internal reseed;
+2. Fork the process and invoke Crypto.Random.atfork() in the child;
+3. Read from the Crypto.Random PRNG again, in at least two different
+     processes (parent and child, or multiple children).
+
+Only applications that invoke Crypto.Random.atfork() and perform the
+above steps are affected by this issue.  Other applications are
+unaffected.
+
+Note: Some PyCrypto functions, such as key generation and PKCS#1-related
+functions, implicitly read from the Crypto.Random PRNG.
+
+== Technical details ==
+
+Crypto.Random uses Fortuna[1] to generate random numbers.  The flow of
+entropy looks something like this:
+
+      /dev/urandom  -\
+                      +-> "accumulator" --> "generator" --> output
+      other sources -/   (entropy pools)     (AES-CTR)
+
+- The "accumulator" maintains several pools that collect entropy from
+    the environment.
+
+- The "generator" is a deterministic PRNG that is reseeded by the
+    accumulator.  Reseeding normally occurs during each request for random
+    numbers, but never more than once every 100 ms (the "minimum reseed
+    interval").
+
+When a process is forked, the parent's state is duplicated in the child.
+In order to continue using the PRNG, the child process must invoke
+Crypto.Random.atfork(), which collects new entropy from /dev/urandom and
+adds it to the accumulator.  When new PRNG output is subsequently
+requested, some of the new entropy in the accumulator is used to reseed
+the generator, causing the output of the child to diverge from its
+parent.
+
+However, in previous versions of PyCrypto, Crypto.Random.atfork() did
+not explicitly reset the child's rate-limiter, so if the child requested
+PRNG output before the minimum reseed interval of 100 ms had elapsed, it
+would generate its output using state inherited from its parent.
+
+This created a race condition between the parent process and its forked
+children that could cause them to produce identical PRNG output for the
+duration of the 100 ms minimum reseed interval.
+
+== Demonstration ==
+
+Here is some sample code that illustrates the problem:
+
+      from binascii import hexlify
+      import multiprocessing, pprint, time
+      import Crypto.Random
+
+      def task_main(arg):
+          a = Crypto.Random.get_random_bytes(8)
+          time.sleep(0.1)
+          b = Crypto.Random.get_random_bytes(8)
+          rdy, ack = arg
+          rdy.set()
+          ack.wait()
+          return "%s,%s" % (hexlify(a).decode(),
+                            hexlify(b).decode())
+
+      n_procs = 4
+      manager = multiprocessing.Manager()
+      rdys = [manager.Event() for i in range(n_procs)]
+      acks = [manager.Event() for i in range(n_procs)]
+      Crypto.Random.get_random_bytes(1)
+      pool = multiprocessing.Pool(processes=n_procs,
+                                  initializer=Crypto.Random.atfork)
+      res_async = pool.map_async(task_main, zip(rdys, acks))
+      pool.close()
+      [rdy.wait() for rdy in rdys]
+      [ack.set() for ack in acks]
+      res = res_async.get()
+      pprint.pprint(sorted(res))
+      pool.join()
+
+The output should be random, but it looked like this:
+
+      ['c607803ae01aa8c0,2e4de6457a304b34',
+       'c607803ae01aa8c0,af80d08942b4c987',
+       'c607803ae01aa8c0,b0e4c0853de927c4',
+       'c607803ae01aa8c0,f0362585b3fceba4']
+
+== Solution ==
+
+The solution is to upgrade to PyCrypto v2.6.1 or later, which properly
+resets the rate-limiter when Crypto.Random.atfork() is invoked in the
+child.
+
+== Files ==
+
+PyCrypto v2.6.1 may be downloaded from the PyCrypto website[2], from 
+PyPI, or using your operating system's package manager or ports tree.  
+
+The official tarball has the following SHA256 sums:
+
+f2ce1e989b272cfcb677616763e0a2e7ec659effa67a88aa92b3a65528f60a3c *pycrypto-2.6.1.tar.gz
+c2ab0516cc55321e6543ae75e2aa6f6e56e97432870f32a7799f3b89f467dc1b *pycrypto-2.6.1.tar.gz.asc
+
+The git repository is here: https://github.com/dlitz/pycrypto/
+The v2.6.1 tag id is: ebb470d3f0982702e3e9b7fb9ebdaeed95903aaf
+The v2.6.1 commit id is: 7fd528d03b5eae58eef6fd219af5d9ac9c83fa50
+
+For informational purposes, patches against pycrypto v2.6 and v2.1.0 are 
+attached.  Distributors patching older versions of the library, please 
+remember to run the test suite before releasing a modified package:
+
+    # From the source tree
+    python setup.py build test
+
+    # After installation
+    python -m Crypto.SelfTest.__init__
+
+== Thanks ==
+
+Thanks to Yves-Alexis Perez and Sebastian Ramacher for helping to 
+coordinate the release of this fix.
+
+== References ==
+
+[1] N. Ferguson and B. Schneier, _Practical Cryptography_,
+      Indianapolis: Wiley, 2003, pp. 155-184.
+
+[2] https://www.dlitz.net/software/pycrypto/ or http://www.pycrypto.org/
+
+-- 
+Dwayne C. Litzenberger <dlitz@...tz.net>
+    OpenPGP: 19E1 1FE8 B3CF F273 ED17  4A24 928C EC13 39C2 5CF7
+
+View attachment "CVE-2013-1445-pycrypto2.6.patch" of type "text/x-diff" (13972 bytes)
+
+View attachment "CVE-2013-1445-pycrypto2.1.0.patch" of type "text/x-diff" (10454 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (223 bytes)

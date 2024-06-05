@@ -1,0 +1,148 @@
+
+Date: Tue, 1 Dec 2015 10:11:28 +0900
+From: Philip Pettersson <philip.pettersson@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2015-5273 + CVE-2015-5287, abrt local root in Centos/Fedora/RHEL
+
+Hi,
+
+Here's a slightly delayed advisory about CVE-2015-5273 and CVE-2015-5287 that
+I reported to Redhat in September. The patches were released on 2015-11-23.
+
+These are issues concerning the abrt crash handling ecosystem in
+Redhat-based distros.
+
+I've attached two local root exploits for CentOS 7.1/Fedora 22 and RHEL 7.0/7.1.
+
+Overview
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+
+A) CVE-2015-5287 (?), Insecure temporary directory and symlink usage
+in sosreport
+B) CVE-2015-5273, Insecure temporary directory usage in
+abrt-action-install-debuginfo-to-abrt-cache
+C) CVE-2015-5287, Insecure symlink handling in abrt-hook-ccpp
+
+A can be used to elevate privileges from an unprivileged user to root
+on a default installation of RHEL 7/7.1. RHEL 6 and lower do not seem
+vulnerable by default.
+
+B can be used to create symlinks and files at arbitrary locations as
+the abrt user. This only works on non-redhat systems such as CentOS 7 or
+RHEL installations that do not use the official RHN yum repositories.
+
+C can be used to elevate privileges from the abrt user to root.
+
+B combined with C can be used to gain root from an unprivileged user.
+
+
+Insecure temporary directory and symlink usage in sosreport, CVE-2015-5287 (?)
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+
+Redhat did not give a separate CVE for this issue so it falls under
+CVE-2015-5287
+I suppose.
+
+When a process receives SIGSEGV, abrt will save diagnostic information in
+/var/tmp/abrt/ccpp-*$pid on RHEL 7. Unless /etc/abrt/abrt.conf contains
+the line "PrivateReports = yes", directories created here by abrt will be
+chown()'d to the user who owned the crashing process. After saving some
+initial information it will call post-create scripts, one of the default
+ones on RHEL is /usr/sbin/sosreport.
+
+/usr/sbin/sosreport will be invoked as root and work with a temporary
+directory named /var/tmp/abrt/ccpp-*$pid/sosreport-$hostname-$date.
+It will save a number of files collected from the system in this directory
+and then archive it. Since the directory is owned by root we cannot
+modify files inside it while sosreport is running, but we do own the parent
+directory and can simply rename the temporary directory and make a new one.
+
+sosreport will then write files into our crafted temp directory and will
+follow any symlinks we make inside. By also renaming some of the temporary
+files that sosreport works with we can exploit sosreport to write a file
+with crafted data at an arbitrary location as root.
+
+See sosreport-rhel7.py for an exploit demonstrating this vulnerability.
+
+I confirmed that RHEL 7 and 7.1 are vulnerable by default. RHEL 6 systems
+will be vulnerable if the system administrator has commented out the line
+"PrivateReports = yes" or set it to "no" in abrt.conf
+
+
+Insecure temporary directory usage in
+abrt-action-install-debuginfo-to-abrt-cache, CVE-2015-5273
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+
+abrt-action-install-debuginfo-to-abrt-cache is a wrapper for
+abrt-action-install-debuginfo
+with the setuid bit for userid abrt. By default it creates a temporary
+directory in
+/var/tmp/abrt-tmp-debuginfo-RANDOM_SUFFIX and downloads debug rpm
+files to this location
+before extracting them to /var/cache/abrt-di. The random suffix is not
+quite random but in fact
+highly predictable, and we can create this directory before executing
+the suid wrapper.
+
+By controlling the "unpacked.cpio" file we can trick
+abrt-action-install-debuginfo into extracting
+a cpio file that we control. By extracting two carefully created cpio
+archives we can leverage
+this to create files or symlinks anywhere on the file system as the abrt user.
+
+
+Insecure symlink handling in abrt-hook-ccpp, CVE-2015-5287
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+
+If a program starting with the name "abrt" crashes, abrt-hook-ccpp
+will write the coredump to
+/var/tmp/abrt/$filename-coredump or /var/spool/abrt/$filename-coredump.
+>From abrt-hook-ccpp.c:
+
+    if (last_slash && strncmp(++last_slash, "abrt", 4) == 0)
+    {
+        /* If abrtd/abrt-foo crashes, we don't want to create a _directory_,
+         * since that can make new copy of abrtd to process it,
+         * and maybe crash again...
+         * Unlike dirs, mere files are ignored by abrtd.
+         */
+        if (snprintf(path, sizeof(path), "%s/%s-coredump",
+g_settings_dump_location, last_slash) >= sizeof(path))
+            error_msg_and_die("Error saving '%s': truncated long file
+path", path);
+
+        int abrt_core_fd = xopen3(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+The call to xopen3() does not include the flag O_NOFOLLOW and is
+therefore vulnerable to a symlink
+attack. We can use the following steps to exploit this:
+
+1. Create a symlink to /proc/sys/kernel/modprobe from
+/var/{spool,tmp}/abrt/abrt-test-coredump
+    * Note that we can use the previous vulnerability to achieve this
+since the abrt root
+      directory can be written to as the abrt user.
+2. Execute a binary at /tmp/abrt-test and send it SIGSEGV
+3. abrt-hook-ccpp will write the memory contents of the crashed
+process to /proc/sys/kernel/modprobe
+
+See abrt-centos-fedora.py for an example exploit for this.
+
+This bug is also exploitable on RHEL installations if the system is
+configured to use non-RHN yum
+repositories. This is because yum is normally not usable by non-root
+users if the only configured
+repositories are RHN.
+
+References
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+https://access.redhat.com/security/cve/CVE-2015-5273
+https://access.redhat.com/security/cve/CVE-2015-5287
+
+Credits
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+Philip Pettersson
+
+View attachment "sosreport-rhel7.py" of type "text/x-python" (2757 bytes)
+
+View attachment "abrt-centos-fedora.py" of type "text/x-python" (7361 bytes)

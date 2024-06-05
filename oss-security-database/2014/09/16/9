@@ -1,0 +1,193 @@
+
+Date: Tue, 16 Sep 2014 17:05:03 +0100
+From: Simon McVittie <simon.mcvittie@...labora.co.uk>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2014-3635 to 3639: security issues in D-Bus < 1.8.8
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+D-Bus <http://www.freedesktop.org/wiki/Software/dbus/> is an
+asynchronous inter-process communication system, commonly used
+for system services or within a desktop session on Linux and other
+operating systems.
+
+Alban Crequy and Simon McVittie at Collabora Ltd. discovered and fixed
+several security flaws in the reference implementation of
+dbus-daemon, the D-Bus message bus daemon. fd.o #83622 is a heap
+overflow and could potentially be exploited to alter data or executable
+code; the rest are denial-of-service issues.
+
+For the stable branch these are fixed in dbus 1.8.8.
+
+For the old stable branch, these are fixed in dbus 1.6.24. Older
+branches are not supported.
+
+CVE-2014-3635 (fd.o #83622)
+- ---------------------------
+
+Bug: https://bugs.freedesktop.org/show_bug.cgi?id=83622
+Category: CWE-805: Buffer Access with Incorrect Length Value
+Impact: heap data corruption, worst-case: arbitrary code execution
+Access required: local
+Mitigation: 32-bit platforms are not vulnerable
+Versions believed to be vulnerable: dbus >= 1.3.0
+Credit: discovered and fixed by Simon McVittie
+
+When using the default Unix-socket-based transport, dbus-daemon accepts
+and forwards file descriptors (fds) attached to D-Bus messages
+("fd-passing"). If the max_message_unix_fds limit is set to an odd
+number on 64-bit platforms, a malicious message-sender could pass one
+more fd through the kernel than the recipient is expecting. This causes
+an assertion failure and dbus-daemon crash if assertions are enabled, or
+a buffer overrun by sizeof (int) otherwise.
+
+This has been resolved by passing the desired maximum size to the
+syscall instead of the rounded-up size of the cmsg buffer, and
+discarding any excess fds if the syscall fills the cmsg buffer anyway.
+
+CVE-2014-3636 (fd.o#82820, parts A and B)
+- -----------------------------------------
+
+Bug: https://bugs.freedesktop.org/show_bug.cgi?id=82820
+Category: CWE-774: Allocation of File Descriptors or Handles
+Without Limits or Throttling
+Impact: denial of service
+Access required: local
+Versions believed to be vulnerable: dbus >= 1.3.0
+Credit: discovered and fixed by Alban Crequy
+
+The default limits for the system bus allowed each uid to open 256
+connections to the system bus, and allowed up to 1024 fds per message,
+and up to 4096 fds queued in total on each connection.
+
+(Part A) By queuing up the maximum allowed number of fds, a malicious
+sender could reach the dbus-daemon's RLIMIT_NOFILE (ulimit -n, typically
+65536 on Linux). This would act as a denial of service in two ways:
+
+* new clients would be unable to connect to the dbus-daemon
+* when receiving a subsequent message from a non-malicious client that
+  contained a fd, dbus-daemon would receive the MSG_CTRUNC flag,
+  indicating that the list of fds was truncated; kernel fd-passing APIs
+  do not provide any way to recover from that, so dbus-daemon responds
+  to MSG_CTRUNC by disconnecting the sender, causing denial of service
+  to that sender
+
+(Part B) Additionally, Linux allows up to 253 fds to be sent in a single
+sendmsg() call; libdbus always sends all of a message's fds, and the
+beginning of the message itself, in a single sendmsg() call. Combining
+these two, a malicious sender could split a message across two or more
+sendmsg() calls to construct a composite message with 254 or more fds.
+When dbus-daemon attempted to relay that message to its
+recipient in a single sendmsg() call, it would receive EINVAL,
+interpret that as a fatal socket error and disconnect the recipient,
+resulting in denial of service.
+
+Both of these related issues have been resolved by changing the defaults
+so up to 16 fds are allowed per message, and up to 64 on each
+connection. This means that each uid can only queue up to 16384 fds, and
+denial of service is only possible if several uids cooperate.
+
+Since this limit might be changed further in future, the D-Bus
+maintainers recommend that designers of D-Bus APIs, particularly on the
+system bus, do not rely on being able to send more than one fd per
+message.
+
+Distributors on operating systems with a smaller default RLIMIT_NOFILE
+should consider adjusting either that limit, or the defaults in
+system.conf.
+
+CVE-2014-3637 (fd.o#80559)
+- --------------------------
+
+Bug: https://bugs.freedesktop.org/show_bug.cgi?id=80559
+Category: CWE-775: Missing Release of File Descriptor or Handle after
+Effective Lifetime
+Impact: denial of service
+Access required: local
+Versions believed to be vulnerable: dbus >= 1.3.0
+Credit: discovered and fixed by Alban Crequy
+
+By attaching the file descriptor of a D-Bus connection to a D-Bus
+message and sending that message via the dbus-daemon, a malicious
+process can create D-Bus connections that persist after the process that
+created them has terminated. This exacerbates various patterns of
+undesirable/abusive behaviour by making it impossible to terminate them
+by killing processes.
+
+This has been addressed by closing any connection that has incoming file
+descriptors queued for deserialization for more than a configurable
+timeout, defaulting to 2.5 minutes.
+
+CVE-2014-3638 (fd.o#81053)
+- --------------------------
+
+Bug: https://bugs.freedesktop.org/show_bug.cgi?id=81053
+Category: CWE-407: Algorithmic Complexity
+Impact: denial of service
+Access required: local
+Versions believed to be vulnerable: all dbus releases
+Credit: discovered and fixed by Alban Crequy
+
+dbus-daemon tracks whether method call messages expect a reply, so that
+unsolicited replies can be dropped. As currently implemented, if there
+are n parallel method calls in progress, each method reply takes O(n)
+CPU time. A malicious user can exploit this by opening the maximum
+allowed number of parallel connections and sending the maximum number of
+parallel method calls on each one, causing subsequent method calls to be
+unreasonably slow, a denial of service.
+
+For the short term, this has been resolved by amending the default
+system bus configuration to reduce the number of parallel method calls
+allowed per connection, from 8192 to 128 (i.e. from 2097152 to 32768 per
+uid).
+
+Longer-term, we plan to use better data structures to make dbus-daemon
+more scalable, but this was not felt to be suitable for a minimal
+security patch.
+
+CVE-2014-3639 (fd.o#80919)
+- --------------------------
+
+Bug: https://bugs.freedesktop.org/show_bug.cgi?id=80919
+Category: CWE-774: Allocation of File Descriptors or Handles Without
+Limits or Throttling
+Impact: denial of service
+Access required: local
+Versions believed to be vulnerable: all dbus releases
+Credit: discovered and fixed by Alban Crequy
+
+dbus-daemon allows a small number of "incomplete" connections (64 by
+default) whose identity has not yet been confirmed. When this limit has
+been reached, subsequent connections are dropped. Alban's testing
+indicates that one malicious process that makes repeated connection
+attempts, but never completes the authentication handshake and instead
+waits for dbus-daemon to time out and disconnect it, can cause the
+majority of legitimate connection attempts to fail.
+
+This has been resolved by reducing the default authentication timeout
+from 30 seconds to 5 seconds, and pausing calls to accept() when the
+maximum number of incomplete connections is reached, resulting in
+subsequent connections being queued in the kernel (blocking in
+connect()) instead of being dropped.
+
+- -- 
+Simon McVittie, Collabora Ltd.
+on behalf of the D-Bus maintainers
+
+-----BEGIN PGP SIGNATURE-----
+
+iQIVAwUBVBhfoE3o/ypjx8yQAQiqjw//T5IZyg8ZTzJZWybeZfaSCkLymcYf+7rf
+uCavmRs507UtDhqRkd0cuFuM0GdEZVRQsFp4jiDOyZTPLr6SWmZJuBisHBzlFsTd
+1zwX72mZL5rYEvkIgnq22Jhs0RHg50Ok+tL8Ld8Lcdhm2SR4SnCubGoV+pwmid5+
+1rjBZc3/YVJ38vMPJDddYKfMidIdprnbpkGtq2jP+IVZFBab2VcHY5I6oB9OzKF/
+EyT4a760TJOug5aAT5Yog++lvZ+UoRf7QOLlsvgARi8HHY7rWXikbs1/Eh3I2O//
+3YadlgrsgibnmnCNYMCSKaR806FaUPD9AYe0G6u8AAcOKvMBg531RSMlENkmPOW5
+WklMyCyfIFMJeOFdc6Vc6G3fAaSc9KX3pbJPVb7cfnuzHWhRnye3quHo1pEWP6EL
+liFBDAtRg51EaD6bMgAEvsFkUSPEltMX2i0piQ7Uh6vTXTJvndq2APlW1w8hHKKn
+MoJ/z1IEwCdYD34H48ddvJZptvZgbEGnTXxhQcs23kKvWt8vYnnidKbvWxctchmC
+EvPv+6Clpnyp5cSkK0UJPxV1Bcc3rzsNK+JX5HMbSadoxwOBYj2efEdedqJ0ZapZ
+430xawijqcFp9jB+tEztGyK/gnHclIUKeFyawCh2DQqGsoD9tSaHYeFz3C8SxssV
+hnPsLAl1KbI=
+=U6YK
+-----END PGP SIGNATURE-----

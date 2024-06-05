@@ -1,0 +1,176 @@
+
+Date: Tue, 15 May 2012 08:18:57 -0400
+From: Steve Grubb <sgrubb@...hat.com>
+To: oss-security@...ts.openwall.com
+Cc: Solar Designer <solar@...nwall.com>,
+        Keegan McAllister <mcallister.keegan@...il.com>
+Subject: Re: Automatic binary hardening with Autoconf
+
+On Tuesday, May 15, 2012 08:13:31 AM Steve Grubb wrote:
+> On Monday, May 14, 2012 09:33:14 PM Solar Designer wrote:
+> > I'd like this sort of topics to be brought up in here, so I'll start by
+> > referring to some blog posts.
+> > 
+> > Here's an interesting one by Keegan McAllister:
+> > 
+> > http://mainisusuallyafunction.blogspot.com/2012/05/automatic-binary-harde
+> > ni ng-with.html
+> > 
+> > This suggests (and shows how) individual programs that use autoconf may
+> > automatically enable the usual set of compile-time hardening settings
+> > that are otherwise normally provided by builds for/by/on hardened
+> > distros only.  This is not rocket science, yet the provided examples may
+> > be reused and it may become a trend.
+> 
+> I think there are conflicting goals in projects like this. There are times
+> when someone may want to go all out and harden everything as much as
+> possible. But there is a cost to that...either startup or runtime. Not all
+> programs have the same threat model and consequence if attacked
+> successfully. Apps that are at greatest risk are: set[ug]id/fs based
+> capabilities, network facing apps, daemons, or parsers of untrusted media.
+> It would be hard to argue that the "cat" program needs full relro and bind
+> now.
+> 
+> > Also interesting are the performance impact numbers (up to 30%), which
+> > are far worse than those I've seen posted before (up to 5.8%):
+> > 
+> > http://d-sbd.alioth.debian.org/www/?page=pax_pie
+> 
+> This is because the stack canary is a random number. Imagine adding a
+> "function call" between every intended function call to grab a random
+> number. Because of this, we want sensible security. You have to live with
+> the performance hit or have some heuristic that you use to decide which
+> apps get the special treatment.
+> 
+> Also, I have been studying the stack-protector, FORTIFY_SOURCE, ASLR (which
+> is how I found the ASLR bypass for fs capability programs recently), and
+> RELRO. It turns out there are many holes in the protection we all expect
+> is working. Not mentioned in the blog is the fact that with compiler
+
+Should be "without". Big difference in meaning. :-)
+
+> optimizations being on, stack-protector and FORTIFY_SOURCE do not work.
+> There are many other loopholes, like an array of structs do not get any
+> stack-protector treatment. Nor do arrays of ints. And the stack-protector
+> is only checked on function exit. So, you may have a function that gets
+> overflowed and passes corrupted variables around and it may do something
+> irreversable like call execve or create a file based on those.
+> 
+> Consider these test cases which show how we can have stack overflows
+> created that aren't detected at the time they occur:
+> 
+> #include <stdio.h>
+> 
+> void *memset(void *dest, int c, size_t n);
+> 
+> void test2(char *buf1, char *buf2, char *buf3, char *buf4)
+> {
+>  printf("buf1:%s, buf2:%s, buf3:%s, buf4:%s\n", buf1, buf2, buf3, buf4);
+> }
+> 
+> void test1(void)
+> {
+>   char buf1[5], buf2[5], buf3[5], buf4[5];
+> 
+>   sprintf(buf1, " ");
+>   sprintf(buf2, " ");
+>   sprintf(buf3, " ");
+>   sprintf(buf4, " ");
+>   memset(buf4, 'a', 80);
+>   buf4[80] = 0;
+>   test2(buf1, buf2, buf3, buf4);
+>   puts("Finished test2");
+> }
+> 
+> int main(void)
+> {
+>   test1();
+>   puts("Finished test1");
+>   return 0;
+> }
+> 
+> and
+> #include <stdio.h>
+> #include <execinfo.h>
+> 
+> void *memset(void *dest, int c, size_t n);
+> 
+> void test2(char *buf1, char *buf2, char *buf3, char *buf4)
+> {
+>  void *array[10];
+>  void *ptr = __builtin_frame_address(0);
+>  printf("buf1:     %p\n", buf1);
+>  printf("buf2:     %p\n", buf2);
+>  printf("buf3:     %p\n", buf3);
+>  printf("buf4:     %p\n", buf4);
+>  printf("t2 frame: %p\n", ptr);
+>  memset(buf1, 'a', 0x01a);
+>  buf1[0x1a] = 0;
+>  printf("buf1:%s, buf2:%s, buf3:%s, buf4:%s\n", buf1, buf2, buf3, buf4);
+> }
+> 
+> void test1(void)
+> {
+>   char buf1[5], buf2[5], buf3[5], buf4[5];
+>  void *ptr = __builtin_frame_address(0);
+>  printf("t1 frame: %p\n", ptr);
+> 
+>   sprintf(buf1, " ");
+>   sprintf(buf2, " ");
+>   sprintf(buf3, " ");
+>   sprintf(buf4, " ");
+>   test2(buf1, buf2, buf3, buf4);
+>   puts("Finished test2");
+> }
+> 
+> int main(void)
+> {
+>   test1();
+>   puts("Finished test1");
+>   return 0;
+> }
+> 
+> I'm slowly putting together a presentation about all the holes in our
+> security so that they can be explained and perhaps fixed. There are a lot.
+> These ^^^ are just 2 examples.
+> 
+> What I have been thinking about is that if we have a protected frame (a
+> canary is already existing) that it be checked prior to calling any
+> function that uses a variable from the protected frame if its been written
+> to.
+> 
+> I've also concluded that FORTIFY_SOURCE is limited in its use. This is
+> because its factored out if it cannot determine the sizes at compile time.
+> At runtime the sizes may be easily determined, but its already not there.
+> 
+> > Perhaps this has to do with the specific code being protected and
+> > benchmarked (some crypto code in Mosh?)  http://mosh.mit.edu
+> > 
+> > An edit to this comment:
+> > 
+> > https://github.com/keithw/mosh/issues/79#issuecomment-4683789
+> > 
+> > says that the impact is less with Ubuntu 12.04's GCC 4.6.3 - but I think
+> > this may be because Ubuntu's GCC has some of the hardening enabled by
+> > default (so its baseline performance is worse, not the impact is less).
+> 
+> We found that compiler flags alone were not enough. For example, if you
+> want to set partial RELRO to be the default, there are a large number of
+> programs which do not take the LD_FLAGS environmental variable. The common
+> fix appears to be to patch binutils to add partial RELRO on all linking.
+> 
+> I created a shell script that can be used to "grade" an installed system
+> based on my own policy. http://people.redhat.com/sgrubb/files/rpm-chksec
+> 
+> This will take an rpm name as input and verify each ELF file to see if its
+> compiled with the intended flags to most effectively use PIE and RELRO.
+> Green is good, Orange could use work but is acceptable, and Red needs
+> fixing. It has a mode --all that is the equivalent of using rpm -qa and
+> feeding the packages to it. In this mode it will only give a summary
+> result for the package. To find which files don't comply, re-run using
+> just the package name.
+> 
+> I want to raise the bar over a couple releases and will be updating the
+> program soon to grade F18 to a higher standard.
+> 
+> -Steve

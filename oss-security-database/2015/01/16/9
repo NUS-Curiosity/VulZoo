@@ -1,0 +1,182 @@
+
+Date: Fri, 16 Jan 2015 17:58:43 +1300
+From: Amos Jeffries <squid3@...enet.co.nz>
+To: oss-security@...ts.openwall.com
+Subject: Re: Re: CVE request: httpd: IP address spoofing in
+ mod_remoteip
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+On 16/01/2015 8:23 a.m., cve-assign@...re.org wrote:
+>> Can a CVE be assigned to this please?
+> 
+> Our interpretation is that the bug reports are actually describing 
+> correct and intended behavior. Similarly, the patch seems to break 
+> some realistic uses of the mod_remoteip module. The patch is only 
+> useful for sites that have chosen to list a trusted proxy that
+> isn't actually trusted.
+
+My 2c from the Squid Project where the X-Forwarded-For HTTP extension
+was designed.
+
+The trust model of that HTTP header is that each hop is trusted
+whether to correctly erase, append or pass-thru the header it receives.
+
+So ...
+
+> 
+> For example, 
+> http://mail-archives.apache.org/mod_mbox/httpd-users/201210.mbox/%3CCAHa2qaJSW7Hvk68grWMbbiFSA=zAxQ1nr_-A-K-pDWbAB0Gd1Q@mail.gmail.com%3E
+>
+> 
+says:
+> 
+> 1. Client(1.1.1.1) send a request with spoofed X-Forwarded-For
+> header. X-Forwarded-For: 2.2.2.2 2. Proxy/Load Balancer(10.0.0.1)
+> append the client IP address to existing X-Forwarded-For header. 
+> X-Forwarded-For: 2.2.2.2, 1.1.1.1 3. Apache server receive
+> forwarded request. (httpd.conf) RemoteIPHeader X-Forwarded-For 
+> RemoteIPTrustedProxy 10.0.0.0/8
+> 
+> I expected that mod_remoteip would override client IP with 1.1.1.1 
+> because 10.0.0.1 is trusted and 1.1.1.1 is not trusted. Actually,
+> client IP was overridden with 2.2.2.2.
+> 
+
+The proxy at 10.0.0.1 is declaring that its client was 1.1.1.1.
+Nothing regarding the 2.2.2.2 or whether the proxy trusts 1.1.1.1 to
+send accurate XFF header.
+
+In fact, quite likely the proxy at 10.0.0.1 does *not* trust 1.1.1.1.
+Because if it had it could have followed the pass-thru option of just
+relaying the "X-Forwarded-For:2.2.2.2" its trusted client sent. For
+whatever reason it chose to relay both 2.2.2.2 and 1.1.1.1 to the
+Apache server to be re-evaluated.
+
+So the bug reports are correct - unless the receiving server admin
+explicitly configures trust for both 10.0.0.1 and 1.1.1.1 it should be
+treating the left-most portion of the XFF header (2.2.2.2) as garbage
+forged by 1.1.1.1. The rightmost value of the untrusted/garbage IPs
+(1.1.1.1) is the verified client.
+
+
+If the security model were as you think then all HTTP implementations
+would have to explicitly code in the non-standard trust validation of
+XFF header before they relay it. Which violates the HTTP standard
+requirement of ignoring/relaying unknown headers - there is a lot of
+software predating the XFF headers creation or where it is simply
+irrelevant.
+
+With the Squid designed trust model any hop can relay, append or
+delete X_Forwarded-For in full compliance with HTTP without
+introducing the multi-hop forgery loophole demonstrated in the bug
+reports.
+
+The XFF header in a nutshell provides a simple chain of trust to *a*
+remote client outside a trusted DMZ area in CDN infrastructure. There
+is no guarantee for that being the origin client, nor even the first
+in the presented header.
+
+> 
+> Here, 10.0.0.1 is trusted to present ANY public IP address,
+> including both 1.1.1.1 and 2.2.2.2. (10.0.0.1 is NOT, for example,
+> trusted to present a private IP address such as 192.168.0.2.) The
+> documentation says "It is critical to only enable this behavior
+> from intermediate hosts (proxies, etc) which are trusted by this
+> server, since it is trivial for the remote useragent to impersonate
+> another useragent." In other words, the operator of the Apache HTTP
+> Server has delegated to 10.0.0.1 the responsibility for sending an
+> X-Forwarded-For header that is valid according to the rule set
+> established by the 10.0.0.1 configuration. Only the 10.0.0.1
+> configuration can determine whether 1.1.1.1 is trusted to send an
+> "X-Forwarded-For: 2.2.2.2" header. The bug reports seem to envision
+> a world in which the Apache HTTP Server configuration has
+> information about the proxy-trust rule sets of the entire outside
+> world. The documentation does not state that it should have that
+> information, and (from a network-architecture perspective) it
+> really wouldn't make much sense for it to have that information.
+> 
+> The documentation says "Processing halts when a given useragent IP 
+> address is not trusted to present the preceding IP address." This
+> is perhaps confusing because the available directives don't provide
+> any way to express a rule about whether a specific N-hops-away
+> external IP address is allowed to present any specific
+> (N+1)-hops-away external IP address. The directives are only about
+> the Apache HTTP Server's trust of 1-hop-away external IP
+> addresses.
+> 
+> It seems plausible that the documentation means that these two
+> types of halts were thought to be desirable:
+> 
+> 1. If the Apache HTTP Server is communicating directly with a
+> host, and that host is specified in neither a RemoteIPTrustedProxy
+> nor a RemoteIPInternalProxy directive, then processing halts at
+> the right-most IP address in the X-Forwarded-For header. Here, the
+> goal of the halt is to reject an unauthorized proxy.
+
+IME not quite. There is no evidence of a proxy in this case. The
+directly received TCP packet src-IP is the "rightmost" in the XFF
+chain of trust. It should never get to trusting any of the textual XFF
+contents if that prefix IP is untrusted.
+
+> 
+> 2. If the Apache HTTP Server is communicating directly with a
+> host, and that host is specified in a RemoteIPTrustedProxy
+> directive but not in a RemoteIPInternalProxy directive, then
+> processing halts at the right-most private IP address in the
+> X-Forwarded-For header. For example:
+> 
+> X-Forwarded-For: 4.4.4.4, 3.3.3.3, 192.168.0.2, 2.2.2.2, 1.1.1.1
+> 
+> halts at 192.168.0.2. From a network-architecture perspective,
+> this seems to make perfect sense because the meaning of 192.168.0.2
+> with respect to host 2.2.2.2 can be completely different from the
+> meaning of 192.168.0.2 on the intranet of the Apache HTTP Server.
+> Here, the goal of the halt is to reject an out-of-context intranet
+> address.
+> 
+
+You seem to be off-by-one in the analysis. The halt is *on* the
+untrusted IP, making that IP itself the indirect client.
+
+This case TCP IP is trusted, but 1.1.1.1 untrusted so 1.1.1.1 is the
+indirect client. That 1.1.1.1 value was appended/relayed by the
+trusted server at the other end of TCP/IP connection.
+
+> 
+> In other words, we believe that the bug report's expectation of 
+> "mod_remoteip would override client IP with 1.1.1.1 because
+> 10.0.0.1 is trusted and 1.1.1.1 is not trusted" is false. From the
+> perspective of directly incoming IP packets to the Apache HTTP
+> Server, 1.1.1.1 is neither trusted nor untrusted. A 1.1.1.1 trust
+> decision is outside the scope of what the Apache HTTP Server can or
+> should do. The 1.1.1.1 trust decision belongs exclusively to the
+> operator of 10.0.0.1.
+> 
+> If all of this is wrong, and mod_remoteip actually wanted to have 
+> complete information about the proxy-trust rule sets of the
+> outside world, then security@...che.org (see the 
+> http://www.apache.org/security/committers.html page) can assign a
+> CVE ID.
+> 
+
+Does their intent and documentation matter if they are/were not
+following someones elses feature design accurately and causing a
+security impact that should not have existed ?
+
+
+HTH,
+Amos Jeffries
+Squid Software Foundation
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v2.0.22 (MingW32)
+
+iQEcBAEBAgAGBQJUuJqDAAoJELJo5wb/XPRjt/MIAJ43EdJBY577xKHAO3u+5Tcs
+Fw7NqZy+ep9lE9kngRLgyYPbsb3Xw9lcTW2h2oOviiM9sFMyQWAnp53Xrx9DJnQD
+LZp1aDlz3LHkIXgApXP3oEwc7GoM24zLIyzdOCjYS+CmZu3G6xlu/sB+6EOUyPkY
+D7UpLpDgBZf18wPCaMsMNh9fnzfPJAxWmCiDA+yX5qUojy3feFKekOqQzKbLOdyR
+mp8nFCGEcZiSx4Aw3KthHHsxrtw1hL85BguyMH3kUwPK4qJ4hxtBh6C1nzDo+2T9
+sDSY8G+TJWi22dhch3ro2ijmidWS0XiaH7wzgR5yJ9AESn5cjdr7sEeI0ZoBOpo=
+=MO4f
+-----END PGP SIGNATURE-----

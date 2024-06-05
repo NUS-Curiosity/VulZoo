@@ -1,0 +1,504 @@
+
+Date: Fri, 6 Dec 2019 05:25:10 +0000
+From: VMware Security Response Center <security@...are.com>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+CC: VMware Security Response Center <security@...are.com>
+Subject: CVE-2019-5544 openslp 1.2.1, 2.0.0 heap overflow vulnerability
+
+openslp has a heap overflow vulnerability that when exploited may result
+in memory corruption and a crash of slpd or in remote code execution.
+
+CVE-2019-5544 has been assigned to this issue.
+
+Below you may find:
+- a copy of the affected code with comments indicating the problem.
+- patches for openslp versions 1.2.1 and 2.0.0
+
+VMware would like to thank the 360Vulcan team working with the 2019
+Tianfu Cup Pwn Contest for reporting this issue to us.
+
+VMware Security Response Center
+
+
+============================== CODE SNIPPET ============================ 
+slpd_process.c
+
+static int ProcessSrvRqst(SLPMessage * message, SLPBuffer * sendbuf,
+      int errorcode)
+{
+   ...
+   if (db && errorcode == 0)
+   {
+      for (i = 0; i < db->urlcount; i++)
+      {
+         /* urlentry is the url from the db result */
+         urlentry = db->urlarray[i];
+
+         size += urlentry->urllen + 6; /*  1 byte for reserved  *///<=======================================(1)here size plus urllen
+                                       /*  2 bytes for lifetime */
+                                       /*  2 bytes for urllen   */
+                                       /*  1 byte for authcount */
+#ifdef ENABLE_SLPv2_SECURITY
+         /* make room to include the authblock that was asked for */
+         if (G_SlpdProperty.securityEnabled
+               && message->body.srvrqst.spistrlen)
+         {
+            for (j = 0; j < urlentry->authcount; j++)
+            {
+               if (SLPCompareString(urlentry->autharray[j].spistrlen,
+                     urlentry->autharray[j].spistr,
+                     message->body.srvrqst.spistrlen,
+                     message->body.srvrqst.spistr) == 0)
+               {
+                  authblock = &(urlentry->autharray[j]);
+                  size += authblock->length;
+                  break;
+               }
+            }
+         }
+#endif
+      }
+   }
+
+   /* reallocate the result buffer */
+   result = SLPBufferRealloc(result, size);//<======================================(2)here use size to malloc a buffer
+   if (result == 0)
+   {
+      errorcode = SLP_ERROR_INTERNAL_ERROR;
+      goto FINISHED;
+   }
+
+   /* add the header */
+
+   /* version */
+   *result->curpos++ = 2;
+
+   /* function id */
+   *result->curpos++ = SLP_FUNCT_SRVRPLY;
+
+   /* length */
+   PutUINT24(&result->curpos, size);
+
+   /* flags */
+   PutUINT16(&result->curpos, (size > (size_t)G_SlpdProperty.MTU?
+         SLP_FLAG_OVERFLOW: 0));
+
+   /* ext offset */
+   PutUINT24(&result->curpos, 0);
+
+   /* xid */
+   PutUINT16(&result->curpos, message->header.xid);
+
+   /* lang tag len */
+   PutUINT16(&result->curpos, message->header.langtaglen);
+
+   /* lang tag */
+   memcpy(result->curpos, message->header.langtag,
+         message->header.langtaglen);
+   result->curpos += message->header.langtaglen;
+
+   /* add rest of the SrvRply */
+
+   /* error code*/
+   PutUINT16(&result->curpos, errorcode);
+   if (db && errorcode == 0)
+   {
+      /* urlentry count */
+      PutUINT16(&result->curpos, db->urlcount);
+      for (i = 0; i < db->urlcount; i++)
+      {
+         /* urlentry is the url from the db result */
+         urlentry = db->urlarray[i];
+
+#ifdef ENABLE_SLPv1
+         if (urlentry->opaque == 0)
+         {
+            /* url-entry reserved */
+            *result->curpos++ = 0;
+
+            /* url-entry lifetime */
+            PutUINT16(&result->curpos, urlentry->lifetime);
+
+            /* url-entry urllen */
+            PutUINT16(&result->curpos, urlentry->urllen);
+
+            /* url-entry url */
+            memcpy(result->curpos, urlentry->url, urlentry->urllen);
+            result->curpos += urlentry->urllen;
+
+            /* url-entry auths */
+            *result->curpos++ = 0;
+         }
+         else
+#endif
+         {
+            /* Use an opaque copy if available (and authentication is
+             * not being used).
+             */
+
+            /* TRICKY: Fix up the lifetime. */
+            TO_UINT16(urlentry->opaque + 1, urlentry->lifetime);
+            memcpy(result->curpos, urlentry->opaque, urlentry->opaquelen);//<==================================(3)opaquelen could be bigger than urllen,lead to heap overflow
+            result->curpos += urlentry->opaquelen;
+         }
+      }
+   }
+   else
+      PutUINT16(&result->curpos, 0); /* set urlentry count to 0*/
+
+FINISHED:
+
+   if (db)
+      SLPDDatabaseSrvRqstEnd(db);
+
+   *sendbuf = result;
+
+   return errorcode;
+}     
+
+============================== /CODE SNIPPET ============================ 
+
+============================== PATCH FOR OPENSLP 1.2.1 ============================
+
+diff -ur openslp-1.2.1.orig/common/slp_buffer.c openslp-1.2.1/common/slp_buffer.c
+--- openslp-1.2.1.orig/common/slp_buffer.c	2005-02-07 21:32:58.000000000 -0800
++++ openslp-1.2.1/common/slp_buffer.c	2019-11-26 21:58:26.000000000 -0800
+@@ -47,6 +47,12 @@
+ /*                                                                         */
+ /***************************************************************************/
+ 
++/* Copyright (c) 2019 VMware, Inc.
++ * SPDX-License-Identifier: BSD-3-Clause
++ * This file is provided under the BSD-3-Clause license.
++ * See COPYING file for more details and other copyrights
++ * that may apply.
++ */
+ 
+ #include "slp_buffer.h" 
+ #include "slp_xmalloc.h"
+@@ -142,6 +148,21 @@
+     return result;
+ }
+ 
++/*=========================================================================*/
++size_t RemainingBufferSpace(SLPBuffer buf)
++/* Report remaining free buffer size in bytes.                             */
++/*                                                                         */
++/* Check if buffer is allocated and if so return bytes left in a           */
++/* @c SLPBuffer object.                                                    */
++/*                                                                         */
++/* @param[in] buf The SLPBuffer to be freed.                               */
++/*=========================================================================*/
++{
++   if (buf->allocated == 0) {
++      return 0;
++   }
++   return buf->end - buf->curpos;
++}
+ 
+ /*=========================================================================*/
+ SLPBuffer SLPBufferDup(SLPBuffer buf)
+diff -ur openslp-1.2.1.orig/common/slp_buffer.h openslp-1.2.1/common/slp_buffer.h
+--- openslp-1.2.1.orig/common/slp_buffer.h	2005-02-07 21:32:58.000000000 -0800
++++ openslp-1.2.1/common/slp_buffer.h	2019-11-26 21:58:16.000000000 -0800
+@@ -48,6 +48,13 @@
+ /*                                                                         */
+ /***************************************************************************/
+ 
++/* Copyright (c) 2019 VMware, Inc.
++ * SPDX-License-Identifier: BSD-3-Clause
++ * This file is provided under the BSD-3-Clause license.
++ * See COPYING file for more details and other copyrights
++ * that may apply.
++ */
++
+ #if(!defined SLP_BUFFER_H_INCLUDED)
+ #define SLP_BUFFER_H_INCLUDED
+ 
+@@ -147,6 +154,15 @@
+ /* Returns the added item in the list.                                     */
+ /*=========================================================================*/
+ 
++size_t RemainingBufferSpace(SLPBuffer buf);
++/*=========================================================================*/
++/* Return bytes left in buffer from current position                       */
++/*                                                                         */
++/* buf (IN) pointer to the buffer                                          */
++/*                                                                         */
++/* Returns number of bytes left in buffer from current position            */
++/*=========================================================================*/
++
+ 
+ /*=========================================================================*/
+ void* memdup(const void* src, int srclen);
+diff -ur openslp-1.2.1.orig/slpd/slpd_process.c openslp-1.2.1/slpd/slpd_process.c
+--- openslp-1.2.1.orig/slpd/slpd_process.c	2005-02-07 22:12:24.000000000 -0800
++++ openslp-1.2.1/slpd/slpd_process.c	2019-11-26 21:58:37.000000000 -0800
+@@ -46,6 +46,13 @@
+ /*                                                                         */
+ /***************************************************************************/
+ 
++/* Copyright (c) 2019 VMware, Inc.
++ * SPDX-License-Identifier: BSD-3-Clause
++ * This file is provided under the BSD-3-Clause license.
++ * See COPYING file for more details and other copyrights
++ * that may apply.
++ */
++
+ /*=========================================================================*/
+ /* slpd includes                                                           */
+ /*=========================================================================*/
+@@ -447,11 +454,26 @@
+         {
+             /* urlentry is the url from the db result */
+             urlentry = db->urlarray[i];
+-
++            if (urlentry->opaque != NULL)
++            {
++                const int64_t newsize = size + urlentry->opaquelen;
++                if (urlentry->opaquelen <= 0 || newsize > INT_MAX)
++                {
++                    SLPDLog("Invalid opaquelen %d or sizeo of opaque url is too big, size=%d\n",
++                            urlentry->opaquelen, size);
++                    errorcode = SLP_ERROR_PARSE_ERROR;
++                    goto FINISHED;
++                }
++            size +=  urlentry->opaquelen;
++         }
++         else
++         {
++            /* urlentry is the url from the db result */
+             size += urlentry->urllen + 6; /*  1 byte for reserved  */
+                                           /*  2 bytes for lifetime */
+                                           /*  2 bytes for urllen   */
+                                           /*  1 byte for authcount */
++          }
+ #ifdef ENABLE_SLPv2_SECURITY
+ 
+             /* make room to include the authblock that was asked for */
+@@ -527,7 +549,7 @@
+             urlentry = db->urlarray[i]; 
+ 
+ #ifdef ENABLE_SLPv1
+-            if (urlentry->opaque == 0)
++            if (urlentry->opaque == NULL)
+             {
+                 /* url-entry reserved */
+                 *result->curpos = 0;        
+@@ -539,8 +561,18 @@
+                 ToUINT16(result->curpos,urlentry->urllen);
+                 result->curpos = result->curpos + 2;
+                 /* url-entry url */
+-                memcpy(result->curpos,urlentry->url,urlentry->urllen);
+-                result->curpos = result->curpos + urlentry->urllen;
++                if (RemainingBufferSpace(result) >= urlentry->urllen)
++                {
++                   memcpy(result->curpos, urlentry->url, urlentry->urllen);
++                   result->curpos = result->curpos + urlentry->urllen;
++                }
++                else
++                {
++                   SLPDLog("Url too big (ask: %d have %lld), failing request\n",
++                           urlentry->opaquelen, (long long) RemainingBufferSpace(result));
++                   errorcode = SLP_ERROR_PARSE_ERROR;
++                   goto FINISHED;
++                }
+                 /* url-entry auths */
+                 *result->curpos = 0;
+                 result->curpos = result->curpos + 1;
+@@ -551,8 +583,18 @@
+                 /* Use an opaque copy if available (and authentication is not being used)*/
+                 /* TRICKY: fix up the lifetime */
+                 ToUINT16(urlentry->opaque + 1,urlentry->lifetime);
+-                memcpy(result->curpos,urlentry->opaque,urlentry->opaquelen);
+-                result->curpos = result->curpos + urlentry->opaquelen;
++                if (RemainingBufferSpace(result) >= urlentry->opaquelen)
++                {
++                   memcpy(result->curpos, urlentry->opaque, urlentry->opaquelen);
++                   result->curpos = result->curpos + urlentry->opaquelen;
++                }
++                else
++                {
++                   SLPDLog("Opaque Url too big (ask: %d have %lld), failing request\n",
++                           urlentry->opaquelen, (long long) RemainingBufferSpace(result));
++                   errorcode = SLP_ERROR_PARSE_ERROR;
++                   goto FINISHED;
++                }
+             }
+         }
+     }
+
+============================== /PATCH FOR OPENSLP 1.2.1 ============================
+
+
+============================== PATCH FOR OPENSLP 2.0.0 =============================
+
+diff -ur openslp-2.0.0.orig/common/slp_buffer.c openslp-2.0.0/common/slp_buffer.c
+--- openslp-2.0.0.orig/common/slp_buffer.c	2012-12-10 15:31:53.000000000 -0800
++++ openslp-2.0.0/common/slp_buffer.c	2019-11-26 21:54:20.000000000 -0800
+@@ -30,6 +30,13 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  *-------------------------------------------------------------------------*/
+ 
++/* Copyright (c) 2019 VMware, Inc.
++ * SPDX-License-Identifier: BSD-3-Clause
++ * This file is provided under the BSD-3-Clause license.
++ * See COPYING file for more details and other copyrights
++ * that may apply.
++ */
++
+ /** Functions for managing SLP message buffers.
+  *
+  * This file provides a higher level abstraction over malloc and free that
+@@ -153,4 +160,20 @@
+    xfree(buf);
+ }
+ 
++/** Report remaining free buffer size in bytes.
++ *
++ * Check if buffer is allocated and if so return bytes left in a
++ * @c SLPBuffer object.
++ *
++ * @param[in] buf The SLPBuffer to be freed.
++ */
++size_t
++RemainingBufferSpace(SLPBuffer buf)
++{
++   if (buf->allocated == 0) {
++      return 0;
++   }
++   return buf->end - buf->curpos;
++}
++
+ /*=========================================================================*/
+diff -ur openslp-2.0.0.orig/common/slp_buffer.h openslp-2.0.0/common/slp_buffer.h
+--- openslp-2.0.0.orig/common/slp_buffer.h	2012-11-28 09:07:04.000000000 -0800
++++ openslp-2.0.0/common/slp_buffer.h	2019-11-26 21:54:32.000000000 -0800
+@@ -30,6 +30,13 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  *-------------------------------------------------------------------------*/
+ 
++/* Copyright (c) 2019 VMware, Inc.
++ * SPDX-License-Identifier: BSD-3-Clause
++ * This file is provided under the BSD-3-Clause license.
++ * See COPYING file for more details and other copyrights
++ * that may apply.
++ */
++
+ /** Header file that defines SLP message buffer management routines.
+  *
+  * Includes structures, constants and functions that used to handle memory 
+@@ -78,6 +85,8 @@
+ 
+ SLPBuffer SLPBufferListAdd(SLPBuffer * list, SLPBuffer buf);
+ 
++size_t RemainingBufferSpace(SLPBuffer buf);
++
+ /*! @} */
+ 
+ #endif /* SLP_BUFFER_H_INCLUDED */
+diff -ur openslp-2.0.0.orig/slpd/slpd_process.c openslp-2.0.0/slpd/slpd_process.c
+--- openslp-2.0.0.orig/slpd/slpd_process.c	2012-12-12 09:38:54.000000000 -0800
++++ openslp-2.0.0/slpd/slpd_process.c	2019-11-26 21:55:10.000000000 -0800
+@@ -30,6 +30,13 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  *-------------------------------------------------------------------------*/
+ 
++/* Copyright (c) 2019 VMware, Inc.
++ * SPDX-License-Identifier: BSD-3-Clause
++ * This file is provided under the BSD-3-Clause license.
++ * See COPYING file for more details and other copyrights
++ * that may apply.
++ */
++
+ /** Processes incoming SLP messages.
+  *
+  * @file       slpd_process.c
+@@ -514,13 +521,27 @@
+    {
+       for (i = 0; i < db->urlcount; i++)
+       {
+-         /* urlentry is the url from the db result */
+          urlentry = db->urlarray[i];
++         if (urlentry->opaque != NULL) {
++            const int64_t newsize = size + urlentry->opaquelen;
++            if (urlentry->opaquelen <= 0 || newsize > INT_MAX)
++            {
++               SLPDLog("Invalid opaquelen %d or sizeo of opaque url is too big, size=%d\n",
++                       urlentry->opaquelen, size);
++               errorcode = SLP_ERROR_PARSE_ERROR;
++               goto FINISHED;
++            }
++            size +=  urlentry->opaquelen;
++         }
++         else
++         {
++            /* urlentry is the url from the db result */
++            size += urlentry->urllen + 6; /*  1 byte for reserved  */
++                                          /*  2 bytes for lifetime */
++                                          /*  2 bytes for urllen   */
++                                          /*  1 byte for authcount */
++          }
+ 
+-         size += urlentry->urllen + 6; /*  1 byte for reserved  */
+-                                       /*  2 bytes for lifetime */
+-                                       /*  2 bytes for urllen   */
+-                                       /*  1 byte for authcount */
+ #ifdef ENABLE_SLPv2_SECURITY
+          /* make room to include the authblock that was asked for */
+          if (G_SlpdProperty.securityEnabled
+@@ -594,7 +615,7 @@
+          urlentry = db->urlarray[i];
+ 
+ #ifdef ENABLE_SLPv1
+-         if (urlentry->opaque == 0)
++         if (urlentry->opaque == NULL)
+          {
+             /* url-entry reserved */
+             *result->curpos++ = 0;
+@@ -606,8 +627,18 @@
+             PutUINT16(&result->curpos, urlentry->urllen);
+ 
+             /* url-entry url */
+-            memcpy(result->curpos, urlentry->url, urlentry->urllen);
+-            result->curpos += urlentry->urllen;
++            if (RemainingBufferSpace(result) >= urlentry->urllen)
++            {
++               memcpy(result->curpos, urlentry->url, urlentry->urllen);
++               result->curpos = result->curpos + urlentry->urllen;
++            }
++            else
++            {
++                SLPDLog("Url too big (ask: %d have %" PRId64 "), failing request\n",
++                        urlentry->opaquelen, (int64_t) RemainingBufferSpace(result));
++                errorcode = SLP_ERROR_PARSE_ERROR;
++                goto FINISHED;
++            }
+ 
+             /* url-entry auths */
+             *result->curpos++ = 0;
+@@ -621,8 +652,18 @@
+ 
+             /* TRICKY: Fix up the lifetime. */
+             TO_UINT16(urlentry->opaque + 1, urlentry->lifetime);
+-            memcpy(result->curpos, urlentry->opaque, urlentry->opaquelen);
+-            result->curpos += urlentry->opaquelen;
++            if (RemainingBufferSpace(result) >= urlentry->opaquelen)
++            {
++               memcpy(result->curpos, urlentry->opaque, urlentry->opaquelen);
++               result->curpos = result->curpos + urlentry->opaquelen;
++             }
++             else
++             {
++               SLPDLog("Opaque Url too big (ask: %d have %" PRId64 "), failing request\n",
++                       urlentry->opaquelen, (int64_t) RemainingBufferSpace(result));
++               errorcode = SLP_ERROR_PARSE_ERROR;
++               goto FINISHED;
++             }
+          }
+       }
+    }
+
+============================== /PATCH FOR OPENSLP 2.0.0 =============================
+ 
+

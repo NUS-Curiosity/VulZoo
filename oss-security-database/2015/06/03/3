@@ -1,0 +1,153 @@
+
+Date: Wed, 3 Jun 2015 20:04:25 +1200
+From: Matthew Daley <mattd@...fuzz.com>
+To: oss-security@...ts.openwall.com, cve-assign@...re.org
+Subject: CVE requests / Advisory: Codestyling Localization (Wordpress plugin)
+ - multiple RCE via CSRF, multiple XSS
+
+Affected software: Codestyling Localization (Wordpress plugin)
+Affected versions: ? -> 1.99.30
+Website: http://www.code-styling.de/english/development/wordpress-plugin-codestyling-localization-en
+Website: https://wordpress.org/plugins/codestyling-localization/ (now gone)
+Reported by: Matthew Daley
+
+I'd like to request CVE IDs for these issues. This is the first such
+request; this message serves as an advisory as well.
+
+I have received no response from the plugin author since 2015-04-03,
+hence there are no vendor fixes for the below issues.
+
+The plugin has since been removed from the Wordpress plugin directory,
+so I don't have the ability to easily link to source code. FWIW, line
+references in this advisory refer to what was the latest version of
+the plugin, 1.99.30.
+
+
+Description:
+
+The plugin contains multiple AJAX actions that, while having the
+necessary permission checks, do not have anti-CSRF protection (ie.
+nonces). Hence, attackers can, with the usual victim interaction
+that's required to trigger a CSRF attack, force logged-in victims with
+the "manage_options" capability (ie. Super Admins or Administrators)
+to perform a number of administrative actions.
+
+Furthermore, some of these administrative actions use user-provided
+input in an unsafe way and can be exploited in order to gain remote
+code execution on the victim's Wordpress installation or to perform
+reflected XSS attacks.
+
+
+* Issue #1: RCE via CSRF in AJAX action "csp_po_scan_source_file":
+
+This action is designed to add in translatable strings from one or
+more PHP files into an existing Portable Object (PO) file (just as
+`xgettext` would in 'join' mode).
+
+The issue with this action is that the user-specified PO and PHP file
+paths are not validated in any way. It is possible to abuse the action
+by executing it with the following user-specified parameters:
+
+- Set "pofile", the file to read and write as a PO-format file, to the
+location of a writable, web-accessible PHP file on the system. For
+example, "/var/www/wordpress/wp-includes/ID3/module.audio.dts.php".
+(This file is unlikely to be executed often by WordPress in normal
+functioning and so is a good choice for being overwritten entirely.)
+- Set "php", the list of files to extract translatable strings from,
+to include the location of a crafted file that contains a translatable
+string with embedded PHP code in it. For example, the contents of this
+file could be "<?php __('<?php echo `id` ?>') ?>", which would allow
+the remote execution of the `id` command. Assuming that the
+"allow_url_fopen" PHP configuration setting is enabled, this file can
+be retrieved over a FTP connection to an attacker-controlled server,
+which allows the file to contain whatever the attacker desires.
+- Set "num" to 0 and "cnt" to 1 (indicating that 0 PHP files have been
+processed so far and that there is a total of 1 to process)
+
+Executing the action with these parameters will cause the file
+specified in "pofile" (a writable, web-accessible PHP file) to be
+overwritten with the PO-format output. One of the translatable strings
+in this output will contain the PHP code, unescaped, from the file
+specified in "php". Hence, the attacker then only needs to access the
+overwritten "pofile" file remotely (by requesting it directly by URL)
+for the attacker's code to then be executed by the server.
+
+I have written a simple POC (not given here) to test this. It takes
+the form of a Python script that hosts dummy FTP and HTTP servers that
+serve the required payloads in order for this attack to function. The
+attacker would then induce the victim, who is logged into the
+Wordpress administration interface, to navigate to the script's HTTP
+server. The payloads served by the script's HTTP server will cause the
+victim to send a CSRF-forced request to the csp_po_scan_source_file
+action with the necessary parameters (as described above). The
+csp_po_scan_source_file action will connect back to the script's FTP
+server in order to retrieve the PHP file to scan for translatable
+strings, one of which contains the attacker-specified PHP code to be
+remotely executed. Finally, the script watches the content of the
+target file that is to be overwritten; when it sees that it has been,
+it shows the result of the attacker-specified code's execution.
+
+A sample run:
+
+$ ./csrf-rce-csp_po_ajax_handle_scan_source_file.py
+http://[redacted]/wordpress/ /var/www/wordpress id
+[redacted] - - [03/Apr/2015 11:02:52] "GET / HTTP/1.1" 200 -
+Pre-CSRF payload sent
+[redacted] - - [03/Apr/2015 11:02:53] "GET /csrf HTTP/1.1" 200 -
+CSRF payload sent
+Input payload sent
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+
+The final line in the above output shows the script's result, namely
+the output of running `id` on the victim's server.
+
+
+* Issue #2: RCE via CSRF in AJAX action "csp_po_save_catalog_entry":
+
+This action is similar in functioning to the previous action, except
+that it takes its translated string inputs directly from
+user-specified parameters instead of extracting them from a
+user-specified file.
+
+The action can therefore be exploited in a similar fashion, with one
+caveat: the writable, web-accessible PHP file that is to be
+overwritten with PO-format output ("path" and "file" POST parameters)
+needs to appear to have at least one translatable string in it when it
+is treated as a PO-format file. One of the ways that this can occur is
+for a quotation-mark surrounded string literal to be alone on a single
+line in the file (ignoring whitespace). Lines like this are parsed by
+the PO-format parser as translatable strings. Hence, there will be at
+least one translatable string extracted from the file that can then be
+overwritten by the user-specified translatable string before it's
+written out again to the writable, web-accessible PHP file.
+
+I have written a simple POC (not given here) to test this. It takes
+the form of an HTML file which sends the required POST parameters for
+the vulnerability to be triggered. Once the victim has navigated to
+the POC and the CSRF has been performed, the attacker can request the
+target file remotely via URL and have their code executed, similarly
+to the previous vulnerability.
+
+(The benefit of this vulnerability is that the "allow_url_fopen" PHP
+configuration setting does not need to be enabled in order for this
+attack to function. However, the possible choices for the target file
+are reduced; the file needs to appear to have a translatable string
+when treated as a PO-format file, which the previous vulnerability
+does not require.)
+
+
+* Other issues: Multiple XSS in various AJAX actions
+
+These XSS are all due to reflected unescaped POST parameters in
+certain AJAX actions' responses. The actions and parameters are:
+
+* Action "csp_self_protection_result": parameter "data[php][]"
+* Action "csp_po_dlg_delete": parameters "language", "name",
+"numlangs", "path", "row", "subpath"
+* Action "csp_po_dlg_rescan": parameter "language"
+* Action "csp_po_generate_mo_file": parameter "pofile"
+* Action "csp_po_save_catalog_entry": parameter "file"
+* Action "csp_po_scan_source_file": parameter "pofile"
+
+
+- Matthew Daley

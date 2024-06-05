@@ -1,0 +1,343 @@
+
+Date: Mon, 6 Dec 2021 16:16:06 +0100
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: tmate-ssh-server: Local Privilege Escalation Issues and DoS issues
+ (CVE-2021-44512, CVE-2021-44513)
+
+Hello,
+
+this report is about code review results of the tmate terminal sharing
+software [1]. Some local privilege escalation and remote denial-of-service
+attack vectors have been identified. Skip to section 6) for the concrete
+findings. The following sections give a broader overview of the tmate
+security design.
+
+[1]: https://tmate.io
+
+1) What is tmate?
+=================
+
+Tmate allows a terminal session to be easily shared over the network using the
+SSH protocol. Other people can attach themselves to the shared terminal
+session either with full access or with read-only access (just viewing what
+happens on the terminal).
+
+Tmate consists of two forks of the tmux terminal multiplexer's [2] code base.
+One fork is for the tmate client side [3] (the party that is sharing its
+terminal over the network) and one fork is for the tmate server side [4] (the
+central party that relays SSH connections). Both forks originate from
+the year 2016 and no sync seems to have happened since then. The upstream
+author states that he doesn't backport fixes any more due to lack of time.
+
+The tmate client actively connects to the tmate server side using an outgoing
+SSH connection. This SSH session will be kept alive and a tmux terminal
+session is established with some additional instructions shown on the screen
+on how to attach to the tmux session via the network.
+
+When other people connect to the tmate server using a regular SSH client and a
+secret token as username they will be relayed to the tmate client's tmux
+session and can fully access or view it (read-only mode).
+
+[2]: https://github.com/tmux/tmux
+[3]: https://github.com/tmate-io/tmate.git
+[4]: https://github.com/tmate-io/tmate-ssh-server.git
+
+2) Review Scope
+===============
+
+This review was performed for tmate client version 2.4.0. On the server side
+the current Git development status of tmate-ssh-server as of commit befd49f4
+was used. This is because the last tmate-ssh-server release (version 2.3.0) is
+already over two years old, and a larger number of unreleased changes is found
+on the project's master branch by now. Most of the statements and findings in
+this report should also be true for the 2.3.0 server version release, however.
+
+This review was focused on the general security architecture of the tmate
+protocol and the network faced interfaces.
+
+3) General Cryptographic Security
+=================================
+
+The tried and tested openssh security model is changed a lot in tmate. In
+regular SSH the two parties establish a secure connection (secure against
+eavesdropping), then verify each other. Verification means that the client
+verifies the fingerprint of the public SSH server host key to make sure it is
+the correct party it is talking to and no man in the middle is around. Then
+the server requires authentication of the client as the requested login user
+e.g. via tunneled cleartext password, public key or PAM module authentication
+mechanisms etc.
+
+In tmate we have three parties:
+
+- A: the party that is sharing its terminal using the tmate client.
+- B: the central tmate server that manages multiple tmate sessions and is
+     typically publicly accessible in some form.
+- C: the party that is connecting to a shared terminal using a regular SSH
+     client.
+
+The typical communication flow goes like this:
+
+1. The tmate client (A) connects to to the tmate server (B). It verifies the
+   server's fingerprint. Server hostname, port and fingerprint are configured
+   via $HOME/.tmate.conf ("tmate-server-host", "tmate-server-port",
+   "tmate-server-rsa-fingerprint").
+2. The tmate server (B) performs no verification at all, because any tmate
+   client is allowed to create a new session on it. It generates a random
+   token consisting of 25 alphanumeric characters. This token uniquely
+   identifies the new session and is communicated back to the tmate client (A).
+3. The tmate client (A) displays the random token and the valid SSH URLs to
+   attach to the shared terminal session. It is a command line like follows for
+   full or read-only access respectively:
+   ```
+   ssh    T6PAFr59tsrfEWCaUZg8APCAe@...e-team-mate-server.org
+   ssh ro-4Eu99VBssTnw9Q3LuYQUzcLEy@...e-team-mate-server.org
+   ```
+4. The secret token / command line now needs to be communicated to people
+   that want to attach to the terminal. This step is critical, because it
+   depends on the person that wants to share the terminal and how it shares the
+   token with others.
+5. The user (C) wanting to attach to the shared session now needs to connect
+   to the tmate server (B) using the correct secret token to get access to the
+   shared terminal. (C) will verify the fingerprint of (B), but (B) will not
+   authenticate (C) beyond the knowledge of the secret token. The tmate server
+   (B) will now relay data between (A) and (C).
+
+So in contrast to the classical SSH setup the two endpoints (A) and (C) are
+never verifying each other in any way, except via the secret token of 25
+characters. So the host fingerprint verification and the user authentication
+is all condensed into this secret token that needs to be forwarded from (C) to
+(A) by some means. Any unintended party that gets hold of the secret token can:
+
+- gain full or read-only access to the session shared by (A)
+- replace the session shared by (A) by a malicious session and thus trick (C)
+  (instead of a random token also an explicit fixed token can be used that
+  overwrites existing sessions)
+
+Furthermore the tmate-server (B) is a third party in this setup that needs to
+be fully trusted by both (A) and (C). If (B) is compromised then all security
+is gone.
+
+To summarize, the security model used in tmate makes it easy for people to
+share their terminals over SSH, but this simplicity may come with a false
+sense of security, because the mechanisms used in the background are rather
+complex and the important step 4 depends fully on how the person sharing its
+terminal is treating the secret token.
+
+4) Default Setup of tmate
+=========================
+
+When looking at a default installation of the tmate client (A) then it is very
+simple to share a terminal via the default upstream server "ssh.tmate.io".
+This upstream server name and its fingerprint are hard coded in the client in
+source file "options-table.c". This means trust for the default upstream
+server party (B) is builtin, a decision that should be left up to the user in
+my opinion.
+
+Thus it is enough to just type "tmate" in a shell to immediately share
+terminal access with the upstream server and possibly give full control to it,
+should it be compromised in some form.
+
+I discussed this with the upstream developer and he agreed to make this an
+opt-in but he is still considering options to maintain backward-compatibility
+for existing users.
+
+5) Code Quality and Design
+==========================
+
+Getting an overview of the critical code is not all that easy. The SSH logic
+(based on libssh) feels crammed into the tmux code base. The dividing line
+between original tmux and changed tmate code was difficult to find for me. In
+some spots `#ifdef TMATE` sections are found, some additional source files are
+sprinkled in the source directory.
+
+Especially on the tmate-ssh-server side the tmux internals are basically
+openly connected to the Internet and this raises the question whether the tmux
+developers considered untrusted input in these areas very much.
+
+The code paths accessible to unauthenticated users (and for the tmate-ssh
+server party (B) all connections are unauthenticated) are pretty broad and
+hard to follow during code review.
+
+The network protocol logic which is based on libmsgpackc binary data items
+does not enforce maximum string lengths which means that a variety of DoS
+attacks are possible against party B.
+
+The one (probably crucial) security measure taken by the tmate server source
+code to protect itself is the following:
+
+- each new session is forked from the master process
+- each forked session is placed into a "jail" that consists of some separate
+  namespaces and a chroot jail that runs as user "nobody" by default
+
+It is time consuming to make sure that there are no major security issues in
+this area reachable over the network. Fuzzing might be an approach to check
+this more quickly, I did not go further in this direction, though.
+
+If code execution could be achieved in a forked session process on party B)
+then "only" a way out of the jail needs to be found to reach the same security
+scope as all the other tmate sessions running on the same host.
+
+6) Individual Findings
+======================
+
+These are all issues on the tmate-ssh-server code base running on party B).
+
+a) Local security issues in /tmp/tmate (CVE-2021-44512, CVE-2021-44513)
+-----------------------------------------------------------------------
+
+The tmate-ssh-server maintains a world-writable directory in
+/tmp/tmate/sessions into which UNIX domain sockets named after the secret
+tokens are placed:
+
+```
+$ ls -ld /tmp/tmate
+drwx-----x 4 tmate users  80  Sep 1 11:04 /tmp/tmate
+
+$ ls -ld /tmp/tmate/sessions
+drwx----wx 2 tmate users 120  Sep 1 11:33 /tmp/tmate/sessions/
+
+$ ls -l /tmp/tmate/sessions
+srw-rw---- 1 user users    0  Sep 1 11:05 aVMAvcCWupR3DTK7JF2NfxLeS
+lrwxrwxrwx 1 user users   25  Sep 1 11:33 ro-4Eu99VBssTnw9Q3LuYQUzcLEy \
+                                      -> T6PAFr59tsrfEWCaUZg8APCAe
+lrwxrwxrwx 1 user users   25  Sep 1 11:05 ro-XjB7FchbDAjmMmNnXf2wry3bV \
+                                      -> aVMAvcCWupR3DTK7JF2NfxLeS
+srw-rw---- 1 user users    0  Sep 1 11:33 T6PAFr59tsrfEWCaUZg8APCAe
+```
+
+So this is how different sessions are maintained. If a file is a symlink then
+it is considered a read-only session, otherwise read-write.
+
+This setup is subject to a race condition (CVE-2021-44513):
+
+- the creation of these directories is unsafe using `mkdir()` and `chmod()`
+  system calls in `main()` found in source file "tmate-main.c". The code
+  potentially reuses existing directories that belong to other users. Only the
+  following `chmod()`s would fail if the owner does not match. This is a race
+  condition, however, that could be won by using symlinks. In this case a
+  local attacker could gain full control over this directory structure and thus
+  create additional malicious sessions or get control of existing, legit
+  sessions.
+
+This setup uses too broad permissions in /tmp/tmate and /tmp/tmate/sessions
+(CVE-2021-44512):
+
+- since /tmp/tmate/sessions is world-writable a local malicious user can
+  create arbitrary new files in there. For example a UNIX domain socket that
+  reaches an attacker controlled local process instead of an actual tmate
+  server session.
+- although /tmp/tmate/sessions only allows 'wx' for other users this still
+  allows to execute a `readlink()` system call on existing symbolic links in
+  the directory. Thus a local compromised user that has knowledge of the
+  secret token for a read-only session can find out the token for the
+  read-write session and get full access.
+
+
+Both problems are addressed by upstream commit 1c020d1f [5]. I recommended to
+the upstream author to perform the ownership check first and only then perform
+the `chmod()` calls, but this change did not happen yet.
+
+[5]: https://github.com/tmate-io/tmate-ssh-server/commit/1c020d1f5ca462f5b150b46a027aaa1bbe3c9596
+
+b) Denial-of-Service Attack Vectors
+-----------------------------------
+
+- there is no limit to the number of sessions that can be created on the tmate
+  ssh server. A simple `ssh someone@...tmate-server -s tmate -p $tmate_port`
+  is enough to establish a new session, get a new session token in
+  /tmp/tmate/sessions and a forked session process. This can be done a lot of
+  times in parallel to consume resources on the host.
+- by sending overlong `HEADER` cilent identification, or overly big window
+  dimensions via the `SYNC_LAYOUT` message memory exhaustion can be triggered
+  on the host. This will usually "only" kill the forked session process but
+  could also negatively impact availibility of the service to other sessions.
+  Practically all string parameters in the network protocol have no size
+  limit, I only outlined two prominent cases.
+- I managed to cause a NULL pointer dereference by sending a bad `SYNC_LAYOUT`
+  message, but triggering it is subject to a race condition for some reason.
+
+### Reproducers
+
+Attached is a simple Python script that allows to trigger some of the DoS
+issues:
+
+```
+# this will not lead to an immediate OOM but shows the principle of sending
+# overly long headers
+$ tmate_dos.py --send-long-header
+
+# this should lead to an immediate OOM by specifying overly large pane
+# parameters
+$ tmate_dos.py --allocate-gigantic-pane
+
+# this often leads to a NULL pointer dereference (not fully reliable for
+# some reason)
+$ tmate_dos.py --send-bad-pane-id
+```
+
+### Fixes
+
+Some of these aspects have been addressed by upstream commits [6], [7], [8].
+
+The upstream author expressed that things like a limit on the number of
+sessions should be covered by using cgroup limits or similar operating system
+features. No such setup is available upstream yet though.
+
+[6]: https://github.com/tmate-io/tmate-ssh-server/commit/36f073b4ccf05da2fd51cc10a2debb443c592c50
+[7]: https://github.com/tmate-io/tmate-ssh-server/commit/b41672b634af4ec8797449e78e4b731e24e26e16
+[8]: https://github.com/tmate-io/tmate-ssh-server/commit/1f314123df2bb29cb07427ed8663a81c8d9034fd
+
+c) Miscellaneous Bits
+---------------------
+
+- the tmate-server only seems to support two SSH host key types "rsa" and
+  "ed25519" and thus restricts the available cryptographic algorithms (for
+  example no ECDSA).
+- the handling of random data via `random_stream_init()` and
+  `random_stream_get()` is a bit peculiar. It caches up to 256 bytes of random
+  data in the process that could in theory be shared with child processes and
+  thus multiple processes could use the same random data. Luckily the only client
+  code currently *always* calls `random_stream_init()` and thus effectively no
+  cached random data is ever used.
+- file descriptors are not opened with `O_CLOEXEC` flag by default but are only
+  later explicitly closed via `close_fds_except()`. Since there is no
+  `execve()` taking place this is necessary, but having `O_CLOEXEC` to avoid
+  accidental future inheritance to unrelated programs would be sensible, too.
+
+7) Timeline
+===========
+
+2021-09-03: I reported the findings to the upstream author offering a maximum
+            of 90 days coordinated disclosure.
+
+2021-10-17: The upstream author published the fixes that are also referenced
+            in this report. I tried to establish a clear publication date for
+            the issues but did not get a clear answer.
+
+2021-11-29: I remembered the upstream author about the maximum 90 days
+            non-disclosure time approaching. I failed to get any concrete
+            information on release plans or finalization of some aspects of
+            the fixes.
+
+2021-11-30: I requested CVEs from Mitre for the most pressing issues found in
+            the report.
+
+Cheers
+
+Matthias
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Security Engineer
+https://www.suse.com/security
+Phone: +49 911 740 53 290
+GPG Key ID: 0x14C405C971923553
+
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev
+
+View attachment "tmate_dos.py" of type "text/x-python" (2151 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

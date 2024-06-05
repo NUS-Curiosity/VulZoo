@@ -1,0 +1,484 @@
+
+Date: Wed, 27 Apr 2016 16:01:42 +0800
+From: "PXO炳林" <271193918@...com>
+To: "oss-security" <oss-security@...ts.openwall.com>
+Subject: 回复： 3 bugs refer to buffer overflow in in libtiff 4.0.6
+
+It seems not a patch upstream.
+
+
+The bugs detail I add as follows:
+
+
+3 bugs: one stack buffer overflow in thumbnail and two heap buffer overflows in bmp2tiff.
+
+
+Because they deal with different buffer(stack and heap), stack trace of alloc and read are also different.
+
+
+#####################################
+1) stack buffer overflow in thumbnail 
+#####################################
+
+
+Memory corruption bugs can be triggered when thumbnail function _TIFFVGetField handling maliciously crafted tiff file, it will cause the target application to crash.
+
+
+overview:
+
+
+alloc workflow:  thumbnail.c:147
+
+
+read workflow :  
+--> thumbnail.c:124  // if (!cpIFD(in, out) || !TIFFWriteDirectory(out))
+--> thumbnail.c:373  // cpTags(in, out)
+--> thumbnail.c:297  // cpTag(in, out, p->tag, p->count, p->type)
+--> thumbnail.c:152  // CopyField(tag, shortv)
+--> tif_dir.c:1158   // status = TIFFVGetField(tif, tag, ap);
+--> tif_dir.c:1174   // return (fip && (isPseudoTag(tag) || TIFFFieldSet(tif, fip->field_bit)) ? (*tif->tif_tagmethods.vgetfield)(tif, tag, ap) : 0);
+--> tif_dir.c:1053   // *va_arg(ap, uint32*) = (uint32)tv->count;
+
+
+my gdb log as follows:
+
+
+1) gdb --args thumbnail poc1.tiff out.tiff    // crash
+
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000000404c90 in _TIFFVGetField (tif=<optimized out>, tag=327, ap=0x7fffffffdca8) at tif_dir.c:1073
+1073								*va_arg(ap, void **) = tv->value;
+(gdb) p tv->value 
+$1 = (void *) 0x651240
+(gdb) info registers
+rax            0x1	1
+rbx            0x147	327
+rcx            0x0	0
+rdx            0x651240	6623808
+rsi            0x147	327
+rdi            0x7fffffffdc30	140737488346160
+rbp            0x7fffffffdca8	0x7fffffffdca8
+rsp            0x7fffffffdc70	0x7fffffffdc70
+r8             0x3	3
+r9             0x7ffff7acd7b8	140737348687800
+r10            0x2	2
+r11            0x0	0
+r12            0x6512e0	6623968
+r13            0x651120	6623520
+r14            0x6605c0	6686144
+r15            0x650010	6619152
+rip            0x404c90	0x404c90 <_TIFFVGetField+4784>
+eflags         0x10206	[ PF IF RF ]
+cs             0x33	51
+ss             0x2b	43
+ds             0x0	0
+es             0x0	0
+fs             0x0	0
+gs             0x0	0
+(gdb) x/i $rip
+=> 0x404c90 <_TIFFVGetField+4784>:	mov    %rdx,(%rax)
+(gdb) x/x $ebx
+0x147:	Cannot access memory at address 0x147
+(gdb) bt
+#0  0x0000000000404c90 in _TIFFVGetField (tif=<optimized out>, tag=327, ap=0x7fffffffdca8) at tif_dir.c:1073
+#1  0x0000000000407177 in TIFFGetField (tif=<optimized out>, tag=tag@...ry=327) at tif_dir.c:1158
+#2  0x00000000004023a9 in cpTag (in=in@...ry=0x650930, out=out@...ry=0x650010, tag=327, count=<optimized out>, 
+    type=<optimized out>) at thumbnail.c:152
+#3  0x00000000004019fb in cpTags (out=<optimized out>, in=<optimized out>) at thumbnail.c:297
+#4  cpIFD (out=<optimized out>, in=<optimized out>) at thumbnail.c:373
+#5  main (argc=<optimized out>, argv=<optimized out>) at thumbnail.c:124
+(gdb) 
+
+
+
+
+2) gdb thumbnail
+b main
+b thumbnail.c:124     //  124, if (!cpIFD(in, out) || !TIFFWriteDirectory(out)), this function is called many times
+b thumbnail.c:373
+b thumbnail.c:297
+b thumbnail.c:152     //  152, CopyField(tag, shortv);
+b tif_dir.c:1158      //  1158, status = TIFFVGetField(tif, tag, ap), this function is called many times
+b tif_dir.c:1073
+
+
+r poc1.tiff out.tiff
+
+
+(gdb) r poc1.tiff out.tiff
+Starting program: /usr/local/bin/thumbnail poc1.tiff out.tiff
+TIFFReadDirectoryCheckOrder: Warning, Invalid TIFF directory; tags are not sorted in ascending order.
+TIFFReadDirectory: Warning, Unknown field with tag 65535 (0xffff) encountered.
+TIFFReadDirectory: Warning, Unknown field with tag 128 (0x80) encountered.
+TIFFReadDirectory: Warning, Unknown field with tag 4608 (0x1200) encountered.
+TIFFReadDirectory: Warning, Unknown field with tag 5888 (0x1700) encountered.
+TIFFReadDirectory: Warning, Unknown field with tag 8960 (0x2300) encountered.
+TIFFReadDirectory: Warning, Unknown field with tag 18247 (0x4747) encountered.
+TIFFReadDirectory: Warning, Unknown field with tag 327 (0x147) encountered.
+TIFFReadDirectory: Warning, Unknown field with tag 5146 (0x141a) encountered.
+TIFFFetchNormalTag: Warning, Incorrect count for "ModeNumber"; tag ignored.
+TIFFFetchNormalTag: Warning, ASCII value for tag "Software" contains null byte in value; value incorrectly truncated during reading due to implementation limitations.
+TIFFReadDirectory: Warning, Ignoring ColorMap since BitsPerSample tag not found.
+TIFFReadDirectory: Warning, TIFF directory is missing required "StripByteCounts" field, calculating from imagelength.
+
+
+......
+......
+Breakpoint 1, TIFFGetField (tif=0x650930, tag=tag@...ry=305) at tif_dir.c:1158
+1158		status = TIFFVGetField(tif, tag, ap);
+(gdb) bt
+#0  TIFFGetField (tif=0x650930, tag=tag@...ry=305) at tif_dir.c:1158
+#1  0x0000000000402231 in cpTag (in=in@...ry=0x650930, out=out@...ry=0x650010, tag=tag@...ry=305, count=count@...ry=65535, 
+    type=type@...ry=TIFF_ASCII) at thumbnail.c:205
+#2  0x000000000040192e in generateThumbnail (out=0x650010, in=0x650930) at thumbnail.c:645
+#3  main (argc=<optimized out>, argv=<optimized out>) at thumbnail.c:122
+(gdb) c
+Continuing.
+
+
+Breakpoint 1, TIFFGetField (tif=0x650930, tag=tag@...ry=270) at tif_dir.c:1158
+1158		status = TIFFVGetField(tif, tag, ap);
+(gdb) bt
+#0  TIFFGetField (tif=0x650930, tag=tag@...ry=270) at tif_dir.c:1158
+#1  0x0000000000402231 in cpTag (in=in@...ry=0x650930, out=out@...ry=0x650010, tag=tag@...ry=270, count=count@...ry=65535, 
+    type=type@...ry=TIFF_ASCII) at thumbnail.c:205
+#2  0x0000000000401949 in generateThumbnail (out=0x650010, in=0x650930) at thumbnail.c:646
+#3  main (argc=<optimized out>, argv=<optimized out>) at thumbnail.c:122
+......
+......
+Breakpoint 1, TIFFGetField (tif=tif@...ry=0x650930, tag=tag@...ry=259) at tif_dir.c:1158
+1158		status = TIFFVGetField(tif, tag, ap);
+......
+......
+(gdb) c
+Continuing.
+
+
+Breakpoint 1, TIFFGetField (tif=0x650930, tag=tag@...ry=327) at tif_dir.c:1158
+1158		status = TIFFVGetField(tif, tag, ap);
+(gdb) c
+Continuing.
+
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000000404c90 in _TIFFVGetField (tif=<optimized out>, tag=327, ap=0x7fffffffdca8) at tif_dir.c:1073
+1073								*va_arg(ap, void **) = tv->value;
+(gdb) c
+
+
+
+
+When tag=tag@...ry=327 , crash happens
+
+
+3) If we make a breakpoint in tif_dir.c:1073   
+
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000000404c90 in _TIFFVGetField (tif=<optimized out>, tag=327, ap=0x7fffffffdca8) at tif_dir.c:1073
+1073								*va_arg(ap, void **) = tv->value;
+(gdb) bt
+#0  0x0000000000404c90 in _TIFFVGetField (tif=<optimized out>, tag=327, ap=0x7fffffffdca8) at tif_dir.c:1073
+#1  0x0000000000407177 in TIFFGetField (tif=<optimized out>, tag=tag@...ry=327) at tif_dir.c:1158
+#2  0x00000000004023a9 in cpTag (in=in@...ry=0x650930, out=out@...ry=0x650010, tag=327, count=<optimized out>, 
+    type=<optimized out>) at thumbnail.c:152
+#3  0x00000000004019fb in cpTags (out=<optimized out>, in=<optimized out>) at thumbnail.c:297
+#4  cpIFD (out=<optimized out>, in=<optimized out>) at thumbnail.c:373
+#5  main (argc=<optimized out>, argv=<optimized out>) at thumbnail.c:124
+(gdb) list tif_dir.c:1073
+1068							if (fip->field_type == TIFF_ASCII
+1069							    || fip->field_readcount == TIFF_VARIABLE
+1070							    || fip->field_readcount == TIFF_VARIABLE2
+1071							    || fip->field_readcount == TIFF_SPP
+1072							    || tv->count > 1) {
+1073								*va_arg(ap, void **) = tv->value;        //   tv->value
+1074								ret_val = 1;
+1075							} else {
+1076								char *val = (char *)tv->value;
+1077								assert( tv->count == 1 );
+(gdb) 
+
+
+
+
+memory error can be detected by asan and log as follows:
+
+
+==31486==ERROR: AddressSanitizer: stack-buffer-overflow on address 0xbfabce80 at pc 0x8058db9 bp 0xbfabcc98 sp 0xbfabcc8c
+WRITE of size 4 at 0xbfabce80 thread T0
+    #0 0x8058db8 in _TIFFVGetField /root/AFL/bin/tiff-4.0.6-ASAN/libtiff/tif_dir.c:1053
+    #1 0x8059dae in TIFFVGetField /root/AFL/bin/tiff-4.0.6-ASAN/libtiff/tif_dir.c:1174
+    #2 0x8059c25 in TIFFGetField /root/AFL/bin/tiff-4.0.6-ASAN/libtiff/tif_dir.c:1158
+    #3 0x80499b1 in cpTag /root/AFL/bin/tiff-4.0.6-ASAN/tools/thumbnail.c:152
+    #4 0x804a0e6 in cpTags /root/AFL/bin/tiff-4.0.6-ASAN/tools/thumbnail.c:297
+    #5 0x804a776 in cpIFD /root/AFL/bin/tiff-4.0.6-ASAN/tools/thumbnail.c:373
+    #6 0x8049808 in main /root/AFL/bin/tiff-4.0.6-ASAN/tools/thumbnail.c:124
+    #7 0xb70a0a82 in __libc_start_main (/lib/i386-linux-gnu/libc.so.6+0x19a82)
+    #8 0x80492d0 (/root/AFL/bin/tiff-4.0.6-ASAN/tools/crashes/thumbnail+0x80492d0)
+
+
+Address 0xbfabce80 is located in stack of thread T0 at offset 96 in frame
+    #0 0x8049885 in cpTag /root/AFL/bin/tiff-4.0.6-ASAN/tools/thumbnail.c:147
+
+
+  This frame has 7 object(s):
+    [32, 34) 'shortv1'
+    [96, 98) 'shortv1' <== Memory access at offset 96 partially overflows this variable
+    [160, 164) 'tr'
+    [224, 228) 'tg'
+    [288, 292) 'tb'
+    [352, 356) 'doubleav'
+    [416, 424) 'ifd8'
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism or swapcontext
+      (longjmp and C++ exceptions *are* supported)
+SUMMARY: AddressSanitizer: stack-buffer-overflow /root/AFL/bin/tiff-4.0.6-ASAN/libtiff/tif_dir.c:1053 _TIFFVGetField
+Shadow bytes around the buggy address:
+  0x37f57980: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x37f57990: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x37f579a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f1 f1
+  0x37f579b0: f1 f1 04 f4 f4 f4 f3 f3 f3 f3 00 00 00 00 00 00
+  0x37f579c0: 00 00 00 00 f1 f1 f1 f1 02 f4 f4 f4 f2 f2 f2 f2
+=>0x37f579d0:[02]f4 f4 f4 f2 f2 f2 f2 04 f4 f4 f4 f2 f2 f2 f2
+  0x37f579e0: 04 f4 f4 f4 f2 f2 f2 f2 04 f4 f4 f4 f2 f2 f2 f2
+  0x37f579f0: 04 f4 f4 f4 f2 f2 f2 f2 00 f4 f4 f4 f3 f3 f3 f3
+  0x37f57a00: 00 00 00 00 00 00 00 00 00 00 00 00 f1 f1 f1 f1
+  0x37f57a10: 02 f4 f4 f4 f3 f3 f3 f3 00 00 00 00 00 00 00 00
+  0x37f57a20: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Heap right redzone:      fb
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack partial redzone:   f4
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Contiguous container OOB:fc
+  ASan internal:           fe
+==31486==ABORTING
+
+
+
+
+####################################
+2) heap buffer overflow in bmp2tiff
+####################################
+
+
+Memory corruption bugs can be triggered when bmp2tiff handling maliciously crafted bmp file, it will cause the target application to crash.
+
+
+overview:
+
+
+alloc workflow:
+
+
+--> bmp2tiff.c:line 672 , comprbuf = (unsigned char *) _TIFFmalloc( compr_size )  // allocate space for compressed scanline buffer
+    --> allocate space for compressed scanline buffer     
+        --> _TIFFmalloc in libtiff/tif_unix.c:line 316 
+	        --> call malloc
+
+
+read workflow : from bmp2tiff.c:line 745 to line 752  
+
+
+          if (comprbuf[i] == 0) /* Next scanline */
+             i++;
+     else if (comprbuf[i] == 1) /* End of image */
+             break;
+     else if (comprbuf[i] == 2) { /* Move to... */
+             i++;
+             if (i < compr_size - 1) {
+                  j+=comprbuf[i]+comprbuf[i+1]*width;   // line 752
+                  i += 2;
+         }
+										
+bmp2tiff.c:line 752 deals with comprbuf and does not check the length of Image width.
+
+
+
+
+memory error can be detected by asan and log as follows:
+
+
+root@...ug:~/Desktop/AFL/tiff-4.0.6-Asan/tools/crashes# ./bmp2tiff poc_745.bmp 1.tiff
+=================================================================
+==2557==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x60300000eff9 at pc 0x403b67 bp 0x7ffd894ad1a0 sp 0x7ffd894ad198
+READ of size 1 at 0x60300000eff9 thread T0
+    #0 0x403b66 in main /root/Desktop/AFL/tiff-4.0.6-Asan/tools/bmp2tiff.c:745
+    #1 0x7f3722bd1ec4 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x21ec4)
+    #2 0x4019f8 (/root/Desktop/AFL/tiff-4.0.6-Asan/tools/crashes/bmp2tiff+0x4019f8)
+
+
+0x60300000eff9 is located 0 bytes to the right of 25-byte region [0x60300000efe0,0x60300000eff9)
+allocated by thread T0 here:
+    #0 0x7f37232cf7ef in __interceptor_malloc (/usr/lib/x86_64-linux-gnu/libasan.so.1+0x547ef)
+    #1 0x45d76e in _TIFFmalloc /root/Desktop/AFL/tiff-4.0.6-Asan/libtiff/tif_unix.c:316
+    #2 0x403277 in main /root/Desktop/AFL/tiff-4.0.6-Asan/tools/bmp2tiff.c:672
+    #3 0x7f3722bd1ec4 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x21ec4)
+
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /root/Desktop/AFL/tiff-4.0.6-Asan/tools/bmp2tiff.c:745 main
+Shadow bytes around the buggy address:
+  0x0c067fff9da0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c067fff9db0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c067fff9dc0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c067fff9dd0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c067fff9de0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+=>0x0c067fff9df0: fa fa fa fa fa fa fa fa fa fa fa fa 00 00 00[01]
+  0x0c067fff9e00: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c067fff9e10: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c067fff9e20: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c067fff9e30: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c067fff9e40: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Heap right redzone:      fb
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack partial redzone:   f4
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Contiguous container OOB:fc
+  ASan internal:           fe
+==2557==ABORTING
+
+
+####################################
+3) heap buffer overflow in bmp2tiff
+####################################
+
+
+Memory corruption bugs can be triggered when bmp2tiff handling maliciously crafted bmp file, it will cause the target application to crash.
+
+
+overview:
+
+
+alloc workflow:
+
+
+--> bmp2tiff.c:line 678 , uncomprbuf = (unsigned char *)_TIFFmalloc(uncompr_size)  //allocate space for uncompressed scanline buffer
+    --> allocate space for compressed scanline buffer     
+        --> _TIFFmalloc in libtiff/tif_unix.c:line 316 
+		
+read workflow : from bmp2tiff.c:line 775 to line 752  
+
+
+--> bmp2tiff.c:775    //  if (TIFFWriteScanline(out, uncomprbuf + (length - row - 1) * width, row, 0) < 0) 
+    --> tif_write.c:173    //  status = (*tif->tif_encoderow)(tif, (uint8*) buf, tif->tif_scanlinesize, sample);
+        --> tif_packbits.c:85   //  PackBitsEncode(TIFF* tif, uint8* buf, tmsize_t cc, uint16 s) -->  for (; cc > 0 && b == *bp; cc--, bp++)
+
+
+PackBitsEncode.c:line 85 does not check the length of bp passed through buf.
+
+
+memory error can be detected by asan and log as follows:
+
+
+root@...ug:~/Desktop/AFL/tiff-4.0.6/tools# ./bmp2tiff ./crashes/poc_775.bmp 1.tiff=================================================================
+==2525==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x6310000107fd at pc 0x4870a0 bp 0x7fff3553b750 sp 0x7fff3553b748
+READ of size 1 at 0x6310000107fd thread T0
+    #0 0x48709f in PackBitsEncode /root/Desktop/AFL/tiff-4.0.6/libtiff/tif_packbits.c:85
+    #1 0x458563 in TIFFWriteScanline /root/Desktop/AFL/tiff-4.0.6/libtiff/tif_write.c:173
+    #2 0x403f83 in main /root/Desktop/AFL/tiff-4.0.6/tools/bmp2tiff.c:775
+    #3 0x7f8f61e1aec4 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x21ec4)
+    #4 0x4019f8 (/root/Desktop/AFL/tiff-4.0.6/tools/bmp2tiff+0x4019f8)
+
+
+0x6310000107fd is located 0 bytes to the right of 65533-byte region [0x631000000800,0x6310000107fd)
+allocated by thread T0 here:
+    #0 0x7f8f625187ef in __interceptor_malloc (/usr/lib/x86_64-linux-gnu/libasan.so.1+0x547ef)
+    #1 0x45d76e in _TIFFmalloc /root/Desktop/AFL/tiff-4.0.6/libtiff/tif_unix.c:316
+    #2 0x4032b4 in main /root/Desktop/AFL/tiff-4.0.6/tools/bmp2tiff.c:678
+    #3 0x7f8f61e1aec4 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x21ec4)
+
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /root/Desktop/AFL/tiff-4.0.6/libtiff/tif_packbits.c:85 PackBitsEncode
+Shadow bytes around the buggy address:
+  0x0c627fffa0a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c627fffa0b0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c627fffa0c0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c627fffa0d0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c627fffa0e0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x0c627fffa0f0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00[05]
+  0x0c627fffa100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c627fffa110: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c627fffa120: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c627fffa130: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c627fffa140: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Heap right redzone:      fb
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack partial redzone:   f4
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Contiguous container OOB:fc
+  ASan internal:           fe
+==2525==ABORTING
+
+
+
+
+
+------------------
+From Debug_Orz 
+
+
+ 
+
+
+
+
+------------------ 原始邮件 ------------------
+发件人: "Jodie Cunningham";<jodie.cunningham@...il.com>;
+发送时间: 2016年4月27日(星期三) 中午12:26
+收件人: "oss-security"<oss-security@...ts.openwall.com>; 
+
+主题: Re: [oss-security] 3 bugs refer to buffer overflow in in libtiff 4.0.6
+
+
+
+On Tue, Apr 26, 2016 at 10:36 PM, PXO炳林 <271193918@...com> wrote:
+>
+> Hello oss-security,
+>
+> I did some test and found three bugs refer to buffer overflow: one stack
+> buffer overflow in thumbnail and two buffer overflows in bmp2tiff.
+>
+> Please let me know whether CVE Identifier number could be assigned.
+>
+> Overview:
+>
+> Running each poc file crashes thumbnail and bmp2tiff made with
+> AddressSanitizer in tiff-4.0.6. I have attached poc and log files .
+> ------------------
+> From Debug_Orz
+>
+
+
+Is there a patch upstream?

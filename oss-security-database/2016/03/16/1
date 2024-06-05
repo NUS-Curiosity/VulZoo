@@ -1,0 +1,141 @@
+
+Date: Tue, 15 Mar 2016 19:11:15 -0500
+From: Tyler Hicks <tyhicks@...onical.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: server and client side remote code execution through a buffer overflow in all git versions before 2.7.1 (unpublished ᴄᴠᴇ-2016-2324 and ᴄᴠᴇ‑2016‑2315)
+
+Hello - Thank you for reporting these issues to the list.
+
+It seems like there's some confusion about which specific issues
+CVE-2016-2315 and CVE-2016-2324 actually correspond to.
+
+Debian's Security Tracker has some links to commits for each issue and,
+from that, I've tried to make sense of each:
+
+* CVE-2016-2315 is listed as being fixed by
+  https://github.com/git/git/commit/34fa79a6cde56d6d428ab0d3160cb094ebad3305
+  - Suggesting to me that CVE-2016-2315 is the more serious buffer
+    overflow issue.
+
+* CVE-2016-2324 is listed as being fixed by
+  https://github.com/git/git/commit/9831e92bfa833ee9c0ce464bbc2f941ae6c2698d
+  - Does this simply fix the issue of allocating much more memory than
+    needed?
+
+Is this correct? Thanks!
+
+Tyler
+
+On 2016-03-15 15:55:37, Laël Cellier wrote:
+> Hello, original report describing the overflow is here
+> http://pastebin.com/UX2P2jjg
+> 
+> 
+> On 11/02/2016 16:50, Jeff King wrote this on the git security mailing list:
+> 
+> >On Thu, Feb 11, 2016 at 02:31:49PM +0100, 'Laël Cellier' via Git Security wrote:
+> >>Ok the bug works by pushing or cloning a repository with a large
+> >>filename or a large number of nested trees.
+> >>[...]
+> >>The point is affected versions are still shipped as part of many
+> >>distributions as part of their stable branch, so I think it’s
+> >>important to get a ᴄᴠᴇ for public awareness.
+> >Yes, I do think versions below v2.7.0 have a heap overflow, as you
+> >mentioned. But I don't think that is the only problem with path_name(),
+> >even in the current version.
+> >
+> >I'll repeat the code here (the version you posted was indented badly,
+> >and I had trouble reading it):
+> >
+> >-- >8 --
+> >char *path_name(const struct name_path *path, const char *name)
+> >{
+> >         const struct name_path *p;
+> >         char *n, *m;
+> >         int nlen = strlen(name);
+> >         int len = nlen + 1;
+> >
+> >         for (p = path; p; p = p->up) {
+> >                 if (p->elem_len)
+> >                         len += p->elem_len + 1;
+> >         }
+> >         n = xmalloc(len);
+> >         m = n + len - (nlen + 1);
+> >         memcpy(m, name, nlen + 1);
+> >         for (p = path; p; p = p->up) {
+> >                 if (p->elem_len) {
+> >                         m -= p->elem_len + 1;
+> >                         memcpy(m, p->elem, p->elem_len);
+> >                         m[p->elem_len] = '/';
+> >                 }
+> >         }
+> >         return n;
+> >}
+> >-- 8< --
+> >
+> >The problem you describe is one where the size of the allocation does
+> >not match what strcpy would write. And that's kind-of fixed by moving to
+> >memcpy() in 34fa79a6, because at least now the initial value of "len"
+> >matches the number of bytes we write (so that number might be totally
+> >bogus, but we don't write more than we allocate).
+> >
+> >But "len" can also change after the fact, due to the loop. If you have a
+> >sequence of path components, each less than 2^31, they can sum to a much
+> >smaller positive value due to integer overflow (e.g., A/B/C with lengths
+> >A=2^31-5, B=2^31-5, C=20 would yield len=10). Then the buffer is too
+> >small to fit C, let alone all of the extra components we insert in the
+> >second loop.
+> >
+> >The fix I came up with for this is to convert all of the "int" variables
+> >here to "size_t". That doesn't actually _fix_ the problem at all, but
+> >does mean on a 64-bit system that you need a 2^64-long path to trigger
+> >it, which is impractical. But that doesn't help 32-bit systems (though
+> >in practice, I wouldn't be surprised if we barf long before that, as we
+> >would be unable to hold the "struct name_path" list in memory).
+> >
+> >Note that there is also a similar problem in tree-diff.c's
+> >path_appendnew().  There we build up the full pathname in a strbuf,
+> >which checks for overflow. But we then pass that length as an int and
+> >allocate a FLEX_ARRAY struct with it, which can end up too-small. This
+> >one is the more interesting of the two, I think, as it triggers via
+> >git-log, whereas the path_name() happens only during a repack (so it
+> >will hit you _eventually_, but probably not as soon as you've cloned).
+> >
+> >My solution there was similar: use size_t, which at least means you'd
+> >have to allocate petabytes on a 64-bit system to trigger it (much less
+> >on a 32-bit system, but _probably_ you'd be saved by malloc failing
+> >first).
+> >
+> >And that's why I dragged my feet on sending those fixes upstream; I
+> >don't think they're complete. The complete fix would be to use size_t
+> >consistently to store return values for strlen(), and to do integer
+> >overflow checks whenever we do computations on size_t.
+> >
+> >Those of you on this list may recall I posted a series for the latter
+> >last year, but it was somewhat invasive. It may be worth resurrecting.
+> >
+> >I think we could also get rid of path_name() entirely. The sole purpose
+> >at this point is to compute the name-hash for pack-objects, which could
+> >be done by walking the name_path list rather than re-constructing the
+> >whole thing in memory.
+> >
+> >-Peff
+> Of course everything Peff talked about above is now fixed in git 2.7.1 with
+> the removal of path_name() and the size_t/overflow check in tree-diff.c. It
+> was even fixed earlier for users of github enterprise.
+> However, several months after the last message on this thread, I’m not aware
+> of any Linux distribution that issued a fix for their stable branch. Last
+> week I could contact wikimedia so they could fix their gerrit‑gc server.
+> Bitbucket, GitLab still suffer from that issue (they even use a git version
+> before git/commit/34fa79a6cde56d6d428ab0d3160cb094ebad3305 which is the
+> easiest one to trigger because of strcpy() instead of memcpy() ). while it
+> seems normal the ᴄᴠᴇ details are still unpublished, I definitely can’t deal
+> with every major provider.
+> 
+> People surely remember https://www.google.fr/search?tbm=nws&q=cve-2014-9390
+> breaking the news about a similar issue in that software (which allowed most
+> distros to fix it quikcly). It seems while this threat is more widespread,
+> it definitely lacks advertisement.
+> So some Peoples suggested me to post about it here.
+
+Download attachment "signature.asc" of type "application/pgp-signature" (820 bytes)

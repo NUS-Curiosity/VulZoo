@@ -1,0 +1,383 @@
+
+Date: Thu, 8 Jun 2017 20:05:34 +0200
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Vixie/ISC Cron group crontab to root escalation
+
+Hi,
+
+Summary:
+
+Two group crontab to root privsep bypasses were found: one in Cron
+itself (with some dependency on the rest of the system) and the other in
+Debian/Ubuntu postinst script for it.  These issues are minor because
+they are only privsep bypasses, so to exploit them one would need to
+gain group crontab first (via some other vulnerability).  Many systems
+(and upstream ISC Cron default build/install) don't even have this
+privsep layer, so there's nothing in those to bypass in the first place.
+For those that do, it provides some defense-in-depth, even if
+non-perfect.  Some fixes and workarounds have been developed and
+proposed, some more are expected.
+
+These findings are a result of a discussion with people from Qualys,
+OpenBSD, Debian, and Ubuntu.
+
+Detail:
+
+Some historical notes on Vixie Cron (now ISC Cron):
+
+https://en.wikipedia.org/wiki/Cron#Modern_versions
+
+"[...] Vixie cron, originally coded by Paul Vixie in 1987.  Version 3 of
+Vixie cron was released in late 1993.  Version 4.1 was renamed to ISC
+Cron and was released in January 2004.  Version 3, with some minor
+bugfixes, is used in most distributions of Linux and BSDs.
+
+In 2007, Red Hat forked vixie-cron 4.1 to the cronie project and
+included anacron 2.3 in 2009."
+
+First, this issue isn't exactly a vulnerability in ISC Cron.  While
+Paul Vixie kindly accepted changes into upstream ISC Cron implementing
+optional support for installation with the crontab(1) program SGID to
+group crontab, so that security-hardened systems have fewer changes to
+maintain, this isn't how upstream ISC Cron is configured and installed
+by default.  The current (and probably final?) upstream version is
+"cron_4.1.shar 201 KB 01/23/2004" at ftp://ftp.isc.org/isc/cron/ (the
+only remaining upstream URL?) and it has CRON_GROUP commented out and
+installation as SUID root:
+
+X                       /* Define this to run crontab setgid instead of
+X                        * setuid root.  Group access will be used to read
+X                        * the tabs/atjobs dirs and the allow/deny files.
+X                        * If this is not defined then crontab and at
+X                        * must be setuid root.
+X                        */
+X/*#define CRON_GROUP   "crontab"       /*-*/
+
+and:
+
+X                       $(INSTALL) -c -m 4111 -o root -s crontab $(DESTBIN)/
+
+Thus, in a default install and on many systems this layer of privilege
+separation is not enabled anyway, and so there's no "group crontab to
+root escalation" since a suitable vulnerability in crontab(1) (or in the
+SUID binary startup code in the kernel, dynamic linker, or libc) would
+result in a root compromise right away.
+
+It's only some systems that do install crontab(1) SGID crontab that are
+affected by the issue described below, and only to the relatively minor
+extent of at worst bringing them on par with the systems that did not
+take advantage of this privilege separation layer.
+
+Now let's proceed to the actual issue, fixed in OpenBSD yesterday.
+
+In a mostly unrelated posting to the distros list, the Qualys Security
+Advisory team casually mentioned that on OpenBSD "/usr/bin/at is
+SGID-crontab (which can be escalated to full root privileges)".  I asked
+them "How can group crontab be escalated to full root privileges?" and
+on May 26 they provided the below detail:
+
+| 1/ Group crontab can write to both:
+| 
+|  25740    4 drwxrwx--T    2 root     crontab       512 Jul 26  2016 /var/cron/atjobs
+|  25741    4 drwx-wx--T    2 root     crontab	   512 Jul 26  2016 /var/cron/tabs
+| 
+| 2/ Both "at" and cron files are checked for the correct owner, but
+| there's an exception for root-owned files. "at" files must have their
+| user execute bit set so we couldn't exploit this loophole through "at"
+| files, but there's no such check for cron files.
+| 
+| 3/ On OpenBSD, at least one daemon allows you to create a temporary file
+| (in /tmp) that belongs to root and contains your own (arbitrary) data,
+| and you can then hard-link it to /var/cron/tabs.
+| 
+| 4/ This doesn't give you root immediately, because there's already a
+| /var/cron/tabs/root (and /var/cron/tabs is sticky), but:
+| 
+| - you can either obtain an admin's privileges and trojan his su (or does
+|   anyone have a better idea?);
+| 
+| - or you can obtain the privileges of one of the system accounts, wait
+|   until the next reboot, delete root's crontab through one of OpenBSD's
+|   startup scripts, and then create your own root crontab.
+| 
+| This includes a few OpenBSD-specific tricks, but maybe the main issue
+| (hard-linked root-owned files whose content is attacker-controlled) is
+| more generic?
+| 
+| We thought this was a known issue
+
+I wish that at this point we switched to public discussion on
+oss-security, since the issue wasn't directly triggerable and was only a
+privsep bypass, but out of inertia the discussion proceeded in private.
+
+The gist of the attack is that the original program managing the
+temporary file deletes its own link to the file, which results in the
+remaining malicious link having st_nlink of 1, thus satisfying the
+"st_nlink == 1" requirement.  When I first read Qualys' response above,
+this detail looked potentially new to me.  However, further in the
+discussion I looked at the patch I wrote for Owl back in 2000:
+
+http://cvsweb.openwall.com/cgi/cvsweb.cgi/~checkout~/Owl/packages/vixie-cron/Attic/vixie-cron-3.0.2.7-owl-sgid-crontab.diff?rev=1.4;content-type=text%2Fplain
+
+and found this comment in there:
+
++/*
++ * The link count check is not sufficient (the owner may delete their
++ * original link, reducing the link count back to 1), but this is all
++ * we've got.
++ */
+
+So I hadn't exactly overlooked this issue, but more like neglected it
+(at the time, Owl normally used -ow kernels that had hard link
+restrictions by default, preventing the attack).
+
+In 2002, Todd C. Miller made similar changes in OpenBSD, including the
+st_nlink check, but not the comment.  The commit message said:
+
+"crontab is no longer setuid root, it is now setgid crontab.
+These changes were modelled after the Owl version of vixie-cron,
+but developed independently."
+
+These are also the changes that Paul Vixie partially accepted upstream.
+
+We've since sync'ed the Vixie Cron package in Owl to newer OpenBSD's
+(thus, gaining Todd's reimplementation of this functionality instead of
+my original) in 2004 and again in 2006.  Dmitry V. Levin did the same in
+ALT Linux, too.  This provided built-in support for "at", which isn't
+found in upstream Vixie/ISC Cron (per Todd, it's something Paul chose
+not to include in there).
+
+In 2003, the original patch went from Owl into Debian (and thus Ubuntu),
+along with the original comment above:
+
+https://anonscm.debian.org/cgit/pkg-cron/pkg-cron.git/commit/?id=ce8f4773590dd76505631bd71874e999a85de607
+
+Thanks to Salvatore Bonaccorso of Debian for locating the above URL for
+the current discussion.  In there, we also see the addition of a
+postinst script changing permissions on existing crontab files.  This
+was also pointed out by Seth Arnold of Ubuntu, who wrote:
+
+| - postinst scripts are already brittle
+| - postinst scripts themselves become a target for elevating privileges if
+|   they'll just set the permissions as needed
+| 
+| But the Debian/Ubuntu packaging already has scripts for this purpose:
+| 
+| http://sources.debian.net/src/cron/3.0pl1-128/debian/postinst/#L53
+| 
+| ...
+| # Fixup crontab , directory and files for new group 'crontab'.
+| # Can't use dpkg-statoverride for this because it doesn't cooperate nicely
+| # with cron alternatives such as bcron
+| if [ -d $crondir/crontabs ] ; then
+|     chown root:crontab $crondir/crontabs
+|     chmod 1730 $crondir/crontabs
+|     # This used to be done conditionally. For versions prior to "3.0pl1-81"
+|     # It has been disabled to suit cron alternative such as bcron.
+|     cd $crondir/crontabs
+|     set +e
+|     ls -1 | xargs -r -n 1 --replace=xxx  chown 'xxx:crontab' 'xxx'
+|     ls -1 | xargs -r -n 1 chmod 600
+|     set -e
+| fi
+
+Qualys promptly broke this script, replying to Seth:
+
+| Hmmm, you're right, the script itself is vulnerable to
+| group-crontab-to-root escalation of privileges:
+| 
+| root@...ian:~# usermod --append --groups crontab nobody
+| root@...ian:~# su --login --shell /bin/bash nobody
+| No directory, logging in with HOME=/
+| 
+| nobody@...ian:/$ id
+| uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup),107(crontab)
+| 
+| nobody@...ian:/$ cd /var/spool/cron/crontabs
+| 
+| # for example, this exploits the chown
+| nobody@...ian:/var/spool/cron/crontabs$ ln --symbolic /etc/passwd- nobody
+| 
+| # for example, this exploits the chmod
+| nobody@...ian:/var/spool/cron/crontabs$ touch ./--reference=.RFILE
+| nobody@...ian:/var/spool/cron/crontabs$ chmod 0666 .RFILE > .RFILE
+| nobody@...ian:/var/spool/cron/crontabs$ ln --symbolic /etc/passwd 600
+| 
+| nobody@...ian:/var/spool/cron/crontabs$ ls -l /etc/passwd*
+| -rw-r--r-- 1 root root 1378 May 10 17:16 /etc/passwd
+| -rw------- 1 root root 1378 May 10 17:16 /etc/passwd-
+| 
+| # run the postinst script
+| root@...ian:~# dpkg-reconfigure cron
+| chown: missing operand
+| Try 'chown --help' for more information.
+| update-rc.d: warning: start and stop actions are no longer supported; falling back to defaults
+| 
+| nobody@...ian:/var/spool/cron/crontabs$ ls -l /etc/passwd*
+| -rw-rw-rw- 1    600 crontab 1378 May 10 17:16 /etc/passwd
+| -rw------- 1 nobody crontab 1378 May 10 17:16 /etc/passwd-
+| 
+| So this is a known issue?  (there may be more ways to exploit it --
+| spaces, newlines, option injections, etc).
+
+So this looked like two issues to fix: the temporary file hard link
+attack (in OpenBSD, Debian, Ubuntu, ALT Linux, and Owl) and the postinst
+script (in Debian and Ubuntu).
+
+For the first issue, I suggested that the Cron daemon should check group
+ownership of crontab files and require them to be of group crontab.
+Ditto for at job files.  Luckily, crontab files were already created
+with group crontab on them.  The at job files (where supported) were
+created with the user's group on them, but having them work across this
+one-time Cron upgrade isn't as important.
+
+This defeats attacks via hard links to unrelated daemons' temporary
+files, as well as via daemons' log files that are rotated and daemons'
+"constant" database files (like cdb) that are replaced atomically with
+rename(2) - these are the various attack vectors that came up in the
+discussion.  However, Qualys came up with another attack scenario:
+
+| 1/ we have somehow obtained GID crontab privileges;
+| 
+| 2/ we found a SUID-root binary (this is hypothetical) that creates a
+| temporary file with suitable permissions and contents, that we can
+| hard-link to the crontab directory (possible, since we have GID
+| crontab).
+| 
+| But since we have GID crontab, the SUID-root binary directly creates the
+| temporary file with GID crontab, and once hard-linked to the crontab
+| directory this file would therefore be accepted by crond
+
+One way to defeat this attack would be to additionally mark intentional
+crontabs and at jobs with unusual file permissions - such as setting the
+sticky bit on them.  This was considered, but we decided against it so
+far because to maintain existing cron jobs across this one Cron upgrade
+we'd require something like Debian's postinst script, and that's risky.
+
+One aspect where we can make a little bit use of file permissions anyway
+is to defeat "cross-links" between crontabs and at jobs.  Luckily, these
+files already differ in permissions: the at jobs have the u+x bit set on
+them, whereas crontabs don't.  I proposed that we harden the permission
+checks even further, to require the exact permission bits that these two
+types of files are being created with.
+
+As to dealing with Qualys' hypothetical attack via some unrelated SUID
+binary, Todd went for hardening the file parsing, to require that both
+types of files have the correct format.  This was already the case for
+at jobs, but not for crontabs.  Todd's latest commit message in:
+
+https://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/cron/
+
+says:
+
+"In cron(8), require that crontab and at files in the spool be owned
+by group crontab.  The at(1) command now creates files owned by
+group crontab, the crontab(1) command already does this.
+
+Files in the crontab spool with parse errors are now ignored;
+crontab(1) will not install a crontab file with parse errors.
+The system crontab file (/etc/crontab) is not affected by this.
+
+The required permissions on crontab files have been tightened.
+Files in the cron spool must be mode 0600 (as created by crontab(1)).
+The system crontab file may be readable/writable by the owner,
+readable by group and readable by other.  The system crontab must
+be readable by the owner."
+
+That's it for OpenBSD.
+
+For Debian and Ubuntu, I suggested:
+
+| One way to fix the cron issue is to restrict hard links in the kernel.
+| This is now the "fs.protected_hardlinks = 1" sysctl supported upstream.
+| So maybe you just make this the default for your distro, if not already,
+| and say that it's also the fix for the cron issue.  However, you will
+| still need to fix the postinst script separately - or maybe remove that
+| script since it's probably only still needed for upgrades from ancient
+| versions of Debian, for which you probably no longer support direct
+| upgrades for other reasons anyway.
+
+Salvatore replied:
+
+| Fortunately the first one is the default already in Debian since quite
+| a long time:
+| 
+| https://bugs.debian.org/609455, so since 3.2.9-1 (then the default was
+| reverted, but Debian added on top the patch to enable it by default in
+| https://anonscm.debian.org/cgit/kernel/linux.git/commit/?id=7893fc2202b138cb9a7ec7b76ea248c2e7ac4503)
+| 
+| We will need to think about what to do with the postinst script yet.
+
+and Moritz Muehlenhoff confirmed:
+
+| > This is now the "fs.protected_hardlinks = 1" sysctl supported upstream.
+| > So maybe you just make this the default for your distro, if not already,
+| 
+| That is in fact the default since Debian 7/wheezy (and it's explicitly
+| documented that that if someone builds a custom kernel instead of the
+| kernel packages shipped in Debian, they need to enable it in a custom
+| build as well).
+| 
+| > However, you will
+| > still need to fix the postinst script separately - or maybe remove that
+| > script since it's probably only still needed for upgrades from ancient
+| > versions of Debian, for which you probably no longer support direct
+| > upgrades for other reasons anyway.
+| 
+| Ack, but we need to loop in the Debian cron maintainers for further
+| discussion, so I'm all for making this public.
+
+For Owl, we had refocused from -ow patches (hardening the kernel) to
+providing a safer userland and OpenVZ integration years ago, and
+currently Owl is a legacy system that's barely maintained.  We might or
+might not resume active development.  However, for now I backported
+upstream's revision of the hardlink restrictions to the RHEL5/OpenVZ
+kernels included in Owl-current.  I intend to also get this into
+3.1-stable soon (almost the same kernels).  This is sufficient to deal
+with the Cron issue, but we might also merge Todd's changes from OpenBSD
+eventually.
+
+I guess ALT Linux will go either route, or both, too.
+
+In Owl, we have our patches relative to OpenBSD's revision of 4.1 from
+2006 in:
+
+http://cvsweb.openwall.com/cgi/cvsweb.cgi/Owl/packages/vixie-cron/
+
+and the corresponding tarball as well as two older ones in e.g.:
+
+https://mirrors.kernel.org/openwall/Owl/pool/sources/vixie-cron/
+
+(as well as on other mirrors).  These tarballs do not contain our
+patches yet - they're extracts from OpenBSD, and our patches from the
+CVS tree above are applied on top of them at package build time.
+This is very old code, but aside from this recently (re)discovered issue
+it just worked for us so far.
+
+ALT Linux has these same patches too, plus some of their own (such as
+adding SELinux support), using the same base version from OpenBSD (we
+shared some development effort on this):
+
+http://sisyphus.ru/en/srpm/Sisyphus/vixie-cron
+http://git.altlinux.org/people/zerg/packages/?p=vixie-cron.git
+
+Gentoo has a wiki page describing their Vixie Cron here:
+
+https://wiki.gentoo.org/wiki/Cron#vixie-cron
+
+Per their description, it's based on 4.1 and has some Linux specifics
+added (SELinux, PAM, etc.)  I don't know whether they use group crontab.
+
+Ideally, we need a new upstream maintainer for ISC Cron, so that other
+distros could easily introduce this privsep layer as well and readily
+have the known issues fixed by simply using upstream code.  It'd be
+great if Todd volunteered for this role.
+
+I did not look at the Red Hat forks mentioned in the Wikipedia article,
+though.  I doubt they're suitable to replace upstream, but maybe?
+Someone should probably take a look before becoming the new upstream.
+
+Sorry for the lengthy message.
+
+Alexander

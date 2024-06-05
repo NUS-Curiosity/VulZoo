@@ -1,0 +1,78 @@
+
+Date: Fri, 11 May 2012 07:54:45 +0400
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: openssl-team@...nssl.org, Ivan Nestlerode <inestlerode@...ibm.com>
+Subject: bug in OpenSSL's CVE-2012-0884 fix
+
+Hi,
+
+This is just a heads up that OpenSSL 1.0.1c, 1.0.0j, and 0.9.8x fix an
+additional issue that is believed to have only little/potential security
+relevance in obscure cases and thus is being treated as a non-security
+fix currently - yet is desirable to include in backports of distros that
+make those instead of simply upgrading.
+
+Here's the fix, by Stephen Henson of the OpenSSL core team:
+
+"Make sure tkeylen is initialised properly when encrypting CMS messages."
+http://cvs.openssl.org/chngview?cn=22537
+
+or with an additional compiler warning fix:
+
+http://cvs.openssl.org/filediff?f=openssl/crypto/cms/cms_enc.c&v1=1.11&v2=1.13
+
+(Note: the "tkeylen = 0" portion is just to silence a possible compiler
+warning; the actual fix is to the code.)
+
+The bug had been introduced in:
+
+"Fix for CMS/PKCS7 MMA. If RSA decryption fails use a random key and
+continue with symmetric decryption process to avoid leaking timing
+information to an attacker."
+http://cvs.openssl.org/chngview?cn=22251
+
+and more specifically in this portion:
+
+http://cvs.openssl.org/filediff?f=openssl/crypto/cms/cms_enc.c&v1=1.10&v2=1.11
+
+which introduced the tkey and tkeylen variables.  Of these, tkey is
+initialized to NULL, tkeylen is left uninitialized (but is only meant to
+be used when tkey is non-NULL?)  However, this line:
+
+	if (ec->keylen != tkeylen)
+
+may use the uninitialized tkeylen if (enc && ec->key) is true (this is
+the opposite of the condition used to decide when to generate a random
+key).  When ec->keylen != tkeylen happens to be true (which is likely),
+the following block may then potentially use both tkey (which is NULL)
+and tkeylen (uninitialized) if the call to
+EVP_CIPHER_CTX_set_key_length() returns failure (shouldn't happen in a
+bug-free app?)  Perhaps the program/thread would at least segfault in
+this unlikely case.
+
+Possibly more interesting is what will happen if the uninitialized
+tkeylen value happens to match ec->keylen in the line quoted above
+(unlikely, but possible).  I tried patching the line to:
+
+	if (tkey && ec->keylen != tkeylen)
+
+This simulates the tkeylen == ec->keylen case because tkey is left at
+NULL precisely in the same cases when tkeylen is left uninitialized.
+
+When this happens, the call to EVP_CIPHER_CTX_set_key_length() is
+skipped.  This actually results in misbehavior seen on "make test":
+
+[...]
+data content test streaming PEM format: OK
+encrypted content test streaming PEM format, 128 bit RC2 key: OK
+encrypted content test streaming PEM format, 40 bit RC2 key: verify error
+make[2]: *** [test_cms] Error 1
+
+Thus, I conclude that the same kind of error might happen in actual
+usage.  What impact this may have, I don't know.  Wrong encryption?
+With what consequences?
+
+Anyhow, at this point the bug is believed to be mostly non-security.
+
+Alexander

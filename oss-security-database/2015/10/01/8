@@ -1,0 +1,98 @@
+
+Date: Thu, 1 Oct 2015 12:07:15 -0700
+From: Julien Tinnes <julien@....org>
+To: oss-security@...ts.openwall.com
+Cc: keescook@...omium.org
+Subject: CVE Request: Unauthorized access to IPC objects with SysV shm
+
+While working on KernelThreadSanitizer (KTSAN), a data race detector
+for kernels, Dmitry Vyukov found a data race that can trick the kernel
+into using unitialized memory.
+
+- This can at least give access to arbitrary SysV shared memory and
+Dmitry developed a proof of concept exploit for this. (On many
+systems, this can be used to escalate privileges).
+
+- While we didn't investigate this deeply, it is almost certain that
+this vulnerability can be used to gain arbitrary code execution in the
+kernel. Exercise left to the reader.
+
+This vulnerability has been fixed upstream by Linus with this commit:
+https://github.com/torvalds/linux/commit/b9a532277938
+
+>From Dmitry Vyukov:
+
+-----------
+
+While working on KernelThreadSanitizer (KTSAN), a data race detector
+for kernel, I've got a report that says that ipc_addid() installs a
+not-completely initialized object into the shared object table. In
+particular, uid/gid are not initialized. ipc_obtain_object_check() in
+turn obtains the object and verifies uid/gid for permission purposes.
+Since the fields are not initialized, the check can falsely succeed.
+
+Below are details including a proof-of-concept exploit.
+
+Here is the race report on 4.2 kernel:
+
+ThreadSanitizer: data-race in ipc_obtain_object_check
+
+Read at 0xffff88047f810f68 of size 8 by thread 2749 on CPU 5:
+ [<ffffffff8147d84d>] ipc_obtain_object_check+0x7d/0xd0 ipc/util.c:621
+ [<     inline     >] msq_obtain_object_check ipc/msg.c:90
+ [<ffffffff8147e708>] msgctl_nolock.constprop.9+0x208/0x430 ipc/msg.c:480
+ [<     inline     >] SYSC_msgctl ipc/msg.c:538
+ [<ffffffff8147f061>] SyS_msgctl+0xa1/0xb0 ipc/msg.c:522
+ [<ffffffff81ee3e11>] entry_SYSCALL_64_fastpath+0x31/0x95
+arch/x86/entry/entry_64.S:188
+
+Previous write at 0xffff88047f810f68 of size 8 by thread 2755 on CPU 4:
+ [<ffffffff8147cf97>] ipc_addid+0x217/0x260 ipc/util.c:257
+ [<ffffffff8147eb4c>] newque+0xac/0x240 ipc/msg.c:141
+ [<     inline     >] ipcget_public ipc/util.c:355
+ [<ffffffff8147daa2>] ipcget+0x202/0x280 ipc/util.c:646
+ [<     inline     >] SYSC_msgget ipc/msg.c:255
+ [<ffffffff8147efaa>] SyS_msgget+0x7a/0x90 ipc/msg.c:241
+ [<ffffffff81ee3e11>] entry_SYSCALL_64_fastpath+0x31/0x95
+arch/x86/entry/entry_64.S:188
+
+Mutexes locked by thread 2755:
+Mutex 445417 is locked here:
+ [<ffffffff81ee0d45>] down_write+0x65/0x80 kernel/locking/rwsem.c:62
+ [<     inline     >] ipcget_public ipc/util.c:348
+ [<ffffffff8147d90c>] ipcget+0x6c/0x280 ipc/util.c:646
+ [<     inline     >] SYSC_msgget ipc/msg.c:255
+ [<ffffffff8147efaa>] SyS_msgget+0x7a/0x90 ipc/msg.c:241
+ [<ffffffff81ee3e11>] entry_SYSCALL_64_fastpath+0x31/0x95
+arch/x86/entry/entry_64.S:188
+
+Mutex 453634 is locked here:
+ [<     inline     >] __raw_spin_lock include/linux/spinlock_api_smp.h:158
+ [<ffffffff81ee37d0>] _raw_spin_lock+0x50/0x70 kernel/locking/spinlock.c:151
+ [<     inline     >] spin_lock include/linux/spinlock.h:312
+ [<ffffffff8147ce0e>] ipc_addid+0x8e/0x260 ipc/util.c:238
+ [<ffffffff8147eb4c>] newque+0xac/0x240 ipc/msg.c:141
+ [<     inline     >] ipcget_public ipc/util.c:355
+ [<ffffffff8147daa2>] ipcget+0x202/0x280 ipc/util.c:646
+ [<     inline     >] SYSC_msgget ipc/msg.c:255
+ [<ffffffff8147efaa>] SyS_msgget+0x7a/0x90 ipc/msg.c:241
+ [<ffffffff81ee3e11>] entry_SYSCALL_64_fastpath+0x31/0x95
+arch/x86/entry/entry_64.S:188
+
+
+What happens is as follows.
+ipc_addid installs new ipc object with idr_alloc, from this point on
+it is accessible to other threads. At this point the object contains
+unitialized garbage. Then it fills in uid, etc:
+
+new->cuid = new->uid = euid;
+new->gid = new->cgid = egid;
+new->seq = ids->seq++;
+
+While this happens another thread can get access to the object and do
+uid check on the unitialized garbage, which can give falsely give
+accesses to the shared object to a process that should not have access
+to the object.
+
+
+-----------

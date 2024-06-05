@@ -1,0 +1,145 @@
+
+Date: Fri, 26 Apr 2024 23:47:46 -0500
+From: Jacob Bachmeyer <jcb62281@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: Update on the distro-backdoor-scanner effort
+
+Hank Leininger wrote:
+> [...]
+>
+> Where we are: main things investigated:
+>
+> - Similar exploitation toolkits / operator-behavior in other packages?
+>
+> [...]
+>
+>   - Output is manageable; able to rule out all hits not part of the
+>     actual xz-utils backdoors as false positives.
+>   
+
+This is what I would expect:  the backdoor dropper appears to have been 
+specifically developed for xz-utils, but could /possibly/ be adaptable 
+to other compression tools.  This is a much narrower field to search 
+than "every package in the distribution" and the potentially reusable 
+"smoking gun" parts (the stage2 and actual blob) were hidden in a way 
+that no scanner could plausibly find.
+
+That said, it would be possible to hide a similar backdoor in another 
+package and use the /installed/ xz to unpack it, but this would (again) 
+require very different patterns in the outermost dropper layers, since 
+the backdoor would have to be hidden somehow in another file type.  Most 
+packages will not have xz files in their testsuites.  While I do not 
+believe that there are more backdoors to find, the chances of any string 
+match based on this one finding another are tiny.
+
+> - Examine the provenance of every .m4 in every package unpacked above
+>
+> [...]
+>   - Big TODOs here are to implement fuzzy hashing when we don't have
+>     a perfect match, so that we can pick the best knowngood candidate
+>     to offer a diff against and to group the unknowns amongst
+>     themselves, and something to facilitate tracking of diff-review
+>     (CSV or another sqlite DB that tracks review status?), and then
+>     to actually read all the diffs (currently only spot-checked).
+>   
+
+You might get better results by indexing macro definitions found in *.m4 
+files, instead of trying to fuzzily hash the files.  The interesting 
+comparison is then different definitions of macros with the same name.
+
+> - Compare decompression of xz-utils vs other compatible tools
+>
+>   - Just to check for some obvious Thompsonesque weird machine where
+>     xz injects malicious .c code into a tarball it unpacks, etc. Very
+>     unlikely to find anything.
+>   
+
+While I agree that this is unlikely, the crackers missed an 
+opportunity:  many (most?) modern Linux kernels are compressed using xz, 
+which means that a Thompsonesque attack could binary-patch a freshly 
+built kernel while compressing vmlinux to make vmlinuz.  (The last time 
+I watched a kernel build, Linux is first linked to produce a kernel 
+image ("vmlinux"), which is then compressed and attached to a 
+decompression stub to produce the final bootable image ("vmlinuz").)
+
+Accomplishing such an attack with a weird machine is /very/ unlikely.  
+Having the inserted blob target xz itself would make far more sense, and 
+the blob from this backdoor (according to reports so far) only targets sshd.
+
+>   - Found nothing except some minor bugs in other decompressors (will
+>     submit upstream bugs, but low priority).
+>   
+
+I expect that you will find nothing here, but if you are paranoid 
+enough, patching the Linux build process to run a similar comparison on 
+common distribution kernels might be interesting.  You would want to 
+ensure that decompressing the compressed kernel image (preferably with a 
+standalone decompressor derived from the xz-embedded used in Linux's 
+decompression stub) yields the original uncompressed kernel image.
+
+>   - Still plan to add more different decompressors for completeness.
+>   
+
+I would like to suggest 7-zip here.
+
+> What's next: rough notions only, not yet implemented:
+>
+> - Analyze IFUNC real-world use. They're dodgy and weird and useful for
+>   backdoors like this one. Removing IFUNC support from glibc has been
+>   floated: https://marc.info/?l=glibc-alpha&m=171389592724184&w=4
+>   But that'll get hung up on "but what if users". AFAWK nobody knows.
+>   So let's find out: survey sources & binaries from major distros and
+>   get some actual numbers. Also thegrugq made an interesting
+>   observation: it'd be telling which projects recently _added_ IFUNC
+>   use, if any. See
+>   https://github.com/hlein/distro-backdoor-scanner/issues/16
+>   
+
+The IFUNC mechanism is actually a security feature.  In "inner-loop" 
+code, having multiple implementations with different optimizations with 
+the preferred implementation for the local processor chosen at runtime 
+is fairly common.  This is most common in cryptographic and other 
+data-processing libraries, where small incremental improvements can 
+significantly add up.
+
+The catch is that choosing an implementation at runtime means that you 
+must dispatch through a function pointer somewhere, typically in the 
+data segment, which is writable and leads to possible ways to hijack 
+control if those function pointers can be corrupted.  IFUNCs allow 
+storing those function pointers in the PLT, which can be made read-only 
+after relocation is completed, most importantly long before *any* input 
+is processed, if LD_BIND_NOW or "-z now" are used to disable lazy binding.
+
+The backdoor does not seem (according to reports so far) to actually use 
+the IFUNC mechanism as anything other than a way to gain control of 
+execution early in process initialization.  In fact, the backdoor's 
+IFUNC resolver ran "too early" so the backdoor tampered with ld.so's 
+data segment to register itself using parts of the LD_AUDIT mechanism, 
+so it would be called later when the PLT entries that it actually wanted 
+to hijack would exist.  I am still unsure whether IFUNC was actually 
+needed here or if __attribute__((__constructor__)) could achieve the 
+same results.
+
+I currently suspect that the crackers used IFUNC support as a covert 
+flag.  The "jankiness" of the current glibc IFUNC implementation 
+provided a convenient excuse to ask oss-fuzz to --disable-ifunc when 
+building xz-utils, which *also* conveniently inhibited the backdoor 
+dropper and ensured that the fuzzing builds would not contain the backdoor.
+
+> - Check for irregular contents in .pc files, inspired by Vegard
+>   Nossum's oss-security post
+>   https://marc.info/?l=oss-security&m=171335763115933&w=4
+>   This seems it'd be pretty easy to look for known bads. Starting
+>   notes: https://github.com/hlein/distro-backdoor-scanner/issues/7
+>   
+
+Much easier:  look for pkg-config descriptions containing text other 
+than a variable definition.  The pkg-config tool itself should probably 
+enforce "cleanliness" on this matter and refuse to process files 
+containing other text.  (It also should complain about and reject an 
+*-uninstalled.pc file found in the system directories, which was another 
+logic error exploited in that sample backdoor.)
+
+
+-- Jacob
+

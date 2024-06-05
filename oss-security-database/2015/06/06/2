@@ -1,0 +1,97 @@
+
+Date: Sat, 6 Jun 2015 14:30:57 +0300
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2015-1805 Linux kernel: pipe: iovec overrun leading to memory corruption
+
+Hi,
+
+This is a Linux kernel bug fixed upstream about a year ago, with its
+security impact discovered by Red Hat recently:
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1202855
+
+Per Red Hat's own statement, all of RHEL 5, 6, and 7 are affected, and
+so far only an update for RHEL5 has been released:
+
+https://rhn.redhat.com/errata/RHSA-2015-1042.html
+
+Also per Red Hat, this is a "high" severity issue, and the fix is
+"Important".
+
+There's also a "testing" update for OpenVZ/RHEL5:
+
+https://openvz.org/Download/kernel/rhel5-testing/028stab119.1
+
+The OpenVZ/RHEL5 branch was previously EOL'ed in Feb 2015, but its EOL
+appears to have been updated to Feb 2018 (a smart move, given the easy
+to include yet critical security fixes still coming from Red Hat):
+
+https://openvz.org/Releases
+
+(If they didn't do it, I would likely be porting the fix myself now.)
+
+Reviewing the upstream commits:
+
+http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=f0d1bec9d58d4c038d0ac958c9af82be6eb18045
+http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=637b58c2887e5e57850865839cc75f59184b23d1
+
+it appears that the issue is that pipe_iov_copy_from_user() and
+pipe_iov_copy_to_user() updated iov->iov_base and iov->iov_len, as well
+as a local variable called len, yet the caller maintained its own
+variables offset + addr and chars, which weren't similarly updated
+between retries.  (Also, it appears that the code will retry at most
+once, and as non-atomic, but maybe this makes sense if it assumes the
+caller is at fault for the fault.)
+
+In pipe_write(), this appears to allow for a read of wrong-offset data
+and an over-read of data from userspace.  This may have security impact
+if the condition is triggerable by other than the caller (and other than
+the caller's other threads, which are trusted).  I don't immediately see
+how this may be the case, or what else I might have overlooked.
+
+In pipe_read(), this similarly appears to allow for a write of
+wrong-offset data and an out of bounds write to the userspace buffer.
+This may similarly have (worse?) security impact if the condition is
+triggerable by other than the caller or their threads, but again it's
+unclear to me whether that is the case.
+
+In both cases, the out of bounds data accesses appear to be to userspace
+addresses, and going via copy_from_user() / copy_to_user().  So impact
+looks limited, and it is unclear if the issue is at all triggerable by a
+party untrusted by the one attacked.  This aspect might be non-security.
+
+However, it's trickier than that, since iov traverses over the multiple
+struct iovec's and may eventually be what wasn't actually a struct iovec
+in the caller.  This requires that iov->iov_len become exactly zero at
+least one extra time.  If iov->iov_len becomes zero on
+"iov->iov_len -= copy;" then pipe_iov_copy_to_user() either returns
+success or proceeds to the next iteration of the loop.  In the former
+case, there's no fault at this time.  In the latter case, there might be
+a fault on the next iteration, in which case the caller will retry
+pipe_iov_copy_to_user() with the original iov pointer.  The function
+will then hit an extra !iov->iov_len (that's been zeroed by its previous
+invocation) and perform iov++ an extra time.
+
+The possibility of "struct iovec *iov" going out of range and the
+subsequent out of bounds metadata accesses feel much more severe than
+the out of bounds accesses to actual data in the userspace.
+"iov->iov_base += copy;" and "iov->iov_len -= copy;" might then be
+corrupting kernel memory.  It feels relatively unimportant what the
+resulting values of iov_base and iov_len will be for their intended
+purpose, since we use copy_from_user() / copy_to_user() on them anyway.
+It feels more important that these "+=" and "-=" operators directly
+modify individual words in kernel memory, albeit only slightly(?) out of
+bounds of the original iov array.  So maybe it's this risk that needs
+to be evaluated further.
+
+I have quite possibly overlooked the elephant.
+
+Red Hat's description includes the usual wording:
+
+"A local, unprivileged user could use this flaw to crash the system
+or, potentially, escalate their privileges on the system."
+
+I'd like to know how.  "Crash the system" will do.  Thanks.
+
+Alexander

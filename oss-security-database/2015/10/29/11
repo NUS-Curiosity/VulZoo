@@ -1,0 +1,232 @@
+
+Date: Thu, 29 Oct 2015 12:00:58 +0000
+From: Xen.org security team <security@....org>
+To: xen-announce@...ts.xen.org, xen-devel@...ts.xen.org,
+ xen-users@...ts.xen.org, oss-security@...ts.openwall.com
+CC: Xen.org security team <security@....org>
+Subject: Xen Security Advisory 153 (CVE-2015-7972) - x86: populate-on-demand
+ balloon size inaccuracy can crash guests
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+            Xen Security Advisory CVE-2015-7972 / XSA-153
+                              version 3
+
+     x86: populate-on-demand balloon size inaccuracy can crash guests
+
+UPDATES IN VERSION 3
+====================
+
+Public release.
+
+ISSUE DESCRIPTION
+=================
+
+The design of the memory populate-on-demand (PoD) system requires that
+a guest's memory ballooning driver reach its memory reduction target.
+The target is not entirely well-defined in terms of the information
+visible to the appropriate parts of the system, so some unknown set of
+guests (but probably most guests) will fail this criterion.
+
+If the guest memory balloon driver does not free sufficient memory to
+reach its target, the guest will proceed to run with a nonzero number
+of outstanding PoD pages.  When the guest or management toolstack
+touches such a page, the hypervisor would search the guest memory for
+a page containing only zeroes.
+
+If no such page is found, the guest crashes.  Prior to the patch for
+XSA-150, the search might lock up the relevant physical cpu for a
+while.  After the patch to XSA-150, it might crash the guest even if a
+suitable zero page is available.
+
+This means that in the current arrangements toolstack software must
+apply an adjustment to a guest's PoD target as supplied to Xen.
+Neither xend nor libxl do this.
+
+IMPACT
+======
+
+Guests configured with PoD might be unstable, especially under load.
+
+In an affected guest, an unprivileged guest user might be able to
+cause a guest crash, perhaps simply by applying load so as to cause
+heavy memory pressure within the guest.
+
+This problem also allows an unprivileged guest user to exercise the
+separate vulnerability described in XSA-150: an unprivileged guest
+user might be able to cause a denial of service affecting the host.
+
+VULNERABLE SYSTEMS
+==================
+
+The vulnerability is restricted to HVM guests which have been
+constructed in Populate-on-Demand mode (ie, with memory < maxmem).
+
+ARM is not vulnerable.  x86 PV VMs are not vulnerable.  x86 HVM
+domains without PoD (ie started with memory==maxmem, or without
+mentioning "maxmem" in the guest config file) are not vulnerable.
+
+Systems using libxl (whether via xl, or libvirt, or another higher
+layer) or xend (whether via xm, or libvirt, or another higher layer)
+are vulnerable.
+
+If the system has been stress-tested (by imposing memory load on the
+guest) and found to be stable, it is less likely that the guest is
+vulnerable.
+
+Combinations of Xen, guest, guest balloon driver, and toolstack
+software, which have an empirical adjustment as described in the
+Description, and which have been formally stress-tested in PoD mode,
+are less likely to be vulnerable.
+
+Migration is not capable of creating a guest with outstanding PoD.  So
+migrating a guest which is vulnerable might crash it.  However, if a
+guest has been migrated successfully since it booted, it is no longer
+vulnerable.
+
+Xen versions back to 3.4.x are affected.
+
+Vulnerability of a particular guest can be tested by the host
+administrator using the utility `xsa153-check.c', attached to this
+advisory.
+
+
+MITIGATION
+==========
+
+Reducing the guest's memory target, after guest startup, can cause the
+guest's ballon driver to eliminate the PoD discrepancy.  If the guest
+successfully balloons down, it will no longer be vulnerable.
+
+On systems using libxl this can be done with `xl mem-set', during or
+after each guest boot:
+
+   # ./xsa153-check `xl domid name-of-guest`
+   checked domain 621 for XSA-153: VULNERABLE (1 more outstanding pages)
+   try using   xl mem-set   to reduce its memory by 1 (Mby)
+   or perhaps reduce /local/domain/621/memory/target by 4
+   # xl list name-of-guest
+   Name                  ID   Mem VCPUs      State   Time(s)
+   name-of-guest        621   512     2     r-----     156.9
+   # xl mem-set name-of-guest 511
+   #
+   [ wait for guest to give up memory ]
+   # ./xsa153-check `xl domid name-of-guest`
+   checked domain 621 for XSA-153: NOT vulnerable
+   #
+
+Alternatively, no matter the toolstack, it is possible for a host
+administrator to bypass the toolstack code and give ballooning
+instructions directly to the guest:
+
+   [ suppose guest domid is 616, eg from xl domid name-of-guest  ]
+   # ./xsa153-check 616
+   checked domain 616 for XSA-153: VULNERABLE (1 more outstanding pages)
+   try using   xl mem-set   to reduce its memory by 1 (Mby)
+   or perhaps reduce /local/domain/616/memory/target by 4
+   # xenstore-read /local/domain/616/memory/target
+   520188
+   # xenstore-write /local/domain/616/memory/target 520184
+   #
+   [ wait for guest to give up memory ]
+   # ./xsa153-check `xl domid name-of-guest`
+   checked domain 616 for XSA-153: NOT vulnerable
+   #
+
+The memory/target value is in decimal, and is a number of kilobytes;
+it must be a multiple of 4, since a page is 4 Kb on affected systems.
+The value to write should be some amount less than the value read.
+
+
+It is not currently known whether use of the VM memory event
+inspection facilities (in-tree, this means the xc_monitor utility)
+might invalidate the workaround.
+
+
+Note that guests may become unstable if given too little memory, so
+large reductions of the memory target should be applied with caution,
+if at all.  The expected offset related to XSA-153 is small (tens of
+pages, perhaps).  If a large reduction is required, it is more likely
+that either the guest is still booting up (and still working to reduce
+the PoD memory), or that the guest's balloon driver is not
+functioning:
+
+   # ./xsa153-check `xl domid name-of-guest`
+   checked domain 623 for XSA-153: VULNERABLE (65536 more outstanding pages)
+   difference is >1Mby
+   ballon driver not running or guest still booting?
+   #
+
+A guest without a working balloon driver will be unstable in PoD mode,
+especially under memory pressure; this is an inherent feature of the
+design of PoD.
+
+
+RESOLUTION
+==========
+
+The attached patch fixes the problem for systems using libxl (via xl,
+or via libvirt, or another higher layer).  At the time of writing
+there is no patch for xend-based systems.
+
+xsa153-libxl.patch            xen-unstable, Xen 4.5, Xen 4.6
+xsa153-libxl.patch            Xen 4.1 to 4.4 inclusive, using libxl
+
+(Xend was removed in Xen 4.5; so the libxl-only patch is always
+sufficient for Xen 4.5 and later.)
+
+$ sha256sum xsa153*
+633df5d970af49476c2d279e604150c444834bb906f6568070f0c2e0ceaa3af4  xsa153-check.c
+f5cbc98cba758e10da0a01d9379012ec56b98a85a92bfeb0c6b8132d4b91ce77  xsa153-libxl.patch
+$
+
+DEPLOYMENT DURING EMBARGO
+=========================
+
+Deployment of the patches and/or mitigations described above (or
+others which are substantially similar) is permitted during the
+embargo, even on public-facing systems with untrusted guest users and
+administrators.
+
+But: Distribution of updated software is prohibited (except to other
+members of the predisclosure list).
+
+Predisclosure list members who wish to deploy significantly different
+patches and/or mitigations, please contact the Xen Project Security
+Team.
+
+
+(Note: this during-embargo deployment notice is retained in
+post-embargo publicly released Xen Project advisories, even though it
+is then no longer applicable.  This is to enable the community to have
+oversight of the Xen Project Security Team's decisionmaking.)
+
+For more information about permissible uses of embargoed information,
+consult the Xen Project community's agreed Security Policy:
+  http://www.xenproject.org/security-policy.html
+
+
+NOTE REGARDING SHORT EMBARGO
+============================
+
+This issue was quickly encountered by the Security Team during our
+investigations of the scope and impact of XSA-150; this issue was
+originally discussed in the `Incomplete Information' section of
+XSA-150 v1.  Accordingly XSA-153 is embargoed and the embargo will
+end at the same time as that of XSA-150.
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.12 (GNU/Linux)
+
+iQEcBAEBAgAGBQJWMgofAAoJEIP+FMlX6CvZaqUIAIzgbftJMwo2ywcWycAGzeDS
+5iseCaCqx1OD8a00m+WvXTLX/yKKJQrgTJkDlJfgqEb4Y2NoVRUKShApSHsbFrFa
+qeocl7ipBdXTYk0FZZrsBd/aCjQgL/NlYf0BCaV+tpPuehOBgJwWpIf4RltOQVkv
+MxfRCGee52yUbWyFykmlKK3fxfGi4wXfMGN6zS9FXpudIBxjedRS4gyksERusXS7
+hcRNEcLNzeQA+4PUmpkOzwS/NrtWiIU265kaHFsMUO8HbxcFgzFJ+15G0GK8JgY5
+9XE0XWxn/B5Uc7IMiDxcFYT79C87XXvH4ctFArN9MJqss/ko0H25fz+Te8iWigc=
+=vBPN
+-----END PGP SIGNATURE-----
+
+Download attachment "xsa153-check.c" of type "application/octet-stream" (2730 bytes)
+
+Download attachment "xsa153-libxl.patch" of type "application/octet-stream" (3394 bytes)

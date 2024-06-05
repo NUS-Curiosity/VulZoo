@@ -1,0 +1,348 @@
+
+Date: Mon, 17 May 2010 21:47:46 +0200
+From: Florian Weimer <fw@...eb.enyo.de>
+To: oss-security@...ts.openwall.com
+Subject: Re: [oCERT-2010-001] multiple http client unexpected download filename vulnerability
+
+* Daniele Bianco:
+
+> Additionally, unsafe behaviours have been found in wget and lwp-download in
+> the case of HTTP 3xx redirections during file downloading. The two
+> applications automatically use the URL's filename portion specified in the
+> Location header.
+
+Thanks.  In another venue, I wrote:
+
+> The difficult thing is that most likely, there are setups out there
+> which expect this particular behavior.  If we change the default
+> behavior, we need an option in wgetrc to turn back on the old one. 8-(
+
+Here's a sequence of patches implementing this approach, against
+1.11.4.  Testing with valgrind revealed a use-after-free bug
+(harmless, I guess) in http_atotm().  Copying the fix in wget 1.12
+revealed an unterminated string (also harmless), which I fixed as
+well.
+
+The resulting wget has received light testing.  File name generation
+is quite different, especially in recursive mode, but that is the
+point of this change.
+
+  ********************************************************
+  *** NOTE WELL: Please post a follow-up if you end up ***
+  *** shipping this change.                            ***
+  ********************************************************
+
+I'm not really happy with the option name and welcome better
+suggestions, but if it ends up in running code, we can't replace it
+with something better anymore.  (And I'm not happy to diverge from
+upstream in this manner, but that's just life, I guess.)
+
+commit ee60c3fc0b97dd859fac77d8c59ec6492177688c
+Author: Florian Weimer <fw@...eb.enyo.de>
+Date:   Sun May 16 11:55:20 2010 +0200
+
+    http_atotm(): fix use-after-free via setlocale()
+    
+    Backport from wget 1.12
+
+diff --git a/src/http.c b/src/http.c
+index bdfe100..15e1caf 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -2914,13 +2914,24 @@ http_atotm (const char *time_string)
+                                    Netscape cookie specification.) */
+   };
+   const char *oldlocale;
+-  int i;
++  char savedlocale[256];
++  size_t i;
+   time_t ret = (time_t) -1;
+ 
+   /* Solaris strptime fails to recognize English month names in
+      non-English locales, which we work around by temporarily setting
+      locale to C before invoking strptime.  */
+   oldlocale = setlocale (LC_TIME, NULL);
++  if (oldlocale)
++    {
++      size_t l = strlen (oldlocale);
++      if (l >= sizeof savedlocale)
++        savedlocale[0] = '\0';
++      else
++        memcpy (savedlocale, oldlocale, l);
++    }
++  else savedlocale[0] = '\0';
++
+   setlocale (LC_TIME, "C");
+ 
+   for (i = 0; i < countof (time_formats); i++)
+@@ -2940,7 +2951,8 @@ http_atotm (const char *time_string)
+     }
+ 
+   /* Restore the previous locale. */
+-  setlocale (LC_TIME, oldlocale);
++  if (savedlocale[0])
++    setlocale (LC_TIME, savedlocale);
+ 
+   return ret;
+ }
+
+commit 1182dcd947bc5718af6a1c797a79487607fcfc9f
+Author: Florian Weimer <fw@...eb.enyo.de>
+Date:   Sun May 16 11:57:52 2010 +0200
+
+    http_atotm(): also copy terminating NUL character
+
+diff --git a/src/http.c b/src/http.c
+index 15e1caf..e7dc830 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -2928,7 +2928,7 @@ http_atotm (const char *time_string)
+       if (l >= sizeof savedlocale)
+         savedlocale[0] = '\0';
+       else
+-        memcpy (savedlocale, oldlocale, l);
++        memcpy (savedlocale, oldlocale, l + 1);
+     }
+   else savedlocale[0] = '\0';
+ 
+
+commit 89be608ace632fc438153f23ee5470c2a9c1d9d3
+Author: Florian Weimer <fw@...eb.enyo.de>
+Date:   Sun May 16 12:03:05 2010 +0200
+
+    Add --use-server-file-name option
+
+diff --git a/src/init.c b/src/init.c
+index 639b277..7e066a3 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -243,6 +243,7 @@ static const struct {
+   { "useproxy",         &opt.use_proxy,         cmd_boolean },
+   { "user",             &opt.user,              cmd_string },
+   { "useragent",        NULL,                   cmd_spec_useragent },
++  { "useserverfilename", &opt.use_server_file_name, cmd_boolean },
+   { "verbose",          NULL,                   cmd_spec_verbose },
+   { "wait",             &opt.wait,              cmd_time },
+   { "waitretry",        &opt.waitretry,         cmd_time },
+diff --git a/src/main.c b/src/main.c
+index fd902c6..2b2d9e4 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -240,6 +240,7 @@ static struct cmdline_option option_data[] =
+     { "timeout", 'T', OPT_VALUE, "timeout", -1 },
+     { "timestamping", 'N', OPT_BOOLEAN, "timestamping", -1 },
+     { "tries", 't', OPT_VALUE, "tries", -1 },
++    { "use-server-file-name", 0, OPT_BOOLEAN, "useserverfilename", -1 },
+     { "user", 0, OPT_VALUE, "user", -1 },
+     { "user-agent", 'U', OPT_VALUE, "useragent", -1 },
+     { "verbose", 'v', OPT_BOOLEAN, "verbose", -1 },
+diff --git a/src/options.h b/src/options.h
+index a4fa2f0..bd4c108 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -236,6 +236,7 @@ struct options
+   bool content_disposition;	/* Honor HTTP Content-Disposition header. */
+   bool auth_without_challenge;  /* Issue Basic authentication creds without
+                                    waiting for a challenge. */
++  bool use_server_file_name; 	/* Use server-provided file name. */
+ };
+ 
+ extern struct options opt;
+
+commit 29ec206d711f7296342ace7d896305b7f56dc251
+Author: Florian Weimer <fw@...eb.enyo.de>
+Date:   Sun May 16 14:53:31 2010 +0200
+
+    Derive file name from the original URL, not the redirected URL
+
+diff --git a/src/http.c b/src/http.c
+index e7dc830..70553dc 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -1359,7 +1359,8 @@ free_hstat (struct http_stat *hs)
+    If PROXY is non-NULL, the connection will be made to the proxy
+    server, and u->url will be requested.  */
+ static uerr_t
+-gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
++gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy,
++         struct url *original_u)
+ {
+   struct request *req;
+ 
+@@ -1418,6 +1419,8 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ 
+   bool host_lookup_failed = false;
+ 
++  assert(original_u != 0);
++
+ #ifdef HAVE_SSL
+   if (u->scheme == SCHEME_HTTPS)
+     {
+@@ -1815,7 +1818,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+         {
+           /* The Content-Disposition header is missing or broken. 
+            * Choose unique file name according to given URL. */
+-          hs->local_file = url_file_name (u);
++          hs->local_file = url_file_name (original_u);
+         }
+     }
+   
+@@ -2325,7 +2328,7 @@ File `%s' already there; not retrieving.\n\n"), hs->local_file);
+    retried, and retried, and retried, and...  */
+ uerr_t
+ http_loop (struct url *u, char **newloc, char **local_file, const char *referer,
+-           int *dt, struct url *proxy)
++           int *dt, struct url *proxy, struct url *original_u)
+ {
+   int count;
+   bool got_head = false;         /* used for time-stamping and filename detection */
+@@ -2341,6 +2344,8 @@ http_loop (struct url *u, char **newloc, char **local_file, const char *referer,
+ 
+   /* Assert that no value for *LOCAL_FILE was passed. */
+   assert (local_file == NULL || *local_file == NULL);
++
++  assert(original_u != 0);
+   
+   /* Set LOCAL_FILE parameter. */
+   if (local_file && opt.output_document)
+@@ -2370,7 +2375,7 @@ http_loop (struct url *u, char **newloc, char **local_file, const char *referer,
+     }
+   else if (!opt.content_disposition)
+     {
+-      hstat.local_file = url_file_name (u);
++      hstat.local_file = url_file_name (original_u);
+       got_name = true;
+     }
+ 
+@@ -2412,7 +2417,7 @@ File `%s' already there; not retrieving.\n\n"),
+    * destination file. */
+   if (opt.timestamping 
+       && !opt.content_disposition
+-      && file_exists_p (url_file_name (u)))
++      && file_exists_p (url_file_name (original_u)))
+     send_head_first = true;
+   
+   /* THE loop */
+@@ -2489,7 +2494,7 @@ Spider mode enabled. Check if remote file exists.\n"));
+         *dt &= ~SEND_NOCACHE;
+ 
+       /* Try fetching the document, or at least its head.  */
+-      err = gethttp (u, &hstat, dt, proxy);
++      err = gethttp (u, &hstat, dt, proxy, original_u);
+ 
+       /* Time?  */
+       tms = datetime_str (time (NULL));
+diff --git a/src/http.h b/src/http.h
+index e0e66ce..c022b88 100644
+--- a/src/http.h
++++ b/src/http.h
+@@ -33,7 +33,7 @@ as that of the covered work.  */
+ struct url;
+ 
+ uerr_t http_loop (struct url *, char **, char **, const char *, int *,
+-		  struct url *);
++		  struct url *, struct url *);
+ void save_cookies (void);
+ void http_cleanup (void);
+ time_t http_atotm (const char *);
+diff --git a/src/retr.c b/src/retr.c
+index 4c1e849..832ebd7 100644
+--- a/src/retr.c
++++ b/src/retr.c
+@@ -604,7 +604,7 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+   bool location_changed;
+   int dummy;
+   char *mynewloc, *proxy;
+-  struct url *u, *proxy_url;
++  struct url *u, *proxy_url, *original_u;
+   int up_error_code;            /* url parse error code */
+   char *local_file;
+   int redirection_count = 0;
+@@ -625,7 +625,7 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+   if (file)
+     *file = NULL;
+ 
+-  u = url_parse (url, &up_error_code);
++  u = original_u = url_parse (url, &up_error_code);
+   if (!u)
+     {
+       logprintf (LOG_NOTQUIET, "%s: %s.\n", url, url_error (up_error_code));
+@@ -672,7 +672,12 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+ #endif
+       || (proxy_url && proxy_url->scheme == SCHEME_HTTP))
+     {
+-      result = http_loop (u, &mynewloc, &local_file, refurl, dt, proxy_url);
++      /* Only use the original URL if useserverfilename has been
++         enabled.  The local file name is extracted from the original
++         URL, and redirection might lead to unexpected file names
++         unless the original URL is used. */
++      result = http_loop (u, &mynewloc, &local_file, refurl, dt, proxy_url,
++                          opt.use_server_file_name ? u : original_u);
+     }
+   else if (u->scheme == SCHEME_FTP)
+     {
+@@ -728,6 +733,8 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+         {
+           logprintf (LOG_NOTQUIET, "%s: %s.\n", escnonprint_uri (mynewloc),
+                      url_error (up_error_code));
++          if (original_u != u)
++            url_free (original_u);
+           url_free (u);
+           xfree (url);
+           xfree (mynewloc);
+@@ -747,6 +754,8 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+           logprintf (LOG_NOTQUIET, _("%d redirections exceeded.\n"),
+                      opt.max_redirect);
+           url_free (newloc_parsed);
++          if (original_u != u)
++            url_free (original_u);
+           url_free (u);
+           xfree (url);
+           xfree (mynewloc);
+@@ -756,7 +765,8 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+ 
+       xfree (url);
+       url = mynewloc;
+-      url_free (u);
++      if (u != original_u)
++        url_free (u);
+       u = newloc_parsed;
+ 
+       /* If we're being redirected from POST, we don't want to POST
+@@ -787,6 +797,8 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+   else
+     xfree_null (local_file);
+ 
++  if (original_u != u)
++    url_free (original_u);
+   url_free (u);
+ 
+   if (redirection_count)
+
+commit 217595c1280a342e71e8989dcd28f231c8818caf
+Author: Florian Weimer <fw@...eb.enyo.de>
+Date:   Sun May 16 15:01:07 2010 +0200
+
+    Document --use-server-file-name
+
+diff --git a/doc/wget.texi b/doc/wget.texi
+index 9ca7698..d3b1285 100644
+--- a/doc/wget.texi
++++ b/doc/wget.texi
+@@ -1372,6 +1372,17 @@ This option is useful for some file-downloading CGI programs that use
+ @code{Content-Disposition} headers to describe what the name of a
+ downloaded file should be.
+ 
++@...dex redirects
++@...dex HTTP redirects
++@...dex file name generation
++@...m --use-server-file-name
++
++If this is set to on, the file name provided from the server is used.
++(The server might return a different name using HTTP redirects.)  It is
++recommended to use this option for backwards compatibility only because
++server-provided file names can be unpredictable and lead to unexpected
++results.
++
+ @cindex authentication
+ @item --auth-no-challenge

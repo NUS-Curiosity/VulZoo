@@ -1,0 +1,148 @@
+
+Date: Mon, 16 Jan 2023 14:44:35 +0100
+From: Sandrine Bailleux <sandrine.bailleux@....com>
+To: oss-security@...ts.openwall.com
+Cc: Demi Marie Obenour <demiobenour@...il.com>
+Subject: CVE-2022-47630 Trusted Firmware-A - Out-of-bounds read in X.509
+ parser
+
+## Overview
+
+The Trusted Firmware Security Team was notified about a vulnerability in
+the X.509 parser used to parse boot certificates in the trusted boot
+implementation of Trusted Firmware-A [1] (or TF-A for short): it is
+possible for a crafted certificate to cause an out-of-bounds memory read.
+
+This vulnerability has been assigned CVE-2022-47630.
+
+## Affected Versions
+
+Versions of TF-A from v1.2 to v2.8 are vulnerable.
+
+Note that TF-A upstream code is *not* vulnerable. Only downstream
+implementations of BL1 and BL2 with Trusted Boot enabled with custom
+usages of get_ext() and/or auth_nvctr() interfaces may be, if (and only
+if) these interfaces are used in a different context than seen in
+upstream code. Details of such context is described in the rest of this
+document.
+
+## Patches
+
+- fd37982a19a4a291 "fix(auth): forbid junk after extensions"
+- 72460f50e2437a85 "fix(auth): require at least one extension to be present"
+- f5c51855d36e399e "fix(auth): properly validate X.509 extensions"
+- abb8f936fd0ad085 "fix(auth): avoid out-of-bounds read in auth_nvctr()"
+
+Note that 72460f50e2437a85 is not fixing any vulnerability per se but it
+is required for f5c51855d36e399e to apply cleanly.
+
+These patches have already been merged upstream.
+
+## Description
+
+#### Bug 1: Insufficient certificate validation
+
+The vulnerability lies in the following source file:
+drivers/auth/mbedtls/mbedtls_x509_parser.c. By design, get_ext() does
+not check the return value of the various mbedtls_*() functions, as
+cert_parse() is assumed to have guaranteed that they will always
+succeed. However, it passes the end of an extension as the end pointer
+to these functions, whereas cert_parse() passes the end of the
+TBSCertificate. Furthermore, cert_parse() does not check that the
+contents of the extension have the same length as the extension itself.
+It also does not check that the extension block extends to the end of
+the TBSCertificate.
+
+This is a problem, as mbedtls_asn1_get_tag() leaves *p and *len
+undefined on failure.  In practice, this results in get_ext() continuing
+to parse at different offsets than were used (and validated) by
+cert_parse(), which means that the in-bounds guarantee provided by
+cert_parse() no longer holds.  The result is that it is possible for
+get_ext() to read memory past the end of the certificate.  This could
+potentially access memory with dangerous read side effects, or leak
+microarchitectural state that could theoretically be retrieved through
+some side-channel attacks as part of a more complex attack.
+
+#### Bug 2: Missing bounds check in auth_nvctr()
+
+auth_nvctr() does not check that the buffer provided is long enough to
+hold an ASN.1 INTEGER.  Since auth_nvctr() will only ever read 6 bytes,
+it is possible to read up to 6 bytes past the end of the buffer.
+
+## Exploitability Analysis
+
+#### Upstream TF-A Code
+
+In upstream TF-A code, the only caller of auth_nvctr() takes its input
+from get_ext(), which means that the second bug is exploitable, so is
+the first. Therefore, only the first bug need be considered.
+
+All standard chains of trust provided in TF-A source tree (that is,
+under drivers/auth/) require that the certificate's signature has
+already been validated prior to calling get_ext(), or any function that
+calls get_ext(). Platforms taking their chain of trust from a dynamic
+configuration file (such as fdts/cot_descriptors.dtsi) are also safe, as
+signature verification will always be done prior to any calls to
+get_ext() or auth_nvctr() in this case, no matter the order of the
+properties in the file.  Therefore, it is not possible to exploit this
+vulnerability pre-authentication in upstream TF-A.
+
+Furthermore, the data read through get_ext() only ever gets used by the
+authentication framework (drivers/auth/auth_mod.c), which greatly
+reduces the range of inputs it will ever receive and thus the impact
+this has. Specifically, the authentication framework uses get_ext() in
+three cases:
+
+   1. Retrieving a hash from an X.509 certificate to check the integrity
+of a child certificate (see auth_hash()).
+
+   2. Retrieving the signature details from an X.509 certificate to
+check its authenticity and integrity (see auth_signature()).
+
+   3. Retrieving the security counter value from an X.509 certificate to
+protect it from unauthorized rollback to a previous version (see
+auth_nvctr()).
+
+None of these uses authentication framework write to the out-of-bounds
+memory, so no memory corruption is possible.
+
+In summary, there are 2 separate issues - one in get_ext() and another
+one in auth_nvctr() - but neither of these can be exploited in the
+context of TF-A upstream code.
+
+Only in the following 2 cases do we expect this vulnerability to be
+triggerable prior to authentication:
+
+   - The platform uses a custom chain of trust which uses the
+non-volatile counter authentication method (AUTH_METHOD_NV_CTR) before
+the cryptographic authentication method (AUTH_METHOD_SIG).
+
+   - The chain of trust uses a custom authentication method that calls
+get_ext() before cryptographic authentication.
+
+#### Custom Image Parsers
+
+If the platform uses a custom image parser instead of the certificate
+parser, the bug in the certificate parser is obviously not relevant. The
+bug in auth_nvctr() *may* be relevant, but only if the returned data is:
+
+   - Taken from an untrusted source (meaning that it is read prior to
+authentication).
+
+   - Not already checked to be a primitively-encoded ASN.1 tag.
+
+In particular, if the custom image parser implementation wraps a 32-bit
+integer in an ASN.1 INTEGER, it is not affected.
+
+## Acknowledgments
+
+Thanks to Demi Marie Obenour from Invisible Things Lab for disclosing
+this security vulnerability to Trusted Firmware according to our
+security policy [2], for providing patches to fix the identified bugs
+and further harden the X.509 parser, for providing a detailed impact
+analysis and for helping put this security advisory together.
+
+[1] https://www.trustedfirmware.org/projects/tf-a/
+[2] https://developer.trustedfirmware.org/w/collaboration/security_center/
+
+IMPORTANT NOTICE: The contents of this email and any attachments are confidential and may also be privileged. If you are not the intended recipient, please notify the sender immediately and do not disclose the contents to any other person, use it for any purpose, or store or copy the information in any medium. Thank you.

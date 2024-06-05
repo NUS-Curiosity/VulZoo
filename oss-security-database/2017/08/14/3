@@ -1,0 +1,104 @@
+
+Date: Tue, 15 Aug 2017 00:39:48 +0200
+From: Jakub Wilk <jwilk@...lk.net>
+To: oss-security@...ts.openwall.com
+Subject: UnRAR: directory traversal + memory safety bugs
+
+(I'm not sure UnRAR bugs are on-topic here. UnRAR is not free software, even 
+though the source is available. But the last time UnRAR was discussed nobody 
+objected, so hey, let me try too.)
+
+I found directory traversal and a few memory safety bugs in UnRAR 5.5.6. These 
+bugs have been fixed in UnRAR 5.5.7.
+
+The memory safety bugs were found using American Fuzzy Lop.
+
+Here are details of the bugs:
+
+* Directory traversal
+
+The PoC (traversal.rar) contains two symlinks and a regular file:
+
+   cur -> .
+   cur/par -> ..
+   par/moo
+
+This setup defeats UnRAR's directory traversal protections:
+
+   $ ls ../moo
+   /bin/ls: cannot access '../moo': No such file or directory
+
+   $ unrar x traversal.rar
+   ...
+   Extracting  cur                                                       OK
+   Extracting  cur/par                                                   OK
+   Extracting  par/moo                                                   OK
+   All OK
+
+   $ ls ../moo
+   ../moo
+
+The code that was used to generate the PoC is available here:
+https://github.com/jwilk/path-traversal-samples
+
+
+* Out-of-bounds read in Archive::ReadHeader15 / EncodeFileName::Decode
+
+The Archive::ReadHeader15 method contains the following code (with boring parts 
+omitted):
+
+   size_t NameSize=Raw.Get2();
+   // ...
+   char FileName[NM*4];
+   size_t ReadNameSize=Min(NameSize,ASIZE(FileName)-1);
+   Raw.GetB((byte *)FileName,ReadNameSize);
+   FileName[ReadNameSize]=0;
+
+   if (FileBlock)
+   {
+     if ((hd->Flags & LHD_UNICODE)!=0)
+     {
+       EncodeFileName NameCoder;
+       size_t Length=strlen(FileName);
+       Length++;
+       NameCoder.Decode(FileName,(byte *)FileName+Length,
+                        NameSize-Length,hd->FileName,
+                        ASIZE(hd->FileName));
+   // ...
+
+If NameSize is bigger than NM*4, this can make EncodeFileName::Decode read past 
+the bounds of the FileName array.
+
+PoC: oob-archive-readheader15.rar
+
+
+* Out-of-bounds reads in Unpack::Unpack20
+
+This method contains:
+
+     int DistNumber=DecodeNumber(Inp,&BlockTables.DD);
+     unsigned int Distance=DDecode[DistNumber]+1;
+
+The array size is 48; but for the PoC (oob-unpack-unpack20.rar), DistNumber is 
+58.
+
+
+* Buffer overflow in Unpack::LongLZ
+
+This method contains:
+
+   ChSetB[DistancePlace]=ChSetB[NewDistancePlace];
+
+The array size is 256; but for the PoC (oob-unpack-longlz.rar), DistancePlace 
+is 256.
+
+-- 
+Jakub Wilk
+
+Download attachment "traversal.rar" of type "application/rar" (161 bytes)
+
+Download attachment "oob-archive-readheader15.rar" of type "application/rar" (8256 bytes)
+
+Download attachment "oob-unpack-unpack20.rar" of type "application/rar" (272 bytes)
+
+Download attachment "oob-unpack-longlz.rar" of type "application/rar" (25 bytes)

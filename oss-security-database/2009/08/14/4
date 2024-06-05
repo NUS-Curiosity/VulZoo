@@ -1,0 +1,126 @@
+
+Date: Fri, 14 Aug 2009 20:36:07 +0400
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: CVE id request: groff (pdfroff)
+
+Hi Nico,
+
+Thank you for forwarding this info in here - it has helped.
+
+Have you notified Werner LEMBERG, the upstream maintainer?
+
+I have some comments on "the first bug" and on groff's temporary file
+handling in general:
+
+On Sun, Aug 09, 2009 at 03:48:17PM +0200, Nico Golde wrote:
+> First one:
+> http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=538330
+> pdfroff tool of groff is creating files in a insecure manner 
+> in the /tmp directory.
+
+There's a mitigating factor: pdfroff will use $TMPDIR (or one of three
+other env vars that it checks) if set.  On Owl, pam_mktemp sets $TMPDIR
+to point to the user's private temporary file directory upon PAM session
+setup, which is invoked on both remote and console logins, and on cron
+job invocations.
+
+I found your trivial patch (pdfroff.sh.diff, 389 bytes) a bit unfinished:
+
+-  WRKFILE=${GROFF_TMPDIR=${TMPDIR-${TMP-${TEMP-"."}}}}/pdf$$.tmp
++  WRKFILE=${GROFF_TMPDIR=$(mktemp -t -d groffXXXXXX)}/pdf$$.tmp
+
+- no check for a possible mktemp error;
+- will leave the directory around upon pdfroff termination;
+- changes semantics, but does not update documentation (the man page is
+explicit on what temporary file directories pdfroff uses).
+
+I included more elaborate changes to pdfroff (both the script and the
+man page) in groff-1.20.1-owl-tmp.diff available here:
+
+http://cvsweb.openwall.com/cgi/cvsweb.cgi/Owl/packages/groff/
+
+Other issues I found (and patched in groff-1.20.1-owl-tmp.diff) are:
+
+Bugs in eqn2graph.sh, grap2graph.sh, pic2graph.sh (duplicated code)
+where these scripts would fail to properly handle the case when all
+attempts to create a temporary directory fail.  In that case, they would
+proceed to use the last-tried pathname.  Hopefully, this would just fail
+in some weird way, but it is also possible that the directory would in
+fact exist and be under someone else's control.  Since this was the last
+thing I dealt with today and I was already tired, I opted for the
+simplest fix, which was to reset the variable at the end of each loop
+iteration.  At a later time, I may drop all non-mktemp code from these
+scripts, like I did in other places.
+
+gendef.sh and doc/fixinfo.sh created files in $TMPDIR (if defined) or in
+the current directory without any precautions.  Not an issue if $TMPDIR
+is safe or is not set, and these are only used during groff build, but
+it is an issue if someone sets $TMPDIR to /tmp or to another shared
+directory.  I've patched these to use mktemp(1).  gendef.sh is on my
+list of files accessed during groff build (which means that it could
+have been run but this is not certain); fixinfo.sh is not (so it was
+certainly not run during my build but this does not mean much for other
+builds).
+
+contrib/gdiffmk/tests/runtests.in created files in /tmp in the worst way
+possible.  I've patched it to use mktemp(1), although maybe it should
+just use the current directory since it does so in other places anyway.
+It is on my list of files accessed during groff build.
+
+contrib/groffer/perl/groffer.pl and contrib/groffer/perl/roff2.pl used
+only four X'es in filename patterns.  The reasonable minimum is
+considered 6; we typically use 10.  Patched to use 10.
+
+doc/groff.texinfo (source) and doc/groff.info-2 (pre-compiled) contained
+an example for invoking an external program with ".sy", saving its
+output to a file under /tmp.  Patched to use a file in the current
+directory instead, even though this is not perfect.
+
+Finally, we're patching configure and config.guess to use the
+mktemp-only code just to be fail-close, even though I understand the
+rationale behind the original portable code.  I am also adding a #error
+comment to src/roff/groff/pipeline.c, just to save a few minutes next
+time I or someone else looks at this code.
+
+That's all for the patch.  However, my grep's also identified potential
+issues in install-sh and contrib/groffer/shell/*.  Since these files
+were not used during our groff package builds, I opted to remove rather
+than patch them.  So I added:
+
+# Remove/disable unused files with temporary file handling issues in them to
+# make sure that these are in fact unused.
+rm -r contrib/groffer/shell
+echo -e '#!/bin/sh\nexit 1' > install-sh
+
+to our groff.spec, and I also had to add
+groff-1.20.1-owl-groffer-Makefile.diff to allow groff to build without
+the contrib/groffer/shell/* files (their presence was checked by make
+even though they were not read).  On systems with Perl, groff uses the
+version of groffer written in Perl instead of this shell version, but
+there's some risk of it falling back to the shell version if Perl can't
+be run for whatever reason.
+
+A related detail is that we force the configure script to detect the
+presence of mkstemp(3), we don't take chances:
+
+export ac_cv_func_mkstemp=yes \
+%configure
+
+In the case of groff, the fallback code (when mkstemp(3) is not present)
+is not that bad, though.
+
+Speaking of my grep's, I used:
+
+fgrep -rl /tmp .
+fgrep -rl mktemp .
+fgrep -rl tmpnam .
+fgrep -rl tempnam .
+fgrep -rl TMPDIR .
+
+Then I briefly reviewed the files identified in this way.  Of course, I
+could have missed something, yet this would have caught the pdfroff
+issue.  We updated Owl-current to this version of groff with pdfroff in
+it just 8 days ago, and we were not as careful right away...
+
+Alexander

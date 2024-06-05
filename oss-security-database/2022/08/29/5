@@ -1,0 +1,361 @@
+
+Date: Mon, 29 Aug 2022 19:26:39 +0000
+From: Alejandro Guerrero <aguerrero@...lys.com>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: N-day exploit for CVE-2022-2586: Linux kernel nft_object UAF
+
+Hi all,
+
+I developed an N-day exploit for CVE-2022-2586. Here is a short writeup and an exploit is attached.
+
+# Exploiting CVE-2022-2586: Linux kernel nft_object use-after-free
+
+On the 9th of August, patches for a vulnerability in the Linux kernel used in Pwn2Own Vancouver (CVE-2022-2586) were made public.
+
+Thanks to [Team Orca of Sea Security](https://twitter.com/Seasecresponse) for this amazing discovery.
+
+The vulnerability is a Use-After-Free (UAF) in nf_tables, that makes it possible to escalate privileges from any user to root, and it is present since kernel version v3.16-rc1. To exploit this bug we need to enter a new network namespace to obtain `CAP_NET_ADMIN` (i.e: unprivileged user namespaces must be enabled, which is the case on most Linux distributions nowadays).
+
+Our exploit has been tested in a Ubuntu 20.04 with kernel 5.12.13.
+
+In this post we will analyze the process we adopted to exploit this use-after-free to achieve Local Privilege Escalation (LPE), bypassing all the default mitigations (SMEP, SMAP, KASLR, Heap randomization, ...)
+
+# Vulnerability analysis
+
+The vulnerability is located in the netfilter subsystem. A feature in netfilter allows referencing sets from other tables in the same batch, so you are in the context of a specific table A, and are able to operate with a set in table B by using its `SET_ID`. This way you can cross-reference objects from the current table, and references will be created in the set from the second table.
+
+Once the first table is removed, all the member objects, as well as the table itself, are kfree()'d, but the references will be kept in the second table, so we can reach a use-after-free condition.
+
+When we provide a `SET_ID` to lookup a set, this is the general involved function:
+
+```c
+struct nft_set *nft_set_lookup_global(const struct net *net,
+                                                  const struct nft_table *table,
+                                                  const struct nlattr *nla_set_name,
+                                                  const struct nlattr *nla_set_id,
+                                                  u8 genmask)
+{
+           struct nft_set *set;
+
+           set = nft_set_lookup(table, nla_set_name, genmask);
+           if (IS_ERR(set)) {
+                      if (!nla_set_id)
+                                 return set;
+
+                      set = nft_set_lookup_byid(net, nla_set_id, genmask);
+           }
+           return set;
+}
+EXPORT_SYMBOL_GPL(nft_set_lookup_global);
+```
+
+Which ends up calling `nft_set_lookup_byid()`:
+
+```c
+static struct nft_set *nft_set_lookup_byid(const struct net *net,
+                                                          const struct nlattr *nla, u8 genmask)
+{
+           struct nft_trans *trans;
+           u32 id = ntohl(nla_get_be32(nla));
+
+           list_for_each_entry(trans, &net->nft.commit_list, list) {
+                      if (trans->msg_type == NFT_MSG_NEWSET) {
+                                 struct nft_set *set = nft_trans_set(trans);
+
+                                 if (id == nft_trans_set_id(trans) &&
+                                     nft_active_genmask(set, genmask))
+                                            return set;
+                      }
+           }
+           return ERR_PTR(-ENOENT);
+}
+```
+
+We can see below how the reference is made when setting `NFTA_SET_ELEM_OBJREF` on creating a set element (`nft_add_set_elem()` at `nf_tables_api.c`):
+
+```c
+
+...
+
+if (obj) {
+           *nft_set_ext_obj(ext) = obj;
+           obj->use++;
+}
+
+...
+
+```
+
+## Triggering the Use-After-Free
+
+Once we left a reference in a second table after removing the first, we can operate over the object.
+
+An object is defined as the following:
+
+```c
+struct nft_object {
+           struct list_head                list;
+           struct rhlist_head            rhlhead;
+           struct nft_object_hash_key     key;
+           u32                                     genmask:2,
+                                                       use:30;
+           u64                                     handle;
+           u16                                     udlen;
+           u8                                       *udata;
+           /* runtime data below here */
+           const struct nft_object_ops     *ops ____cacheline_aligned;
+           unsigned char                             data[]
+                      __attribute__((aligned(__alignof__(u64))));
+};
+```
+
+To reference an object from a table, we can use `NFT_SET_EXT_OBJREF`. This feature is helpful when used in maps, as we can use a different object (eg.: counter) when a specific index (like a port) is found in the set/map. Example:
+
+```
+table ip foo {
+           counter cnt_obj {
+                      packets 0 bytes 0
+           }
+
+           map set1 {
+                      type inet_service : counter
+                      elements = { 1337 : "cnt_obj" }
+           }
+
+           chain output {
+                      type filter hook output priority filter; policy accept;
+                      counter name tcp dport map @set1
+           }
+}
+```
+
+This reference is not heavily used, in fact, there are just a few operations applied over it. First, every time we request its name, the contents of `obj->key.name` are read. Every time a new reference is created (e.g: in a map) the `obj->use` will be increased, and will be decreased every time we remove an element with its reference.
+
+Another access we can force is the object functionality itself, for example, in counters there is a percpu pointer that is used to access a structure where the values for the number of packets and data are increased or decreased. The interesting point is that to reach this through a map, the following code is executed:
+
+```c
+static void nft_objref_map_eval(const struct nft_expr *expr,
+                                            struct nft_regs *regs,
+                                            const struct nft_pktinfo *pkt)
+{
+           struct nft_objref_map *priv = nft_expr_priv(expr);
+           const struct nft_set *set = priv->set;
+           const struct nft_set_ext *ext;
+           struct nft_object *obj;
+           bool found;
+
+           found = set->ops->lookup(nft_net(pkt), set, &regs->data[priv->sreg],
+                                            &ext);
+           if (!found) {
+                      regs->verdict.code = NFT_BREAK;
+                      return;
+           }
+           obj = *nft_set_ext_obj(ext);
+           obj->ops->eval(obj, regs, pkt);
+}
+```
+
+There is a dereference of `obj->ops->eval`, which means that if as part of the use-after-free we can take control of the object and modify `obj->ops`, we have the possibility of hijacking RIP and the legitimate execution flow to escalate our privileges.
+
+## Achieving KASLR leak
+
+As already mentioned, we can issue reads over `obj->key.name` to retrieve the name of the object. This is an important functionality in the exploitation as it will give us interesting leaks and primitives.
+
+On object creation, we can specify a string for the name of the object. This is interesting as we can craft a string of a specific size to enter the `obj->key.name` allocation in a specific slab of our need / interest.
+
+The designed KASLR leak primitive is pretty straightforward: As `seq_operations` structs are of 0x20 bytes, we can provide a `0x1f`-sized string (allocation is made with string size plus one for the null terminator) so that when `obj->key.name` is freed, spraying with `seq_operations` will make one of them allocated in the space we had our string placed in.
+
+We can request the name of the object now and the contents of `seq_operations` will be returned to us, resulting in a `single_open` leak, allowing us to calculate the base for KASLR.
+
+## Designing the strategy
+
+At this point, we realize that if we want to hijack the `obj->ops->eval` execution, we will need a way to store a fake `nft_object_ops` struct in kernel memory (due to SMAP migitation), and predict its address to place it in `obj->ops`.
+
+We can achieve this condition by applying the following process:
+
+1) Trigger the use-after-free and provide a 0xc7-sized string (`nft_object` counter allocation size).
+2) Create another table.
+3) Spray with `nft_object` structs by adding multiple objects to the last created table.
+4) If it succeeds, a `nft_object` struct will occupy the memory space where the string was.
+5) Request the string name for the UAF'ed object, the `list.next` pointer will be leaked.
+6) The last step leaked `&table->chain`, which is a `list_head` structure inside a `nft_table`.
+7) Prepare another UAF condition and spray by using the table userdata feature (in table creation) to force `nla_memdup()` allocations to occupy the `nft_object`.
+8) Place in the `nft_object` of the UAF the leaked address of `&table->chain`.
+9) Request the name of the object to leak `table->chain.next`, which has the address of one of the sprayed `nft_object` structs.
+10) Delete the third table to free all the sprayed `nft_object` structs.
+11) By using the userdata feature again, spray with table creation to make `nla_memdup()` allocations (0xc7-sized) to occupy the now freed `nft_object` structs.
+12) Those `nla_memdup()` allocations will fill all the structs with a fake `nft_object_ops`.
+
+After all these steps, we know for certain that the struct for which we know the address, contains a fake `nft_object_ops` struct. This covers all the requirements for the exploitation to work, which are:
+
+a) Know the KASLR base (predict address for gadgets and functions)
+
+b) Know a heap address with our arbitrary contents (predict address with our fake `obj->ops`)
+
+### Leaking ctx->table address
+
+Using the same trick we used in the KASLR base prediction phase, we can make a `nft_object` be allocated right where our string was.
+
+We can do this by providing a 0xc7-sized string for the object name:
+
+```c
+
+...
+
+obj->key.table = table;
+obj->handle = nf_tables_alloc_handle(table);
+
+obj->key.name = nla_strdup(nla[NFTA_OBJ_NAME], GFP_KERNEL);
+if (!obj->key.name) {
+           err = -ENOMEM;
+           goto err_strdup;
+}
+
+...
+
+```
+
+This will leak us the `list.next` entry, that points to `&table->objects` (which is a `list_head` struct):
+
+```c
+struct nft_table {
+           struct list_head                list;
+           struct rhltable                             chains_ht;
+           struct list_head                chains;
+           struct list_head                sets;
+           struct list_head                objects;
+           struct list_head                flowtables;
+           u64                                     hgenerator;
+           u64                                     handle;
+           u32                                     use;
+           u16                                     family:6,
+                                                       flags:8,
+                                                       genmask:2;
+           u32                                     nlpid;
+           char                                    *name;
+           u16                                     udlen;
+           u8                                       *udata;
+};
+```
+
+### Achieving arbitrary read primitive
+
+Through the `obj->key.name`, by taking control of a freed-but-referenced `nft_object`, we can achieve an arbitrary read primitive to read strings (or any data until a null terminator) at any valid address in memory.
+
+To take over the control of a `nft_object` struct, we can use `nla_memdup()` from the userdata buffers added to tables when setting `NFTA_TABLE_USERDATA` on table creation:
+
+```c
+
+...
+
+if (nla[NFTA_TABLE_USERDATA]) {
+           table->udata = nla_memdup(nla[NFTA_TABLE_USERDATA], GFP_KERNEL);
+           if (table->udata == NULL)
+                      goto err_table_udata;
+
+           table->udlen = nla_len(nla[NFTA_TABLE_USERDATA]);
+}
+
+...
+
+```
+
+As we have arbitrary size and data, we can replace the `nft_object` contents with our own, and, as we know the address of `&table->objects`, we can get the address of one of the sprayed `nft_object` structs that is pointed to by this entry. We have to point `obj->key.name` to this address and request the object name.
+
+## Code execution and LPE
+
+After we achieved all the requirements for the function pointer hijack to be executed, this phase of the exploitation is a reuse of the previously mentioned primitives and refill techniques.
+
+This is the definition of `nft_object_ops`:
+
+```c
+struct nft_object_ops {
+           void                                    (*eval)(struct nft_object *obj,
+                                                                  struct nft_regs *regs,
+                                                                  const struct nft_pktinfo *pkt);
+           unsigned int                                 size;
+           int                                       (*init)(const struct nft_ctx *ctx,
+                                                                  const struct nlattr *const tb[],
+                                                                  struct nft_object *obj);
+           void                                    (*destroy)(const struct nft_ctx *ctx,
+                                                                     struct nft_object *obj);
+           int                                       (*dump)(struct sk_buff *skb,
+                                                                  struct nft_object *obj,
+                                                                  bool reset);
+           void                                    (*update)(struct nft_object *obj,
+                                                                    struct nft_object *newobj);
+           const struct nft_object_type    *type;
+};
+```
+
+We need to first trigger the UAF, and use the `nla_memdup()` refill to take control over `obj` and place our arbitrary contents there. We should point `obj->ops` to the leaked `nft_object` address, where our stack pivot gadget address is stored.
+
+```c
+obj = *nft_set_ext_obj(ext);
+obj->ops->eval(obj, regs, pkt);
+```
+
+The first argument is the `obj` address itself, so we can find a stack pivot gadget to move the stack to `obj` and execute a ROP chain to achieve arbitrary code execution.
+
+We found the gadget: `push rdi ; pop rsp ; add cl, cl ; ret`, which is exactly what we need. The ROP chain will use a write-what-where gadget to write an arbitrary path into `modprobe_path`: `mov qword ptr [rdx], rax ; ret`.
+
+We can finally force the kernel to execute our own script as root by executing a dummy script with magic numbers unknown to the kernel, resulting in a call to `call_modprobe()` to execute the usermode helper, which is now our custom path. This will allow us to obtain root privileges outside the network namespace (in the initial namespace).
+
+## Patch
+
+The main patch is pretty simple. It just makes sure that the current table is the one the set we refer (using its `SET_ID`) belongs to:
+
+```c
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -3842,6 +3842,7 @@ static struct nft_set *nft_set_lookup_byhandle(const struct nft_table *table,
+}
+static struct nft_set *nft_set_lookup_byid(const struct net *net,
++                                                        const struct nft_table *table,
+                                                          const struct nlattr *nla, u8 genmask)
+{
+           struct nftables_pernet *nft_net = nft_pernet(net);
+@@ -3853,6 +3854,7 @@ static struct nft_set *nft_set_lookup_byid(const struct net *net,
+                                 struct nft_set *set = nft_trans_set(trans);
+                                 if (id == nft_trans_set_id(trans) &&
++                                   set->table == table &&
+                                     nft_active_genmask(set, genmask))
+                                            return set;
+                      }
+@@ -3873,7 +3875,7 @@ struct nft_set *nft_set_lookup_global(const struct net *net,
+                      if (!nla_set_id)
+                                 return set;
+-                    set = nft_set_lookup_byid(net, nla_set_id, genmask);
++                    set = nft_set_lookup_byid(net, table, nla_set_id, genmask);
+           }
+           return set;
+}
+```
+
+## Conclusion
+
+In this post we analyzed a use-after-free in the Linux Kernel and our solution to develop a LPE exploit that bypasses the default mitigations (SMAP, SMEP, KASLR, Heap randomization, ...).
+
+## References
+
+Patches:
+
+- \[1\] [https://lore.kernel.org/netfilter-devel/20220809170148.164591-1-cascardo@canonical.com/T/](https://lore.kernel.org/netfilter-devel/20220809170148.164591-1-cascardo@canonical.com/T/)
+- \[2\] [https://lore.kernel.org/all/20220819153832.533116527@linuxfoundation.org/](https://lore.kernel.org/all/20220819153832.533116527@linuxfoundation.org/)
+- \[3\] [https://lore.kernel.org/lkml/20220819153832.580611023@linuxfoundation.org/](https://lore.kernel.org/lkml/20220819153832.580611023@linuxfoundation.org/)
+
+Advisory and disclosure:
+
+- \[4\] [https://www.zerodayinitiative.com/advisories/ZDI-22-1118/](https://www.zerodayinitiative.com/advisories/ZDI-22-1118/)
+- \[5\] [https://www.openwall.com/lists/oss-security/2022/08/09/5](https://www.openwall.com/lists/oss-security/2022/08/09/5)
+
+Distribution kernel updates:
+
+- \[6\] [https://ubuntu.com/security/CVE-2022-2586](https://ubuntu.com/security/CVE-2022-2586)
+- \[7\] [https://security-tracker.debian.org/tracker/CVE-2022-2586](https://security-tracker.debian.org/tracker/CVE-2022-2586)
+- \[8\] [https://access.redhat.com/security/cve/cve-2022-2586](https://access.redhat.com/security/cve/cve-2022-2586)
+
+
+Content of type "text/html" skipped
+
+View attachment "exploit.c" of type "text/plain" (34180 bytes)

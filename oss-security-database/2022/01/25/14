@@ -1,0 +1,796 @@
+
+Date: Tue, 25 Jan 2022 21:02:49 +0000
+From: Alejandro Guerrero <aguerrero@...lys.com>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: CVE-2022-0185: Linux kernel slab out-of-bounds write: exploit and writeup
+
+Hi all,
+
+Now that the discoverers of this bug (CVE-2022-0185) have published their exploit and writeup (https://twitter.com/cor_ctf/status/1486022971034529794), here is the exploit I wrote (attached) and a short writeup:
+
+# Exploiting CVE-2022-0185: A Linux kernel slab out-of-bounds write
+
+Last week, a newly discovered vulnerability was announced on the oss-security mailing list (reference \[6\] at the end of this post).
+
+The bug was discovered and reported to Red Hat by Alec Petridis, Hrvoje Mišetić, Isaac Badipe, Jamie Hill-Daniel, Philip Papurt, and William Liu: thank you very much for discovering this amazing bug and for the opportunity to work on it!
+
+This vulnerability is a heap-based overflow in the Linux kernel, that makes it possible to achieve Local Privilege Escalation (LPE), from any unprivileged user to root.
+
+As mentioned in the announcement on oss-security, we need `CAP_SYS_ADMIN` capability to exploit this bug, but we as an unprivileged user can call `unshare(CLONE_NEWNS | CLONE_NEWUSER)` to enter a new namespace where we have this capability.
+
+This short post analyzes the bug, and explains the approach we adopted to exploit it.
+
+(This is my first Linux kernel exploit for a real-world vulnerability, so please let me know if you have comments or improvements on this post or exploit).
+
+We developed our exploit for Ubuntu 21.04 Hirsute with kernel 5.11.
+
+## Bug analysis
+
+The bug is located in `fs/fs_context.c` in the function `legacy_parse_param()`:
+
+```c
+static int legacy_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+           struct legacy_fs_context *ctx = fc->fs_private;
+           unsigned int size = ctx->data_size;
+           size_t len = 0;
+
+           if (strcmp(param->key, "source") == 0) {
+                      if (param->type != fs_value_is_string)
+                                 return invalf(fc, "VFS: Legacy: Non-string source");
+                      if (fc->source)
+                                 return invalf(fc, "VFS: Legacy: Multiple sources");
+                      fc->source = param->string;
+                      param->string = NULL;
+                      return 0;
+           }
+
+           if (ctx->param_type == LEGACY_FS_MONOLITHIC_PARAMS)
+                      return invalf(fc, "VFS: Legacy: Can't mix monolithic and individual options");
+
+           switch (param->type) {
+           case fs_value_is_string:
+                      len = 1 + param->size;
+                      fallthrough;
+           case fs_value_is_flag:
+                      len += strlen(param->key);
+                      break;
+           default:
+                      return invalf(fc, "VFS: Legacy: Parameter type for '%s' not supported",
+                                       param->key);
+           }
+
+           if (len > PAGE_SIZE - 2 - size)
+                      return invalf(fc, "VFS: Legacy: Cumulative options too large");
+           if (strchr(param->key, ',') ||
+               (param->type == fs_value_is_string &&
+                memchr(param->string, ',', param->size)))
+                      return invalf(fc, "VFS: Legacy: Option '%s' contained comma",
+                                       param->key);
+           if (!ctx->legacy_data) {
+                      ctx->legacy_data = kmalloc(PAGE_SIZE, GFP_KERNEL);
+                      if (!ctx->legacy_data)
+                                 return -ENOMEM;
+           }
+
+           ctx->legacy_data[size++] = ',';
+           len = strlen(param->key);
+           memcpy(ctx->legacy_data + size, param->key, len);
+           size += len;
+           if (param->type == fs_value_is_string) {
+                      ctx->legacy_data[size++] = '=';
+                      memcpy(ctx->legacy_data + size, param->string, param->size);
+                      size += param->size;
+           }
+           ctx->legacy_data[size] = '\0';
+           ctx->data_size = size;
+           ctx->param_type = LEGACY_FS_INDIVIDUAL_PARAMS;
+           return 0;
+}
+```
+
+The first time we call `legacy_parse_param()` within a fs context, `ctx->legacy_data` is NULL, so a call to `kmalloc()` is performed, requesting a `PAGE_SIZE`-sized chunk and providing `GFP_KERNEL` as flags.
+
+If we provide a `FSCONFIG_SET_STRING` when calling `fsconfig()`, `legacy_parse_param()` is called to add the parameters to a legacy configuration. Every time this function is called, the `ctx->legacy_data` buffer is filled with the parameters of the legacy configuration. Actually, what is written to the buffer is the key and value for the parameters specified through the `fsconfig()` syscall.
+
+For example, if we call `fsconfig()` and provide `AAAA` as the key and `BBBB` as the value, here is what would be written to the buffer: `,AAAA=BBBB`.
+
+If we keep calling `fsconfig()` with the cmd `FSCONFIG_SET_STRING`, the contents of `ctx->legacy_data` will be increasing, as well as the `ctx->data_size`, which defines the amount of bytes residing in the buffer.
+
+If we can make `size` (`ctx->data_size`) be a value higher than or equal to `PAGE_SIZE - 1`, the result of the subtraction will underflow to a huge value, thus always making `len` be less than the result of the subtraction. This will make every subsequent calls to `fsconfig()` have the ability to keep sending strings, which are actually going to be written out-of-bounds (OOB).
+
+To reach this OOB condition, we need to call `fsconfig()` a number of times (sending parameter strings) until `ctx->data_size` is higher than or equal to `PAGE_SIZE - 1`, so the following calls to `fsconfig()` will continue the string-writing without limits.
+
+## Exploitation overview
+
+This is a short summary of the exploitation process:
+
+1) Spray the kmalloc-4096 with `ctx->legacy_data` buffers and `msg_msg` structures.
+2) Spray the kmalloc-32 with `shm_file_data` structures.
+3) Overflow the next chunk (hopefully a `msg_msg` struct), overwriting the size entry with a higher value.
+4) Request the message through `msgrcv()` with a size bigger than the one used for `msgsnd()`, to trigger an out-of-bounds read.
+5) Hopefully the out-of-bounds data contains the `init_ipc_ns` address, which will allow us to calculate the KASLR base.
+6) Spray the heap again in a similar way to step 1.
+7) Register userfaultfd or FUSE on `mmap()`'ed pages and pass them to `msgsnd()` to block a thread in `copy_from_user()`.
+8) Overflow the next chunk (hopefully a `msg_msg struct`), overwriting the `msg_msg.next` entry with `modprobe_path` - 8.
+9) Release the blocked thread (using userfaultfd or FUSE) and copy data to overwrite `modprobe_path` with our own script.
+10) Force the kernel to call `call_modprobe()`, which executes our script as root.
+
+## Exploitation details
+
+This overflow happens in the kmalloc-4096 cache, and there are not many well-known ways to spray kmalloc-4096 with useful chunks.
+
+After reading other vulnerability analyses and exploitation posts (please see the references at the end of this post), we found out that `msg_msg` is the ideal object to use for getting read and write primitives.
+
+### IPC msg operations: a short overview
+
+**Note:** To understand the IPC msg operations better, it is recommended to read the references **[2]** and **[4]** (references at the end of this post).
+
+As we are going to exploit the `msg_msg` structure in this analysis, let us briefly overview how it behaves, and then explain how to get primitives with it.
+
+Using the Linux Kernel IPC message operations, we can send and receive messages to/from a message queue.
+
+This is the main structure that defines it:
+
+```c
+struct msg_msg {
+           struct list_head m_list;
+           long m_type;
+           size_t m_ts;           /* message text size */
+           struct msg_msgseg *next;
+           void *security;
+           /* the actual message follows immediately */
+};
+```
+
+We can send messages to the message queue by using `msgsnd()`, which ends up calling `do_msgsnd()`:
+
+```c
+static long do_msgsnd(int msqid, long mtype, void __user *mtext,
+                      size_t msgsz, int msgflg)
+{
+           struct msg_queue *msq;
+           struct msg_msg *msg;
+           int err;
+           struct ipc_namespace *ns;
+           DEFINE_WAKE_Q(wake_q);
+
+           ns = current->nsproxy->ipc_ns;
+
+           if (msgsz > ns->msg_ctlmax || (long) msgsz < 0 || msqid < 0)
+                      return -EINVAL;
+           if (mtype < 1)
+                      return -EINVAL;
+
+           msg = load_msg(mtext, msgsz);
+           if (IS_ERR(msg))
+                      return PTR_ERR(msg);
+
+           msg->m_type = mtype;
+           msg->m_ts = msgsz;
+
+           rcu_read_lock();
+           msq = msq_obtain_object_check(ns, msqid);
+           if (IS_ERR(msq)) {
+                      err = PTR_ERR(msq);
+                      goto out_unlock1;
+           }
+
+           ipc_lock_object(&msq->q_perm);
+
+           for (;;) {
+                      struct msg_sender s;
+
+                      err = -EACCES;
+                      if (ipcperms(ns, &msq->q_perm, S_IWUGO))
+                                 goto out_unlock0;
+
+                      /* raced with RMID? */
+                      if (!ipc_valid_object(&msq->q_perm)) {
+                                 err = -EIDRM;
+                                 goto out_unlock0;
+                      }
+
+                      err = security_msg_queue_msgsnd(&msq->q_perm, msg, msgflg);
+                      if (err)
+                                 goto out_unlock0;
+
+                      if (msg_fits_inqueue(msq, msgsz))
+                                 break;
+
+                      /* queue full, wait: */
+                      if (msgflg & IPC_NOWAIT) {
+                                 err = -EAGAIN;
+                                 goto out_unlock0;
+                      }
+
+                      /* enqueue the sender and prepare to block */
+                      ss_add(msq, &s, msgsz);
+
+                      if (!ipc_rcu_getref(&msq->q_perm)) {
+                                 err = -EIDRM;
+                                 goto out_unlock0;
+                      }
+
+                      ipc_unlock_object(&msq->q_perm);
+                      rcu_read_unlock();
+                      schedule();
+
+                      rcu_read_lock();
+                      ipc_lock_object(&msq->q_perm);
+
+                      ipc_rcu_putref(&msq->q_perm, msg_rcu_free);
+                      /* raced with RMID? */
+                      if (!ipc_valid_object(&msq->q_perm)) {
+                                 err = -EIDRM;
+                                 goto out_unlock0;
+                      }
+                      ss_del(&s);
+
+                      if (signal_pending(current)) {
+                                 err = -ERESTARTNOHAND;
+                                 goto out_unlock0;
+                      }
+
+           }
+
+           ipc_update_pid(&msq->q_lspid, task_tgid(current));
+           msq->q_stime = ktime_get_real_seconds();
+
+           if (!pipelined_send(msq, msg, &wake_q)) {
+                      /* no one is waiting for this message, enqueue it */
+                      list_add_tail(&msg->m_list, &msq->q_messages);
+                      msq->q_cbytes += msgsz;
+                      msq->q_qnum++;
+                      atomic_add(msgsz, &ns->msg_bytes);
+                      atomic_inc(&ns->msg_hdrs);
+           }
+
+           err = 0;
+           msg = NULL;
+
+out_unlock0:
+           ipc_unlock_object(&msq->q_perm);
+           wake_up_q(&wake_q);
+out_unlock1:
+           rcu_read_unlock();
+           if (msg != NULL)
+                      free_msg(msg);
+           return err;
+}
+```
+
+which ends up calling `load_msg()`:
+
+```c
+struct msg_msg *load_msg(const void __user *src, size_t len)
+{
+           struct msg_msg *msg;
+           struct msg_msgseg *seg;
+           int err = -EFAULT;
+           size_t alen;
+
+           msg = alloc_msg(len);
+           if (msg == NULL)
+                      return ERR_PTR(-ENOMEM);
+
+           alen = min(len, DATALEN_MSG);
+           if (copy_from_user(msg + 1, src, alen))
+                      goto out_err;
+
+           for (seg = msg->next; seg != NULL; seg = seg->next) {
+                      len -= alen;
+                      src = (char __user *)src + alen;
+                      alen = min(len, DATALEN_SEG);
+                      if (copy_from_user(seg + 1, src, alen))
+                                 goto out_err;
+           }
+
+           err = security_msg_msg_alloc(msg);
+           if (err)
+                      goto out_err;
+
+           return msg;
+
+out_err:
+           free_msg(msg);
+           return ERR_PTR(err);
+}
+```
+
+If the message provided is longer than `DATALEN_MSG`, `alloc_msg()` will allocate segments, where the remaining data is stored forming a linked list. `DATALEN_MSG` is defined as `PAGE_SIZE - sizeof(struct msg_msg)`, and `DATALEN_SEG` is defined as `PAGE_SIZE - sizeof(struct msg_msgseg)`.
+
+`msg_msgseg`, which is the header for the segments that form the linked list of remaining data, is defined as:
+
+```c
+struct msg_msgseg {
+           struct msg_msgseg* next;
+           /* the next part of the message follows immediately */
+};
+```
+
+We can see this just defines the pointer to the next element within the linked list, or NULL to end it.
+
+On the other hand, when calling `msgrcv()`, `do_msgrcv()` ends up being called:
+
+```c
+static long do_msgrcv(int msqid, void __user *buf, size_t bufsz, long msgtyp, int msgflg,
+                  long (*msg_handler)(void __user *, struct msg_msg *, size_t))
+{
+           int mode;
+           struct msg_queue *msq;
+           struct ipc_namespace *ns;
+           struct msg_msg *msg, *copy = NULL;
+           DEFINE_WAKE_Q(wake_q);
+
+           ns = current->nsproxy->ipc_ns;
+
+           if (msqid < 0 || (long) bufsz < 0)
+                      return -EINVAL;
+
+           if (msgflg & MSG_COPY) {
+                      if ((msgflg & MSG_EXCEPT) || !(msgflg & IPC_NOWAIT))
+                                 return -EINVAL;
+                      copy = prepare_copy(buf, min_t(size_t, bufsz, ns->msg_ctlmax));
+                      if (IS_ERR(copy))
+                                 return PTR_ERR(copy);
+           }
+           mode = convert_mode(&msgtyp, msgflg);
+
+           rcu_read_lock();
+           msq = msq_obtain_object_check(ns, msqid);
+           if (IS_ERR(msq)) {
+                      rcu_read_unlock();
+                      free_copy(copy);
+                      return PTR_ERR(msq);
+           }
+
+           for (;;) {
+                      struct msg_receiver msr_d;
+
+                      msg = ERR_PTR(-EACCES);
+                      if (ipcperms(ns, &msq->q_perm, S_IRUGO))
+                                 goto out_unlock1;
+
+                      ipc_lock_object(&msq->q_perm);
+
+                      /* raced with RMID? */
+                      if (!ipc_valid_object(&msq->q_perm)) {
+                                 msg = ERR_PTR(-EIDRM);
+                                 goto out_unlock0;
+                      }
+
+                      msg = find_msg(msq, &msgtyp, mode);
+                      if (!IS_ERR(msg)) {
+                                 /*
+                                 * Found a suitable message.
+                                 * Unlink it from the queue.
+                                 */
+                                 if ((bufsz < msg->m_ts) && !(msgflg & MSG_NOERROR)) {
+                                            msg = ERR_PTR(-E2BIG);
+                                            goto out_unlock0;
+                                 }
+                                 /*
+                                 * If we are copying, then do not unlink message and do
+                                 * not update queue parameters.
+                                 */
+                                 if (msgflg & MSG_COPY) {
+                                            msg = copy_msg(msg, copy);
+                                            goto out_unlock0;
+                                 }
+
+                                 list_del(&msg->m_list);
+                                 msq->q_qnum--;
+                                 msq->q_rtime = ktime_get_real_seconds();
+                                 ipc_update_pid(&msq->q_lrpid, task_tgid(current));
+                                 msq->q_cbytes -= msg->m_ts;
+                                 atomic_sub(msg->m_ts, &ns->msg_bytes);
+                                 atomic_dec(&ns->msg_hdrs);
+                                 ss_wakeup(msq, &wake_q, false);
+
+                                 goto out_unlock0;
+                      }
+
+                      /* No message waiting. Wait for a message */
+                      if (msgflg & IPC_NOWAIT) {
+                                 msg = ERR_PTR(-ENOMSG);
+                                 goto out_unlock0;
+                      }
+
+                      list_add_tail(&msr_d.r_list, &msq->q_receivers);
+                      msr_d.r_tsk = current;
+                      msr_d.r_msgtype = msgtyp;
+                      msr_d.r_mode = mode;
+                      if (msgflg & MSG_NOERROR)
+                                 msr_d.r_maxsize = INT_MAX;
+                      else
+                                 msr_d.r_maxsize = bufsz;
+
+                      /* memory barrier not require due to ipc_lock_object() */
+                      WRITE_ONCE(msr_d.r_msg, ERR_PTR(-EAGAIN));
+
+                      /* memory barrier not required, we own ipc_lock_object() */
+                      __set_current_state(TASK_INTERRUPTIBLE);
+
+                      ipc_unlock_object(&msq->q_perm);
+                      rcu_read_unlock();
+                      schedule();
+
+                      /*
+                      * Lockless receive, part 1:
+                      * We don't hold a reference to the queue and getting a
+                      * reference would defeat the idea of a lockless operation,
+                      * thus the code relies on rcu to guarantee the existence of
+                      * msq:
+                      * Prior to destruction, expunge_all(-EIRDM) changes r_msg.
+                      * Thus if r_msg is -EAGAIN, then the queue not yet destroyed.
+                      */
+                      rcu_read_lock();
+
+                      /*
+                      * Lockless receive, part 2:
+                      * The work in pipelined_send() and expunge_all():
+                      * - Set pointer to message
+                      * - Queue the receiver task for later wakeup
+                      * - Wake up the process after the lock is dropped.
+                      *
+                      * Should the process wake up before this wakeup (due to a
+                      * signal) it will either see the message and continue ...
+                      */
+                      msg = READ_ONCE(msr_d.r_msg);
+                      if (msg != ERR_PTR(-EAGAIN)) {
+                                 /* see MSG_BARRIER for purpose/pairing */
+                                 smp_acquire__after_ctrl_dep();
+
+                                 goto out_unlock1;
+                      }
+
+                      /*
+                        * ... or see -EAGAIN, acquire the lock to check the message
+                        * again.
+                        */
+                      ipc_lock_object(&msq->q_perm);
+
+                      msg = READ_ONCE(msr_d.r_msg);
+                      if (msg != ERR_PTR(-EAGAIN))
+                                 goto out_unlock0;
+
+                      list_del(&msr_d.r_list);
+                      if (signal_pending(current)) {
+                                 msg = ERR_PTR(-ERESTARTNOHAND);
+                                 goto out_unlock0;
+                      }
+
+                      ipc_unlock_object(&msq->q_perm);
+           }
+
+out_unlock0:
+           ipc_unlock_object(&msq->q_perm);
+           wake_up_q(&wake_q);
+out_unlock1:
+           rcu_read_unlock();
+           if (IS_ERR(msg)) {
+                      free_copy(copy);
+                      return PTR_ERR(msg);
+           }
+
+           bufsz = msg_handler(buf, msg, bufsz);
+           free_msg(msg);
+
+           return bufsz;
+}
+```
+
+
+When `do_msgrcv()` is called, once the data is received, the message is unlinked from the queue, unless we provide flag `MSG_COPY`:
+
+```c
+/*
+* If we are copying, then do not unlink message and do
+* not update queue parameters.
+*/
+if (msgflg & MSG_COPY) {
+           msg = copy_msg(msg, copy);
+           goto out_unlock0;
+}
+
+list_del(&msg->m_list);
+msq->q_qnum--;
+msq->q_rtime = ktime_get_real_seconds();
+ipc_update_pid(&msq->q_lrpid, task_tgid(current));
+msq->q_cbytes -= msg->m_ts;
+atomic_sub(msg->m_ts, &ns->msg_bytes);
+atomic_dec(&ns->msg_hdrs);
+ss_wakeup(msq, &wake_q, false);
+
+goto out_unlock0;
+```
+
+As we can see, using `MSG_COPY` prevents the use of the `msg_msg.m_list` pointers (`msg_msg.mlist.prev` and `msg_msg.m_list.next`), which (as explained later for both read and write primitives) we need to overwrite to reach entries that follow, like `msg_msg.m_ts` or `msg_msg.next`, and might contain invalid pointers.
+
+Messages are freed with `free_msg()`:
+
+```c
+void free_msg(struct msg_msg *msg)
+{
+           struct msg_msgseg *seg;
+
+           security_msg_msg_free(msg);
+
+           seg = msg->next;
+           kfree(msg);
+           while (seg != NULL) {
+                      struct msg_msgseg *tmp = seg->next;
+
+                      cond_resched();
+                      kfree(seg);
+                      seg = tmp;
+           }
+}
+```
+
+which calls `kfree()` to free the `msg_msg` structure chunk, and then traverses the linked list until all the segments are `kfree()`'d
+
+This is the function `copy_msg()`:
+
+```c
+struct msg_msg *copy_msg(struct msg_msg *src, struct msg_msg *dst)
+{
+           struct msg_msgseg *dst_pseg, *src_pseg;
+           size_t len = src->m_ts;
+           size_t alen;
+
+           if (src->m_ts > dst->m_ts)
+                      return ERR_PTR(-EINVAL);
+
+           alen = min(len, DATALEN_MSG);
+           memcpy(dst + 1, src + 1, alen);
+
+           for (dst_pseg = dst->next, src_pseg = src->next;
+                src_pseg != NULL;
+                dst_pseg = dst_pseg->next, src_pseg = src_pseg->next) {
+
+                      len -= alen;
+                      alen = min(len, DATALEN_SEG);
+                      memcpy(dst_pseg + 1, src_pseg + 1, alen);
+           }
+
+           dst->m_type = src->m_type;
+           dst->m_ts = src->m_ts;
+
+           return dst;
+}
+```
+
+As we can see, it performs a copy of a `msg_msg` structure contents, to a destination `msg_msg`.
+
+>From `do_msgrcv()`, and through `do_msg_fill()`,  `store_msg()` is called:
+
+```c
+int store_msg(void __user *dest, struct msg_msg *msg, size_t len)
+{
+           size_t alen;
+           struct msg_msgseg *seg;
+
+           alen = min(len, DATALEN_MSG);
+           if (copy_to_user(dest, msg + 1, alen))
+                      return -1;
+
+           for (seg = msg->next; seg != NULL; seg = seg->next) {
+                      len -= alen;
+                      dest = (char __user *)dest + alen;
+                      alen = min(len, DATALEN_SEG);
+                      if (copy_to_user(dest, seg + 1, alen))
+                                 return -1;
+           }
+           return 0;
+}
+```
+
+We can see it uses `copy_to_user()` to copy the data to userspace. It first calls `copy_to_user()` for the data stored after the `msg_msg` struct, and then traverses the linked list to send all the remaining segment data.
+
+### Disclosing memory: out-of-bounds (OOB) read primitive
+
+We want to exploit this bug to achieve LPE, in an environment with default hardening mechanisms (SMEP, SMAP, KPTI, KASLR, ...), so if we want predictable addresses to continue the exploitation we will need to get useful primitives that let us leak pointers.
+
+As mentioned before, if the size of our data surpasses the space within a block, a segment is created for it. Segments are accessed through the entry `msg_msg.next`, which creates a singly linked list to be traversed. We have the ability to overwrite `msg_msg` headers but we have no predictable addresses. The `msg_msg.m_ts` (which corresponds to the size) would allow us (if corrupting it to a higher value), to trigger an out-of-bounds read primitive by requesting more size than the initial one, so it will disclose memory from subsequent allocated chunks.
+
+As detailed in the referenced post **[3]**, if we make msgutil to allocate a `msg_msg` structure, and a segment in the kmalloc-32 cache, we will be able to read out-of-bounds within the kmalloc-32 cache, so spraying with `shm_file_data` structures (which also reside in the kmalloc-32) will allow us to leak the KASLR base due to the existence of a specific entry that points to `init_ipc_ns`, which resides in the kernel data section.
+
+To first be able to trigger an overflow into one of the `msg_msg` chunks, we need to spray the heap to maximize the probability of hitting one of the `msg_msg` sprayed chunks.
+
+To do so, we first spray with `ctx->legacy_data` chunks, to fill the previous holes using `fsopen()` and `fsconfig()`. Then, we spray the kmalloc-4096 with `msg_msg` objects using `msgsnd()`.
+
+To achieve the information leak primitive for `init_ipc_ns` we will need to fill the kmalloc-32 cache, spraying with `shm_file_data` structures, using `shmget()` and `shmat()`.
+
+Finally, allocate the chunk from where we are going to overflow using `fsopen()` and `fsconfig()` (the first time will allocate the chunk).
+
+Now, we will fill the `ctx->legacy_data` buffer by repeatedly calling `fsconfig()` until the conditions to trigger the integer underflow are met.
+
+Once the check causes an integer underflow, we are ready to overflow the next chunk, which is hopefully a `msg_msg` structure. We need to replace the `msg_msg.m_list` pointers, both `msg_msg.m_list.prev` and `msg_msg.m_list.next` with dummy values, as well as `msg_msg.m_type`, and partially overwrite `msg_msg.m_ts` by making it bigger than its original value.
+
+If everything succeeds, we do not know which of the sprayed chunks might be the one we overflowed (if any!), so we call `msgrcv()` on all of these messages with an increased size, so that if any of them had its size increased as a result of the `msg_msg.m_ts` value corruption, it will return out-of-bounds data.
+
+Hopefully, the out-of-bounds data will contain the `init_ipc_ns` pointer, so we have the KASLR base.
+
+Our main target, now that we have the KASLR base, is to craft a write primitive to overwrite `modprobe_path` with our own custom script.
+
+### Write-what-where primitive
+
+Achieving a write-what-where is a bit more difficult because `msgsnd()` actually allocates and sends bytes, so each call to `msgsnd()` will write to a different newly allocated chunk, unlike `msgrcv()` which reads data from already allocated chunks from previous calls.
+
+However, if we take a look at `load_msg()`:
+
+```c
+struct msg_msg *load_msg(const void __user *src, size_t len)
+{
+           struct msg_msg *msg;
+           struct msg_msgseg *seg;
+           int err = -EFAULT;
+           size_t alen;
+
+           msg = alloc_msg(len);
+           if (msg == NULL)
+                      return ERR_PTR(-ENOMEM);
+
+           alen = min(len, DATALEN_MSG);
+           if (copy_from_user(msg + 1, src, alen))
+                      goto out_err;
+
+           for (seg = msg->next; seg != NULL; seg = seg->next) {
+                      len -= alen;
+                      src = (char __user *)src + alen;
+                      alen = min(len, DATALEN_SEG);
+                      if (copy_from_user(seg + 1, src, alen))
+                                 goto out_err;
+           }
+
+           err = security_msg_msg_alloc(msg);
+           if (err)
+                      goto out_err;
+
+           return msg;
+
+out_err:
+           free_msg(msg);
+           return ERR_PTR(err);
+}
+```
+
+We can see it calls `alloc_msg()`, which allocates both the `msg_msg` and the segments that form the linked list, but our data has not yet been copied.
+
+```c
+static struct msg_msg *alloc_msg(size_t len)
+{
+           struct msg_msg *msg;
+           struct msg_msgseg **pseg;
+           size_t alen;
+
+           alen = min(len, DATALEN_MSG);
+           msg = kmalloc(sizeof(*msg) + alen, GFP_KERNEL_ACCOUNT);
+           if (msg == NULL)
+                      return NULL;
+
+           msg->next = NULL;
+           msg->security = NULL;
+
+           len -= alen;
+           pseg = &msg->next;
+           while (len > 0) {
+                      struct msg_msgseg *seg;
+
+                      cond_resched();
+
+                      alen = min(len, DATALEN_SEG);
+                      seg = kmalloc(sizeof(*seg) + alen, GFP_KERNEL_ACCOUNT);
+                      if (seg == NULL)
+                                 goto out_err;
+                      *pseg = seg;
+                      seg->next = NULL;
+                      pseg = &seg->next;
+                      len -= alen;
+           }
+
+           return msg;
+
+out_err:
+           free_msg(msg);
+           return NULL;
+}
+```
+
+Looking at the `alloc_msg()` function, we first see there is a `kmalloc()` allocation of the main `msg_msg` structure plus the contiguous data, and then, there is a loop that will create the singly linked list by initializing the `msg_msg.next` entries.
+
+Returning to `load_msg()` we can see there is a call to `copy_from_user()` once `alloc_msg()` returns, which copies the data from userspace into the space after the `msg_msg` headers.
+
+Then, the remaining data will be copied into segments, so it reads `msg->next` (which was initialized in the `alloc_msg()` function) and performs a `copy_from_user()` for each segment.
+
+The important fact here is that, if we can block the thread in the first `copy_from_user()`, the situation is the following: the objects have already been allocated, and are residing in the heap, and the `msg_msg.next` pointer is already initialized, and pending to be used.
+
+This situation is really favorable to us if we can trigger the OOB write while the thread is blocked, so the events will happen in this order:
+
+1) `load_msg()` / `alloc_msg()`: Allocate chunks and initialize `msg_msg.next` pointers.
+2) `load_msg()` / `copy_from_user()`: Thread will hang here due to a blocking mechanism (like userfaultfd or FUSE).
+2) exploit: Overwrite next chunk, which is a `msg_msg` structure already allocated by `alloc_msg()`, and replace `msg_msg.next` with the address where to write minus 8 (the segment's first value is the pointer to the next value within the linked list, and we want it to be NULL, to end the linked list traversal).
+3) exploit: Release the blocked thread, and copy the payload (the one that overwrites `modprobe_path`, which means the *what* element in the write-what-where primitive) as part of the thread-blocking handling (this can be done with both userfaultfd handlers and FUSE handlers)
+4) `load_msg()`: Retrieve `msg->next` to start traversing the linked list and copying data from userspace memory to segments, but the pointer has already been overwritten previously by our exploit while the thread was blocked.
+5) `load_msg()`: Within that loop, as the pointer has been hijacked, eventually `modprobe_path` will be overwritten by our arbitrary value.
+
+Once we have modified the value of `modprobe_path`, the battle is won! Now we need to force the kernel to make a call to `call_modprobe()`. The typical way, and the one we used in our exploit, is executing a dummy script with magic numbers unknown to the kernel, so the kernel will call `call_modprobe()` to execute the usermode helper to handle this situation, which means the script that we specified for `modprobe_path` will be executed as root.
+
+## FUSE as a replacement for userfaultfd
+
+Initially, our exploit was developed with userfaultfd as the blocking mechanism to achieve the write primitive. However, since unprivileged userfaultfd is now disabled by default after kernel 5.11, the exploit has been rewritten to use FUSE as the blocking mechanism, and the implementation is quite similar to the one applied with userfaultfd.
+
+We can use FUSE's hello.c program as the base for our FUSE handlers: [https://github.com/libfuse/libfuse/blob/master/example/hello.c](https://github.com/libfuse/libfuse/blob/master/example/hello.c).
+
+We first need to define the operations for which we need a handler, typically:
+
+```c
+static const struct fuse_operations hello_oper = {
+           .getattr        = hello_getattr,
+           .readdir       = hello_readdir,
+           .open           = hello_open,
+           .read            = hello_read,
+           .write           = hello_write
+};
+```
+
+This structure should be passed to `fuse_main()`, as well as the arguments, which can be passed from the hello.c program `main()` argument themselves:
+
+```c
+int main(int argc, char *argv[]) {
+           return fuse_main(argc, argv, &hello_oper, NULL);
+}
+```
+
+If we want to handle write accesses to a FUSE-backed mmapped page, we can use the function specified by `.write`. We can do the same with `.read` (for read accesses) or with any operation that we define in the `fuse_operations` structure.
+
+If for example we want to block a thread on `copy_from_user()`, we:
+
+1) `mkdir()` a directory to be used as the FUSE mountpoint.
+2) Run the compiled hello.c and provide the path to the directory.
+3) The operations applied over that FUSE mount will be handled by our hello.c handlers.
+4) `open()` a file within the FUSE mount.
+5) `mmap()` the fd returned by `open()` to map the file.
+6) When read/write accesses are performed from/to this memory space, we will be able to handle them; for example, we can sleep or synchronize the thread-blocking/unblocking states with the exploit.
+
+## Conclusion
+
+This post analyzed CVE-2022-0185 and the approach we adopted to exploit this bug and escalate our privileges to root.
+
+## Mitigating the bug
+
+If you are unable to patch this bug, disabling unprivileged user namespaces will force the exploitation to require the `CAP_SYS_ADMIN` capability, which prevents this vulnerability from being exploited by unprivileged users:
+
+```
+sysctl -w kernel.unprivileged_userns_clone = 0
+```
+
+
+## References
+
+The use of `msg_msg` objects for exploitation to achieve read/write primitives is really well documented in the following posts:
+
+- \[1\] [https://a13xp0p0v.github.io/2021/02/09/CVE-2021-26708.html](https://a13xp0p0v.github.io/2021/02/09/CVE-2021-26708.html)
+- \[2\] [https://www.willsroot.io/2021/08/corctf-2021-fire-of-salvation-writeup.html](https://www.willsroot.io/2021/08/corctf-2021-fire-of-salvation-writeup.html)
+- \[3\] [https://syst3mfailure.io/sixpack-slab-out-of-bounds](https://syst3mfailure.io/sixpack-slab-out-of-bounds)
+- \[4\] [https://syst3mfailure.io/wall-of-perdition](https://syst3mfailure.io/wall-of-perdition)
+
+Advisory, disclosure, patch:
+
+- \[5\] [https://access.redhat.com/security/cve/CVE-2022-0185](https://access.redhat.com/security/cve/CVE-2022-0185)
+- \[6\] [https://www.openwall.com/lists/oss-security/2022/01/18/7](https://www.openwall.com/lists/oss-security/2022/01/18/7)
+- \[7\] [https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=722d94847de2](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=722d94847de2)
+
+Distribution kernel updates:
+
+- \[8\] [https://ubuntu.com/security/CVE-2022-0185](https://ubuntu.com/security/CVE-2022-0185)
+- \[9\] [https://security-tracker.debian.org/tracker/CVE-2022-0185](https://security-tracker.debian.org/tracker/CVE-2022-0185)
+- \[10\] [https://www.suse.com/security/cve/CVE-2022-0185.html](https://www.suse.com/security/cve/CVE-2022-0185.html)
+- \[11\] [https://access.redhat.com/security/cve/cve-2022-0185](https://access.redhat.com/security/cve/cve-2022-0185)
+
+
+Content of type "text/html" skipped
+
+Download attachment "CVE-2022-0185.zip" of type "application/x-zip-compressed" (11791 bytes)

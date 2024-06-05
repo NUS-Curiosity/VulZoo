@@ -1,0 +1,127 @@
+
+Date: Mon, 2 Oct 2023 12:53:20 -0700
+From: Kyle Zeng <zengyhkyle@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: [CVE-2023-42754] null pointer dereference in Linux kernel ipv4 stack
+
+Hi there,
+
+I recently found a null pointer dereference in Linux kernel that
+affects at least upstream and v6.2.16 and v6.1.y, more versions may be affected.
+
+[Root Cause]
+The bug is in "ipv4_send_dest_unreach" function in net/ipv4/route.c.
+~~~
+static void ipv4_send_dest_unreach(struct sk_buff *skb)
+{
+        ...
+        res = __ip_options_compile(dev_net(skb->dev), &opt, skb, NULL);
+        ...
+}
+~~~
+As shown above, this function assumes there is always a device
+associated with a sk_buff, which is not always the case. For exmaple,
+when the skb is rerouted through ipvs, its skb->dev is NULL. Then the
+following `dev_net` call, which accesses `dev->nd_net`, becomes null
+pointer dereference.
+
+[Patch]
+I have contacted Linux kernel team and prepared a patch for this bug:
+https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net.git/commit/?id=0113d9c9d1cc
+Currently, the patch is merged into upstream and added to the stable-queue.
+The patch is queued up for v6.5, v6.1, v5.15, v5.10, v5.4, v4.19, v4.14.
+
+A proof-of-concept crash code is attached to this email..
+
+Best,
+Kyle Zeng
+
+===================================================================
+[    6.289675] general protection fault, probably for non-canonical
+address 0xdffffc0000000096: 0000 [#1] PREEMPT SMP KASAN NOPTI
+[    6.292146] KASAN: null-ptr-deref in range
+[0x00000000000004b0-0x00000000000004b7]
+[    6.293823] CPU: 0 PID: 509 Comm: poc Not tainted 6.1.47+ #59
+[    6.294699] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996),
+BIOS 1.15.0-1 04/01/2014
+[    6.295151] RIP: 0010:ipv4_link_failure+0x2dc/0x610
+[    6.295423] Code: 80 3c 28 00 48 89 e9 74 12 4c 89 f7 e8 5d e8 bd
+fd 48 b9 00 00 00 00 00 fc ff df bd b0 04 00 00 49 03 2e 48 89 e8 48
+c1 e8 03 <80> 3c 08 00 74 08 48 89 ef e8 36 e8 bd fd 48 8b 7d 00 48 8d
+74 24
+[    6.296423] RSP: 0018:ffff88800bc87530 EFLAGS: 00010206
+[    6.296710] RAX: 0000000000000096 RBX: ffff88800af22c04 RCX: dffffc0000000000
+[    6.297096] RDX: dffffc0000000000 RSI: 00000000fffffff8 RDI: ffff88800bc87578
+[    6.297482] RBP: 00000000000004b0 R08: dffffc0000000000 R09: ffff88800bc87570
+[    6.297868] R10: dfffe91001790eb1 R11: 1ffff11001790eae R12: ffff88800af22b40
+[    6.298282] R13: 1ffff110015e4576 R14: ffff88800af22b50 R15: 1ffff110015e4576
+[    6.298679] FS:  00000000032493c0(0000) GS:ffff888034e00000(0000)
+knlGS:0000000000000000
+[    6.299123] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[    6.299442] CR2: 0000000000404dfe CR3: 000000000d492004 CR4: 0000000000770ef0
+[    6.299841] PKRU: 55555554
+[    6.299995] Call Trace:
+[    6.300137]  <TASK>
+[    6.300259]  ? __die_body+0x67/0xb0
+[    6.300455]  ? die_addr+0xb2/0xe0
+[    6.300641]  ? exc_general_protection+0x27f/0x3c0
+[    6.300902]  ? asm_exc_general_protection+0x22/0x30
+[    6.301167]  ? ipv4_link_failure+0x2dc/0x610
+[    6.301398]  __ip_vs_get_out_rt+0x54a/0x1060
+[    6.301629]  ? kasan_save_free_info+0x27/0x40
+[    6.301871]  ip_vs_nat_xmit+0x144/0x800
+[    6.302114]  ? ip_vs_in_stats+0x1ca/0x2d0
+[    6.302334]  ip_vs_in_hook+0xc13/0x1b20
+[    6.302546]  ? ip_vs_out_hook+0xd70/0xd70
+[    6.302767]  nf_hook_slow+0xb4/0x190
+[    6.302963]  __ip_local_out+0x347/0x450
+[    6.303171]  ? __ip_local_out+0x450/0x450
+[    6.303387]  ip_send_skb+0x48/0x110
+[    6.303589]  udp_send_skb+0x6e4/0x1370
+[    6.303805]  udp_sendmsg+0x16ba/0x2850
+[    6.304016]  ? ip_skb_dst_mtu+0x5e0/0x5e0
+[    6.304250]  ? inet_send_prepare+0x2f0/0x2f0
+[    6.304492]  ____sys_sendmsg+0x560/0x6d0
+[    6.304726]  __sys_sendmsg+0x1bd/0x240
+[    6.304959]  do_syscall_64+0x67/0x90
+[    6.305165]  ? exit_to_user_mode_prepare+0x12/0xa0
+[    6.305429]  ? syscall_exit_to_user_mode+0x28/0x150
+[    6.305701]  ? do_syscall_64+0x75/0x90
+[    6.305915]  ? exit_to_user_mode_prepare+0x12/0xa0
+[    6.306199]  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+[    6.306485] RIP: 0033:0x474087
+[    6.306690] Code: ff ff f7 d8 64 89 02 b8 ff ff ff ff eb b8 0f 1f
+44 00 00 f3 0f 1e fa 64 8b 04 25 18 00 00 00 85 c0 75 10 b8 2e 00 00
+00 0f 05 <48> 3d 00 f0 ff ff 77 51 c3 48 83 ec 28 89 54 24 1c 48 89 74
+24 10
+[    6.308329] RSP: 002b:00007ffe8e9dce28 EFLAGS: 00000246 ORIG_RAX:
+000000000000002e
+[    6.308792] RAX: ffffffffffffffda RBX: 00007ffe8e9dd0a8 RCX: 0000000000474087
+[    6.309199] RDX: 0000000000000000 RSI: 00007ffe8e9dce40 RDI: 0000000000000006
+[    6.309629] RBP: 00007ffe8e9dcea0 R08: 0000000000000004 R09: 000000000324b480
+[    6.310071] R10: 00007ffe8e9dce30 R11: 0000000000000246 R12: 0000000000000001
+[    6.310451] R13: 00007ffe8e9dd098 R14: 00000000004fd740 R15: 0000000000000002
+[    6.310869]  </TASK>
+[    6.311002] Modules linked in:
+[    6.311222] ---[ end trace 0000000000000000 ]---
+[    6.311493] RIP: 0010:ipv4_link_failure+0x2dc/0x610
+[    6.311807] Code: 80 3c 28 00 48 89 e9 74 12 4c 89 f7 e8 5d e8 bd
+fd 48 b9 00 00 00 00 00 fc ff df bd b0 04 00 00 49 03 2e 48 89 e8 48
+c1 e8 03 <80> 3c 08 00 74 08 48 89 ef e8 36 e8 bd fd 48 8b 7d 00 48 8d
+74 24
+[    6.312941] RSP: 0018:ffff88800bc87530 EFLAGS: 00010206
+[    6.313283] RAX: 0000000000000096 RBX: ffff88800af22c04 RCX: dffffc0000000000
+[    6.313766] RDX: dffffc0000000000 RSI: 00000000fffffff8 RDI: ffff88800bc87578
+[    6.314248] RBP: 00000000000004b0 R08: dffffc0000000000 R09: ffff88800bc87570
+[    6.314676] R10: dfffe91001790eb1 R11: 1ffff11001790eae R12: ffff88800af22b40
+[    6.315138] R13: 1ffff110015e4576 R14: ffff88800af22b50 R15: 1ffff110015e4576
+[    6.315591] FS:  00000000032493c0(0000) GS:ffff888034e00000(0000)
+knlGS:0000000000000000
+[    6.316130] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[    6.316501] CR2: 0000000000404dfe CR3: 000000000d492004 CR4: 0000000000770ef0
+[    6.316979] PKRU: 55555554
+[    6.317146] Kernel panic - not syncing: Fatal exception
+[    6.317688] Kernel Offset: disabled
+[    6.317910] Rebooting in 1000 seconds..
+
+View attachment "poc.c" of type "text/x-csrc" (2417 bytes)

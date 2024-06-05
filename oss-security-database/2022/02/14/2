@@ -1,0 +1,75 @@
+
+Date: Sun, 13 Feb 2022 20:32:44 -0500
+From: Willem de Bruijn <willemdebruijn.kernel@...il.com>
+To: "Liu, Congyu" <liu3101@...due.edu>
+Cc: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: Re: Linux kernel: potential net namespace bug in IPv6 flow label management
+
+On Sun, Feb 13, 2022 at 11:11 AM Willem de Bruijn
+<willemdebruijn.kernel@...il.com> wrote:
+>
+> On Sun, Feb 13, 2022 at 5:31 AM Liu, Congyu <liu3101@...due.edu> wrote:
+> >
+> >
+> > Hi,
+> >
+> > In the test conducted on namespace, I found that one unsuccessful IPv6 flow label
+> > management from one net ns could stop other net ns's data transmission that requests
+> > flow label for a short time. Specifically, in our test case, one unsuccessful
+> > `setsockopt` to get flow label will affect other net ns's `sendmsg` with flow label
+> > set in cmsg. Simple PoC is included for verification. The behavior descirbed above
+> > can be reproduced in latest kernel.
+> >
+> > I managed to figure out the data flow behind this: when asking to get a flow label,
+> > some `setsockopt` parameters can trigger function `ipv6_flowlabel_get` to call `fl_create`
+> > to allocate an exclusive flow label, then call `fl_release` to release it before returning
+> > -ENOENT. Global variable `ipv6_flowlabel_exclusive`, a rate limit jump label that keeps
+> > track of number of alive exclusive flow labels, will get increased instantly after calling
+> > `fl_create`. Due to its rate limit design, `ipv6_flowlabel_exclusive` can only decrease
+> > sometime later after calling `fl_decrease`. During this period, if data transmission function
+> > in other net ns (e.g. `udpv6_sendmsg`) calls `fl_lookup`, the false `ipv6_flowlabel_exclusive`
+> > will invoke the `__fl_lookup`. In the test case observed, this function returns error and
+> > eventually stops the data transmission.
+> >
+> > I further noticed that this bug could somehow be vulnerable: if `setsockopt` is called
+> > continuously, then `sendmmsg` call from other net ns will be blocked forever. Using the PoC
+> > provided, if attack and victim programs are running simutaneously, victim program cannot transmit
+> > data; when running without attack program, the victim program can transmit data normally.
+>
+> Thanks for the clear explanation.
+>
+> Being able to use flowlabels without explicitly registering them
+> through a setsockopt is a fast path optimization introduced in commit
+> 59c820b2317f ("ipv6: elide flowlabel check if no exclusive leases
+> exist").
+>
+> Before this, any use of flowlabels required registering them, whether
+> the use was exclusive or not. As autoflowlabels already skipped this
+> stateful action, the commit extended this fast path to all non-exclusive
+> use. But if any exclusive flowlabel is active, to protect it, all
+> other flowlabel use has to be registered too.
+>
+> The commit message does state
+>
+>     This is an optimization. Robust applications still have to revert to
+>     requesting leases if the fast path fails due to an exclusive lease.
+>
+> Though I can see how the changed behavior has changed the perception of the API.
+>
+> That this extends up to a second after release of the last exclusive
+> flowlabel due to deferred release is only tangential to the issue?
+>
+> Flowlabels are stored globally, but associated with a netns
+> (fl->fl_net). Perhaps we can add a per-netns check to the
+> static_branch and maintain stateless behavior in other netns, even if
+> some netns maintain exclusive leases.
+
+To clarify, I don't consider this a vulnerability.
+
+The issue is under the control of the victim. It can avoid the ENOENT
+by requesting the flowlabel it intends to use.
+
+I have responded with more technical detail on the Linux kernel
+netdev list:
+
+https://lore.kernel.org/netdev/CA+FuTScRGQV5ePxbu7LReuAUc_AU3sQd7Mb8KGVmu+X2jSQSCQ@mail.gmail.com/T/#m01181a0b1ac93f560275175b1b23a8b6f9e0fe45

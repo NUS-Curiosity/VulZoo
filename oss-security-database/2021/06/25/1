@@ -1,0 +1,141 @@
+
+Date: Fri, 25 Jun 2021 10:57:09 +0800
+From: "Luo Likang" <luolikang@...ocus.com>
+To: <oss-security@...ts.openwall.com>
+Subject: FW: An out-of-bound read/write in fsi driver
+
+ 
+
+Because of my mistake, I took a normal bug as a security bug and reported it
+to linux-distros，linux-distros requested me notify oss-security since these
+bugs were deemed to not be a security vulnerability, and no embargo was set.
+
+
+ 
+
+Because of copy_ from_user has some check, so - 1 does not cause
+cross-border access, and lots of check in fsi_check_access().
+
+ 
+
+The following is the original of my report:
+
+ 
+
+I found an oob read/write bug in function cfam_read/cfam_write of
+drivers/fsi/fsi-core.c
+
+It lack of the check of count and offset.
+
+ 
+
+```
+
+/* Create chardev for userspace access */
+
+       cdev_init(&slave->cdev, &cfam_fops);
+
+- - - -  - - - - - - - - - - - -- - - - - - - - - - - 
+
+static const struct file_operations cfam_fops = {
+
+       .owner           = THIS_MODULE,
+
+       .open             = cfam_open,
+
+       .llseek            = cfam_llseek,
+
+       .read       = cfam_read,
+
+       .write             = cfam_write,
+
+};
+
+```
+
+In userspace, we can open this chardev can invoke read to use cfam_read.
+
+ 
+
+cfam_read
+
+```
+
+static ssize_t cfam_read(struct file *filep, char __user *buf, size_t count,
+
+                     loff_t *offset)
+
+{
+
+       struct fsi_slave *slave = filep->private_data;
+
+       size_t total_len, read_len;
+
+       loff_t off = *offset;
+
+       ssize_t rc;
+
+ 
+
+       if (off < 0)
+
+              return -EINVAL;
+
+ 
+
+       if (off > 0xffffffff || count > 0xffffffff || off + count >
+0xffffffff)//[0]
+
+              return -EINVAL;
+
+ 
+
+       for (total_len = 0; total_len < count; total_len += read_len) {
+
+              __be32 data;
+
+ 
+
+              read_len = min_t(size_t, count, 4); //[1]
+
+              read_len -= off & 0x3;          //[2]
+
+ 
+
+              rc = fsi_slave_read(slave, off, &data, read_len);//[3]
+
+              if (rc)
+
+                     goto fail;
+
+              rc = copy_to_user(buf + total_len, &data, read_len);//[4]
+
+              ………
+
+       }
+
+       ……..
+
+       return count;
+
+}
+
+```
+
+In [0]: This line will check the parameters to prevent integer overflow, but
+it did not compare the size of count and offset, wo can pass count=2,
+offset=3 to this function.
+
+In [1]: read_len will be assigned a value of 2
+
+In [2]: read_len-=offset&3  => read_len-=3 => read_len=-1.
+
+In[3]/[4]: will OOB access
+
+ 
+
+Cfam_write :
+
+The reason for the vulnerability of cfam_write is the same as cfam_read.
+
+

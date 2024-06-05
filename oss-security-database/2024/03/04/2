@@ -1,0 +1,276 @@
+
+Date: Mon, 4 Mar 2024 16:43:09 +0100
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: dnf5daemon-server: Local root Exploit and Local Denial-of-Service in
+ dnf5 D-Bus Components (CVE-2024-1929, CVE-2024-1930)
+
+Hello list,
+
+please find below a report about a local root exploit and other issues
+in dnf5daemon-server. We also offer a rendered HTML version of the
+report on our blog [1].
+
+1) Introduction
+===============
+
+The dnf5daemon-server [2] component offers a collection of D-Bus
+interfaces to interact with the dnf5 package manager on the system. An
+openSUSE community packager wanted to add the additional D-Bus component to
+the openSUSE Tumbleweed distribution. New D-Bus system services require a
+review by the SUSE security team. In the course of this review I found the
+issues described in this report.
+
+The version of dnf5 I reviewed for this is 5.1.9 [3], and any source
+code references below are based on the corresponding version tag in the
+upstream Git repository.
+
+2) D-Bus Interface Design
+=========================
+
+The dnf5daemon-server offers a main interface "org.rpm.dnf.v0.SessionManager"
+on which clients can create a new session, which results in a new dynamically
+allocated D-Bus object being registered on the bus. This session object
+provides a set of additional D-Bus interfaces for modifying package manager
+configuration, for installing or removing packages or for inspecting metadata
+about packages and repositories on the system.
+
+The dnf5daemon-server is running as root and can be autostarted via the D-Bus
+system bus if it is not already running. Any other users with access to the
+D-Bus system bus may talk to it.
+
+For certain privileged operations the D-Bus service implements Polkit
+authentication. Only three operations are protected by Polkit:
+
+- `org.rpm.dnf.v0.rpm.RepoConf.write`
+- `org.rpm.dnf.v0.rpm.execute_transaction`
+- `org.rpm.dnf.v0.rpm.Repo.confirm_key`
+
+These relate to changing the repository configuration, executing transactions
+or importing new trusted signing keys. Transactions cover all kinds of changes
+introduced through the package manager.
+
+All of these operations require `auth_admin` privileges on Polkit level. The
+integration of the Polkit authorization logic is correct as far as I can tell.
+
+The per-session D-Bus interface provided by dnf5daemon-server is rather large
+and many calls take additional key/value maps to tune the behaviour of the
+package manager logic contained in libdnf5. In summary, the libdnf5 library is
+attached very closely to the D-Bus system bus via dnf5daemon-server.
+
+3) Local Root Exploit via Configuration Dictionary (CVE-2024-1929)
+==================================================================
+
+While the privileged operations mentioned above are correctly protected by
+Polkit, there are issues with the D-Bus interface long before Polkit is even
+invoked.
+
+The `org.rpm.dnf.v0.SessionManager.open_session` method takes a key/value map
+of configuration entries. A sub-entry in this map, placed under the "config"
+key, is another key/value map. The configuration values found in it will be
+forwarded as configuration overrides to the `libdnf5::Base` configuration. The
+spot where this happens is found in `session.cpp:63` [4].
+
+Practically all libdnf5 configuration aspects can be influenced here, as can be
+seen in the ConfigMain class in `config_main.hpp` [5].
+Already when opening the session via D-Bus, the libdnf5 will be initialized
+using these override configuration values. There is no sanity checking of the
+content of this "config" map, which is untrusted data.
+
+There are surely a lot of different ways to exploit this possibility to
+influence the libdnf5 configuration. The simplest approach to get full root
+privileges I found is to trick the library into loading a plug-in shared
+library under control of the unprivileged user.
+
+To do this, the "pluginpath" and "pluginconfpath" configuration entries need to
+be supplied and need to point to a user-controlled path. There the
+unprivileged user can place a configuration file that in turn points towards a
+user controlled shared library. The library will then `dlopen()` this user
+controlled shared library, which will lead to full code execution in the
+context of the root user.
+
+3.1) Proof of Concept
+---------------------
+
+The tarball attached to this email contains a proof of concept that I
+wrote, which shows this vulnerability in action. I successfully tested
+this exploit also on Fedora 39 using dnf5daemon-server version 5.1.10.
+The only precondition for this exploit is that the dnf5daemon-server
+package is installed on the system. Any local user, even `nobody`, can
+obtain root privileges this way.
+
+3.2) Bugfix
+-----------
+
+To fix this, I suggested to enforce a whitelist of configuration parameters
+that are allowed to be overridden. Only a very small subset of values should
+be allowed for unprivileged clients.
+
+In upstream commit e51bf2f0d [6] such a whitelist enforcement has been
+implemented for dnf5daemon-server.
+
+3.3) CVE Assignment
+-------------------
+
+Red Hat Product Security assigned CVE-2024-1929 for this issue.
+
+4) No Limit on Number of Open Sessions / Bad Session Close Behaviour (CVE-2024-1930)
+====================================================================================
+
+There is no limit on how many sessions D-Bus clients may create using the
+`open_session()` D-Bus method. In my tests I was able to quickly create about
+4,500 sessions and keep them open. For each session a thread is created in
+dnf5daemon-server. This spends a couple of hundred megabytes of memory in the
+process. Further connections will become impossible, likely because no more
+threads can be spawned by the D-Bus service.
+
+In some cases I even managed to cause the D-Bus service to `abort()` as a
+result of hitting resource limits. If the service continues running and the
+client disconnects, then the cleanup code found in
+`SessionManager::on_name_owner_changed()` runs for each session that has been
+created. Each Session holds a `ThreadsManager`, where the thread associated
+with each session originates from. It is a thread that is busy-waiting to join
+other threads, the code for this is found in `threads_manager.cpp:33`
+[7]. Since there is a sleep of one second in this thread's loop it takes
+about ~4,500 seconds for all the threads from the 4,500 sessions to be
+joined one by one. The service will be unreachable for more than an
+hour.
+
+4.1) Bugfix
+-----------
+
+To fix this, I suggested to limit the number of sessions for each unprivileged
+user in the system to a sensible value. Also the busy-wait loop in
+`ThreadsManager` seems ill-devised. Maybe using a condition variable to inform
+the cleanup thread of new work would be more efficient. Having a dedicated
+`ThreadsManager` and join-thread for each session seems a bit overkill, too.
+
+In upstream commit c090ffeb79 [8] the maximum number of sessions is
+limited to three sessions. The problematic thread joining behaviour has
+not been addressed as of now.
+
+4.2) CVE Assignment
+-------------------
+
+Red Hat Product Security assigned CVE-2024-1930 for this issue.
+
+5) Untrusted `locale` Setting for each Session
+==============================================
+
+Another part of the per-session setup is the use of an untrusted `locale`
+setting in `session.cpp:54` [9]. This string is passed
+to the C library's `newlocale()` function in `threads_manager.cpp:92`
+[10]. A danger here is that arbitrary user controlled files or symlinks
+could be processed by the C library, which could lead to various issues
+like information leaks, denial of service or even code execution. I
+looked into the GNU glibc implementation of `newlocale()`, and luckily
+it already implements a very careful locale lookup algorithm, that
+prevents that arbitrary paths are accessed if crafted `locale` strings
+are passed to it. This outcome might change if a different C library is
+used.
+
+Whether anything bad could happen, apart from file system issues, when exotic
+locales are selected for a thread running in dnf5daemon-server is another
+question that I did not investigate more closely.
+
+For hardening purposes I suggested that dnf5daemon-server performs a sanity
+check of the `locale` string to prevent a string that contains e.g. a slash
+character `/` from being used. I don't know of any upstream commits that
+address this yet, but upstream stated that they intend to work on this in the
+future.
+
+6) dnfdaemon-client Demands Full Root
+=====================================
+
+Although the D-Bus service implements Polkit for privileged operations, the
+dnf5daemon-client refuses to perform privileged operations for non-root users.
+For example:
+
+    user$ dnf5daemon-client distro-sync
+    This command has to be run with superuser privileges (under the root user on most systems).
+
+The code for this is found in various sub-command implementations:
+
+    $ grep -r 'throw UnprivilegedUserError' -C 1
+    dnf5daemon-client/commands/downgrade/downgrade.cpp-    if (!libdnf5::utils::am_i_root()) {
+    dnf5daemon-client/commands/downgrade/downgrade.cpp:        throw UnprivilegedUserError();
+    dnf5daemon-client/commands/downgrade/downgrade.cpp-    }
+    --
+    dnf5daemon-client/commands/distro-sync/distro-sync.cpp-    if (!libdnf5::utils::am_i_root()) {
+    dnf5daemon-client/commands/distro-sync/distro-sync.cpp:        throw UnprivilegedUserError();
+    dnf5daemon-client/commands/distro-sync/distro-sync.cpp-    }
+    --
+    dnf5daemon-client/commands/install/install.cpp-    if (!libdnf5::utils::am_i_root()) {
+    dnf5daemon-client/commands/install/install.cpp:        throw UnprivilegedUserError();
+    dnf5daemon-client/commands/install/install.cpp-    }
+    --
+    dnf5daemon-client/commands/remove/remove.cpp-    if (!libdnf5::utils::am_i_root()) {
+    dnf5daemon-client/commands/remove/remove.cpp:        throw UnprivilegedUserError();
+    dnf5daemon-client/commands/remove/remove.cpp-    }
+    --
+    dnf5daemon-client/commands/upgrade/upgrade.cpp-    if (!libdnf5::utils::am_i_root()) {
+    dnf5daemon-client/commands/upgrade/upgrade.cpp:        throw UnprivilegedUserError();
+    dnf5daemon-client/commands/upgrade/upgrade.cpp-    }
+    --
+    dnf5daemon-client/commands/reinstall/reinstall.cpp-    if (!libdnf5::utils::am_i_root()) {
+    dnf5daemon-client/commands/reinstall/reinstall.cpp:        throw UnprivilegedUserError();
+    dnf5daemon-client/commands/reinstall/reinstall.cpp-    }
+
+It doesn't make sense that the client forces users to run as root (and thereby
+increase the attack surface by running also the client code as root) when the
+service could authenticate the user via Polkit.
+
+I suggested to drop this root-check code in the client, and rely on the
+authentication logic in the service side code. If authentication fails, then
+the client code can still hint at the possibility to run the program as root.
+I am not aware on any upstream commits that address this yet, but upstream
+stated that they intend to work on this in the future.
+
+7) General Review Summary
+=========================
+
+In summary my impression is that the libdnf5 library is too closely connected
+to the D-Bus system bus. The library itself is unaware of the fact that it is
+running with partially untrusted input. The dnf5daemon-server code needs to
+carefully filter untrusted input before it is passed to the generic library
+code.
+
+8) Timeline
+===========
+
+2024-01-10: I reported the findings to secalert@...hat.com offering coordinated disclosure.
+2024-01-16: We received a reply that the issue would affect Fedora only and it was suggested that I create a bug in their Bugzilla for direct communication with the dnf5 developers.
+2024-01-18: I created a private Bugzilla bug [11] as suggested.
+2024-01-24: The bug did not receive any attention, so I asked Red Hat Product Security once more about the procedures going forward, as the offer for coordinated disclosure has not been accepted or denied yet.
+2024-01-25: We received a reply that bugfixes are being worked on, but they would likely need the full 90 days maximum embargo period for publishing updates.
+2024-02-26: From the openSUSE packager for dnf5 I learned that a bugfix [6] for issue 3) was already public. So I contacted Red Hat Product Security once more to learn about the publication status of the issues.
+2024-02-27: We received a reply with the two CVE assignments mentioned in this report and have been asked what our wishes are regarding a publication date.
+
+9) References
+=============
+
+[1]: https://security.opensuse.org/2024/03/04/dnf5daemon-server-local-root.html
+[2]: https://github.com/rpm-software-management/dnf5
+[3]: https://github.com/rpm-software-management/dnf5/releases/tag/5.1.9 
+[4]: https://github.com/rpm-software-management/dnf5/blob/5.1.9/dnf5daemon-server/session.cpp#L63
+[5]: https://github.com/rpm-software-management/dnf5/blob/5.1.9/include/libdnf5/conf/config_main.hpp
+[6]: https://github.com/rpm-software-management/dnf5/commit/6e51bf2f0d585ab661806076c1e428c6482ddf86
+[7]: https://github.com/rpm-software-management/dnf5/blob/5.1.9/dnf5daemon-server/threads_manager.cpp#L33
+[8]: https://github.com/rpm-software-management/dnf5/commit/c090ffeb79da57b88d51da6ee76f02f6512c7d91
+[9]: https://github.com/rpm-software-management/dnf5/blob/5.1.9/dnf5daemon-server/session.cpp#L54
+[10]: https://github.com/rpm-software-management/dnf5/blob/5.1.9/dnf5daemon-server/threads_manager.cpp#L92
+[11]: https://bugzilla.redhat.com/show_bug.cgi?id=2258969
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Security Engineer
+https://www.suse.com/security
+GPG Key ID: 0x14C405C971923553
+ 
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev, Andrew McDonald, Werner Knoblich
+
+Download attachment "dnf5daemon-server.tar.gz" of type "application/gzip" (2648 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

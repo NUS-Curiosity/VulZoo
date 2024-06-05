@@ -1,0 +1,160 @@
+
+Date: Thu, 27 Sep 2012 22:42:24 -0400
+From: George Argyros <argyros.george@...il.com>
+To: Solar Designer <solar@...nwall.com>
+Cc: oss-security@...ts.openwall.com, Aggelos Kiayias <aggelos@...yias.com>, 
+	Vladimir Vorontsov <vladimir.vorontsov@...ec.ru>, gifts <gifts.antichat@...il.com>, 
+	Anthony Ferrara <ircmaxell@...il.com>, Pierre Joye <pierre.php@...il.com>
+Subject: Re: Randomness Attacks Against PHP Applications
+
+Hi Alexander,
+
+On Sun, Sep 23, 2012 at 1:14 AM, Solar Designer <solar@...nwall.com> wrote:
+> George,
+>
+> I watched a video of your USENIX Security talk the other day (after I
+> was done with my experiments with mt_rand() seed cracking, though):
+>
+> http://www.youtube.com/watch?v=yE0qTTi-_iQ
+>
+> Thanks.  Shortly before that, I released a faster version of my PHP
+> mt_rand() seed cracker, now down to 1 minute worst case on CPU:
+>
+> http://www.openwall.com/lists/john-users/2012/09/20/2
+> http://download.openwall.net/pub/projects/php_mt_seed/
+>
+> $ time ./php_mt_seed 1328851649
+> Found 0, trying 637534208 - 671088639, speed 63310249 seeds per second
+> seed = 658126103
+> Found 1, trying 1207959552 - 1241513983, speed 63343447 seeds per second
+> seed = 1234567890
+> Found 2, trying 4261412864 - 4294967295, speed 63347894 seeds per second
+> Found 2
+>
+> real    1m7.798s
+> user    9m1.942s
+> sys     0m0.008s
+>
+> In one minute of real time (on an FX-8120 CPU, using vectorized fused
+> multiply-add instructions), it found the original seed, another seed
+> that also produces the same mt_rand() output, and it searched the rest
+> of the 32-bit seed space (not finding other matches in this case).
+>
+Very fast and cool! :-)
+
+> Gifts implemented the same thing in OpenCL:
+>
+> https://github.com/Gifts/pyphp_rand_ocl
+> https://github.com/Gifts/pyphp_rand_ocl/tree/SpeedyOCL
+>
+> His SpeedyOCL branch achieves similar performance (and even 10% better
+> than mine in his test of both on a Core i5-2500) on CPUs (with Intel's
+> OpenCL SDK) and several times better performance on GPUs.
+>
+> ...
+>
+> The way I'd approach this is by limiting the set of possible seeds based
+> on the first mt_rand() output (perhaps with a min-max range, so _many_
+> seeds will be potentially valid - could be millions, yet significantly
+> fewer than the full 4 billion set).  This can be accomplished almost as
+> quickly as cracking the seed based on an exact mt_rand() output (full
+> 31 bits of it, no min-max range) - that is, in one minute on CPU.  Then
+> slower, but more generic code may be used to filter out the impossible
+> seeds based on further mt_rand() outputs, until there's just one seed
+> value left.  The slowness of that second cracker would not matter much
+> because it'd only need to search a much smaller seed space.
+>
+> A limitation, though, is that the very first mt_rand() output after
+> seeding must be among those available, even if in truncated form.  If it
+> is not, then more of the state has to be maintained in the initial
+> cracking pass, thereby making it slightly slower.  When the first output
+> is (at least partially) available, we only need 3 state elements, so
+> they're kept in registers nicely.
+>
+This sounds like a good approach and it would probably be faster when
+even truncated outputs are available. The problem is that we
+encountered quite a few applications with a pattern of generating
+tokens like md5(mt_rand()), and in general we found all kinds of weird
+ways to generate tokens that a random developer came up with. In the
+md5 case you won't be able to get the output of mt_rand unless you
+bruteforce the md5 in the same fashion (which would still be faster
+using code like the one you wrote, than using our approach, however
+you will need to write some application specific code for cracking and
+thats what we wanted to avoid).
+
+Our goal was to provide a usable interface so that people will only
+have to deal with the application specific part of the attack, rather
+than getting the cracking done correctly. Nevertheless, I think that
+applications that leak an mt_rand output are common out there and in
+that case your cracker is a simpler and faster choice since it does
+not require the user to write any C code at all. For cases when more
+complex token generation algorithms are used I think that an approach
+that takes care of all the cracking like the one we used may be
+better. Also in case you use the option to generate some rainbow
+tables (which may take some time too, depending on the "hash" function
+used), the online search time will be a few seconds.
+Another option could be to combine these two approaches and further
+optimize the code that handles the cracking while also providing a
+basic optimized version of mt_rand like the one you wrote to use when
+writing other more complex "hash" functions.
+
+>> Just as PHP devs use
+>> session_start() to start a new PHP session there is a need for a
+>> generate_token() function that will return a random token and take
+>> care of providing the necessary level of security for this token.
+>
+> Perhaps, and this is in line with Anthony Ferrara's work on a new
+> password hashing API for PHP 5.5 (which will eventually obsolete phpass,
+> I guess).  Simpler interfaces that are easier to use correctly than not.
+>
+> However, a reason why many PHP app devs use mt_rand() and the like is
+> because they want to generate tokens of a certain format, such as to
+> meet a standard.  One such use is crypt() salts, which we're helping
+> eliminate with phpass and then with Anthony Ferrara's new API.  But I
+> guess other uses will remain.  So perhaps that generate_token() function
+> would need to accept arguments and return tokens of different target
+> formats accordingly.  Maybe it should have a format argument similar to
+> that of pack().  Its advantage over separate calls to a PRNG and then to
+> pack() on the PRNG's output would be that it'd keep the distribution
+> uniform.
+>
+By format in the case of these tokens you mean like user friendly
+strings for example?
+Many PHP developers attempt to make their tokens have some kind of
+format like that so it would be indeed nice if we could add it in this
+function.
+
+> It is curious how it is often overlooked that simple modulo division may
+> turn a uniform distribution into non-uniform.  Here's an illustration
+> (in case this is news to someone on oss-security):
+>
+> $ php -r 'for ($n = $i = 0; $i < 1000000; $i++) { $x = mt_rand(); $n += ($x < 0x40000000); } echo "$n\n";'
+> 499567
+> $ php -r 'for ($n = $i = 0; $i < 1000000; $i++) { $x = mt_rand(); $n += ($x < 0x40000000); } echo "$n\n";'
+> 500558
+>
+> $ php -r 'for ($n = $i = 0; $i < 1000000; $i++) { $x = mt_rand() % 500000000; $n += ($x < 250000000); } echo "$n\n";'
+> 535117
+> $ php -r 'for ($n = $i = 0; $i < 1000000; $i++) { $x = mt_rand() % 500000000; $n += ($x < 250000000); } echo "$n\n";'
+> 534124
+>
+> First two runs show uniform distribution of mt_rand() outputs themselves
+> (assuming the 0 to 0x7fffffff range).  The other two runs show
+> non-uniform distribution over the 0 to 500 million minus 1 range,
+> after the modulo division by 500 million.  (Values lower than half the
+> maximum suddenly became more common than higher values.  It was 50/50
+> before the modulo division, but became 53.5/46.5 afterwards.  The reason
+> is obvious: the original space is not divisible into a whole number of
+> 500 million sub-spaces.)
+>
+> This is why having separate functions that return a random number and
+> those that process it to the desired format might not be good enough.
+> A single function that does both jobs at once (avoiding the above
+> problem by using a smarter approach) could work better.
+>
+This is a nice point, and something that I have also seen many
+developers get wrong when I talk with them about these things. It is
+also a very basic and simple argument on why developers should never
+handle any cryptographic primitives by themselves...
+
+George

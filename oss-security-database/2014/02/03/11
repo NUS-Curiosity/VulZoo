@@ -1,0 +1,126 @@
+
+Date: Mon, 3 Feb 2014 09:12:16 +0000 (UTC)
+From: mancha <mancha1@...h.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: Linux 3.4+: arbitrary write with CONFIG_X86_X32 (CVE-2014-0038)
+
+mancha <mancha1@...> writes:
+> 
+> On Mon, 03 Feb 2014 03:45:27 +0000 "Solar Designer" wrote:
+> 
+> >Rather than post via Gmane's NNTP gateway, can you please reply
+> >to this message with the files MIME-attached, or include the files
+> >in message body with some sort of delimiters (e.g. Phrack-style)?
+> >
+> >Thanks,
+> >
+> >Alexander
+> 
+> Hushmail screws up replies so this will likely not show up in the
+> right hierarchy. Nonetheless, files promised attached.
+> 
+> --mancha
+> Attachment (Makefile): application/octet-stream, 224 bytes
+> Attachment (nox32recvmmsg.c): application/octet-stream, 2287 bytes
+
+I made a change to the kernel module to minimize the amount of time
+things are rw. Please use this version (not the one attached in my
+first post).
+
+New version also uploaded to:
+http://sf.net/projects/mancha/file/sec/nox32recvmmsg.tar.bz2.
+
+--mancha
+
+========= nox32recvmmsg.c =========
+#define _GNU_SOURCE
+#include <linux/init.h>
+#include <linux/socket.h>
+#include <linux/module.h>
+#include <linux/kernel.h> 
+#include <linux/errno.h> 
+#include <linux/types.h>
+#include <linux/unistd.h>
+#include <asm/cacheflush.h>  
+#include <asm/page.h>  
+#include <asm/current.h>
+#include <linux/sched.h>
+#include <linux/kallsyms.h>
+#include <linux/syscalls.h>
+#include <asm/string.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("mancha <mancha1@...h.com>");
+MODULE_DESCRIPTION("disable x32 recvmmsg()");
+
+unsigned long **syscall_table;
+
+#define __NR_x32_recvmmsg 537
+
+asmlinkage int (*orig_recvmmsg)(int sockfd, struct mmsghdr *msgvec, unsigned
+int vlen, unsigned int flags, struct timespec *timeout);
+
+static unsigned long **aquire_syscall_table(void)
+{
+  unsigned long int offset = PAGE_OFFSET;
+  unsigned long **sct;
+
+  while (offset < ULLONG_MAX) {
+    sct = (unsigned long **)offset;
+    if (sct[__NR_close] == (unsigned long *) sys_close) 
+      return sct;
+    offset += sizeof(void *);
+  }
+  printk(KERN_ALERT "Unable to get syscall table\n");
+  return NULL;
+}
+
+void set_addr_rw(long unsigned int _addr)
+{
+    unsigned int level;
+    pte_t *pte = lookup_address(_addr, &level);
+    if (pte->pte &~ _PAGE_RW) pte->pte |= _PAGE_RW;
+}
+
+void set_addr_ro(long unsigned int _addr)
+{
+    unsigned int level;
+    pte_t *pte = lookup_address(_addr, &level);
+    pte->pte = pte->pte &~_PAGE_RW;
+}
+
+asmlinkage int norecvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int
+vlen, unsigned int flags, struct timespec *timeout) {
+
+    printk(KERN_ALERT "x32 recvmmsg call intercepted\n");
+    return -1;
+}
+
+static int __init init_recvmmsg(void) {
+
+    if(!(syscall_table = aquire_syscall_table())) {
+      printk(KERN_INFO "Unable to acquire syscall table\n");
+      return -1;
+    }
+    printk(KERN_ALERT "x32 recvmmsg disabled\n");
+    set_addr_rw((unsigned long)syscall_table);
+    orig_recvmmsg = (void*)syscall_table[__NR_x32_recvmmsg];
+    syscall_table[__NR_x32_recvmmsg] = (unsigned long*)norecvmmsg;  
+    set_addr_ro((unsigned long)syscall_table);
+    return 0;
+}
+
+static void __exit exit_recvmmsg(void) {
+
+    set_addr_rw((unsigned long)syscall_table);
+    syscall_table[__NR_x32_recvmmsg] = (unsigned long*)orig_recvmmsg;  
+    set_addr_ro((unsigned long)syscall_table);
+    printk(KERN_ALERT "x32 recvmmsg restored\n");
+}
+
+module_init(init_recvmmsg);
+module_exit(exit_recvmmsg);
+===================================
+
+
+

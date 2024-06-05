@@ -1,0 +1,165 @@
+
+Date: Mon, 16 Jul 2018 15:10:41 +0800
+From: Ruikai Liu <lrk700@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Integer underflow/overflow in MP4v2 2.0.0
+
+Hi,
+
+Integer underflow and overflow are found in MP4v2 2.0.0, a legacy library
+dealing with MP4 media file.
+
+========= Underflow =========
+
+Atom is the basic element of MP4. However there's an integer underflow when
+parsing an atom(src/mp4atom.cpp):
+
+ 121     uint64_t dataSize = file.ReadUInt32();
+ ...
+ 146     dataSize -= hdrSize;
+ ...
+ 151     if (pos + hdrSize + dataSize > pParentAtom->GetEnd()) {
+ ...
+ 164         // skip to end of atom
+ 165         dataSize = pParentAtom->GetEnd() - pos - hdrSize;
+ 166     }
+
+If `dataSize` read from file is less than `hdrSize`, then underflow happens
+and it becomes a very large unsigned integer at line 146. Yet the check at
+line 151 would still be passed, which results in an corrupted atom with
+extremely large size.
+
+========= Overflow =========
+
+`ftyp` is an atom that describes the version info of the MP4 file. It will
+allocate memory for compatible brands according to the atom's size:
+
+ 54 void MP4FtypAtom::Read()
+ 55 {
+ 56     compatibleBrands.SetCount( (m_size - 8) / 4 ); // brands array
+fills rest of atom
+ 57     MP4Atom::Read();
+ 58 }
+
+ 342 void MP4StringProperty::SetCount(uint32_t count)
+ 343 {
+ 344     uint32_t oldCount = m_values.Size();
+ 345
+ 346     m_values.Resize(count);
+ 347
+ 348     for (uint32_t i = oldCount; i < count; i++) {
+ 349         m_values[i] = NULL;
+ 350     }
+ 351 }
+
+`Resize` here is a wrapper of `realloc`:
+
+102         void Resize(MP4ArrayIndex newSize) { \
+103             m_numElements = newSize; \
+104             m_maxNumElements = newSize; \
+105             m_elements = (type*)MP4Realloc(m_elements, \
+106                 m_maxNumElements * sizeof(type)); \
+107         } \
+
+We notice that an integer overflow could happen when calculating
+`m_maxNumElements * sizeof(type)`. So the allocation may return a buffer
+smaller than needed, and later operations on the buffer could result in
+invalid memory reference, like setting values to be NULL in
+`MP4StringProperty::SetCount`. This is the case for 64-bits program which
+allows memory allocation for large(~4GB) size.
+
+Things are a little different for 32-bits. In this case `realloc` would
+fail and throws an exception:
+
+ 74 inline void* MP4Realloc(void* p, uint32_t newSize) {
+ 75     // workaround library bug
+ 76     if (p == NULL && newSize == 0) {
+ 77         return NULL;
+ 78     }
+ 79
+ 80     void* temp = realloc(p, newSize);
+ 81     if (temp == NULL && newSize > 0) {
+ 82         throw new PlatformException("malloc
+failed",errno,__FILE__,__LINE__,__FUNCTION__);
+ 83     }
+ 84     return temp;
+ 85 }
+
+And the destructor the `MP4StringProperty` would be invoked:
+
+ 334 MP4StringProperty::~MP4StringProperty()
+ 335 {
+ 336     uint32_t count = GetCount();
+ 337     for (uint32_t i = 0; i < count; i++) {
+ 338         MP4Free(m_values[i]);
+ 339     }
+ 340 }
+
+But the count here is still the extremly large number we set before, and
+the for-loop would certainly have some invalid addresses been freed.
+
+========= POC =========
+
+Here's a very simple POC file:
+
+root@...ian:~# hexdump -Cv c2.mp4
+00000000  00 00 00 07 66 74 79 70  6d 70 34 32 41 41 41 41
+|....ftypmp42AAAA|
+00000010  41 41 41 41 41 41 41 41                           |AAAAAAAA|
+00000018
+
+The size of the `ftyp` box is 7(the first 4 bytes), which is smalller than
+the header size(8 bytes). Therefore the `dataSize` for this atom would
+become -1=0xffffffffffffffff.
+
+This POC file crashes both 32-bits and 64-bits mp4info.
+
+========= Fix =========
+
+For the underflow, we could check if `dataSize >= hdrSize` satisfies:
+
+--- src/mp4atom.cpp     2018-07-16 14:54:33.513635593 +0800
++++ ../mp4v2-2.0.0-orig/src/mp4atom.cpp     2012-05-21 06:11:53.000000000
++0800
+@@ -143,9 +143,6 @@
+         dataSize = file.GetSize() - pos;
+     }
+
+-    if(dataSize < hdrSize) {
+-        throw new Exception( "invalid dataSize", __FILE__, __LINE__,
+__FUNCTION__ );
+-    }
+     dataSize -= hdrSize;
+
+     log.verbose1f("\"%s\": type = \"%s\" data-size = %" PRIu64 " (0x%"
+PRIx64 ") hdr %u",
+
+
+For the overflow, we could check the result of the integer multiplication:
+
+--- src/mp4array.h      2018-07-16 15:00:51.333620723 +0800
++++ ../mp4v2-2.0.0-orig-/src/mp4array.h      2012-05-21 06:11:53.000000000
++0800
+@@ -102,11 +102,8 @@
+         void Resize(MP4ArrayIndex newSize) { \
+             m_numElements = newSize; \
+             m_maxNumElements = newSize; \
+-            uint32_t mul = newSize * sizeof(type); \
+-            if(mul / newSize != sizeof(type)) \
+-                throw new Exception("multiplication overflow", __FILE__,
+__LINE__, __FUNCTION__);\
+             m_elements = (type*)MP4Realloc(m_elements, \
+-                mul); \
++                m_maxNumElements * sizeof(type)); \
+         } \
+
+
+========= Reference =========
+
+https://code.google.com/archive/p/mp4v2/
+
+-- 
+Best regards,
+
+Ruikai Liu
+

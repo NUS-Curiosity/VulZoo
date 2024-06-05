@@ -1,0 +1,167 @@
+
+Date: Thu, 5 Oct 2023 10:04:53 +0200
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: Cadence: Fixed /tmp path issues; no longer maintained by upstream
+ (CVE-2023-43782, CVE-2023-43783)
+
+Hello list,
+
+this is a report about two fixed temporary file path issues in the Cadence [1]
+tools for audio production. There are no upstream fixes available since the
+upstream author considers this project as deprecated and mostly no longer
+necessary. The GitHub project has consequently been archived as a response to
+my report of these security issues.
+
+Cadence is still packaged on a number of Linux distributions though (e.g.
+Gentoo, openSUSE, Fedora, Arch). Our openSUSE Cadence package maintainer
+informed me that there still exist some use cases for which there is no proper
+replacement for Cadence yet, when using the Jack audio system [2].
+
+This detailed report and the CVE assignments are mostly intended to make the
+community aware that there are issues in Cadence and that it is no longer
+maintained, thus it should be moved away from. For short term fixes I have
+attached two patches that address the two issues outlined in this report.
+
+1) CVE-2023-43782: Use of Fixed Temporary File Path in /tmp/.cadence-aloop-daemon.x
+===================================================================================
+
+This temporary file is used in `cadence.py` and `cadence_aloop_daemon.py`. It
+is used to control the starting and stopping of the aloop daemon.
+
+- in cadence.py only the `stat()` and `unlink()` system calls are used on this
+  path. Symlink attacks should not be possible.
+- in `cadence_aloop_daemon.py` `mknod()` is used to create this file. This
+  system call is pretty safe against following symlinks as well.
+- the content of the file is not evaluated by any of the scripts.
+
+In `cadence_aloop_daemon.py` the use of the file is as follows:
+
+```
+    checkFile = "/tmp/.cadence-aloop-daemon.x"
+    
+    [...]
+    
+    # Create check file
+    if not os.path.exists(checkFile):
+        os.mknod(checkFile)
+    
+    [...]
+    
+    while doLoop and os.path.exists(checkFile):
+        [...]
+        sleep(1)
+    
+    [...]
+    if os.path.exists(checkFile):
+        os.remove(checkFile)
+```
+
+If the file already exists (created by another user in the system) then the
+file is used as is. This allows other users in the system to perform a
+denial-of-service against the aloop daemon, by pre-creating this file
+and removing it at an arbitrary time again, to make the daemon stop.
+
+2) CVE-2023-43783: Use of Fixed Temporary File Path in /tmp/cadence-wineasio.reg
+================================================================================
+
+This file is used if Wine is installed on the system and when the Wine ASIO
+related settings are changed and applied in the Cadence GUI dialog. In
+Cadence.py the following code deals with it:
+
+```
+    if "wineasio" in self.settings_changed_types:
+        REGFILE  = 'REGEDIT4\n'
+        REGFILE += '\n'
+        REGFILE += '[HKEY_CURRENT_USER\Software\Wine\WineASIO]\n'
+        REGFILE += '"Autostart server"=dword:0000000%i\n' % int(1 if self.cb_wineasio_autostart.isChecked() else 0)
+        REGFILE += '"Connect to hardware"=dword:0000000%i\n' % int(1 if self.cb_wineasio_hw.isChecked() else 0)
+        REGFILE += '"Fixed buffersize"=dword:0000000%i\n' % int(1 if self.cb_wineasio_fixed_bsize.isChecked() else 0)
+        REGFILE += '"Number of inputs"=dword:000000%s\n' % smartHex(self.sb_wineasio_ins.value(), 2)
+        REGFILE += '"Number of outputs"=dword:000000%s\n' % smartHex(self.sb_wineasio_outs.value(), 2)
+        REGFILE += '"Preferred buffersize"=dword:0000%s\n' % smartHex(int(self.cb_wineasio_bsizes.currentText()), 4)
+        
+        writeFile = open("/tmp/cadence-wineasio.reg", "w")
+        writeFile.write(REGFILE)
+        writeFile.close()
+        
+        os.system("regedit /tmp/cadence-wineasio.reg")
+```
+
+Without the Linux kernel's symlink protection (`fs.protected_symlinks` sysctl)
+this would allow other users to stage a symlink attack. Thus other users could
+point /tmp/cadence-wineasio.reg to a compromised file, or have the user
+running Cadence create this file in an arbitrary location.
+
+Without the Linux kernel's regular file protection (`fs.protected_regular`
+sysctl) this would allow other users to place an attacker controlled
+world-writable file in this location. By winning a race condition (waiting for
+Cadence to write its desired content and then quickly replacing the file's
+content again) the attacker can cause arbitrary data to be passed to
+`regedit`. Since the Wine registry controls ample application behaviour this
+can be considered a local arbitrary code execution.
+
+Luckily most modern Linux distributions have the kernel protections mentioned
+above enabled which means that the worst case will not happen. Even with these
+protection mechanisms the following problems remain:
+
+- Cadence can be prevented from saving Wine ASIO settings by pre-creating this
+  file.
+- The file is created world-readable by Cadence, thus the content of the file
+  can leak to other user contexts on the system. Luckily the data that is
+  written there is not sensitive at the moment.
+
+3) Affectedness and Patches
+===========================
+
+These two fixed tmp file paths have been around in Cadence since commits in
+2012, all upstream version tags since version 0.9.0 contain them.
+
+The attached patches are hotfixes based on version release 0.9.2 that I
+authored to allow distributors to fix these issues until ways are found to
+move away from Cadence.
+
+4) Timeline
+===========
+
+2023-08-04: I contacted the Cadence upstream author and reported the two
+            vulnerabilities, offering coordinated disclosure.
+            I quickly received a reply from the author stating that Cadence
+            should no longer be used and that he intends to archive the
+            project at some point.
+2023-08-07: I replied that the tmp file issues aren't hard to fix and a
+            maintenance-only release that also makes packagers aware of the
+            need to move away from Cadence would be helpful.
+2023-08-21: I received no more replies from the upstream author. Instead I
+            found the GitHub repository archived in the meantime. Therefore I
+            decided to provide custom patches for the openSUSE package.
+2023-09-06: I requested CVE IDs from Mitre for the issues. I also published
+            the information about the issues in our Bugzilla bug tracker.
+2023-10-04: It took a longer time for Mitre to assign the CVE IDs. With all
+            data available I published this report.
+
+5) References
+=============
+
+[1]: https://github.com/falkTX/Cadence.git
+[2]: https://bugzilla.suse.com/show_bug.cgi?id=1213983#c5
+
+Best Regards
+
+Matthias
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Security Engineer
+https://www.suse.com/security
+GPG Key ID: 0x14C405C971923553
+ 
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev, Andrew McDonald, Werner Knoblich
+
+View attachment "0001-cadence_aloop_daemon-place-lockfile-into-non-public-.patch" of type "text/plain" (3037 bytes)
+
+View attachment "0001-cadence.py-wine-ASIO-settings-use-safe-tempfile.patch" of type "text/plain" (1812 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

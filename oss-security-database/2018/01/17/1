@@ -1,0 +1,65 @@
+
+Date: Tue, 16 Jan 2018 23:03:20 -0500
+From: Michael Orlitzky <michael@...itzky.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2017-16933: Icinga2 root privilege escalation via init script and
+ systemd service
+
+Product: Icinga2 open source monitoring system
+Versions-affected: 2.8.0 and earlier (all current 2.x versions)
+Author: Michael Orlitzky
+Bug-report: https://github.com/Icinga/icinga2/issues/5793
+
+
+== Summary ==
+
+The icinga2 init script and systemd service file allow the unprivileged
+$ICINGA2_USER to gain root privileges by replacing the target of chown
+with a link.
+
+
+== Details ==
+
+The "chown" command follows both symlinks and hard links by default on
+a vanilla Linux kernel. It is therefore unsafe to call "chown" on a
+path that is not wholly controlled by root; if the target path can be
+replaced with a link by a non-root user, then that user can do so to
+gain root when "chown" is called.
+
+The "etc/initsystem/prepare-dirs" script that ships with icinga2 calls
+"chown" in that manner, leading to a root exploit for the $ICINGA2_USER.
+For example,
+
+  chown $ICINGA2_USER... $(dirname -- $ICINGA2_PID_FILE)
+  if [ -f $ICINGA2_PID_FILE ]; then
+    chown $ICINGA2_USER:$ICINGA2_GROUP $ICINGA2_PID_FILE
+  fi
+
+The first line gives away ownership of the directory containing the
+$ICINGA2_PID_FILE, and the next line calls chown on that file. The
+exploit is that, after the first line executes, the $ICINGA2_USER can
+simply replace $ICINGA2_PID_FILE with a link (sym or hard) to a
+root-owned file. The call to "chown" will then change ownership of the
+link's target. That is easily exploitable to gain root, by taking
+ownership of e.g. "/etc/passwd" or root's ".bashrc" file.
+
+The prepare-dirs script is used by both the SysV-style init script,
+
+  start() {
+    printf "Starting Icinga 2: "
+    @CMAKE_INSTALL_PREFIX@...b/icinga2/prepare-dirs $SYSCONFIGFILE
+    ...
+
+and the systemd service file,
+
+  ExecStartPre=.../prepare-dirs @ICINGA2_SYSCONFIGFILE@
+
+and so both are vulnerable to the problem in prepare-dirs.
+
+To exploit the "chown" calls the first time the service is started,
+you would need to take advantage of the race condition to create a
+link before the "-f" test is executed. However, there's a much easier
+scenario: if the service is started, stopped, and started again (even
+across reboots, for persistent directories), then the "-f" test will
+succeed, and call "chown" on a path that has been controlled by
+$ICINGA2_USER since the first time the service was started.

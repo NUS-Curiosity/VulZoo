@@ -1,0 +1,133 @@
+
+Date: Sat, 2 May 2015 15:53:30 +0300
+From: Solar Designer <solar@...nwall.com>
+To: Wen Xu <hotdog3645@...il.com>
+Cc: oss-security@...ts.openwall.com, Vasily Kulikov <segoon@...nwall.com>
+Subject: Re: CVE request for a fixed bug existed in all versions of linux kernel from KeenTeam
+
+Hi,
+
+I expect MITRE will assign a CVE ID.
+
+On Sat, May 02, 2015 at 06:31:12PM +0800, Wen Xu wrote:
+> Recently we found a use-after-free bug which can lead to kernel arbitrary
+> execution in Linux kernel.
+> The bug was reported to the linux security group and it has been fixed.(commit
+> a134f083e79f ("ipv4: Missing sk_nulls_node_init() in ping_unhash()"). You
+> can find the fix commit here:
+> https://github.com/torvalds/linux/commit/6c3c1eb3c35e8856d6dcb01b412316a676f58bbe
+
+More specifically:
+
+https://github.com/torvalds/linux/commit/a134f083e79fb4c3d0a925691e732c56911b4326
+
+> The bug exists in all versions of linux kernel.
+
+"All" as in "all upstream versions that contain the feature at all
+(3.0+), and likely some backports".  It appears the bug got introduced
+in Vasily's forward-porting of the functionality to newer 2.6.x kernels
+before it finally got merged in this thread:
+
+https://lkml.org/lkml/2011/5/13/382
+
+Vasily's patch against RHEL5 kernels that we still use in Owl looks
+unaffected.  It has:
+
++               write_lock_bh(&ping_table.lock);
++               sk_del_node_init(sk);
++               sock_put(sk);
+
+where sk_del_node_init() calls sk_node_init(), which does
+"node->pprev = NULL;"  I'd like Vasily to double-check this, though.
+
+> And the credit is to Wen Xu and wushi of KeenTeam.
+
+Cool!  How did you find this bug?  Did/do you actively search for more
+bugs with usage of these and similar kernel interfaces?  (I think
+someone should!)
+
+Do you have a reproducer (non-weaponized exploit) that you could post?
+
+Is my understanding correct that to trigger the bug you need direct
+access to a ping socket, not indirect via the ping utility (if that is
+enabled at all)?  By default, access to ping sockets is disabled:
+
+	/*
+	 * Sane defaults - nobody may create ping sockets.
+	 * Boot scripts should set this to distro-specific group.
+	 */
+	net->ipv4.ping_group_range.range[0] = make_kgid(&init_user_ns, 1);
+	net->ipv4.ping_group_range.range[1] = make_kgid(&init_user_ns, 0);
+
+and distros are supposed to enable it selectively - e.g., on Owl we
+enable it for group _icmp only:
+
+_icmp:x:111:
+
+# Range of group IDs permitted to access non-raw (datagram) ICMP sockets.
+#
+# These are an Openwall extension to the Linux kernel.  Our ping(1) program is
+# able to use these sockets, which enables it to start and run without
+# requiring root privileges nor a capability.  Access to these sockets is
+# restricted at all primarily in order to reduce direct exposure of the added
+# kernel code to potential attacks.  In other words, we gain privilege
+# separation due to keeping this access restricted and installing ping(1) SGID.
+#
+net.ipv4.ping_group_range = 111 111
+
+and install ping as:
+
+-rwx--s--x 1 root _icmp 34336 Aug 14  2012 /bin/ping
+
+So there's a layer of privsep here.
+
+I'd like us to learn something useful from this.  Maybe it's "don't add
+more code to the kernel, even if it's for security" - but we knew that,
+and this is why there's the layer of privsep mentioned above (to make
+things no worse than before even in presence of bugs in the new code).
+
+Are there distros that enable access to ping sockets for all users by
+default?
+
+Then, perhaps we should harden the poison pointers to be either below
+typical mmap_min_addr or in an unmapped portion of kernel space?  Do I
+understand correctly that, short of possible mmap_min_addr bypasses in
+general (if relevant), this would mitigate the issue?
+
+Right now, they are:
+
+/*
+ * These are non-NULL pointers that will result in page faults
+ * under normal circumstances, used to verify that nobody uses
+ * non-initialized list entries.
+ */
+#define LIST_POISON1  ((void *) 0x00100100 + POISON_POINTER_DELTA)
+#define LIST_POISON2  ((void *) 0x00200200 + POISON_POINTER_DELTA)
+
+I'd change them to e.g.:
+
+#define LIST_POISON1  ((void *) 0x00000100 + POISON_POINTER_DELTA)
+#define LIST_POISON2  ((void *) 0x00000200 + POISON_POINTER_DELTA)
+
+where POISON_POINTER_DELTA would normally be 0 on 32-bit x86, so they'd
+be below mmap_min_addr on that arch.  Meanwhile, a mitigation appears to
+be to set mmap_min_addr higher than 0x00200200 (slightly over 2 MB), but
+that's not great as it leaves significantly less ASCII-armored space for
+libraries.
+
+BTW, it appears that on x86_64 POISON_POINTER_DELTA is
+0xdead000000000000 by default, which I guess would hit an unmapped page
+even with the current LIST_POISON2 value?  If so, is the bug at worst a
+kernel Oops on x86_64 unless someone changed POISON_POINTER_DELTA in
+their build?
+
+config ILLEGAL_POINTER_VALUE
+	hex
+	default 0 if X86_32
+	default 0xdead000000000000 if X86_64
+
+Regardless, as a supporter of that kernel patch, I am embarrassed!
+
+Thanks,
+
+Alexander

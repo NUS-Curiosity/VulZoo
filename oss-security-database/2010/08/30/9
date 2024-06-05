@@ -1,0 +1,88 @@
+
+Date: Mon, 30 Aug 2010 18:08:47 -0400
+From: Brad Spengler <spender@...ecurity.net>
+To: Solar Designer <solar@...nwall.com>
+Cc: Roland McGrath <roland@...hat.com>, Kees Cook <kees.cook@...onical.com>,
+	linux-kernel@...r.kernel.org, oss-security@...ts.openwall.com,
+	Al Viro <viro@...iv.linux.org.uk>,
+	Andrew Morton <akpm@...ux-foundation.org>,
+	Oleg Nesterov <oleg@...hat.com>,
+	KOSAKI Motohiro <kosaki.motohiro@...fujitsu.com>,
+	Neil Horman <nhorman@...driver.com>, linux-fsdevel@...r.kernel.org,
+	pageexec@...email.hu
+Subject: Re: [PATCH] exec argument expansion can inappropriately trigger
+	OOM-killer
+
+Hi guys,
+
+I see you're having fun with my code ;)  Just wanted to remind you that 
+I do exist; I reported this in December 2009 to Ted Tso and again 
+recently (forwarded the same email from 2009) to Kees Cook and James 
+Morris.  So even though nobody's actually emailed me about the issue(s), 
+I am available to answer any questions.  Just CC me on the email as I'm 
+not subscribed to the list.
+
+Anyway, I did actually research the bug(s) involved quite a bit around 
+the time I reported it, so hopefully some of the below will help.
+
+The bug seems to have been introduced in 2.6.23, see:
+http://thread.gmane.org/gmane.linux.ports.hppa/752
+http://www.spinics.net/lists/linux-arch/msg01584.html
+http://www.mail-archive.com/linux-kernel@vger.kernel.org/msg170491.html
+though I'm guessing the functionality was also backported to major 
+distros
+
+The check using the current stack limit as a byte value (including when 
+it's RLIMIT_INFINITY) by dividing it by 4 is completely broken for a 
+number of reasons:
+1/4th of a 64bit ~0 is several times larger than the size of addressable 
+userland address space on most 64bit architectures (amd64 is 47 bits)
+1/4th of a 64bit ~0 is way bigger than any 32bit value
+No other place in the kernel treats a limit in this way
+With a high rlimit and high usage, the code doesn't do what it intends 
+to do -- be able to return a meaningful error message to execve, instead 
+of having the process doing the execve terminated with a SIGKILL in 
+later stages of ELF loading.
+
+Combined with the fact that the max arg size * max number of args 
+(~256TB) is also again larger than the 32bit address space and the 
+amd64 userland address space (as well as the address space of several other 
+64bit architectures), lots of problems appear.  This was exacerbated by 
+the behavior that, until recently fixed, allowed the stack to grow over 
+any other existing mappings.  Combine this with ASLR and shifting that 
+whole stack range down a random amount via shift_arg_pages/adjust_vma 
+which skips many of the sanity checks that exist elsewhere, and even 
+more problems appear (I think this latter problem may make it possible 
+to still trigger the BUG_ON() on patched kernels if a static binary is 
+used and ASLR shifts the stack over the binary).
+
+From my research, it's not possible to successfully execute a binary 
+such that mmap_min_addr with normal values can be bypassed by the stack 
+shifting trick.  I was able to determine the exact number+sizes of 
+arguments to use for ASLR to have a chance to shift the stack down to 0 
+(any more and we would trigger that BUG_ON()).  Though this was 
+successful, after this point in the ELF loader, additional data is set 
+up on the stack, proportional to the number of arguments passed.  It's 
+impossible for this additional setup to consume less than a page, so it 
+triggers a stack expansion which then gets checked against the normal 
+mmap_min_addr checks.  What actually ends up happening on this 
+second-stage setup is the binary gets killed with SIGKILL by the ELF 
+loader.
+
+The fix to the OOM killer looks correct, but the other problem (causing 
+extreme interactivity hits with almost no effort in userland) needs some 
+more thought, especially since it appears no distro is shipping with 
+hard limits on the stack.
+
+If the  "/ 4" check is to be preserved, it needs to take into account 
+the personality of the target binary: this way, the exec'ing task should 
+always get a proper error back instead of being terminated by the 
+kernel.
+
+There shouldn't be any additional risk from adding the extra rescheds, 
+as copy_*_user can already sleep and be raced against via a number of 
+methods.
+
+-Brad
+
+Download attachment "signature.asc" of type "application/pgp-signature" (198 bytes)

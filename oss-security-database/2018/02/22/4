@@ -1,0 +1,266 @@
+
+Date: Thu, 22 Feb 2018 19:29:26 +0100
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: Dietmar Maurer <dietmar@...xmox.com>
+Subject: review of LibVNCServer/vncterm proxmox/vncterm proxmox/spiceterm xenserver/vncterm qemu/ui/console.c
+
+Hi,
+
+Well, this is not a proper review.  Rather, I just took a quick look at
+more of these today.
+
+Turns out there are at least 3 (sub-)projects named vncterm, and
+apparently they aren't even forks of each other: there's a vncterm that
+used to be part of LibVNCServer and is now maintained in a nearby repo,
+another vncterm in xenserver derived from QEMU's ui/console.c, and yet
+another one in proxmox.  There's also spiceterm in proxmox, which
+duplicates code from their vncterm (or vice versa).
+
+I already pointed out one issue with LibVNCServer's vncterm in here a
+few days ago:
+
+http://www.openwall.com/lists/oss-security/2018/02/18/2
+
+and I also opened a GitHub issue with them suggesting that they
+"Document that the code is unsafe for future extension":
+
+https://github.com/LibVNC/vncterm/issues/7
+
+To me, the code only appears to dodge other issues because of its
+presently limited functionality - more limited than that of the
+alternatives that the rest of this message is about.
+
+proxmox/vncterm and proxmox/spiceterm look the worst to me.  One issue
+is that vncterm_putchar() case ESgetpars appears to be willing to
+increase vt->esc_count indefinitely, and that's a signed int variable,
+which (despite of this being UB in C) may eventually (e.g., after two
+gigabytes of semicolons?) wraparound to negative and then pass one of
+the many "vt->esc_count < MAX_ESC_PARAMS" checks present throughout the
+code, resulting in an out-of-bounds write or/and read relative to the
+vt->esc_buf[] array:
+
+  case ESgetpars:
+    if (ch >= '0' && ch <= '9') {
+      vt->esc_has_par = 1;
+      if (vt->esc_count < MAX_ESC_PARAMS) {
+        vt->esc_buf[vt->esc_count] = vt->esc_buf[vt->esc_count] * 10 + ch - '0';
+      }
+      break;
+    } else if (ch == ';') {
+      vt->esc_count++;
+      break;
+    } else {
+      if (vt->esc_has_par) {
+        vt->esc_count++;
+      }
+      vt->tty_state = ESgotpars;
+    }
+
+Notice that the "vt->esc_count < MAX_ESC_PARAMS" check here does not
+prevent the two instances of "vt->esc_count++;" from being reached.
+
+The relevant excerpts from vncterm.h are:
+
+#define MAX_ESC_PARAMS 16
+
+  int esc_buf[MAX_ESC_PARAMS];
+  int esc_count;
+
+If you'd like to track this unconfirmed issue (I only skimmed the code -
+I didn't try to trigger the issue), please use OVE-20180222-0001.
+
+Also seen above is the lack of sanity limits on the values that
+vt->esc_buf[] elements can get.  (The math above can also overflow,
+formally speaking triggering UB.)  A consequence of this is that they
+can become negative, too.  Then some cursor movement commands assume
+that the values are non-negative nor can overflow the math, e.g.:
+
+    case 'A':
+      /* move cursor up */
+      if (vt->esc_buf[0] == 0) {
+        vt->esc_buf[0] = 1;
+      }
+      vt->cy -= vt->esc_buf[0];
+      if (vt->cy < 0) {
+        vt->cy = 0;
+      }
+      break;
+    case 'B':
+    case 'e':
+      /* move cursor down */
+      if (vt->esc_buf[0] == 0) {
+        vt->esc_buf[0] = 1;
+      }
+      vt->cy += vt->esc_buf[0];
+      if (vt->cy >= vt->height) {
+        vt->cy = vt->height - 1;
+      }
+      break;
+    case 'C':
+    case 'a':
+      /* move cursor right */
+      if (vt->esc_buf[0] == 0) {
+        vt->esc_buf[0] = 1;
+      }
+      vt->cx += vt->esc_buf[0];
+      if (vt->cx >= vt->width) {
+        vt->cx = vt->width - 1;
+      }
+      break;
+    case 'D':
+      /* move cursor left */
+      if (vt->esc_buf[0] == 0) {
+        vt->esc_buf[0] = 1;
+      }
+      vt->cx -= vt->esc_buf[0];
+      if (vt->cx < 0) {
+        vt->cx = 0;
+      }
+      break;
+
+Notice how these only perform sanity checks in the expected direction of
+the cursor movement, but not in the opposite direction (which can occur
+with a negative value in vt->esc_buf[0], or with a value large enough to
+cause integer wraparound right here).  This unconfirmed issue is
+OVE-20180222-0002.
+
+There might or might not be more problematic commands like this.
+However, some look OK, e.g.:
+
+    case 'G':
+    case '`':
+      /* move cursor to column */
+      vncterm_gotoxy (vt, vt->esc_buf[0] - 1, vt->cy);
+      break;
+    case 'd':
+      /* move cursor to row */
+      vncterm_gotoxy (vt, vt->cx , vt->esc_buf[0] - 1);
+      break;
+    case 'f':
+    case 'H':
+      /* move cursor to row, column */
+      vncterm_gotoxy (vt, vt->esc_buf[1] - 1,  vt->esc_buf[0] - 1);
+      break;
+
+where vncterm_gotoxy() performs all the necessary sanity checks.
+
+There are also many places that are difficult to review.  At first, this
+looked like it'd overflow vt->esc_buf[] over multiple invocations:
+
+  case ESpalette:
+    if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F')
+        || (ch >= 'a' && ch <= 'f')) {
+      vt->esc_buf[vt->esc_count++] = (ch > '9' ? (ch & 0xDF) - 'A' + 10 : ch - '0');
+      if (vt->esc_count == 7) {
+        // fixme: this does not work - please test
+        rfbColourMap *cmap =&vt->screen->colourMap;
+
+        int i = color_table[vt->esc_buf[0]] * 3, j = 1;
+        cmap->data.bytes[i] = 16 * vt->esc_buf[j++];
+        cmap->data.bytes[i++] += vt->esc_buf[j++];
+        cmap->data.bytes[i] = 16 * vt->esc_buf[j++];
+        cmap->data.bytes[i++] += vt->esc_buf[j++];
+        cmap->data.bytes[i] = 16 * vt->esc_buf[j++];
+        cmap->data.bytes[i] += vt->esc_buf[j];
+
+        //set_palette(vc); ?
+
+        vt->tty_state = ESnormal;
+      }
+    } else
+       vt->tty_state = ESnormal;
+    break;
+
+However, upon a closer look "vt->tty_state = ESnormal;" prevents this
+code from being reached again without having vt->esc_count reset to 0 as
+the only place setting vt->tty_state to ESpalette is:
+
+  case ESnonstd: /* Operating System Controls */
+    vt->tty_state = ESnormal;
+
+    switch (ch) {
+    case 'P':   /* palette escape sequence */
+      for(i = 0; i < MAX_ESC_PARAMS; i++) {
+        vt->esc_buf[i] = 0;
+      }
+
+      vt->esc_count = 0;
+      vt->tty_state = ESpalette;
+      break;
+
+so in the end this looks OK to me.  It's just I would have preferred an
+explicit range check or resetting of vt->esc_count right in or after the
+ESpalette code.
+
+Perhaps there are more issues than those I noticed.  The numbered issues
+above are both also present in proxmox/spiceterm/spiceterm.[ch].  (Same
+OVE IDs apply.)
+
+xenserver/vncterm looks the best to me.  Apparently, it's been hardened
+over time relative to the QEMU-derived original.  For example, it does:
+
+static int handle_params(TextConsole *s, int ch)
+{
+    int i;
+
+    dprintf("putchar csi %02x '%c'\n", ch, ch > 0x1f ? ch : ' ');
+    if (ch >= '0' && ch <= '9') {
+        if (s->nb_esc_params < MAX_ESC_PARAMS && (s->esc_params[s->nb_esc_params] < 10000)) {
+            s->esc_params[s->nb_esc_params] =
+                s->esc_params[s->nb_esc_params] * 10 + ch - '0';
+        }
+        s->has_esc_param = 1;
+        return 0;
+    } else {
+        if (s->has_esc_param && s->nb_esc_params < MAX_ESC_PARAMS)
+            s->nb_esc_params++;
+        s->has_esc_param = 0;
+        if (ch == '?') {
+            s->has_qmark = 1;
+            return 0;
+        }
+        if (ch == ';')
+            return 0;
+
+Notice that s->nb_esc_params is never increased to/beyond
+MAX_ESC_PARAMS, and s->esc_params[] values are limited to at most ~100k.
+
+The cursor movement commands use set_cursor(), which invokes clip_xy(),
+which in turn performs all the needed range checks.
+
+QEMU's ui/console.c looks OK'ish, but not nearly as hardened:
+
+    case TTY_STATE_CSI: /* handle escape sequence parameters */
+        if (ch >= '0' && ch <= '9') {
+            if (s->nb_esc_params < MAX_ESC_PARAMS) {
+                int *param = &s->esc_params[s->nb_esc_params];
+                int digit = (ch - '0');
+
+                *param = (*param <= (INT_MAX - digit) / 10) ?
+                         *param * 10 + digit : INT_MAX;
+            }
+        } else {
+            if (s->nb_esc_params < MAX_ESC_PARAMS)
+                s->nb_esc_params++;
+            if (ch == ';' || ch == '?') {
+                break;
+            }
+
+s->nb_esc_params is also never increased to/beyond MAX_ESC_PARAMS, and
+integer overflow of s->esc_params[] values right here is prevented, but
+they are not sanity-limited.  This allows for integer overflows
+(normally benign, albeit formally UB) e.g. in:
+
+            case 'B':
+                /* move cursor down */
+                if (s->esc_params[0] == 0) {
+                    s->esc_params[0] = 1;
+                }
+                set_cursor(s, s->x, s->y + s->esc_params[0]);
+                break;
+
+but then set_cursor()'s range checks prevent any out-of-bounds values
+from staying in s->x and s->y.
+
+Alexander

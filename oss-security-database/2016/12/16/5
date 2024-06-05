@@ -1,0 +1,208 @@
+
+Date: Fri, 16 Dec 2016 19:01:54 +0100
+From: Florent Rougon <f.rougon@...e.fr>
+To: oss-security@...ts.openwall.com
+Subject: Re: CVE Request: FlightGear: Allows the route manager to overwrite arbitrary files
+
+[ This is in reply to Salvatore Bonaccorso's mail from Wed, 14 Dec 2016
+  16:57:11 +0100, i.e.
+  <http://www.openwall.com/lists/oss-security/2016/12/14/11>,
+  unfortunately I don't have its Message-ID to reply in the same thread
+  (just subscribed a few hours ago). ]
+
+Hello,
+
+As already written in private to Salvatore and maintainers of a few
+distributions, it is quite unclear to me how to achieve arbitrary code
+execution using this vulnerability. The reason I'm saying this is that
+the bug allows an attacker to choose which user-writable files he wants
+to overwrite, but *not their contents*, at least not freely at all. The
+actual writing is not done by Nasal code but by the Route manager's C++
+code, which doesn't seem to give much freedom as to the contents being
+written (Nasal code can only *trigger* the flightplan writing).
+
+Here is how the flightplan is saved
+(flightgear/src/Autopilot/route_mgr.cxx, code from FlightGear's 'next'
+branch):
+
+  bool FGRouteMgr::saveRoute(const SGPath& p)
+  {
+    if (!_plan) {
+      return false;
+    }
+
+    return _plan->save(p);
+  }
+
+calling (flightgear/src/Navaids/FlightPlan.cxx):
+
+  bool FlightPlan::save(const SGPath& path)
+  {
+    SG_LOG(SG_NAVAID, SG_INFO, "Saving route to " << path);
+    try {
+      SGPropertyNode_ptr d(new SGPropertyNode);
+      d->setIntValue("version", 2);
+
+      if (_departure) {
+        d->setStringValue("departure/airport", _departure->ident());
+        if (_sid) {
+          d->setStringValue("departure/sid", _sid->ident());
+        }
+
+        if (_departureRunway) {
+          d->setStringValue("departure/runway", _departureRunway->ident());
+        }
+      }
+
+      if (_destination) {
+        d->setStringValue("destination/airport", _destination->ident());
+        if (_star) {
+          d->setStringValue("destination/star", _star->ident());
+        }
+
+        if (_approach) {
+          d->setStringValue("destination/approach", _approach->ident());
+        }
+
+        //d->setStringValue("destination/transition", destination->getStringValue("transition"));
+
+        if (_destinationRunway) {
+          d->setStringValue("destination/runway", _destinationRunway->ident());
+        }
+      }
+
+      // route nodes
+      SGPropertyNode* routeNode = d->getChild("route", 0, true);
+      for (unsigned int i=0; i<_legs.size(); ++i) {
+        Waypt* wpt = _legs[i]->waypoint();
+        wpt->saveAsNode(routeNode->getChild("wp", i, true));
+      } // of waypoint iteration
+      writeProperties(path, d, true /* write-all */);
+      return true;
+    } catch (sg_exception& e) {
+      SG_LOG(SG_NAVAID, SG_ALERT, "Failed to save flight-plan '" << path << "'. " << e.getMessage());
+      return false;
+  }
+
+calling [1] and [2] with:
+
+[1] (flightgear/src/Navaids/route.cxx):
+
+  void Waypt::saveAsNode(SGPropertyNode* n) const
+  {
+    n->setStringValue("type", type());
+    writeToProperties(n);
+  }
+
+calling (flightgear/src/Navaids/route.cxx):
+
+  void Waypt::writeToProperties(SGPropertyNode_ptr aProp) const
+  {
+    if (flag(WPT_OVERFLIGHT)) {
+      aProp->setBoolValue("overflight", true);
+    }
+
+    if (flag(WPT_DEPARTURE)) {
+      aProp->setBoolValue("departure", true);
+    }
+
+    if (flag(WPT_ARRIVAL)) {
+      aProp->setBoolValue("arrival", true);
+    }
+
+    if (flag(WPT_APPROACH)) {
+      aProp->setBoolValue("approach", true);
+    }
+
+    if (flag(WPT_MISS)) {
+      aProp->setBoolValue("miss", true);
+    }
+
+    if (flag(WPT_GENERATED)) {
+      aProp->setBoolValue("generated", true);
+    }
+
+    if (_altRestrict != RESTRICT_NONE) {
+      aProp->setStringValue("alt-restrict", restrictionToString(_altRestrict));
+      aProp->setDoubleValue("altitude-ft", _altitudeFt);
+    }
+
+    if (_speedRestrict != RESTRICT_NONE) {
+      aProp->setStringValue("speed-restrict", restrictionToString(_speedRestrict));
+      aProp->setDoubleValue("speed", _speed);
+    }
+  }
+
+(not very interesting IMHO), the actual writing to file being done
+above in FlightPlan::save() by
+
+[2] (simgear/props/props_io.cxx):
+
+  void
+  writeProperties (const SGPath &path, const SGPropertyNode * start_node,
+                   bool write_all, SGPropertyNode::Attribute archive_flag)
+  {
+    SGPath dpath(path);
+    dpath.create_dir(0755);
+
+    ofstream output(path.local8BitStr().c_str());
+    if (output.good()) {
+      writeProperties(output, start_node, write_all, archive_flag);
+    } else {
+      throw sg_io_exception("Cannot open file", sg_location(path.utf8Str()));
+    }
+  }
+
+which relies on (same file):
+
+  void
+  writeProperties (ostream &output, const SGPropertyNode * start_node,
+                   bool write_all, SGPropertyNode::Attribute archive_flag)
+  {
+    int nChildren = start_node->nChildren();
+
+    output << "<?xml version=\"1.0\"?>" << endl << endl;
+    output << "<PropertyList>" << endl;
+
+    for (int i = 0; i < nChildren; i++) {
+      writeNode(output, start_node->getChild(i), write_all, INDENT_STEP, archive_flag);
+    }
+
+    output << "</PropertyList>" << endl;
+  }
+
+...
+
+All this to say that the *contents* written to an arbitrary file is
+rather constrained, unless I missed something, and that an attacker has
+very little control over it. This contents is a flightplan in
+FlightGear's XML PropertyList format
+(<http://wiki.flightgear.org/PropertyList_XML_files>) and the attacker
+basically only gets to choose the departure, arrival and intermediate
+waypoints... which gives something as the LFPO-EDDF.xml file I am
+attaching to this mail.
+
+So, from my POV, an attacker can:
+  - destroy any user-writable file he wants (not remove it, but
+    overwrite it with a flightplan in XML format)
+    -> data loss
+  - because of this, cause software malfunctions
+    -> “DoS”
+
+But AFAICT, the attacker has *very little control* over the kinds of
+malfunctions he can cause, thus it is unclear to me how to go from the
+vulnerability to arbitrary code execution.
+
+Of course, I might have missed something and am ready to be educated if
+this happens to be the case; though, as Salvatore said in private mail
+inviting me to post this here, the mention of arbitrary code execution
+in his post was rather the result of a misunderstanding (no worries).
+
+Regards
+
+-- 
+Florent
+
+Download attachment "LFPO-EDDF.xml" of type "application/xml" (2176 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (833 bytes)

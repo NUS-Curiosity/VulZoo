@@ -1,0 +1,113 @@
+
+Date: Sat, 15 Jun 2019 19:39:56 +0200
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: security@...tpractical.com
+Subject: Re: Apache::Session's use of md5 and more
+
+Hi,
+
+On Sat, Jun 15, 2019 at 05:09:53PM +0200, Raphael Geissert wrote:
+> I just stumbled upon Apache::Session's Generate::MD5 module, which
+> appears to be used to generate the session ids for cookies and the
+> like.
+> 
+> Not only does it use MD5,
+
+Which is perfectly fine for this use case, except that it distracts
+attention from real issues, so might need to be "fixed" to be e.g.
+SHA-256 for that reason.
+
+Let's not confuse technical and psychological aspects.
+
+> but its source of entropy is weak
+
+That's the real issue.
+
+> and does two rounds of hashing.
+
+This is fine, but can be optimized out along with the move to SHA-256.
+
+> From the source code[1]:
+> 
+>     $session->{data}->{_session_id} =
+>         substr(Digest::MD5::md5_hex(Digest::MD5::md5_hex(time(). {}.
+> rand(). $$)), 0, $length);
+> 
+> (where $length is 32 by default)
+
+This uses 3 or 4 pieces of data: time in seconds since Unix epoch, an
+address within the process, whatever seed rand() was initialized with
+(might also be time, or not), and PID.  This might be insufficient to
+prevent successfully inferring these inputs from the hash (by probing
+likely inputs), in which case this also leaks these inputs - kind of a
+remote ASLR leak, which matters if the process is persistent, etc. - on
+top of the more obvious impact of being able to predict session IDs.
+
+Also, does this generate unique session IDs if called twice in a row
+from the same process?  It appears that due to the "{}" and the "rand()"
+call it usually does, but perhaps not reliably to an extent where we'd
+rely on that for security.
+
+> Am I missing something, or has this code actually been in use for ages
+> and gone unnoticed ? I couldn't find any CVE for this.
+> 
+> So far I found this reference, but only mentions the use of MD5 as a weakness:
+> https://gitlab.ow2.org/lemonldap-ng/lemonldap-ng/issues/695
+
+That thread focuses on MD5 to an extent where everyone in there seems to
+think that replacing MD5 with SHA-256 would magically fix whatever issue
+they're thinking there is.  They're wrong.
+
+This is especially surprising given that Nuel Guillaume who opened the
+issue writes in one of the comments (5 years ago):
+
+| We can easily determine time()
+| 
+| {} A memory allocation for a hash (dict).
+| The output looks like "HASH (0x97b27ec)."
+| The last 3 characters: "7EC" are fixed to each machine.
+| 
+| Rand Perl function calls directly to the rand () function in libc.
+| rand() is not secure at all. Just find 30 values of rand() to determine the srand (the seed).
+| But it can be easier if we have Perl prior to 5.004. ( => srand(time() ).
+| If we have Perl 5.004 or upper, /dev/urandom is used for the default srand.
+| See:
+| http://turtle.ee.ncku.edu.tw/docs/perl/manual/pod/perlfunc/srand.html
+| http://stackoverflow.com/questions/12497045/what-are-the-weaknesses-of-perls-srand-default-seed-post-version-5-004
+| 
+| $$ Is the PID of the process and his value is between 1000 and 32768 (/proc/sys/kernel/pid_max = 32768)
+
+but then even with this understanding goes on to suggest merely "Replace
+md5 with SHA1 or SHA256 and keep your Perl version update."
+
+I didn't review Perl's rand(), but apparently Nuel thought the
+initialization from /dev/urandom on newer Perl somehow made rand() safe
+from having its seed inferred?  I doubt this is the case, as I expect
+the seed and/or the internal state is tiny either way.  And I doubt it
+takes as many as "30 values of rand() to determine the srand (the
+seed)."  I'd expect 1 to be enough.  But we need to review the code
+before making any claims.
+
+...OK, I just took a look.  Perl's util.c: Perl_seed() reads just 32
+bits from /dev/urandom, with compile-time and runtime fallbacks to
+gettimeofday() and getpid() and some more ASLR leaks.  (Fun fact: the
+fallbacks will also occur when the 32-bit value read from /dev/urandom
+just happens to be 0.  As a result, the seed is almost never a 0.)
+
+> From a quick look at the reverse dependencies of the Debian package,
+> there are some users of Apache::Session:
+> * RequestTracker (RT) : from a quick look at the session id in the
+> cookie set by rt.cpan.org I'd say it does use Generate::MD5
+> * Torrus: no idea if the Generate::MD5 module is used
+> * LemonLdap::NG : they replaced Generate::MD5 by a similar code using
+> SHA256, but still using two rounds of hashing
+> 
+> CC'ing BestPractical. Will open an issue on LemonLdap::NG's gitlab.
+
+Please focus on lack of (explicit) use of a CSPRNG such as /dev/urandom,
+not on use of MD5 nor the double-hashing (which are non-issues).
+
+> [1]https://metacpan.org/source/CHORNY/Apache-Session-1.93/lib/Apache/Session/Generate/MD5.pm
+
+Alexander

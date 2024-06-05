@@ -1,0 +1,167 @@
+
+Date: Wed, 21 Dec 2022 12:51:24 +0100
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: systemd-coredump: CVE-2022-4415: local information leak due to
+ systemd-coredump not respecting fs.suid_dumpable kernel setting
+
+Hello list,
+
+this is the publication of a report that was privately shared with the
+linux-distros mailing list on 2022-12-09 with a communicated coordinated
+release date of 2022-12-20.
+
+I made small changes to the report to reflect recent developments.
+
+This report is about a security issue I found in systemd-coredump.
+systemd-coredump is a userspace coredump handler for Linux that is part
+of the systemd suite [1].
+
+[1]: https://github.com/systemd/systemd
+
+The Issue
+=========
+
+systemd-coredump sets the sysctl fs.suid_dumpable by default to 2 via
+a sysctl.d drop-in configuration file. For the kernel's builtin coredump
+handling this setting means that core dumps for setuid (or otherwise
+privileged) processes will be written to disk but will only be
+accessible to the root user to avoid sensitive data leaking to
+unprivileged user accounts. See also `man 5 proc` for the full
+documentation of this sysctl.
+
+systemd-coredump in userspace, however, does not respect this kernel
+setting in the implementation of its coredump handling. The real user ID
+of a dumping process will receive read access to the core dump via an
+ACL entry:
+
+    someuser$ cat /proc/sys/kernel/core_pattern
+    |/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h
+    someuser$ cat /cat /proc/sys/fs/suid_dumpable
+    2
+    someuser$ /usr/bin/su # run a setuid-root program and keep it running
+    Password:
+    
+    # in another shell trigger a SEGFAULT in the setuid-root program
+    someuser$ kill -s SIGSEGV `pidof su`
+    
+    # back in the original shell
+    Password: Segmentation fault (core dumped)
+    someuser$ cd /var/lib/systemd/coredump
+    someuser$ ls -l
+    -rw-r-----+ 1 root root 90K Okt 20 11:59 core.su.1000.76f0e40af2a240d98e50b90ab141d974.3529.1666259998000000.zst
+    someuser$ getfacl core.su.*
+    # file:
+    # core.su.1000.76f0e40af2a240d98e50b90ab141d974.3529.1666259998000000.zst
+    # owner: root
+    # group: root
+    user::rw-
+    user:someuser:r--
+    group::r--
+    mask::r--
+    other::---
+
+I have reproduced this on openSUSE Tumbleweed with systemd version 251.
+I have been able to reproduce it also on other current Linux
+distributions like Arch, Debian, Fedora and SLES.
+
+Patch and Workaround
+====================
+
+Attached are the current (two) patches I received from systemd upstream.
+Upstream published the fix by now in their GitHub repository [2].
+
+A simple workaround without patching systemd-coredump is to revert the
+sysctl setting of fs.suid_dumpable back to 0. In this mode the kernel
+will not invoke systemd-coredump for privileged programs. The issue will
+thus not be triggered.
+
+[2]: https://github.com/systemd/systemd/commit/b7641425659243c09473cd8fb3aef2c0d4a3eb9c
+
+Affected Versions
+=================
+
+The vulnerable default of the fs.suid_dumpable sysctl has been present
+since systemd version 246 (introduced via commit 6635f57d3ee). Even
+older versions may be affected though, should a system administrator
+decide to change this setting to 2.
+
+Upstream states that only systemd starting with version 247 are
+affected, I don't know how they come to this different conclusion.
+
+Upstream also states that only builds of systemd with libacl support are
+affected. This makes sense since the read access to the core dumps is
+granted via ACL entries and there is no fallback to this.
+
+Exploit and Severity
+====================
+
+Exploiting this issue is pretty simple at the outset. Regular users are
+allowed to send arbitrary signals to privileged processes they create.
+Thus the privileged processes can be forced to dump core at arbitrary
+points in time and the memory contents of the program will become
+accessible via systemd-coredump.
+
+Whether data obtained this way allows for a relevant information leak
+depends on the timing, on the one hand, and on the type of program
+executed on the other hand. What comes to mind is attempting to obtain
+the password hash for the root user account that is stored in
+/etc/shadow. Tools like 'su' and 'sudo' will have to process these
+password hashes when authenticating the invoking user.
+
+With 'sudo' this will not work, because it actively sets the ulimit for
+coredumps to 0. The reason for this is to protect against exactly this
+attack scenario [3].
+
+With 'su' it works, however. Attached you can find a Python script I
+created that shows that it is relatively simple to obtain the root
+user's hash digest from /etc/shadow. From here on an attacker can
+attempt to crack the hash using a GPU rig, for example. While it is not
+a simple local root exploit it can be one if there is a dedicated
+attacker.
+
+Other setuid programs (or also programs running only with certain raised
+Linux capabilties) could allow for different kinds of information leaks.
+Even for 'su' it depends a lot on the PAM stack configuration. Some PAM
+modules might read in data from private files in the target user's home
+directory, or private configuration files which could leak via
+systemd-coredump.
+
+[3]: https://github.com/sudo-project/sudo/blob/3040bf54c99ed1baa9e7006be2fed3d5fa71f80e/docs/sudo.man.in#L1260
+
+Timeline
+========
+
+2022-10-20: I sent a first report and some questions to
+            systemd-security@...hat.com, offering coordinated disclosure.
+2022-11-28: Communication did not progress much; I investigated the issue
+            further by creating a PoC. Upstream confirmed the issue now and
+            acknowledged a higher severity than initially considered.
+2022-12-09: The final patches have been shared with us and we agreed to
+            the CRD 2022-20-20. I shared the report with the
+	    linux-distros mailing list.
+2022-12-12: The CVE assignment was communicated by upstream and I also
+            shared it with the linux-distros mailing list.
+2022-12-20: Upstream published the fix.
+
+Regards
+
+Matthias
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Security Engineer
+https://www.suse.com/security
+GPG Key ID: 0x14C405C971923553
+ 
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev, Andrew Myers, Andrew McDonald, Boudien Moerman
+
+View attachment "0001-coredump-adjust-whitespace.patch" of type "text/plain" (5417 bytes)
+
+View attachment "0002-coredump-do-not-allow-user-to-access-coredumps-with-.patch" of type "text/plain" (15695 bytes)
+
+View attachment "su_core_shadow_extract.py" of type "text/plain" (6337 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

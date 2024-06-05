@@ -1,0 +1,146 @@
+
+Date: Fri, 19 Apr 2024 17:44:35 +0200
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: Linux: Disabling network namespaces
+
+On Wed, Apr 17, 2024 at 09:52:10AM -0300, Georgia Garcia wrote:
+> I just wanted to add that in the Ubuntu Noble Numbat release we are
+> using AppArmor to restrict unprivileged user namespaces.
+
+For those who like me are confused by release names, this is 24.04 LTS.
+
+> Applications that don't have an AppArmor profile will use a default
+> profile which denies the use of capabilities within the user namespace.
+
+In other words, there's now precedent of allowing namespace creation
+while disallowing use of capabilities in the namespace.  I started
+thinking of doing the same, but in a lightweight distro-neutral way, by
+introducing a new sysctl.
+
+Possible logic could be to set the maximum namespace nesting depth where
+capabilities (or maybe specifically CAP_NET_ADMIN) still work.  We could
+have this apply to unprivileged user namespaces only or to all.  I guess
+systemd's PrivateNetwork services generally don't configure networking
+(they just give up network access), so would continue to work even with
+capabilities disallowed?
+
+A max depth setting of 1 could allow network configuration in top-level
+containers if needed, while reducing the kernel's attack surface exposed
+to further sandboxed programs, nested containers, and unintended
+namespaces created by exploits running as a user inside a top-level
+container.  My thinking is that if someone uses containers with custom
+network configuration, they probably mostly care about attacks by
+container users (and nested containers, if any) rather than by host
+users.  They could also care about attacks by top-level container root,
+but there's little we can do here while allowing container root to
+configure networking.
+
+Does this sound like it has a chance of getting accepted upstream?
+
+Meanwhile, this looks implementable via security_capable() LSM hook, and
+I am thinking of experimenting with it in LKRG:
+
+https://github.com/lkrg-org/lkrg/issues/331
+
+Limiting this new logic only to unprivileged user namespaces feels
+tricky or hackish as there doesn't appear to be an existing struct field
+to indicate parent's capabilities at namespace creation time.  There is
+parent_could_setfcap, which we maybe could abuse.  Any better ideas?
+
+Detailed discussion of implementation wouldn't belong on oss-security.
+We'll need to move to kernel-hardening or linux-hardening for that.  But
+initial feedback on the idea is fine to have in here, especially from
+perspective of required functionality.
+
+> Applications that need to use capabilities will have to be confined by
+> a profile. Since we understand that creating an AppArmor profile might
+> not be a trivial task for large programs, we introduced the
+> "unconfined" flag which makes the profile act as if it were unconfined
+> from the perspective of AppArmor, allowing all operations.
+
+Thank you, this is helpful.
+
+> There are more details here:
+> https://discourse.ubuntu.com/t/noble-numbat-release-notes/39890#unprivileged-user-namespace-restrictions-13
+
+Looks like the direct link to this section of the release notes has
+since changed, now it is:
+
+https://discourse.ubuntu.com/t/noble-numbat-release-notes/39890/1#unprivileged-user-namespace-restrictions-14
+
+I'll quote this section's content below, for archival:
+
+---
+Unprivileged user namespace restrictions
+
+In combination with the apparmor package, the Ubuntu kernel now
+restricts the use of unprivileged user namespaces. This affects all
+programs on the system that are unprivileged and unconfined. A default
+AppArmor profile is provided that allows the use of user namespaces for
+unprivileged and unconfined applications but will deny the subsequent
+use of any capabilities within the user namespace. A common use-case for
+unprivileged user namespaces is applications that construct their own
+sandboxes or work with styles of container workloads. As such, AppArmor
+profiles that allow the use of unprivileged user namespaces are also
+provided for common applications and frameworks that come from the
+Ubuntu archive, as well as popular third party applications like Google
+Chrome, Discord and others. This is a subsequent step towards trying to
+mitigate the larger attack surface presented by unprivileged user
+namespaces (the first being the introduction of this feature in Ubuntu
+23.10 where it was not enabled by default).
+
+Whilst significant effort has been expended to try and identify all
+applications that may require such profiles, it is expected that there
+may be cases where additional profiles are required.
+
+In this case, there are several options if you run into problems:
+
+- Confine your applications with an AppArmor profile. Because this can
+be potentially onerous, a new unconfined profile mode/flag has been
+added to AppArmor. This designates the profile to essentially act like
+the unconfined mode for AppArmor where an application is not restricted,
+and it allows additional permissions to be added, such as the userns,
+permission. Such profile for, e.g. Google Chrome, would look like the
+following, and it would be located within the /etc/apparmor.d/chrome
+file:
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+/opt/google/chrome/chrome flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/chrome>
+}
+
+Alternatively, a complete AppArmor profile for the application can be
+created (see the AppArmor 1 documentation).
+
+- Launch your application in a way that doesn't use unprivileged user
+namespaces, e.g. google-chrome-stable --no-sandbox. However, since this
+disables the use of an internal security feature within the application,
+this is not recommended. Instead, use the unconfined profile mode
+described above instead.
+
+- Disable this restriction on the entire system for one boot by
+executing echo 0 | sudo tee
+/proc/sys/kernel/apparmor_restrict_unprivileged_userns. This setting is
+lost on reboot. This similar to the previous behaviour, but it does not
+mitigate against kernel exploits that abuse the unprivileged user
+namespaces feature.
+
+- Disable this restriction using a persistent setting by adding a new
+file (/etc/sysctl.d/60-apparmor-namespace.conf) with the following
+contents:
+
+kernel.apparmor_restrict_unprivileged_userns=0
+
+Reboot. This is similar to the previous behaviour, but it does not
+mitigate against kernel exploits that abuse the unprivileged user
+namespaces feature.
+---
+
+Alexander

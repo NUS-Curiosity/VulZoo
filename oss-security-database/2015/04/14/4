@@ -1,0 +1,128 @@
+
+Date: Tue, 14 Apr 2015 06:30:41 -0700
+From: Tavis Ormandy <taviso@...gle.com>
+To: oss-security@...ts.openwall.com
+Subject: Problems in automatic crash analysis frameworks
+
+Hello, this is CVE-2015-1318 and CVE-2015-1862 (essentially the same
+bugs in two different implementations, apport and abrt respectively).
+These were discussed on the vendors list last week.
+
+If the first character of kern.core_pattern sysctl is a pipe, the
+kernel will invoke the specified program, and pass it the core on
+stdin. Apport (Ubuntu) and Abrt (Fedora) use this feature to analyze
+and log crashes.
+
+Since the introduction of containers, Abrt and Apport have attempted
+to transparently handle namespaces by chrooting into the same root as
+the crashing program [1] [2]. Unfortunately, this is incorrect because
+root cannot safely execve() after a chroot into a user specified
+directory.
+
+Furthermore, Abrt suffers from numerous race conditions and symlink
+problems from trusting unprivileged programs. For example, the code
+below (and lots of similar code) is vulnerable to a filesystem race
+where a user unlinks the file after the copy but before the chown.
+
+https://github.com/abrt/abrt/blob/master/src/hooks/abrt-hook-ccpp.c#L634
+
+        strcpy(source_filename + source_base_ofs, "maps");
+        strcpy(dest_base, FILENAME_MAPS);
+        copy_file(source_filename, dest_filename, DEFAULT_DUMP_DIR_MODE);
+        IGNORE_RESULT(chown(dest_filename, dd->dd_uid, dd->dd_gid));
+
+This code trusts various symlinks in /tmp without validation:
+
+https://github.com/abrt/abrt/blob/master/src/hooks/abrt-hook-ccpp.c#L806
+
+        char *java_log = xasprintf("/tmp/jvm-%lu/hs_error.log", (long)pid);
+        int src_fd = open(java_log, O_RDONLY);
+        free(java_log);
+
+This code trusts the /proc/pid/exe symlink, even though it is possible
+to link it anywhere you want.
+
+https://github.com/abrt/abrt/blob/master/src/hooks/abrt-hook-ccpp.c#L368
+
+        sprintf(buf, "/proc/%lu/exe", (long)pid);
+        int src_fd_binary = open(buf, O_RDONLY); /* might fail and
+return -1, it's ok */
+
+This code trusts the attacker controlled root symlink and copies files from it.
+
+https://github.com/abrt/libreport/blob/master/src/lib/dump_dir.c#L671
+
+        if (chroot_dir)
+            copy_file_from_chroot(dd, FILENAME_OS_INFO_IN_ROOTDIR,
+chroot_dir, "/etc/os-release");
+
+This instructs librpm to trust an unprivileged root symlink:
+
+https://github.com/abrt/abrt/blob/master/src/daemon/rpm.c#L184
+
+        if (rpmtsSetRootDir(*ts, rootdir_or_NULL) != 0)
+        {
+            rpmtsFree(*ts);
+            return -1;
+        }
+
+And so on.
+
+There are other automatic crash analysis scripts, I believe systemd
+also has one - I haven't looked at it all.
+
+WORKAROUND
+
+I highly recommend setting `sysctl -w kern.core_pattern=core`.
+
+EXPLOITATION
+
+Two demonstration exploits are attached.
+
+The file `newpid.c` should produce a root shell on Fedora 20 or Ubuntu
+by invoking the crash handler inside an unprivileged chroot (possible
+since kernel 3.8).
+
+ $ gcc -static newpid.c
+ $ ./a.out
+ uid=0(root) gid=0(root) groups=0(root)
+ sh-4.3# exit
+ exit
+
+The file `raceabrt.c` should make you the owner of any file on Fedora
+by racing the Abrt report creation.
+
+ $ cat /etc/fedora-release
+ Fedora release 21 (Twenty One)
+ $ ./a.out /etc/passwd
+ Detected ccpp-2015-04-13-17:40:31-5506.new, attempting to race...
+   [ wait a few minutes ]
+   exploit successful...
+ -rw-r--r--. 1 taviso abrt 2421 Apr 13 11:15 /etc/passwd
+
+In case it isn't obvious, you can then give yourself uid zero.
+
+ $ getent passwd taviso
+ taviso:x:1000:1000:Tavis Ormandy:/home/taviso:/bin/bash
+ $ vi /etc/passwd
+ $ getent passwd taviso
+ taviso:x:0:0:Tavis Ormandy:/home/taviso:/bin/bash
+ $ su taviso
+ Password:
+ # id
+ uid=0(root) gid=0(root) groups=0(root)
+ exit
+
+REFERENCES
+
+[1] https://code.launchpad.net/~stgraber/apport/pidns-support/+merge/200893
+[2] https://github.com/abrt/abrt/pull/810
+[3] http://man7.org/linux/man-pages/man7/user_namespaces.7.html
+
+CREDIT
+
+Tavis Ormandy, Google Project Zero.
+
+View attachment "raceabrt.c" of type "text/x-csrc" (6519 bytes)
+
+View attachment "newpid.c" of type "text/x-csrc" (5061 bytes)

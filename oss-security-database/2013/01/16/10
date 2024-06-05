@@ -1,0 +1,146 @@
+
+Date: Wed, 16 Jan 2013 17:26:59 +0200
+From: George Kargiotakis <kargig@...d.gr>
+To: P J P <ppandit@...hat.com>
+Cc: oss-security@...ts.openwall.com
+Subject: Re: Linux kernel handling of IPv6 temporary
+ addresses
+
+Hello,
+
+On Wed, 16 Jan 2013 18:17:28 +0530 (IST)
+P J P <ppandit@...hat.com> wrote:
+
+> 
+>    Hello George,
+> 
+> +-- On Wed, 16 Jan 2013, George Kargiotakis wrote --+
+> | You can reproduce the bug with a new option for flood_router26 that
+> has been added to the thc-ipv6 toolkit v2.1. | # ./flood_router26 -A
+> eth0
+> 
+>   I tried this, it takes quite a while for other hosts to receive the 
+> generated traffic. On the receiving hosts kernel logs
+> 
+> ==
+> ...
+> ...kernel: Neighbour table overflow.
+> ==
+> 
+> no log message from ipv6_create_tempaddr() routine. 
+> 
+Weird because the '-A' flag of flood_router26 sends very few packets so it shouldn't 
+have filled your neighbour table.
+
+what distro/kernel version are you trying ? I'm using latest ubuntu 12.10 with 3.5.7.
+The messages I'm mentioning certainly appear upon testing with ubuntu 12.10 live CD for example.
+
+> 
+> | I've applied your patch to 3.5.7 and unless I've done something
+> wrong, it doesn't seem to work. Actually I can't | get any temporary
+> address assignment with it. This is what I get upon booting with your
+> patch:
+> 
+>   Ah, very sorry, I missed to say: ift = ipv6_add_addr(...) : in my
+> last patch. It remains NULL all the time. Please try this fixed
+> version
+> 
+> ===
+> diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+> index 420e563..0aaaa63 100644
+> --- a/net/ipv6/addrconf.c
+> +++ b/net/ipv6/addrconf.c
+> @@ -1046,12 +1046,19 @@ retry:
+>  	if (ifp->flags & IFA_F_OPTIMISTIC)
+>  		addr_flags |= IFA_F_OPTIMISTIC;
+>  
+> -	ift = !max_addresses ||
+> -	      ipv6_count_addresses(idev) < max_addresses ?
+> -		ipv6_add_addr(idev, &addr, tmp_plen,
+> -
+> ipv6_addr_type(&addr)&IPV6_ADDR_SCOPE_MASK,
+> -			      addr_flags) : NULL;
+> -	if (!ift || IS_ERR(ift)) {
+> +    ift = NULL;
+> +    if (!max_addresses || ipv6_count_addresses(idev) < max_addresses)
+> +        ift = ipv6_add_addr(idev, &addr, tmp_plen,
+> +                        ipv6_addr_type(&addr) & IPV6_ADDR_SCOPE_MASK,
+> +                        addr_flags);
+> +    if (!ift) {
+> +        in6_ifa_put(ifp);
+> +        in6_dev_put(idev);
+> +        pr_info("%s: ipv6 temporary address upper limit reached\n",
+> __func__);
+> +        ret = -1;
+> +        goto out;
+> +    }
+> +    else if (IS_ERR(ift)) {
+>  		in6_ifa_put(ifp);
+>  		in6_dev_put(idev);
+>  		pr_info("%s: retry temporary address
+> regeneration\n", __func__); ===
+> 
+> 
+> Thanks so much.
+> --
+> Prasad J Pandit / Red Hat Security Response Team
+> DB7A 84C5 D3F9 7CD1 B5EB  C939 D048 7860 3655 602B
+
+
+Your new patch works "better", but still the main problem hasn't been
+eliminated. And I explain myself.
+
+While flooding with RAs the following appears in the dmesg:
+[  117.721878] IPv6: ipv6_create_tempaddr: ipv6 temporary address upper limit reached
+
+which is what your patch is supposed to do. But acquired addresses
+from flooding all seem to have the tentative flag on:
+
+    inet6 fd00:966f:7996:c731:9191:a3ce:99bc:897e/64 scope global temporary tentative dynamic 
+       valid_lft 131007sec preferred_lft 65471sec
+    inet6 fd00:966f:7996:c731:222:aaff:fecc:1111/64 scope global tentative dynamic 
+       valid_lft 131007sec preferred_lft 65471sec
+    inet6 fd00:966e:7796:c731:9191:a3ce:99bc:897e/64 scope global temporary tentative dynamic 
+       valid_lft 131007sec preferred_lft 65471sec
+    inet6 fd00:966e:7796:c731:222:aaff:fecc:1111/64 scope global tentative dynamic 
+       valid_lft 131007sec preferred_lft 65471sec
+    inet6 fd00:966c:7396:c731:9191:a3ce:99bc:897e/64 scope global temporary tentative dynamic 
+       valid_lft 131007sec preferred_lft 65471sec
+    inet6 fd00:966c:7396:c731:222:aaff:fecc:1111/64 scope global tentative dynamic 
+       valid_lft 131007sec preferred_lft 65471sec
+    inet6 fd00:966b:7196:c731:9191:a3ce:99bc:897e/64 scope global temporary tentative dynamic 
+       valid_lft 131007sec preferred_lft 65471sec
+    inet6 fd00:966b:7196:c731:222:aaff:fecc:1111/64 scope global tentative dynamic 
+       valid_lft 131007sec preferred_lft 65471sec
+
+what I also find wrong here is that all temporary addresses (dynamic) acquired have gotten the same last 64bits.
+I don't think this is OK per RFC 4941 even if not explicitly defined there. Every temp. address created should be different per prefix from the rest.
+
+use_tempaddr for the iface still has '2' as its value
+# cat /proc/sys/net/ipv6/conf/eth0/use_tempaddr 
+2
+
+then after taking the interface down and up again even the new addresses acquired still have the tentative flag enabled:
+    inet6 2001:db8:f00:f00:222:aaff:fecc:1111/64 scope global tentative dynamic 
+       valid_lft 86371sec preferred_lft 3571sec
+    inet6 fdbf:468f:aaa0:474d:222:aaff:fecc:1111/64 scope global tentative dynamic 
+       valid_lft 86371sec preferred_lft 3571sec
+    inet6 fe80::222:aaff:fecc:1111/64 scope link tentative 
+       valid_lft forever preferred_lft forever
+
+dmesg reports:
+[  322.195426] IPv6: ipv6_create_tempaddr: regeneration time exceeded - disabled temporary address support
+
+use_tempaddr for the iface now has '-1' as its value though
+# cat /proc/sys/net/ipv6/conf/eth0/use_tempaddr 
+-1
+
+And so there actually isn't any IPv6 connectivity from then on until a reboot.
+Flooding triggers something that corrupts ipv6 functionality.
+
+Best regards,
+-- 
+George Kargiotakis
+https://void.gr
+GPG KeyID: 0xE4F4FFE6
+GPG Fingerprint: 9EB8 31BE C618 07CE 1B51 818D 4A0A 1BC8 E4F4 FFE6

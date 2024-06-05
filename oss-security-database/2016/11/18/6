@@ -1,0 +1,78 @@
+
+Date: Fri, 18 Nov 2016 16:53:24 +0800
+From: "wykcomputer@...il.com" <wykcomputer@...il.com>
+To: oss-security <oss-security@...ts.openwall.com>
+Subject: [Bug report] Vulnerability In libbpg-1
+
+I find a out-of-bounds read issue in libbpg(0.9.7, maybe other early versions), which can lead to memory corruption.
+I have reported it to the author of libbpg, but no responding, so I report it to you.
+
+Run ./bpgdec PoC.bpg, get the crash as follows.
+Crash Log：
+Program received signal SIGBUS, Bus error.
+0x000000000041a34e in sao_band_filter_0_var () at libavcodec/hevcdsp_template.c:351
+351             dst[x] = av_clip_pixel(src[x] + offset_table[src[x] >> shift]);
+(gdb) bt
+#0  0x000000000041a34e in sao_band_filter_0_var () at libavcodec/hevcdsp_template.c:351
+#1  0x0000000000430ae2 in sao_filter_CTB () at libavcodec/hevc_filter.c:323
+#2  0x0000000000433cff in ff_hevc_hls_filter () at libavcodec/hevc_filter.c:894
+#3  0x00000000004109e9 in hls_decode_entry () at libavcodec/hevc.c:2400
+#4  0x0000000000428025 in avcodec_default_execute () at libavcodec/utils.c:121
+#5  0x0000000000410a41 in hls_slice_data () at libavcodec/hevc.c:2413
+#6  0x00000000004111d8 in decode_nal_unit () at libavcodec/hevc.c:2826
+#7  0x0000000000411c9f in decode_nal_units () at libavcodec/hevc.c:3063
+#8  0x0000000000411dc3 in hevc_decode_frame () at libavcodec/hevc.c:3193
+#9  0x00000000004285f3 in avcodec_decode_video2 () at libavcodec/utils.c:242
+#10 0x00000000004025ec in hevc_write_frame () at libbpg.c:401
+#11 0x00000000004029d8 in hevc_decode_frame_internal () at libbpg.c:486
+#12 0x0000000000402b5a in hevc_decode_start () at libbpg.c:528
+#13 0x0000000000406d4d in bpg_decoder_decode () at libbpg.c:1860
+#14 0x0000000000401abf in main () at bpgdec.c:332
+
+The function in libavcodec/hevcdsp_template.c, the offset_table is an array which size is 32.
+dst[x] = av_clip_pixel(src[x] + offset_table[src[x] >> shift]);
+(src[x] >> shift) maybe larger than 31, lead to out-of-bounds read.
+
+static void FUNC(sao_band_filter_0)(uint8_t *_dst, uint8_t *_src,
+                                  ptrdiff_t stride_dst, ptrdiff_t stride_src, SAOParams *sao,
+                                  int *borders, int width, int height,
+                                  int c_idx BIT_DEPTH_PARAM)
+{
+    pixel *dst = (pixel *)_dst;
+    pixel *src = (pixel *)_src;
+    int offset_table[32] = { 0 };
+    int k, y, x;
+    int shift  = BIT_DEPTH - 5;
+    int16_t *sao_offset_val = sao->offset_val[c_idx];
+    int sao_left_class  = sao->band_position[c_idx];
+
+    stride_dst /= sizeof(pixel);
+    stride_src /= sizeof(pixel);
+
+    for (k = 0; k < 4; k++)
+        offset_table[(k + sao_left_class) & 31] = sao_offset_val[k + 1];
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++)
+            dst[x] = av_clip_pixel(src[x] + offset_table[src[x] >> shift]); 
+        dst += stride_dst;
+        src += stride_src;
+    }
+}
+
+Fix:
+for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++)
+            - dst[x] = av_clip_pixel(src[x] + offset_table[src[x] >> shift]); 
++ dst[x] = av_clip_pixel(src[x] + offset_table[(src[x] >> shift) & 31]); 
+        dst += stride_dst;
+        src += stride_src;
+    }
+
+Thank you!
+
+
+wykcomputer@...il.com
+
+Content of type "text/html" skipped
+
+Download attachment "PoC.bpg" of type "application/octet-stream" (2516 bytes)

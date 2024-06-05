@@ -1,0 +1,69 @@
+
+Date: Mon, 2 Jan 2012 04:49:28 +0400
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: deraadt@...nbsd.org, Todd Miller <Todd.Miller@...rtesan.com>,
+	Colin Percival <cperciva@...ebsd.org>, dillon@...llo.backplane.com,
+	Christos Zoulas <christos@...las.com>
+Subject: OpenBSD bcrypt 8-bit key_len wraparound
+
+Hi,
+
+Christos Zoulas of NetBSD discovered that the key_len variable was
+declared in bcrypt.c as u_int8_t and it would potentially wrap around here:
+
+key_len = strlen(key) + (minor >= 'a' ? 1 : 0);
+
+While bcrypt truncates very long passwords at 72 characters (by design),
+which is sort of expected behavior, the wraparound is not expected.  It
+is substantially different behavior than truncation.  For example, the
+following three kinds of passwords all produce the same hash as tested
+by calling crypt() with the same $2a$ salt from a C program on OpenBSD 4.6:
+
+1. A string of 72 zeroes:
+
+000000000000000000000000000000000000000000000000000000000000000000000000
+
+2. Any 255-character string starting with a "0", e.g.:
+
+012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234
+
+3. Any 256-character string starting with a "0", e.g.:
+
+0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345
+
+while #2 and #3 would produce the same hash anyway (because of
+truncation at 72), it is not expected that they produce the same hash as
+the obviously very weak password #1.  (John the Ripper will test all
+such passwords quickly if invoked with "--external=Repeats".)
+
+#2 and #3 would produce this same hash even if they contained a lot of
+entropy in character positions 2 through 72, which get ignored.
+
+Luckily, it is unrealistic that people will use passwords this long, yet
+there's a theoretical issue to fix here.
+
+Simply changing the type of key_len to u_int32_t (assuming that longer
+strings are not supported at higher levels anyway, which may or may not
+be the case) wouldn't fully do the trick because the underlying
+functions use u_int16_t for some reason.  Thus, we opted to fix the
+issue by limiting key_len to 72 or 73 right in that place:
+
+http://cvsweb.netbsd.org/bsdweb.cgi/src/lib/libcrypt/bcrypt.c.diff?r1=1.13&r2=1.15
+
++	size_t len;
+
+-	key_len = strlen(key) + (minor >= 'a' ? 1 : 0);
++	len = strlen(key);
++	if (len > 72)
++		key_len = 72;
++	else
++		key_len = (uint8_t)len;
++	key_len += minor >= 'a' ? 1 : 0;
+
+Other *BSDs may want to do the same.
+
+...Oh, and someone may want to check Solaris for this and for the ":"
+return bcrypt issue.  (I did not.)
+
+Alexander

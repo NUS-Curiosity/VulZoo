@@ -1,0 +1,143 @@
+
+Date: Tue, 17 Sep 2019 08:19:33 +0000
+From: cradminzhang(张博) <cradminzhang@...cent.com>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: CVE-2019-14835: QEMU-KVM Guest to Host Kernel Escape Vulnerability:
+ vhost/vhost_net kernel buffer overflow
+
+Severity: Important
+Vendor:
+Versions affected: 
+It looks like this vulnerability was introduced in this commit https://github.com/torvalds/linux/commit/3a4d5c94e959359ece6d6b55045c3f046677f55c,
+from kernel version 2.6.34 and fixed in latest stable kernel 5.3.
+
+Tencent Blade Team discovered a QEMU-KVM Guest to Host Kernel Escape Vulnerability which is in vhost/vhost_net kernel module.
+
+Description:
+
+The vulnerability is in vhost/vhost_net kernel module, vhost/vhost_net is a virtio network backend.
+
+The bug happens in the live migrate flow, when migrating, QEMU needs to know the dirty pages, vhost/vhost_net uses a kernel buffer to record the dirty log, but it doesn't check the bounds of the log buffer.
+So we can forge the desc table in guest, wait for migrate or doing something (like increase host machine workload or combine a mem leak bug, depends on vendor’s migrate schedule policy) to trigger cloud vendor to migrate this guest. 
+When the guest migrating, it will make the host kernel log buffer overflow.
+
+The vulnerable call path is :  handle_rx(drivers/vhost/net.c) -> get_rx_bufs -> vhost_get_vq_desc -> get_indirect(drivers/vhost/vhost.c)
+
+In VM guest, attack can make a indirect desc table in VM driver to let vhost to enter above call path when live migrates the VM, finally to enter into function get_indirect.
+
+In get_indirect, there is the log buffer overflow bug can be triggered as comments below:
+
+static int get_indirect(struct vhost_virtqueue *vq,
+			struct iovec iov[], unsigned int iov_size,
+			unsigned int *out_num, unsigned int *in_num,
+			struct vhost_log *log, unsigned int *log_num,
+			struct vring_desc *indirect)
+{
+	struct vring_desc desc;
+	unsigned int i = 0, count, found = 0;
+	u32 len = vhost32_to_cpu(vq, indirect->len);  <---------------- len can be controlled from VM guest
+	struct iov_iter from;
+	int ret, access;
+
+	/* Sanity check */
+	if (unlikely(len % sizeof desc)) {
+		vq_err(vq, "Invalid length in indirect descriptor: "
+		       "len 0x%llx not multiple of 0x%zx\n",
+		       (unsigned long long)len,
+		       sizeof desc);
+		return -EINVAL;
+	}
+
+	ret = translate_desc(vq, vhost64_to_cpu(vq, indirect->addr), len, vq->indirect,
+			     UIO_MAXIOV, VHOST_ACCESS_RO);
+	if (unlikely(ret < 0)) {
+		if (ret != -EAGAIN)
+			vq_err(vq, "Translation failure %d in indirect.\n", ret);
+		return ret;
+	}
+	iov_iter_init(&from, READ, vq->indirect, ret, len);
+
+	/* We will use the result as an address to read from, so most
+	 * architectures only need a compiler barrier here. */
+	read_barrier_depends();
+
+	count = len / sizeof desc;             <--------- so, count can be controlled from VM guest
+	/* Buffers are chained via a 16 bit next field, so
+	 * we can have at most 2^16 of these. */
+	if (unlikely(count > USHRT_MAX + 1)) {           <---------- the max value of count can be USHRT_MAX + 1
+		vq_err(vq, "Indirect buffer length too big: %d\n",
+		       indirect->len);
+		return -E2BIG;
+	}
+
+	do {
+		unsigned iov_count = *in_num + *out_num;
+		if (unlikely(++found > count)) {         <---------- so, this while loop can run USHRT_MAX+1 times
+			vq_err(vq, "Loop detected: last one at %u "
+			       "indirect size %u\n",
+			       i, count);
+			return -EINVAL;
+		}
+		if (unlikely(!copy_from_iter_full(&desc, sizeof(desc), &from))) {  <------- iter desc from the indirect table, each desc can be controlled
+			vq_err(vq, "Failed indirect descriptor: idx %d, %zx\n",
+			       i, (size_t)vhost64_to_cpu(vq, indirect->addr) + i * sizeof desc);
+			return -EINVAL;
+		}
+		if (unlikely(desc.flags & cpu_to_vhost16(vq, VRING_DESC_F_INDIRECT))) {
+			vq_err(vq, "Nested indirect descriptor: idx %d, %zx\n",
+			       i, (size_t)vhost64_to_cpu(vq, indirect->addr) + i * sizeof desc);
+			return -EINVAL;
+		}
+
+		if (desc.flags & cpu_to_vhost16(vq, VRING_DESC_F_WRITE))
+			access = VHOST_ACCESS_WO;
+		else
+			access = VHOST_ACCESS_RO;
+
+		ret = translate_desc(vq, vhost64_to_cpu(vq, desc.addr),
+				     vhost32_to_cpu(vq, desc.len), iov + iov_count,      <---------- set desc.len to 0, translate_desc will return without error and ret == 0
+				     iov_size - iov_count, access);
+		if (unlikely(ret < 0)) {
+			if (ret != -EAGAIN)
+				vq_err(vq, "Translation failure %d indirect idx %d\n",
+					ret, i);
+			return ret;
+		}
+		/* If this is an input descriptor, increment that count. */
+		if (access == VHOST_ACCESS_WO) {
+			*in_num += ret;         <------------ because ret == 0, so the value of in_num not changed. (if in_num bigger than iov_size, will cause translate_desc return error)
+			if (unlikely(log)) {      <------------- when live migrate, the log buffer will not be NULL
+				log[*log_num].addr = vhost64_to_cpu(vq, desc.addr);   <-------- log buffer overflow, because log_num can be USHRT_MAX, but log buffer size is far below than USHRT_MAX
+				log[*log_num].len = vhost32_to_cpu(vq, desc.len);
+				++*log_num;
+			}
+		} else {
+			/* If it's an output descriptor, they're all supposed
+			 * to come before any input descriptors. */
+			if (unlikely(*in_num)) {
+				vq_err(vq, "Indirect descriptor "
+				       "has out after in: idx %d\n", i);
+				return -EINVAL;
+			}
+			*out_num += ret;
+		}
+	} while ((i = next_desc(vq, &desc)) != -1);
+	return 0;
+}
+
+Function vhost_get_vq_desc also has above while loop which may cause log buffer overflow.
+
+Mitigation:
+update to latest stable kernel 5.3 or apply the upstream patch.
+upstream patch: 
+https://github.com/torvalds/linux/commit/060423bfdee3f8bc6e2c1bac97de24d5415e2bc4
+https://git.kernel.org/pub/scm/linux/kernel/git/mst/vhost.git/commit/?h=for_linus&id=060423bfdee3f8bc6e2c1bac97de24d5415e2bc4
+
+About the Poof of concept:
+We(Tencent Blade Team) plan to publish simple reproduce steps of this vulnerability about a week later.
+
+Credit:
+The vulnerability was discovered by Peter Pi of Tencent Blade Team
+
+---
+Cradmin of Tencent Blade Team

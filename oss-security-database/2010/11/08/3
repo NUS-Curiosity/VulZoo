@@ -1,0 +1,156 @@
+
+Date: Mon, 8 Nov 2010 05:52:58 +0300
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: Daniel Walsh <dwalsh@...hat.com>
+Subject: filesystem capabilities
+
+Kees, all -
+
+There's a lot of talk lately regarding replacing the SUID bit on program
+binaries in Linux distros with filesystem capabilities.  Specifically,
+Fedora and Ubuntu are heading in that direction.
+
+Fedora:
+http://fedoraproject.org/wiki/Features/RemoveSETUID
+https://bugzilla.redhat.com/show_bug.cgi?id=646440
+
+Ubuntu:
+http://www.outflux.net/blog/archives/2010/02/09/easy-example-of-fscaps/
+https://wiki.ubuntu.com/Security/FilesystemCapabilties
+
+While in general this is a good idea, there are issues with it, in
+arbitrary order:
+
+- Some currently-SUID programs are aware of them being (potentially)
+SUID, and will drop the "more privileged" euid when it is no longer
+needed, but they will probably not be aware of them possessing
+capabilities.  This may result in larger parts of the programs
+(sometimes orders of magnitude larger) running with elevated privileges
+(or with allowed-to-be-elevated privileges, which is a privilege on its
+own and is usable through vulnerabilities that allow for arbitrary code
+execution).  Let's consider ping, which appears to be the classical
+example of "where filesystem capabilities will help" (or so it is
+claimed).  IIRC, it starts by acquiring a raw socket (NB: of a certain
+somewhat-limited type), then drops root privs (if it was installed SUID
+root and run by non-root), then proceeds to parse the command-line,
+resolve the provided hostname, and so on.  If the SUID bit is replaced
+with cap_net_raw+ep, as seen in Kees' example above, will ping know to
+drop this capability?  Hardly.  Not without a source code patch.
+Besides, dropping the capability might [need to] require privileges
+beyond CAP_NET_RAW itself (recall the capability-dropping attack on
+sendmail from a decade ago).  So does moving from SUID root to
+cap_net_raw+ep improve security?  Most likely not.  On the contrary, it
+results in hundreds of lines of ping's code and thousands of lines of
+library code (DNS resolver) running with elevated privileges, as
+compared to just a few lines of ping.c, which was the case with simple
+SUID root.  Granted, those "elevated privileges" are a lot less than
+root privileges, but they're a lot more than having a single raw socket
+of a specific type.
+
+- In some cases, the capability sets being granted are (almost)
+equivalent (or expandable to) full root powers.  This is seen in:
+
+http://people.fedoraproject.org/~dwalsh/policycoreutils_setuid.patch
+
+-%attr(4755,root,root) %{_bindir}/newrole
++%attr(0755,root,root) %caps(cap_audit_write,cap_setuid) %{_bindir}/newrole
+
+-%{_sbindir}/seunshare
++%attr(0755,root,root) %caps(cap_setuid,cap_dac_override,cap_sys_admin,cap_sys_nice) %{_sbindir}/seunshare
+
+This mostly just sweeps the SUID root under the rug, where the sysadmin
+will hopefully not see it and thus feel safer.  However, it may expose
+more problems in the programs if they knew to drop root, but wouldn't
+know to drop the capabilities (same issue I described above for ping).
+
+Granted, vulnerabilities of certain classes might become unexploitable
+or be partially mitigated.  For example, if no direct code execution is
+possible (not a buffer overflow, etc.), but "only" privileged access to
+an attacker-provided arbitrary pathname is possible, then "newrole"
+above would be protected, but "seunshare" above would not (because of
+cap_dac_override).
+
+- Completely getting rid of SUID root programs in the default install,
+like we did in Owl-current (but without filesystem capabilities!), is a
+great idea.  It mitigates the impact of possible vulnerabilities in
+certain code paths in the dynamic linker, libc, and the kernel.
+However, if you have even a single SUID root program left, you do not
+achieve this goal.  Thus, switching from SUID root to CAP_NET_RAW for
+ping, with its tiny and obviously-correct code that used to run as root,
+gives you absolutely nothing as long as you keep su and/or sudo
+available for invocation (not necessarily actual use) by all users.
+
+For servers, I think people need to reconsider and, in most cases,
+disallow invocation of su and sudo by the users.  There's no added
+security from the old "login as non-root, then su or sudo to root"
+sysadmin "wisdom", as compared to logging in as non-root and as root
+directly (two separate sessions).  On the contrary, the latter approach
+is the only correct one, from a security standpoint:
+
+http://www.openwall.com/lists/owl-users/2004/10/20/6
+
+(For accountability of multiple sysadmins, the system needs to support
+having multiple root-privileged accounts, like Owl does.)
+
+(For desktops with X, this gets trickier.)
+
+You also absolutely have to deal with passwd, which would be another
+SUID root program.  Like we did:
+
+http://www.openwall.com/tcb/
+
+And with all others (e.g., our crontab/at and crond changes). :-)
+
+- Support for filesystem capabilities and extended attributes is still
+not mature.  Many userspace tools (such as for backup/restore) lack it.
+
+Thus, if you must, it might make sense to use a poor man's replacement,
+which will be more reliable.  Introduce a sysctl to configure a groups
+range to map onto capabilities.  With 32 or 64 group IDs allocated for
+the purpose, you can have any one capability set.
+
+<gettingold>I briefly experimented with just that on a Slackware 3.1
+system with capabilities support patched into the 2.0.x kernel, with the
+caps-by-gid changes hacked into the kernel on top of the capabilities
+patch on my own.  That was in 1998 or so.  The conclusion was that
+without userspace patches this would achieve too little.</gettingold>
+
+With 1024 or 4096 IDs (or 992 or 4032 with a smarter approach), you can
+have any two caps.  32-bit GIDs permit you to have up to 5 or 6 caps
+simultaneously in this way.  I think that in practice 1 or 2 caps will
+be enough; the cases where you'd assign more are typically the ones
+where the caps are (almost) equivalent to root anyway.
+
+This is more reliable in several aspects:
+
+* The SGID bit and st_gid are stored/restored by all existing Unix
+backup/restore/copy/packaging tools.
+
+* Such programs are easy for a sysadmin to identify with the familiar
+options to "find", etc.
+
+* Programs either already know to drop the "elevated" egid or are easy
+to teach to do so (and the kernel patch may include logic to drop
+egid-granted caps when the egid is dropped).  This does not require
+privileges on its own.  And that fact will not confuse any correct but
+old program (no "sendmail risk").
+
+- For ping in particular, we've been considering another approach -
+namely, a new socket type (non-raw ICMP, similar to the usual UDP
+sockets).  This would eliminate the need for ping to run with elevated
+privileges, or we could introduce some privilege boundary (SGID to some
+sysctl'able ICMP-socket-enabling group) just not to expose potential
+vulnerabilities in the added kernel code.  We have a Linux 2.4.x patch
+and a ping patch to implement this, both by Pavel Kankovsky.  It's my
+fault this never actually got into Owl (so far); I ran out of time.
+Any volunteers to update this to Linux 2.6.x, introduce the sysctl, and
+actually make use of it in a distro?  Please let me know.
+
+Thanks for reading this far, and I'd appreciate any comments and/or
+corrections.  Some of the info above might be outdated - e.g., I am not
+sure of what current kernels require (or not) to drop capabilities.
+(If they no longer require anything extra to drop CAP_SETUID, then
+that's a security problem on its own - the "sendmail risk" is back.)
+
+Alexander

