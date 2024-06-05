@@ -1,0 +1,437 @@
+
+Date: Mon, 6 Apr 2015 15:25:55 +0100
+From: "Nicholas Lemonias." <lem.nikolas@...glemail.com>
+To: bugtraq@...urityfocus.com, cve-assign@...re.org
+Subject: Security Audit Notes = Kerberos (krb5-1.13) issues - Advanced
+ Information Security Corp
+
+ -=[Advanced Information Security Corp]=-
+
+
+ Nicholas Lemonias
+ Report Date: 3/4/2015
+ Email: lem.nikolas@...il.com
+
+
+ Introduction
+ ==============
+ During a source-code audit of the krb5-1.13 stable release (15 October 2014)
+ implementation for linux; conducted internally by the Advanced
+ Information Security Group, instances of insecure function use were
+observed, which could
+ lead to a number of attacks.
+
+ Software Overview
+ ==================
+ Kerberos is a computer network authentication protocol which works on
+the basis of 'tickets' to allow nodes
+ communicating over a non-secure network to prove their identity to
+one another in a secure manner.
+ Its designers aimed it primarily at a client–server model and it
+provides mutual authentication—both the user
+ and the server verify each other's identity. Kerberos protocol
+messages are protected against eavesdropping and replay attacks.
+ Kerberos builds on symmetric key cryptography and requires a trusted
+third party, and optionally may use
+ public-key cryptography during certain phases of authentication.
+
+ Massachusetts Institute of Technology (MIT) developed Kerberos to
+protect network services provided by Project Athena.
+ The protocol is based on the earlier Needham–Schroeder symmetric key
+protocol. Several versions of the protocol exist; versions
+1–3 occurred only internally at MIT.
+ Steve Miller and Clifford Neuman, the primary designers of Kerberos
+version 4, published that version in the late 1980s, although they had
+targeted it primarily for Project Athena.
+ Version 5, designed by John Kohl and Clifford Neuman, appeared as RFC
+1510 in 1993 (made obsolete by RFC 4120 in 2005), with the intention
+of overcoming the limitations and security problems of version 4.
+ Authorities in the United States classified Kerberos as auxiliary
+military technology and banned its export because it used the Data
+Encryption Standard (DES) encryption algorithm (with 56-bit keys).
+
+ PoC 1 - Code Snippet [CWE 362]
+ ==============================
+ (.../src/ccapi/server/win/ccs_win_pipe.c:67)
+
+ struct ccs_win_pipe_t* ccs_win_pipe_new (const char* uuid, const UINT64 h) {
+
+    cc_int32                err         = ccNoError;
+    struct ccs_win_pipe_t*  out_pipe    = NULL;
+    char*                   uuidCopy    = NULL;
+
+    if (!err) {
+        if (!uuid)      {err = cci_check_error(ccErrBadParam);}
+        }
+
+    if (!err) {
+        uuidCopy = (char*)malloc(1+strlen(uuid));
+        if (!uuidCopy)  {err = cci_check_error(ccErrBadParam);}
+        strcpy(uuidCopy, uuid);
+        }
+
+    if (!err) {
+        out_pipe = (struct ccs_win_pipe_t*)malloc(sizeof(struct
+ccs_win_pipe_t));
+        if (!out_pipe)  {err = cci_check_error(ccErrBadParam);}
+        out_pipe->uuid          = uuidCopy;
+        out_pipe->clientHandle  = h;
+        }
+#if 0
+    cci_debug_printf("0x%X = %s(%s, 0x%X)", out_pipe, __FUNCTION__, uuid, h);
+#endif
+    return out_pipe;
+    }
+
+
+Description: Memory leak [1]
+
+
+ PoC 2 - Code Snippet [CWE 457]
+ ==============================
+(.../src/lib/kadm5/chpass_util.c:110)
+
+ int code, code2;
+    unsigned int pwsize;
+    static char buffer[255];
+    char *new_password;
+    kadm5_principal_ent_rec princ_ent;
+    kadm5_policy_ent_rec policy_ent;
+
+    _KADM5_CHECK_HANDLE(server_handle);
+
+    if (ret_pw)
+        *ret_pw = NULL;
+
+    if (new_pw != NULL) {
+        new_password = new_pw;
+    } else { /* read the password */
+        krb5_context context;
+
+        if ((code = (int) kadm5_init_krb5_context(&context)) == 0) {
+            pwsize = sizeof(buffer);
+            code = krb5_read_password(context, KADM5_PW_FIRST_PROMPT,
+                                      KADM5_PW_SECOND_PROMPT,
+                                      buffer, &pwsize);
+            krb5_free_context(context);
+        }
+
+        if (code == 0)
+            new_password = buffer;
+        else {
+#ifdef ZEROPASSWD
+            memset(buffer, 0, sizeof(buffer));
+#endif
+            if (code == KRB5_LIBOS_BADPWDMATCH) {
+                strncpy(msg_ret, string_text(CHPASS_UTIL_NEW_PASSWORD_MISMATCH),
+                        msg_len - 1);
+                msg_ret[msg_len - 1] = '\0';
+                return(code);
+            } else {
+                snprintf(msg_ret, msg_len, "%s %s\n\n%s",
+                         error_message(code),
+                         string_text(CHPASS_UTIL_WHILE_READING_PASSWORD),
+                         string_text(CHPASS_UTIL_PASSWORD_NOT_CHANGED));
+                msg_ret[msg_len - 1] = '\0';
+                return(code);
+            }
+        }
+        if (pwsize == 0) {
+#ifdef ZEROPASSWD
+            memset(buffer, 0, sizeof(buffer));
+#endif
+            strncpy(msg_ret,
+string_text(CHPASS_UTIL_NO_PASSWORD_READ), msg_len - 1);
+            msg_ret[msg_len - 1] = '\0';
+            return(KRB5_LIBOS_CANTREADPWD); /* could do better */
+        }
+    }
+
+    if (ret_pw)
+        *ret_pw = new_password;
+
+ Description: Unitialized variable pwsize
+
+
+ PoC 3 - Code Snippet [CWE  401]
+ ===============================
+(.../src/lib/krb5/krb/rd_req_dec.c:672)
+
+retval = krb5int_validate_times(context, &req->ticket->enc_part2->times);
+    if (retval != 0)
+        goto cleanup;
+
+    if ((retval = krb5_check_clockskew(context,
+(*auth_context)->authentp->ctime)))
+        goto cleanup;
+
+    if (check_valid_flag) {
+        if (req->ticket->enc_part2->flags & TKT_FLG_INVALID) {
+            retval = KRB5KRB_AP_ERR_TKT_INVALID;
+            goto cleanup;
+        }
+
+        if ((retval = krb5_authdata_context_init(context,
+                                                 &(*auth_context)->ad_context)))
+            goto cleanup;
+        if ((retval = krb5int_authdata_verify(context,
+                                              (*auth_context)->ad_context,
+                                              AD_USAGE_MASK,
+                                              auth_context,
+                                              &decrypt_key,
+                                              req)))
+            goto cleanup;
+    }
+
+    /* read RFC 4537 etype list from sender */
+    retval = decode_etype_list(context,
+                               (*auth_context)->authentp,
+                               &desired_etypes,
+                               &rfc4537_etypes_len);
+    if (retval != 0)
+        goto cleanup;
+
+    if (desired_etypes == NULL)
+        desired_etypes = (krb5_enctype *)calloc(4, sizeof(krb5_enctype));
+    else
+        desired_etypes = (krb5_enctype *)realloc(desired_etypes,
+                                                 (rfc4537_etypes_len + 4) *
+                                                 sizeof(krb5_enctype));
+    if (desired_etypes == NULL) {
+        retval = ENOMEM;
+        goto cleanup;
+    }
+
+    desired_etypes_len = rfc4537_etypes_len;
+
+
+ Description: desired_etypes nulled but not freed upon failure.
+
+ PoC 4 - Code Snippet [CWE 362]
+ ================================
+(.../src/plugins/kdb/ldap/libkdb_ldap/ldap_principal2.c:1440)
+
+ static char *
+getstringtime(krb5_timestamp epochtime)
+{
+    struct tm           tme;
+    char                *strtime=NULL;
+    time_t              posixtime = epochtime;
+
+    strtime = calloc (50, 1);
+    if (strtime == NULL)
+        return NULL;
+
+    if (gmtime_r(&posixtime, &tme) == NULL)
+        return NULL;
+
+    strftime(strtime, 50, "%Y%m%d%H%M%SZ", &tme);
+    return strtime;
+}
+
+Description: Memory leak on strtime.
+
+
+ PoC 5 - Code Snippet [CWE 362]
+ ================================
+(.../src/plugins/preauth/pkinit/pkinit_crypto_nss.c:1897)
+char *rnd_buf;
+    size_t kbyte, klength;
+    krb5_data rnd_data;
+    krb5_error_code result;
+    NSSInitContext *ncontext;
+
+    if (counter_length > sizeof(counter))
+        return EINVAL;
+    result = krb5_c_keylengths(context, etype, &kbyte, &klength);
+    if (result != 0)
+        return result;
+    rnd_buf = malloc(dh_key_len);
+    if (rnd_buf == NULL)
+        return ENOMEM;
+
+    memset(counter, 0, sizeof(counter));
+    for (i = sizeof(counter) - 1; i >= 0; i--)
+        counter[i] = (counter_start >> (8 * (counter_length - 1 - i))) & 0xff;
+    rnd_len = kbyte;
+    left = rnd_len;
+    ncontext = NSS_InitContext(DEFAULT_CONFIGDIR,
+                               NULL,
+                               NULL,
+                               NULL,
+                               NULL,
+                               NSS_INIT_READONLY |
+                               NSS_INIT_NOCERTDB |
+                               NSS_INIT_NOMODDB |
+                               NSS_INIT_FORCEOPEN |
+                               NSS_INIT_NOROOTINIT |
+                               NSS_INIT_PK11RELOAD);
+    while (left > 0) {
+        ctx = PK11_CreateDigestContext(hash_alg);
+        if (ctx == NULL) {
+            krb5int_zap(buf, sizeof(buf));
+            krb5int_zap(rnd_buf, dh_key_len);
+            free(rnd_buf);
+            return ENOMEM;
+        }
+        if (PK11_DigestBegin(ctx) != SECSuccess) {
+            PK11_DestroyContext(ctx, PR_TRUE);
+            krb5int_zap(buf, sizeof(buf));
+            krb5int_zap(rnd_buf, dh_key_len);
+            free(rnd_buf);
+            return ENOMEM;
+        }
+        if (PK11_DigestOp(ctx, counter, counter_length) != SECSuccess) {
+            PK11_DestroyContext(ctx, PR_TRUE);
+            krb5int_zap(buf, sizeof(buf));
+            krb5int_zap(rnd_buf, dh_key_len);
+            free(rnd_buf);
+            return ENOMEM;
+        }
+        if (PK11_DigestOp(ctx, dh_key, dh_key_len) != SECSuccess) {
+            PK11_DestroyContext(ctx, PR_TRUE);
+            krb5int_zap(buf, sizeof(buf));
+            krb5int_zap(rnd_buf, dh_key_len);
+            free(rnd_buf);
+            return ENOMEM;
+        }
+        if ((other_data_len > 0) &&
+            (PK11_DigestOp(ctx, (const unsigned char *) other_data,
+                           other_data_len) != SECSuccess)) {
+            PK11_DestroyContext(ctx, PR_TRUE)
+
+Description: rnd_buf in pkinit_octetstring_hkdf() can be leaked on
+malloc failure.
+
+
+ PoC 6 - Code Snippet [CWE 401]
+ ==================================
+(.../src/plugins/preauth/pkinit/pkinit_crypto_openssl.c:1909)
+
+
+/* transfer the decoded PKCS7 SignedData message into a separate buffer */
+
+for (;;) {
+
+if ((tmp_buf = realloc(tmp_buf, size + 1024 * 10)) == NULL)
+
+goto cleanup;
+
+i = BIO_read(out, &(tmp_buf[size]), 1024 * 10);
+
+if (i <= 0)
+
+break;
+
+else
+
+size += i;
+
+}
+
+tmp_buf_len = size;
+
+
+Description: Buffer tmp_buf is nulled but not freed upon failure.
+
+
+ PoC 7 - Code Snippet [CWE 467]
+ ===============================
+(.../src/windows/leashdll/krb5routines.c:183)
+
+
+/* initialize ticket cache */
+
+
+if ((icode = pkrb_in_tkt(v4creds->pname, v4creds->pinst,
+v4creds->realm) != KSUCCESS)) {
+
+
+goto cleanup;
+
+
+}
+
+
+/* stash ticket, session key, etc. for future use */
+
+
+if ((icode = pkrb_save_credentials(v4creds->service,v4creds->instance,v4creds->realm,v4creds->session,v4creds->lifetime,v4creds->kvno,
+
+& (v4creds->ticket_st),v4creds->issue_date))) {
+
+
+goto cleanup;
+
+
+}
+
+
+
+cleanup:
+
+
+memset(v4creds, 0, sizeof(v4creds));
+
+free(v4creds);
+
+
+if (v5creds) {
+
+pkrb5_free_creds(ctx, v5creds);
+
+}
+
+
+Description: size of pointer v4credis is used instead of its data.
+This should be  'sizeof(*v4creds). This
+could lead to buffer overflows.
+
+
+PoC 8 - Code Snippet [CWE 120]
+===============================
+(.../src/windows/leashdll/lshfunc.c:534,539)
+
+
+sscanf(principal, "%[/0-9a-zA-Z._-]@%[/0-9a-zA-Z._-]", first_part, second_part);
+
+strcpy(temp, first_part);
+
+strcpy(realm, second_part);
+
+memset(first_part, '\0', sizeof(first_part));
+
+memset(second_part, '\0', sizeof(second_part));
+
+
+if (sscanf(temp, "%[@0-9a-zA-Z._-]/%[@0-9a-zA-Z._-]", first_part,
+second_part) == 2)
+
+{
+
+strcpy(aname, first_part);
+
+strcpy(inst, second_part);
+
+
+}
+
+Description: Function Scanf doesn't have field limits on input, and
+could lead to a buffer overflow attack. [2]
+
+
+
+Appendices
+===========
+Sincere Thanks to the Kerberos team for their mutual security efforts.
+
+
+References
+===========
+
+[1]  M. Howard, D. LeBlanc Writing Secure Code, Second Edition Microsoft Press.
+
+[2] Oracle. Basic Library Functions - Title: scaf() man pages
+section 3: Basic Library Functions [Online]
+ Available at: http://docs.oracle.com/cd/E36784_01/html/E36874/scanf-3c.html
+[Last Accessed 2 April, 2015]

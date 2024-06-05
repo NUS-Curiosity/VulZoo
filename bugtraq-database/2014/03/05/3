@@ -1,0 +1,117 @@
+
+Date: Tue, 4 Mar 2014 21:48:37 +0100
+From: Jann Horn <jann+bugtraq_20140304_phpsess@...jh.net>
+To: bugtraq@...urityfocus.com
+Subject: PHP: patch to make session handling with default config more secure
+ against local attackers
+
+There is an issue with PHP's session handling in its default configuration that
+is also partially pointed out in the manual:
+
+http://www.php.net/manual/en/session.configuration.php#ini.session.save-path
+> Warning
+> If you leave this set to a world-readable directory, such as /tmp (the
+> default), other users on the server may be able to hijack sessions by getting
+> the list of files in that directory.
+
+Debian uses a directory with mode "rwx--x--t" to get around that – this way,
+an unprivileged user can't list the contents of the directory and the attack
+the manual mentions doesn't work anymore. But is that secure?
+
+No, because any local user can still choose an unused session ID himself, then
+create a mode 0777 file in that directory with a name matching the session ID
+he chose and then fill the file with arbitrary session data. Any PHP instance
+that uses the same folder for its session storage will then accept the
+attacker-chosen sessionid and associate the data from the file with it.
+
+What this means is that unless the admin of a box running PHP explicitly
+reconfigured PHP to use a secure folder, any local user can e.g. sign in to any
+PHP webapp running on the system which uses sessions as admin by creating a
+fake admin session.
+
+
+Also, you might be thinking "so what about symlinks? could a local attacker
+also make the webserver read data from an arbitrary file using a symlink?".
+The answer to that has two parts. First part: The PHP session code explicitly
+checks for symlinks. Second part: It does this by opening the file, then doing
+fstat() on the open FD. I can't figure out any way for this code path to
+actually catch anything – the FD would point to the file to which the symlink
+points, not to the symlink.
+To test this, simply create a symlink named sess_aaaa in the folder where php
+stores its sessions that points to a file only accessible for your webserver
+user. If it contained text before, it will be wiped blank after a request with
+PHPSESSID=aaaa to a script that uses sessions (if the script didn't have any
+data it wanted to store).
+
+
+I filed a bug about this in the PHP bugtracker at
+<https://bugs.php.net/bug.php?id=66171> (but it's still marked as private),
+they haven't done anything about it so far. That bug contains a patch I wrote.
+The patch should eliminate the issue with symlinks (but hardlinks would probably
+still work, so I'm not sure how useful that is) and should also
+make the evil session creation attack at least a bit harder by requiring that a
+session file is owned by the current UID or UID 0. An attacker could still
+hardlink an existing file over into the directory, but he would at least need a
+file on the same partition that is owned by the webserver UID or UID 0 and that
+he can write to (directly or through some other process) in order to create a
+session with arbitrary data. So you should still change that PHP configuration
+even with the patch.
+I'll paste it here so that anyone who wants it can apply it to his
+system/distribution:
+
+diff --git a/ext/session/mod_files.c b/ext/session/mod_files.c
+index 004d9d4..7a430ef 100644
+--- a/ext/session/mod_files.c
++++ b/ext/session/mod_files.c
+@@ -135,22 +135,22 @@ static void ps_files_open(ps_files *data, const char *key TSRMLS_DC)
+ 
+                data->lastkey = estrdup(key);
+ 
++               /* O_NOFOLLOW to prevent us from following evil symlinks */
++#ifdef O_NOFOLLOW
++               data->fd = VCWD_OPEN_MODE(buf, O_CREAT | O_RDWR | O_BINARY | O_NOFOLLOW, data->filemode);
++#else
+                data->fd = VCWD_OPEN_MODE(buf, O_CREAT | O_RDWR | O_BINARY, data->filemode);
++#endif
+ 
+                if (data->fd != -1) {
+ #ifndef PHP_WIN32
+-                       /* check to make sure that the opened file is not a symlink, linking to data outside of allowable dirs */
+-                       if (PG(open_basedir)) {
+-                               struct stat sbuf;
+-
+-                               if (fstat(data->fd, &sbuf)) {
+-                                       close(data->fd);
+-                                       return;
+-                               }
+-                               if (S_ISLNK(sbuf.st_mode) && php_check_open_basedir(buf TSRMLS_CC)) {
+-                                       close(data->fd);
+-                                       return;
+-                               }
++                       /* check that this session file was created by us or root – we
++                          don't want to end up accepting the sessions of another webapp */
++                       struct stat sbuf;
++                       if (fstat(data->fd, &sbuf) || (sbuf.st_uid != 0 && sbuf.st_uid != getuid())) {
++                               close(data->fd);
++                               data->fd = -1;
++                               return;
+                        }
+ #endif
+                        flock(data->fd, LOCK_EX);
+
+
+Of course, the real fix would be to just refuse to start unless the sessions
+folder is mode 0700 or so. Or maybe to use a setuid helper.
+
+
+
+
+### Disclosure Timeline ###
+2013-11-25 filed a bug report (but forgot to include the actual patch)
+2013-12-13 asked for a response
+2014-02-03 told them they have 14 more days. I notice that I can't see my patch
+           in the bugtracker, they confirm and ask me to add it to the bug,
+           which I do
+2014-03-04 public disclosure on bugtraq
+
+Download attachment "signature.asc" of type "application/pgp-signature" (837 bytes)

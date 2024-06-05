@@ -1,0 +1,123 @@
+
+Date: Wed, 11 Mar 2015 18:51:53 GMT
+From: j.v.vallejo@...il.com
+To: bugtraq@...urityfocus.com
+Subject: Microsoft Office Compatibility Pack tries to execute path without
+ quotes
+
+A couple of days ago i found a weird behaviour in my computer. When i double-clicked a .docx file, an error message appeared saying c:\Program couldn�t be executed. I don�t know when and why i had an empty file named �c:\Program� on my computer (i had been doing tests with %PROGRAMFILES% envar in my code and i guess the file derived of this).
+
+I investigated a bit about it and it seems to be a bug of the �Microsoft Office Compatibility Pack for Word, Excel, and PowerPoint File Formats�. It seems it keeps into a registry key a path to wordconv.exe without quotes, so when svchost.exe tries to execute c:\Program files\Microsoft office\Office12\Wordconv.exe, if c:\Program exists in the machine, it executes c:\Program.
+
+It�s not an important bug and doesnt seem a security problem, because c:\Program is executed in the context of the currently logged user. However i decided to analyze the bug. A complete analysis is here:
+
+
+http://vallejo.cc/2015/03/11/microsoft-office-compatibility-pack-tries-to-execute-path-without-quotes/
+
+
+And i paste the main part of the analysis in this mail.
+ 
+
+Sympthoms
+---------
+
+We have installed �Microsoft Office Compatibility Pack for Word, Excel, and PowerPoint File Formats�:
+
+http://www.microsoft.com/en-us/download/details.aspx?id=3
+
+And we haven�t installed a office or we have a version previous to 2007.
+
+We copy a executable file to the root of windows unit (for example c:\) with the name of the start of %PROGRAMFILES%. For example:
+
+English:   c:\Program
+
+Spanish:   c:\Archivos
+
+i.e, in a spanish computer: copy c:\windows\system32\calc.exe c:\Archivos
+
+Now we double click a docx file and wordconv.exe should be launched. However our executable c:\Archivos is launched.
+
+ 
+Explanation
+-----------
+
+The reason is the path to wordconv.exe in registry hasn�t quotes:
+
+registry key: HKEY_CLASSES_ROOT\CLSID\{BC7ADC2B-CC8C-48d2-A820-1BC605B0D3C7}\LocalServer32
+value: C:\Archivos de programa\Microsoft Office\Office12\Wordconv.exe
+ 
+The launching process is svchost.exe. We attach windbg and we search this svchost.exe, and we set a bp in ZwCreateSection only for the context of this svchost.exe process:
+
+kd> !process 0 0 svchost.exe
+�
+PROCESS 8220c880  SessionId: 0  Cid: 0370    Peb: 7ffd5000  ParentCid: 02c4
+    DirBase: 093c00c0  ObjectTable: e197f4a8  HandleCount: 210.
+    Image: svchost.exe
+�
+
+
+kd> bp /p 8220c880 ntdll!ZwCreateSection
+
+Breakpoint 4 hit
+ntdll!ZwCreateSection:
+001b:7c91d17e b832000000      mov     eax,32h
+kd> bl
+ 0 d 7c80236b     0001 (0001) kernel32!CreateProcessA
+ 1 d 7c802336     0001 (0001) kernel32!CreateProcessW
+ 2 d 7c91d17e     0001 (0001) ntdll!ZwCreateSection
+ 3 d 7c863231     0001 (0001) kernel32!WinExec
+ 4 e 7c91d17e     0001 (0001) ntdll!ZwCreateSection
+     Match process data 8220c880
+
+kd> kb
+ChildEBP RetAddr  Args to Child              
+00ebeb48 7c81855b 00ebefac 000f001f 00000000 ntdll!ZwCreateSection
+00ebf61c 77dba96c 00000358 00000000 000a17b8 kernel32!CreateProcessInternalW+0x989
+00ebf670 76a5510d 00000358 00000000 000a17b8 ADVAPI32!CreateProcessAsUserW+0x153
+00ebf7d0 76a54f76 000b0a08 000cd8a8 000003e4 rpcss!CClsidData::PrivilegedLaunchActivatorServer+0x42b
+00ebf84c 77e59eb6 000a1310 bc7adc2b 48d2cc8c rpcss!_LaunchActivatorServer+0xbc
+00ebf8a8 77ed521a 76a54ebb 00ebf8bc 00000012 RPCRT4!Invoke+0x30
+00ebfcf4 77ed56ee 00000000 00000000 000a1434 RPCRT4!NdrStubCall2+0x297
+00ebfd10 77e599c4 000a1434 0009fc88 000a1434 RPCRT4!NdrServerCall2+0x19
+00ebfd44 77e59929 76a41e6c 000a1434 00ebfdec RPCRT4!DispatchToStubInC+0x38
+00ebfd98 77e59855 00000000 00000000 76a7f6e4 RPCRT4!RPC_INTERFACE::DispatchToStubWorker+0x113
+00ebfdbc 77e5ba0d 000a1434 00000000 76a7f6e4 RPCRT4!RPC_INTERFACE::DispatchToStub+0x84
+00ebfdf8 77e5b86a 000a4050 0009fd98 000a4a38 RPCRT4!LRPC_SCALL::DealWithRequestMessage+0x2db
+00ebfe1c 77e5b7ae 0009fdd4 00ebfe38 000a4a38 RPCRT4!LRPC_ADDRESS::DealWithLRPCRequest+0x16d
+00ebff80 77e56caf 00ebffa8 77e56ad1 0009fd98 RPCRT4!LRPC_ADDRESS::ReceiveLotsaCalls+0x310
+00ebff88 77e56ad1 0009fd98 00000008 000a0008 RPCRT4!RecvLotsaCallsWrapper+0xd
+00ebffa8 77e56c97 0009d538 00ebffec 7c80b729 RPCRT4!BaseCachedThreadRoutine+0x79
+00ebffb4 7c80b729 000c5f48 00000008 000a0008 RPCRT4!ThreadStartRoutine+0x1a
+00ebffec 00000000 77e56c7d 000c5f48 00000000 kernel32!BaseThreadStart+0x37
+
+We can see how svchost with DcomLauncher launchs our process c:\Archivos with CreateProcessAsUserW. The process is created in the context of the current user, so it seems not posible to use the bug to get SYSTEM privileges.
+
+If we see CreateProcessAsUserW parameters:
+
+BOOL WINAPI CreateProcessAsUser(
+  _In_opt_     HANDLE hToken,
+  _In_opt_     LPCTSTR lpApplicationName,
+  _Inout_opt_  LPTSTR lpCommandLine,
+  _In_opt_     LPSECURITY_ATTRIBUTES lpProcessAttributes,
+  _In_opt_     LPSECURITY_ATTRIBUTES lpThreadAttributes,
+  _In_         BOOL bInheritHandles,
+  _In_         DWORD dwCreationFlags,
+  _In_opt_     LPVOID lpEnvironment,
+  _In_opt_     LPCTSTR lpCurrentDirectory,
+  _In_         LPSTARTUPINFO lpStartupInfo,
+  _Out_        LPPROCESS_INFORMATION lpProcessInformation
+);
+
+In Windbg we can see hToken=00000358, lpApplicationName=NULL and lpCommandLine=000a17b8:
+
+000a17b8 -> C.:.\.A.r.c.h.i.v.o.s. .d.e. .p.r.o.g.r.a.m.a.\.M.i.c. r.o.s.o.f.t. .O.f. f.i.c.e.\.O.f.f.i.c.e.1.2.\.W.o.r.d. c.o.n.v�e.x.e. . -.E.m.b.e.d.d.i.n.g
+
+So the problem is the string read from registry is passed directly to CreateProcessAsUser.
+
+ 
+Security
+--------
+
+>From a security point of view, this is not a dangerous bug. The process created by svchost.exe (c:\Archivos, or c:\Program, or �) is created with the credentials of the logged user, so it seems it is not possible to escalate privileges.
+
+Maybe, it could be possible to use this to avoid some security products behavioural heuristics. You only need to install a Microsoft tool (the Microsoft Office Compatibility Pack), and dump a PE with no extension and a docx, xlsx or pptx file. Then, with this, you can get your PE executed with a legitimate svchost.exe as parent and no suspicious or injected processes in the process-tree ancestors.

