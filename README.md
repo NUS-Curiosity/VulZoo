@@ -18,6 +18,7 @@
 
 - [Exploit-DB](https://gitlab.com/exploit-database/exploitdb)
 - [oss-security mailing list](https://www.openwall.com/lists/oss-security)
+- [bugtraq mailing list](https://lists.openwall.net/bugtraq/)
 
 ### Hybrid
 

@@ -91,7 +91,7 @@ def fetch_msg_links(url, interval=5, print_result=sys.stdout):
         for month in mail_table[year]:
             specs = fetch_msg_list_per_month(year, month)
             if not specs:
-                print("[!] No message list for year {year}, month {month}", file=sys.stderr)
+                print(f"[!] No message list for year {year}, month {month}", file=sys.stderr)
                 continue
             res[year][month] = specs
             if print_result:

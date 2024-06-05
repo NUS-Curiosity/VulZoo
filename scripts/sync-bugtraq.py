@@ -7,9 +7,9 @@ import os
 import time
 import json
 
-dest_dir = "../oss-security-database"
-link_index = f"{dest_dir}/oss-security-msg-links.json"
-oss_security_url = 'https://www.openwall.com/lists/oss-security'
+dest_dir = "../bugtraq-database"
+link_index = f"{dest_dir}/bugtraq-msg-links.json"
+bugtraq_url = 'https://lists.openwall.net/bugtraq'
 
 
 def ensure_dir(directory):
@@ -63,7 +63,7 @@ def parse_mail_table_month(html):
 
 def fetch_msg_list_per_month(mail_year, mail_month):
     print(f"[*] Fetching message list for year {mail_year}, month {mail_month}", file=sys.stderr)
-    url = f"{oss_security_url}/{mail_year}/{mail_month}"
+    url = f"{bugtraq_url}/{mail_year}/{mail_month}"
     r = requests.get(url)
     if r.status_code != 200:
         print(f"[-] Failed to fetch message list for year {mail_year}, month {mail_month}", file=sys.stderr)
@@ -76,7 +76,7 @@ def fetch_msg_list_per_month(mail_year, mail_month):
 def fetch_msg_links(url, interval=5, print_result=sys.stdout):
     r = requests.get(url)
     if r.status_code != 200:
-        print("[-] Failed to fetch oss-security page", file=sys.stderr)
+        print("[-] Failed to fetch bugtraq page", file=sys.stderr)
         return
 
     mail_table = parse_mail_table_year(r.text)
@@ -91,7 +91,7 @@ def fetch_msg_links(url, interval=5, print_result=sys.stdout):
         for month in mail_table[year]:
             specs = fetch_msg_list_per_month(year, month)
             if not specs:
-                print("[!] No message list for year {year}, month {month}", file=sys.stderr)
+                print(f"[!] No message list for year {year}, month {month}", file=sys.stderr)
                 continue
             res[year][month] = specs
             if print_result:
@@ -126,7 +126,7 @@ def download_messages(msg_links, interval=5, print_result=sys.stdout):
             for date, msg_num in msg_links[year][month]:
                 print(f"[*] Fetching message for {year}/{month}/{date}", file=sys.stderr)
                 for i in range(1, msg_num+1):
-                    url = f"{oss_security_url}/{year}/{month}/{date}/{i}"
+                    url = f"{bugtraq_url}/{year}/{month}/{date}/{i}"
                     msg = fetch_msg(url)
                     if msg:
                         ensure_dir(f"{dest_dir}/{year}/{month}/{date}")
@@ -151,7 +151,7 @@ if __name__ == '__main__':
         else:
             print(f"[!] {link_index} found, fetching links from the website", file=sys.stderr)
             with open(link_index, 'w') as f:
-                msg_links = fetch_msg_links(oss_security_url, interval=1, print_result=sys.stdout)
+                msg_links = fetch_msg_links(bugtraq_url, interval=1, print_result=sys.stdout)
                 f.write(json.dumps(msg_links))
             delta = msg_links
         # downloading the messages

