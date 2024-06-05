@@ -1,4 +1,4 @@
-# Vulnerability Information All in One
+# VulZoo
 
 ## Integrated Sources
 
