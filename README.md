@@ -1,4 +1,6 @@
-# VulZoo
+<p align="center">
+  <img src="images/vulzoo.png" alt="vulzoo-logo" height="250" />
+</p>
 
 ## Introduction
 
