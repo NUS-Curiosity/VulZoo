@@ -1,5 +1,30 @@
 # VulZoo
 
+## Introduction
+
+VulZoo is a vulnerability intelligence dataset that integrates various sources of structured and unstructured data. It is designed to be used by security researchers, penetration testers, and security analysts to get a comprehensive view of vulnerabilities and their associated data.
+
+## How to Use
+
+VulZoo is composed of both git-based and non-git-based sources. The git-based sources are from upstream repositories and organized as git submodules in this repository. The non-git-based sources are crawled and maintained in this repository. To get started, clone the repository with the following command:
+
+```bash
+git clone --recurse-submodules https://github.com/brant-ruan/VulZoo
+```
+
+VulZoo provides some useful scripts to help you manage the data. As some scripts require specific Python packages, it is recommended to install the required packages first:
+
+```bash
+pip install -r requirements.txt
+```
+
+You can run the `update-databases.sh` script to incrementally update the local dataset:
+
+```bash
+cd VulZoo/
+./update-databases.sh
+```
+
 ## Integrated Sources
 
 ### Structural
