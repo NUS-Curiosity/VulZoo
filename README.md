@@ -17,6 +17,7 @@ git clone --recurse-submodules https://github.com/brant-ruan/VulZoo
 VulZoo provides some useful scripts to help you manage the data. As some scripts require specific Python packages, it is recommended to install the required packages first:
 
 ```bash
+cd VulZoo/
 pip install -r requirements.txt
 ```
 
