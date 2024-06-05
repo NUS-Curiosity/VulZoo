@@ -1,0 +1,146 @@
+
+Date: Tue, 05 Mar 2013 20:45:37 +0000
+From: tytusromekiatomek@...hmail.com
+To: bugtraq@...urityfocus.com
+Subject: Varnish 2.1.5, 3.0.3 DoS in VRY_Create() while parsing Vary header
+
+######################################
+# VRY_Create()      |   (*q == ',')  #
+######################################
+#
+# Authors:
+#
+# 22733db72ab3ed94b5f8a1ffcde850251fe6f466
+# c8e74ebd8392fda4788179f9a02bb49337638e7b
+# AKAT-1
+#
+#######################################
+
+## Versions affected:
+3.0.3
+2.1.5
+
+## Summary:
+Varnish 2.1.5 and 3.0.3 crash and restart (via assert) while parsing Vary header (backend response).
+This could be used if attacker gained access to backed systems (for example injecting HTTP headers
+in buggy web application), or when backend system is not managed by the same entity as the varnish 
+proxy.
+
+
+
+## PoC (response from backend):
+-- cut --
+HTTP/1.1 200 OK
+Vary: a a
+
+
+-- cut --
+
+
+
+##  PoC (request):
+ -- cut --
+GET / HTTP/1.1
+Host: foo
+
+ -- cut --
+
+
+
+## Details:
+Varnish 2.1.5)
+  child pid will crash with the following message:
+  "Panic message: Missing errorhandling code in VRY_Create(), cache_vary.c line 128:#012  Condition(*q == ',') not true."
+
+Varnish 3.0.3)
+  child pid will crash with the followin message:
+  "Condition(*q == ',') not true.thread = (cache-worker)#012ident = Linux,3.2.0-4-amd64,x86_64,-smalloc,-smalloc,-hcritbit,epoll#012Backtrace:#"
+
+
+
+# Brief and unfinished pointers on what happens here (based on 2.1.5) :
+
+   The 'q' variable (90 line) is a pointer to 1st character of the 'Vary'
+   header value, which is 'a' from POC. The 'for' loop (90 line) then
+   checks if the 'q' isn't space and ','. If it is, then increments the
+   'q'. The 2nd iteration makes 'q' pointing at ' ' from POC. The 'while'
+   loop (118 line) then skips spaces incrementing 'q', thus 'q' points
+   at 'b' from POC, which is obviously != '\0' (120 line). Finaly 'q'
+   is != ',' so the assert is triggered (122 line).
+
+
+    include/vas.h:
+    57 #define xxxassert(e)                                                    \
+    58 do {                                                                    \
+    59         if (!(e))                                                       \
+    60                 VAS_Fail(__func__, __FILE__, __LINE__, #e, errno, 1);   \
+    61 } while (0)
+
+
+    bin/varnishd/cache_vary.c:
+    62  struct vsb *
+    63  VRY_Create(const struct sess *sp, const struct http *hp)
+    64  {
+    65          char *v, *p, *q, *h, *e;
+    66          struct vsb *sb, *sbh;
+    67          unsigned l;
+    68
+    69          /* No Vary: header, no worries */
+    70          if (!http_GetHdr(hp, H_Vary, &v))
+    71                  return (NULL);
+    72
+    73          /* For vary matching string */
+    74          sb = VSB_new_auto();
+    75          AN(sb);
+    76
+    77          /* For header matching strings */
+    78          sbh = VSB_new_auto();
+    79          AN(sbh);
+    80
+    81          if (*v == ':') {
+    82                  WSP(sp, SLT_Error, "Vary header had extra ':', fix backend");
+    83                  v++;
+    84          }
+    85          for (p = v; *p; p++) {
+    86
+    87                  /* Find next header-name */
+    88                  if (vct_issp(*p))
+    89                          continue;
+    90                  for (q = p; *q && !vct_issp(*q) && *q != ','; q++)
+    91                          continue;
+    92
+    93                  /* Build a header-matching string out of it */
+    94                  VSB_clear(sbh);
+    95                  VSB_printf(sbh, "%c%.*s:%c",
+    96                      (char)(1 + (q - p)), (int)(q - p), p, 0);
+    97                  AZ(VSB_finish(sbh));
+    98
+    99                  if (http_GetHdr(sp->http, VSB_data(sbh), &h)) {
+    100                         AZ(vct_issp(*h));
+    101                         /* Trim trailing space */
+    102                         e = strchr(h, '\0');
+    103                         while (e > h && vct_issp(e[-1]))
+    104                                 e--;
+    105                         /* Encode two byte length and contents */
+    106                         l = e - h;
+    107                         assert(!(l & ~0xffff));
+    108                 } else {
+    109                         e = h;
+    110                         l = 0xffff;
+    111                 }
+    112                 VSB_printf(sb, "%c%c", (int)(l >> 8), (int)(l & 0xff));
+    113                 /* Append to vary matching string */
+    114                 VSB_bcat(sb, VSB_data(sbh), VSB_len(sbh));
+    115                 if (e != h)
+    116                         VSB_bcat(sb, h, e - h);
+    117
+    118                 while (vct_issp(*q))
+    119                         q++;
+    120                 if (*q == '\0')
+    121                         break;
+    122                 xxxassert(*q == ',');
+    123                 p = q;
+    124         }
+
+EOF
+

