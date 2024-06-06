@@ -1,0 +1,269 @@
+
+Date: Fri, 30 Jun 2006 02:03:05 -0500
+From: sean <infamous41md@...pop.com>
+To: bugtraq <bugtraq@...urityfocus.com>
+Subject: libwmf integer/heap overflow
+
+
+Sorry I don't have time to chase down multiple email addresses of alleged
+developers; so here this is after weeks of no response.  POC is not attached
+unlike advisory says.  It's not very difficult to exploit.
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Subject:
+
+libwmf integer/heap overflow
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Product:
+
+libwmf is a library for reading vector images in Microsøft's native Windøws
+Metafile Format (WMF) and for either (a) displaying them in, e.g., an X window;
+or (b) converting them to more standard/open file formats such as, e.g., the
+W3C's XML-based Scaleable Vector Graphic (SVG) format.
+
+http://wvware.sourceforge.net/libwmf.html
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Vulnerable:
+
+I tested the most recent release, 0.2.8.4
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Summary:
+
+An integer overflow in memory allocation leads to a heap overflow.
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Details:
+
+
+-------------------------------------------------------------------------------
+file: src/meta.c +117
+-------------------------------------------------------------------------------
+
+
+wmf_error_t wmf_header_read (wmfAPI* API)
+{	U16 u16a;
+	U16 u16b;
+
+    ...snip...
+
+
+	if (API->File->wmfheader->HeaderSize == 9)
+	{	API->File->wmfheader->Version       = wmf_read_16 (API);
+		API->File->wmfheader->FileSize      = wmf_read_32 (API,0,0);
+		API->File->wmfheader->NumOfObjects  = wmf_read_16 (API);
+1]		API->File->wmfheader->MaxRecordSize = wmf_read_32 (API,0,0);
+		API->File->wmfheader->NumOfParams   = wmf_read_16 (API);
+
+
+        1) This value is taken directly from the wmf file, later it will be used
+        to allocate memory.  It is not sanitized at any point.
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+file: src/player.c +86
+-------------------------------------------------------------------------------
+
+
+wmf_error_t wmf_scan (wmfAPI* API,unsigned long flags,wmfD_Rect* d_r)
+{	wmfPlayer_t* P  = (wmfPlayer_t*) API->player_data;
+
+
+    ...snip...
+
+	wmf_header_read (API);
+
+    ...snip...
+
+1]
+
+/*	P->Parameters = (unsigned char*) wmf_malloc (API,(MAX_REC_SIZE
+(API)-3) * 2 * sizeof (unsigned char)); */	P->Parameters = (unsigned
+char*) wmf_malloc (API,(MAX_REC_SIZE(API)  ) * 2 * sizeof (unsigned
+char));   /* HOLE */
+
+
+	WmfPlayMetaFile (API);
+
+
+
+        1) Overflow the calculation.
+
+
+    **************************
+
+ 
+static wmf_error_t WmfPlayMetaFile (wmfAPI* API)
+{	int i;
+	int byte;
+	int changed;
+
+	unsigned char* Par;
+
+
+    ...snip...
+
+
+1]	Par = P->Parameters;
+
+
+    ...snip...
+
+	number = 0;
+	do
+	{	if (++number < API->store.count)
+		{	atts = API->store.attrlist + number;
+		}
+		else
+		{	atts = &attrlist;
+			wmf_attr_clear (API, atts);
+		}
+
+2]		Size     = wmf_read_32 (API,0,0);
+		Function = wmf_read_16 (API);
+
+		if ((Size == 3) && (Function == 0))
+		{	if (SCAN (API)) wmf_write (API, Size, Function,
+"empty", atts->atts, 0, 0);
+			break; /* Probably final record ?? */
+		}
+
+/*		if ((Size > MAX_REC_SIZE (API)) || (Size < 3))
+ */		if (((Size - 3) > MAX_REC_SIZE (API)) || (Size < 3))
+		{	WMF_ERROR (API,"libwmf: wmf with bizarre record size;
+bailing..."); WMF_ERROR (API,"        please send it to us at
+http://www.wvware.com/"); wmf_printf (API,"maximum record size = %u\n",
+(unsigned) MAX_REC_SIZE (API)); wmf_printf (API,"record size = %u\n",(unsigned)
+Size); API->err = wmf_E_BadFormat;
+			break;
+		}
+
+		pos_params = WMF_TELL (API);
+
+		if (pos_params < 0)
+		{	WMF_ERROR (API,"API's tell() failed on input stream!");
+			API->err = wmf_E_BadFile;
+			break;
+		}
+
+3]		for (i = 0; i < ((Size - 3) * 2); i++)
+		{	byte = WMF_READ (API);
+			if (byte == (-1))
+			{	WMF_ERROR (API,"Unexpected EOF!");
+				API->err = wmf_E_EOF;
+				break;
+			}
+			Par[i] = (unsigned char) byte;  /* VECTOR */
+		}
+
+
+    1) Points to the memory we allocated above.
+
+    2) Controls the number of bytes we write into the buffer.
+
+    3) Overflow the buffer by arbitrarily huge amounts.
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Mitigating factors:
+
+None.
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Workaround:
+
+Do not open up untrusted wmf files.
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Notes:
+
+libwmf is used by:
+
+wv
+abiword
+freetype
+gimp
+libgsf
+imagemagick
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+
+Exploits:
+
+POC is provided that crashes in free().  The easiest way to test is to use the
+example conversion programs that come with libwmf, they are found in the
+src/convert/.libs directory:
+
+
+sean@...ra:~/libwmf-0.2.8.4/src/convert/.libs$ gcc -Wall exwmf.c
+sean@...ra:~/libwmf-0.2.8.4/src/convert/.libs$ ./a.out > evil.wmf
+sean@...ra:~/libwmf-0.2.8.4/src/convert/.libs$ gdb wmf2x
+GNU gdb 6.3-debian
+
+(gdb) r evil.wmf
+Starting program: /home/sean/libwmf-0.2.8.4/src/convert/.libs/wmf2x evil.wmf
+ERROR: player.c (482): Unexpected EOF!
+
+Program received signal SIGSEGV, Segmentation fault.
+0x402d5354 in mallopt () from /lib/libc.so.6
+(gdb) bt
+#0  0x402d5354 in mallopt () from /lib/libc.so.6
+#1  0x402d415f in free () from /lib/libc.so.6
+#2  0x402c283b in fclose () from /lib/libc.so.6
+#3  0x4006e10e in wmf_file_close (API=0x804ad38) at bbuf.c:137
+#4  0x4006d7d8 in wmf_lite_destroy (API=0x804ad38) at api.c:336
+#5  0x40021e6f in wmf_api_destroy (API=0x804ad38) at wmf.c:167
+#6  0x08048aec in wmf2x_draw (pdata=0xbffff8a0) at wmf2x.c:279
+#7  0x08049518 in main (argc=1229353872, argv=0x49467390) at wmf2x.c:401
+
+(gdb) up 1
+#1  0x402d415f in free () from /lib/libc.so.6
+
+(gdb) x/4x $ebp
+0xbffff654:     0xbffff688      0x402c283b      0x08053258      0x00000000
+                                                ^^^
+                                                chunk being free()'d
+
+
+(gdb) x/30x 0x08053258-16
+0x8053248:      0x41414141      0x41414141      0x41414141      0x41414141
+                                                ^^^^^
+                                                chunk header
+
+
+0x8053258:      0x00000000      0x40087000      0x40087000      0x40087000
+0x8053268:      0x40087000      0x40087000      0x40087000      0x40087000
+0x8053278:      0x40088000      0x00000000      0x00000000      0x00000000
+0x8053288:      0x00000000      0x4038c440      0x00000006      0x00000000
+0x8053298:      0x0804bb70      0x08000000      0x080532f0      0x00001018
+0x80532a8:      0x00000000      0x0804bbe8      0x08053308      0xffffffff
+0x80532b8:      0x0804bc30      0x0804bc40
+(gdb)
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+
+-- 
+[ sean ]
+[ pgp key id: 0x421C8CD9 ]
+[ The advantage of a bad memory is that one enjoys several ]
+[ times the same good things for the first time. ]
+
+
+

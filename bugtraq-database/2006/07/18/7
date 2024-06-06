@@ -1,0 +1,235 @@
+
+Date: Sun, 16 Jul 2006 17:37:01 +0200
+From: Luigi Auriemma <aluigi@...istici.org>
+To: bugtraq@...urityfocus.com, bugs@...uritytracker.com,
+	news@...uriteam.com, full-disclosure@...ts.grok.org.uk,
+	vuln@...unia.com
+Subject: Multiple vulnerabilities in UFO2000 svn 1057
+
+
+#######################################################################
+
+                             Luigi Auriemma
+
+Application:  UFO2000
+              http://ufo2000.sourceforge.net
+Versions:     <= SVN 1057
+Platforms:    Windows, *nix, *BSD, Mac and more
+Bugs:         A] buffer-overflow in recv_add_unit
+              B] invalid memory access in decode_stringmap
+              C] possible code execution through arrays
+              D] SQL injection
+              E] mapdata global buffer overflow
+Exploitation: A] remote, versus client
+              B] remote, versus server
+              C] remote, versus client
+              D] remote, versus server
+              E] remote, versus client
+Date:         16 Jul 2006
+Author:       Luigi Auriemma
+              e-mail: aluigi@...istici.org
+              web:    aluigi.org
+
+
+#######################################################################
+
+
+1) Introduction
+2) Bugs
+3) The Code
+4) Fix
+
+
+#######################################################################
+
+===============
+1) Introduction
+===============
+
+
+UFO2000 is a multiplayer turn based game based on the X-COM series.
+
+
+#######################################################################
+
+=======
+2) Bugs
+=======
+
+-----------------------------------
+A] buffer-overflow in recv_add_unit
+-----------------------------------
+
+The command used for adding units (just the first command used at the
+beginning of the challenge) is affected by a buffer-overflow
+vulnerability which happens during the copying of the incoming data to
+the name buffer of only 26 bytes.
+
+>From multiplay.cpp:
+
+int Net::recv_add_unit()
+{
+    int num;
+    char name[26];
+    int cost;
+
+    pkt >> num;
+    pkt >> name;
+    ...
+
+
+--------------------------------------------
+B] invalid memory access in decode_stringmap
+--------------------------------------------
+
+When a packet is received the server calls decode_stringmap which is
+used for reading the number of informations (keys and values) contained
+in the incoming data block and for their subsequent reading.
+Here exist two problems:
+- invalid size values can lead to the reading of the unallocated memory
+  after the packet and to the subsequent crash of the server (for
+  example keysize says to read 100 bytes while the packet is only 2
+  bytes long)
+- the server terminates if keysize or valsize are too big and cannot be
+  allocated with the resize function
+
+>From server_transport.cpp:
+
+bool decode_stringmap(std::map<std::string, std::string> &info, const void *buffer)
+{
+    const unsigned char *p = (const unsigned char *)buffer;
+    unsigned int num = decode_unsigned_int(p);
+
+    while (num--) {
+        unsigned int keysize = decode_unsigned_int(p);
+        unsigned int valsize = decode_unsigned_int(p);
+        std::string key;
+        key.resize(keysize);
+        std::string val;
+        val.resize(valsize);
+        for (unsigned int i = 0; i < keysize; i++)
+            key[i] = decode_unsigned_char(p);
+        for (unsigned int i = 0; i < valsize; i++)
+            val[i] = decode_unsigned_char(p);
+        info[key] = val;
+    }
+    return true;
+}
+
+
+-----------------------------------------
+C] possible code execution through arrays
+-----------------------------------------
+
+Some commands can be used for crashing the remote client/opponent
+through invalid values (too big or negative) used for moving into the
+internal arrays of the game.
+Another effect is the possibility to execute malicious code, in fact
+the game uses large numbers (usually signed 32 bit values) which can be
+used to reach any location of the memory, then these commands allow
+the writing of the data contained in the packet into these locations
+like what happens with "pkt >> scenario->rules[index]" where our 32 bit
+number (pkt >>) is copied in the location chosed by us with index.
+
+These commands are recv_rules, recv_select_unit (select_unit checks
+only if num if major not minor), recv_options and recv_unit_data (with
+a negative value or minor than 19).
+
+>From multiplay.cpp:
+
+int Net::recv_rules()
+{
+    int index;
+    
+    pkt >> index;
+    pkt >> scenario->rules[index];
+    ...
+
+
+----------------
+D] SQL injection
+----------------
+
+The server uses an internal SQL database for handling accounts and
+other informations about the matches.
+In the points where is used the user's input and the %s format argument
+instead of %q could be possible to inject own SQL commands in the query
+prepared by the server.
+
+>From server_protocol.cpp:
+
+bool ServerClientUfo::recv_packet(NLuint id, const std::string &raw_packet)
+        ...
+        case SRV_GAME_REPLAY_REQUEST: {
+            send_packet_back(SRV_GAME_RECOVERY_START, "1");
+            try {
+                debug_game_id = atol(packet.c_str());
+                sqlite3::reader reader=db_conn.executereader("select command, packet_type, id from ufo2000_game_packets where game=%s order by id;", packet.c_str());
+        ...
+
+
+---------------------------------
+E] mapdata global buffer overflow
+---------------------------------
+
+mapdata is a global buffer declared in main.cpp as a GEODATA structure
+of 56 bytes which can be overflowed through the recv_map_data function.
+The effect is the immediate crash of the opponent.
+
+>From multiplay.cpp:
+
+int Net::recv_map_data()
+{
+    std::string map_name;
+    std::string map_data;
+    pkt >> map_name;
+    pkt >> mapdata.x_size;
+    pkt >> mapdata.y_size;
+    pkt >> mapdata.z_size;
+    pkt >> map_data;
+    ASSERT((int)map_data.size() == mapdata.x_size * mapdata.y_size);
+    memcpy(&mapdata.mapdata, map_data.data(), map_data.size());
+    ....
+
+
+#######################################################################
+
+===========
+3) The Code
+===========
+
+
+No proof-of-concept available.
+
+The following is a quick introduction about how server and client work
+for understanding the possible exploitation of these bugs.
+The server simply acts as a place where clients can meet themselves and
+can start 1vs1 challenges.
+The server could also disallow anonyomous logins, using just accounts
+which require a valid username and password.
+In each challenge the work of the server is only that of forwarding the
+packets from and to the clients, so they are in a virtual direct
+communication and their vulnerabilities can be exploited by both
+malicious clients and servers.
+The packets exchanged in the lobby are handled by the server (SRV_*)
+while those during the challenge by the clients (CMD_*).
+
+
+#######################################################################
+
+======
+4) Fix
+======
+
+
+Some of the most critical bugs have been fixed in SVN 1058 while the
+remaining in revision 1061.
+
+
+#######################################################################
+
+
+--- 
+Luigi Auriemma
+http://aluigi.org
+http://mirror.aluigi.org

@@ -1,0 +1,308 @@
+
+Date: Thu, 6 Jul 2006 19:01:39 +0200
+From: Luigi Auriemma <aluigi@...istici.org>
+To: bugtraq@...urityfocus.com, bugs@...uritytracker.com,
+	news@...uriteam.com, full-disclosure@...ts.grok.org.uk, vuln@...unia.com
+Subject: Various heap and stack overflow bugs in AdPlug
+ library 2.0 (CVS 04 Jul 2006)
+
+
+
+#######################################################################
+
+                             Luigi Auriemma
+
+Application:  AdPlug
+              http://adplug.sourceforge.net
+Versions:     <= 2.0 and CVS <= 04 Jul 2006
+Platforms:    Windows, DOS, *nix, *BSD and more
+Bugs:         A] heap overflow in the unpacking of CFF files
+              B] heap overflow in the unpacking of MTK files
+              C] heap overflow in the unpacking of DMO files
+              D] buffer-overflow in DTM files
+              E] buffer-overflow in S3M files
+              F] heap overflow in the unpacking of U6M files
+Exploitation: local
+Date:         06 Jul 2006
+Author:       Luigi Auriemma
+              e-mail: aluigi@...istici.org
+              web:    aluigi.org
+
+
+#######################################################################
+
+
+1) Introduction
+2) Bugs
+3) The Code
+4) Fix
+
+
+#######################################################################
+
+===============
+1) Introduction
+===============
+
+
+AdPlug is an open source library used for playing many Adlib file
+formats.
+It also includes some programs and plugins for Winamp and XMMS.
+
+
+#######################################################################
+
+=======
+2) Bugs
+=======
+
+
+The library is affected by various heap and stack overflow
+vulnerabilities.
+As intuitable by the types of bugs almost all the unpacking
+instructions don't verify the size of the destination buffers and trust
+in the values provided by the same files which are used for allocating
+the needed buffers (except in the CFF files where it has a fixed size).
+The following are the parts of bugged code:
+
+
+----------------------------------------------
+A] heap overflow in the unpacking of CFF files
+----------------------------------------------
+
+>From cff.cpp:
+
+bool CcffLoader::load(const std::string &filename, const CFileProvider &fp)
+    ...
+    f->readString(header.id, 16);
+    header.version = f->readInt(1); header.size = f->readInt(2);
+    header.packed = f->readInt(1); f->readString((char *)header.reserved, 12);
+    if (memcmp(header.id,"<CUD-FM-File>""\x1A\xDE\xE0",16))
+      { fp.close(f); return false; }
+
+    unsigned char *module = new unsigned char [0x10000];
+
+    // packed ?
+    if (header.packed)
+    {
+        cff_unpacker *unpacker = new cff_unpacker;
+
+        unsigned char *packed_module = new unsigned char [header.size + 4];
+
+        memset(packed_module,0,header.size + 4);
+
+        f->readString((char *)packed_module, header.size);
+        fp.close(f);
+
+        if (!unpacker->unpack(packed_module,module))
+        ...
+
+
+----------------------------------------------
+B] heap overflow in the unpacking of MTK files
+----------------------------------------------
+
+>From mtk.cpp:
+
+bool CmtkLoader::load(const std::string &filename, const CFileProvider &fp)
+    ...
+    // read header
+    f->readString(header.id, 18);
+    header.crc = f->readInt(2);
+    header.size = f->readInt(2);
+
+    // file validation section
+    if(strncmp(header.id,"mpu401tr\x92kk\xeer@...a",18))
+      { fp.close(f); return false; }
+
+    // load section
+    cmpsize = fp.filesize(f) - 22;
+    cmp = new unsigned char[cmpsize];
+    org = new unsigned char[header.size];
+    for(i = 0; i < cmpsize; i++) cmp[i] = f->readInt(1);
+    fp.close(f);
+
+    while(cmpptr < cmpsize) {   // decompress
+    ...
+
+
+----------------------------------------------
+C] heap overflow in the unpacking of DMO files
+----------------------------------------------
+
+>From dmo.cpp:
+
+#define ARRAY_AS_WORD(a, i) ((a[i + 1] << 8) + a[i])
+...
+bool CdmoLoader::load(const std::string &filename, const CFileProvider &fp)
+  ...
+  // get file size
+  long packed_length = fp.filesize(f);
+  f->seek(0);
+
+  unsigned char *packed_module = new unsigned char [packed_length];
+
+  // load file
+  f->readString((char *)packed_module, packed_length);
+  fp.close(f);
+
+  // decrypt
+  unpacker->decrypt(packed_module,packed_length);
+
+  long unpacked_length = 0x2000 * ARRAY_AS_WORD(packed_module, 12);
+  unsigned char *module = new unsigned char [unpacked_length];
+
+  // unpack
+  if (!unpacker->unpack(packed_module+12,module))
+  ...
+
+
+-------------------------------
+D] buffer-overflow in DTM files
+-------------------------------
+
+>From dtm.cpp:
+
+bool CdtmLoader::load(const std::string &filename, const CFileProvider &fp)
+    ...
+    char bufstr[80];
+
+    for (i=0;i<16;i++)
+    {
+        // get line length
+        unsigned char bufstr_length = f->readInt(1);
+
+        // read line
+        if (bufstr_length)
+        {
+            f->readString(bufstr,bufstr_length);
+
+            for (j=0;j<bufstr_length;j++)
+                if (!bufstr[j])
+                    bufstr[j] = 0x20;
+
+            bufstr[bufstr_length] = 0;
+
+            strcat(desc,bufstr);
+        }
+
+        strcat(desc,"\n");
+    }
+    ...
+
+
+-------------------------------
+E] buffer-overflow in S3M files
+-------------------------------
+
+>From s3m.cpp:
+
+bool Cs3mPlayer::load(const std::string &filename, const CFileProvider &fp)
+  ...
+  unsigned short    insptr[99],pattptr[99];
+      ...
+      f->seek(checkhead->ordnum, binio::Add);
+      for(i = 0; i < checkhead->insnum; i++)
+    insptr[i] = f->readInt(2);
+      for(i=0;i<checkhead->insnum;i++) {
+    f->seek(insptr[i]*16);
+    if(f->readInt(1) >= 2) {
+      adlibins = true;
+      break;
+    }
+      }
+      delete checkhead;
+      if(!adlibins) { fp.close(f); return false; }
+    }
+
+  // load section
+  f->seek(0);   // rewind for load
+  load_header(f, &header);          // read header
+  for(i = 0; i < header.ordnum; i++) orders[i] = f->readInt(1); // read orders
+  for(i = 0; i < header.insnum; i++) insptr[i] = f->readInt(2); // instrument parapointers
+  for(i = 0; i < header.patnum; i++) pattptr[i] = f->readInt(2);    // pattern parapointers
+  ...
+
+
+----------------------------------------------
+F] heap overflow in the unpacking of U6M files
+----------------------------------------------
+
+destination.size is set but not used so there is no check on the real
+size of the output buffer.
+
+>From u6m.cpp:
+
+bool Cu6mPlayer::load(const std::string &filename, const CFileProvider &fp)
+    ...
+        unsigned char pseudo_header[6];
+        f->readString((char *)pseudo_header, 6);
+        decompressed_filesize = pseudo_header[0] + (pseudo_header[1] << 8);
+
+        if (!( (pseudo_header[2]==0) && (pseudo_header[3]==0) &&
+               (pseudo_header[4] + ((pseudo_header[5] & 0x1)<<8) == 0x100) &&
+               (decompressed_filesize > (filesize-4)) ))
+        {
+        fp.close(f);
+            return(false);
+        }
+    ...
+    song_data = new unsigned char[decompressed_filesize];
+    unsigned char* compressed_song_data = new unsigned char[filesize-4];
+
+    f->seek(4);
+    f->readString((char *)compressed_song_data, filesize - 4);
+    fp.close(f);
+
+    // attempt to decompress the song data
+    // if unsuccessful, deallocate song_data[] on the spot, and return(false)
+    data_block source, destination;
+    source.size = filesize-4;
+    source.data = compressed_song_data;
+    destination.size = decompressed_filesize;
+    destination.data = song_data;
+    
+    if (!lzw_decompress(source,destination))
+    ...
+
+
+#######################################################################
+
+===========
+3) The Code
+===========
+
+
+I have written a basic experimental proof-of-concept but for some
+limitations (I don't know all the compression algorithms used) it
+cannot test all the bugs.
+Anyway it's not completed or optimized so please don't consider it a
+real working code except for bugs 4 and 5.
+
+  http://aluigi.org/poc/adplugbof.c
+
+
+#######################################################################
+
+======
+4) Fix
+======
+
+
+CVS 05 Jul 2006
+
+
+#######################################################################
+
+
+--- 
+Luigi Auriemma
+http://aluigi.org
+http://mirror.aluigi.org
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
+
+

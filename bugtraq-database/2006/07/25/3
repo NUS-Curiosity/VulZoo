@@ -1,0 +1,178 @@
+
+Date: Sun, 23 Jul 2006 21:57:17 +0200
+From: Luigi Auriemma <aluigi@...istici.org>
+To: bugtraq@...urityfocus.com, bugs@...uritytracker.com,
+	news@...uriteam.com, full-disclosure@...ts.grok.org.uk,
+	vuln@...unia.com
+Subject: Two crash vulnerabilities in Freeciv 2.1.0-beta1 (SVN 15 Jul 2006)
+
+
+#######################################################################
+
+                             Luigi Auriemma
+
+Application:  Freeciv
+              http://www.freeciv.org
+Versions:     <= 2.1.0-beta1 and SVN <= 15 Jul 2006
+Platforms:    Windows, *nix, *BSD, MacOS and more
+Bugs:         A] memcpy crash in generic_handle_player_attribute_chunk
+              B] invalid memory access in handle_unit_orders
+Exploitation: remote, versus server
+Date:         23 Jul 2006
+Author:       Luigi Auriemma
+              e-mail: aluigi@...istici.org
+              web:    aluigi.org
+
+
+#######################################################################
+
+
+1) Introduction
+2) Bugs
+3) The Code
+4) Fix
+
+
+#######################################################################
+
+===============
+1) Introduction
+===============
+
+
+Freeciv is an open source clone of the well known Civilization game.
+The game supports also online gaming through its own metaserver (which
+can be seen on the web too) and GGZ (http://www.ggzgamingzone.org).
+
+
+#######################################################################
+
+=======
+2) Bugs
+=======
+
+--------------------------------------------------------
+A] memcpy crash in generic_handle_player_attribute_chunk
+--------------------------------------------------------
+
+handle_player_attribute_chunk (which points to
+generic_handle_player_attribute_chunk) is a function used by both
+client and server when a PACKET_PLAYER_ATTRIBUTE_CHUNK packet is
+received.
+The function acts like a reassembler of data for an allocated buffer
+which can have a size of max 262144 bytes.
+Exist two problems in this function:
+- the length of the current chunk received (chunk_length) is not
+  verified so using a negative value an attacker can bypass the initial
+  check and can copy a huge amount of data ((unsigned)chunk_length) in
+  the data buffer with the subsequent crash
+- the check "chunk->offset + chunk->chunk_length > chunk->total_length"
+  can be bypassed using a very big positive offset like 0x7fffffff
+  which will allow the copying of data from our packet to the memory
+  located at the malformed offset of the allocated buffer.
+  Doesn't seem possible to execute malicious code with this bug since
+  the destination memory is usually invalid
+
+>From common/packets.c:
+
+void generic_handle_player_attribute_chunk(struct player *pplayer,
+                       const struct
+                       packet_player_attribute_chunk
+                       *chunk)
+{
+  freelog(LOG_DEBUG, "received attribute chunk %d/%d %d", chunk->offset,
+      chunk->total_length, chunk->chunk_length);
+
+  if (chunk->total_length < 0
+      || chunk->total_length >= MAX_ATTRIBUTE_BLOCK
+      || chunk->offset < 0
+      || chunk->offset + chunk->chunk_length > chunk->total_length
+      || (chunk->offset != 0
+          && chunk->total_length != pplayer->attribute_block_buffer.length)) {
+    /* wrong attribute data */
+    if (pplayer->attribute_block_buffer.data) {
+      free(pplayer->attribute_block_buffer.data);
+      pplayer->attribute_block_buffer.data = NULL;
+    }
+    pplayer->attribute_block_buffer.length = 0;
+    freelog(LOG_ERROR, "Received wrong attribute chunk");
+    return;
+  }
+  /* first one in a row */
+  if (chunk->offset == 0) {
+    if (pplayer->attribute_block_buffer.data) {
+      free(pplayer->attribute_block_buffer.data);
+      pplayer->attribute_block_buffer.data = NULL;
+    }
+    pplayer->attribute_block_buffer.data = fc_malloc(chunk->total_length);
+    pplayer->attribute_block_buffer.length = chunk->total_length;
+  }
+  memcpy((char *) (pplayer->attribute_block_buffer.data) + chunk->offset,
+     chunk->data, chunk->chunk_length);
+  ...
+
+
+----------------------------------------------
+B] invalid memory access in handle_unit_orders
+----------------------------------------------
+
+The server's function handle_unit_orders doesn't check the maximum
+size of the packet->length value which should not be bigger than 2000
+(MAX_LEN_ROUTE) while is possible for an attacker to use any positive
+number.
+The crash could require different tries (usually 3) before happening.
+
+>From server/unithand.c:
+
+void handle_unit_orders(struct player *pplayer,
+			struct packet_unit_orders *packet)
+{
+  struct unit *punit = player_find_unit_by_id(pplayer, packet->unit_id);
+  struct tile *src_tile = map_pos_to_tile(packet->src_x, packet->src_y);
+  int i;
+
+  if (!punit || packet->length < 0 || punit->activity != ACTIVITY_IDLE) {
+    return;
+  }
+
+  if (src_tile != punit->tile) {
+    /* Failed sanity check.  Usually this happens if the orders were sent
+     * in the previous turn, and the client thought the unit was in a
+     * different position than it's actually in.  The easy solution is to
+     * discard the packet.  We don't send an error message to the client
+     * here (though maybe we should?). */
+    return;
+  }
+
+  for (i = 0; i < packet->length; i++) {
+  ...
+
+
+#######################################################################
+
+===========
+3) The Code
+===========
+
+
+No proof-of-concept available, you must modify the source code of the
+client for forcing the sending of the malformed data.
+
+
+#######################################################################
+
+======
+4) Fix
+======
+
+
+The bugs have been fixed in the SVN of the 16 Jul 2006
+
+
+#######################################################################
+
+
+--- 
+Luigi Auriemma
+http://aluigi.org
+http://mirror.aluigi.org
