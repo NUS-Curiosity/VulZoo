@@ -1,0 +1,281 @@
+
+Date: Wed, 29 Aug 2007 23:39:48 +0200
+From: Luigi Auriemma <aluigi@...istici.org>
+To: bugtraq@...urityfocus.com, bugs@...uritytracker.com,
+	news@...uriteam.com, full-disclosure@...ts.grok.org.uk,
+	vuln@...unia.com, packet@...ketstormsecurity.org
+Subject: Multiple vulnerabilities in Doomsday 1.9.0-beta5.1
+
+
+#######################################################################
+
+                             Luigi Auriemma
+
+Application:  Doomsday
+              http://www.doomsdayhq.com
+              http://www.dengine.net
+              http://sourceforge.net/projects/deng/
+Versions:     <= 1.9.0-beta5.1 and current SVN
+Platforms:    Windows, Linux and Mac
+Bugs:         A] D_NetPlayerEvent global buffer-overflow using PKT_CHAT
+              B] Msg_Write global buffer-overflow through PKT_CHAT
+              C] undelimited strcpy in PKT_CHAT
+              D] integer overflow in PKT_CHAT
+              E] static buffer-overflow in NetSv_ReadCommands
+              F] client format string through PSV_CONSOLE_TEXT
+Exploitation: remote, versus servers or clients depending by the bug
+Date:         29 Aug 2007
+Author:       Luigi Auriemma
+              e-mail: aluigi@...istici.org
+              web:    aluigi.org
+
+
+#######################################################################
+
+
+1) Introduction
+2) Bugs
+3) The Code
+4) Fix
+
+
+#######################################################################
+
+===============
+1) Introduction
+===============
+
+
+Doomsday (aka deng) is an open source port of the original Doom code
+with tons of enhancements and addons which make it the most advanced
+port at the moment.
+
+
+#######################################################################
+
+=======
+2) Bugs
+=======
+
+---------------------------------------------------------
+A] D_NetPlayerEvent global buffer-overflow using PKT_CHAT
+---------------------------------------------------------
+
+When a chat message is received, the server takes the incoming packet
+and reads who sent it, its destination and naturally the entire message
+which is copied in a heap buffer using the remaining size of the packet
+for calculating the amount of data to allocate.
+Then a strcpy() is performed for copying the message from the packet to
+the new allocated buffer called msg.
+If the message is directed to the server it's displayed in the console
+using the D_NetPlayerEvent function.
+Subsequently the message is copied from msg in a global buffer called
+netBuffer for sending the message to all the other clients using the
+function MSG_Write.
+
+This explanation is valid for the other three bugs below too since they
+are exploited all through this same set of instructions which are
+showed here:
+
+from sv_main.c:
+
+void Sv_HandlePacket(void)
+    ...
+    case PKT_CHAT:
+        // The first byte contains the sender.
+        msgfrom = Msg_ReadByte();
+        // Is the message for us?
+        mask = Msg_ReadShort();
+        // Copy the message into a buffer.
+        msg = M_Malloc(netBuffer.length - 3);
+        strcpy(msg, (char *) netBuffer.cursor);
+        // Message for us? Show it locally.
+        if(mask & 1)
+        {
+            Net_ShowChatMessage();
+            gx.NetPlayerEvent(msgfrom, DDPE_CHAT_MESSAGE, msg);
+        }
+        // Servers relay chat messages to all the recipients.
+        Msg_Begin(PKT_CHAT);
+        Msg_WriteByte(msgfrom);
+        Msg_WriteShort(mask);
+        Msg_Write(msg, strlen(msg) + 1);
+        for(i = 1; i < MAXPLAYERS; i++)
+            if(players[i].ingame && mask & (1 << i) && i != from)
+            {
+                Net_SendBuffer(i, SPF_ORDERED);
+            }
+        M_Free(msg);
+        break;
+
+In the case of D_NetPlayerEvent we have the following global buffer
+overflow of msgBuff caused by a sprintf or strcpy depending by the
+number of players in the server.
+
+Important note: although this is a global buffer-overflow, on the
+Windows game server (not the dedicated one) is possible to control the
+code flow since EIP takes the value sent by the attacker, and so could
+be possible to execute malicious code.
+Then this bug can be exploited not only versus the servers but also
+versus all the clients connected since the big data is forwarded to
+them by the same server.
+
+from d_net.c:
+
+char    msgBuff[256];
+float   netJumpPower = 9;
+...
+long int D_NetPlayerEvent(int plrNumber, int peType, void *data)
+    ...
+    // DDPE_CHAT_MESSAGE occurs when a PKT_CHAT is received.
+    // Here we will only display the message (if not a local message).
+    else if(peType == DDPE_CHAT_MESSAGE && plrNumber != consoleplayer)
+        ...
+        // If there are more than two players, include the name of
+        // the player who sent this.
+        if(num > 2)
+            sprintf(msgBuff, "%s: %s", Net_GetPlayerName(plrNumber),
+                    (const char *) data);
+        else
+            strcpy(msgBuff, data);
+
+
+----------------------------------------------------
+B] Msg_Write global buffer-overflow through PKT_CHAT
+----------------------------------------------------
+
+The Msg_Write function used for filling the "send" buffer suffers of a
+global buffer-overflow too, in this case the target buffer is netBuffer
+which is 32768 bytes long.
+
+from net_msg.c:
+
+void Msg_Write(const void *src, int len)
+{
+    memcpy(netBuffer.cursor, src, len);
+    netBuffer.cursor += len;
+}
+
+
+---------------------------------
+C] undelimited strcpy in PKT_CHAT
+---------------------------------
+
+Although this specific bug has no reason of being exploited at the
+moment due to the presence of the other more critical vulnerabilities I
+want to report it for thoroughness.
+In fact in my tests after having patched the above bugs my test server
+was still affected by a crash caused by the absence of the final NULL
+byte in my chat messages which caused an unexploitable heap-overflow of
+the msg buffer.
+
+
+-------------------------------
+D] integer overflow in PKT_CHAT
+-------------------------------
+
+As already said the size of the msg buffer is calculated through the
+size of the packet but without the proper checks.
+The result is that an attacker can send an incomplete PKT_CHAT packet
+which has a data length minor than 3 causing the attempt of allocating
+a too big amount of memory (for example 0xfffffffd, resulted by 0 - 3)
+which will fail and return a NULL msg buffer causing a crash during the
+copying performed by strcpy:
+
+        mask = Msg_ReadShort();
+        // Copy the message into a buffer.
+        msg = M_Malloc(netBuffer.length - 3);
+        strcpy(msg, (char *) netBuffer.cursor);
+
+
+-----------------------------------------------
+E] static buffer-overflow in NetSv_ReadCommands
+-----------------------------------------------
+
+A static buffer-overflow is located in the function which reads the
+commands sent by the clients allowing an attacker to fill the data
+buffer with more than the 30 max commands supported.
+
+from d_netsv.c:
+
+void *NetSv_ReadCommands(byte *msg, uint size)
+{
+#define MAX_COMMANDS 30
+    static byte data[2 + sizeof(ticcmd_t) * MAX_COMMANDS];
+    ticcmd_t *cmd;
+    byte   *end = msg + size, flags;
+    ushort *count = (ushort *) data;
+
+    memset(data, 0, sizeof(data));
+
+    // The first two bytes of the data contain the number of commands.
+    *count = 0;
+
+    // The first command.
+    cmd = (void *) (data + 2);
+
+    while(msg < end)
+    {
+        // One more command.
+        *count += 1;
+
+        // First the flags.
+        flags = *msg++;
+        if(flags & CMDF_FORWARDMOVE)
+            cmd->forwardMove = *msg++;
+        ...
+        // Copy to next command (only differences have been written).
+        memcpy(cmd + 1, cmd, sizeof(ticcmd_t));
+
+        // Move to next command.
+        cmd++;
+    }
+
+
+------------------------------------------------
+F] client format string through PSV_CONSOLE_TEXT
+------------------------------------------------
+
+The clients are affected by a format string vulnerability exploitable
+during the handling of a PSV_CONSOLE_TEXT message.
+This attack can be exploited only through a malicious server to which
+the victim must connect.
+
+from cl_main.c:
+
+void Cl_GetPackets(void)
+    ...
+        case PSV_CONSOLE_TEXT:
+            i = Msg_ReadLong();
+            Con_FPrintf(i, (char*)netBuffer.cursor);
+            break;
+
+
+#######################################################################
+
+===========
+3) The Code
+===========
+
+
+http://aluigi.org/poc/dumsdei.zip
+
+
+#######################################################################
+
+======
+4) Fix
+======
+
+
+No fix.
+No reply from the developers.
+
+
+#######################################################################
+
+
+--- 
+Luigi Auriemma
+http://aluigi.org
+http://mirror.aluigi.org

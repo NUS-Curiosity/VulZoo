@@ -1,0 +1,228 @@
+
+Date: Sun, 12 Aug 2007 17:05:16 +0200
+From: Wouter Coekaerts <wouter@...kaerts.be>
+To: bugtraq@...urityfocus.com, full-disclosure@...ts.grok.org.uk,
+	irc-security@...ts.irc-unity.org
+Subject: Multiple vulnerabilities in ircu
+
+Ircu is the open source IRC server used on Undernet and other IRC networks.
+I (Wouter Coekaerts) discovered multiple vulnerabilities in various versions
+some time ago, which have all been fixed for some time (since 2.10.12.06)
+but not yet made public. Now that servers have had enough time to upgrade,
+I feel it's time to do so.
+None of these bugs can be abused for arbitrary code execution. Two are about
+crashing a server, one about exposing IP addresses, and the effect of the
+others stay within IRC: they allow clients to get more privileges on the IRC
+network then they are supposed to have.
+
+Overview
+========
+Affecting only 2.10.12.01:
+1. Crashing servers with an innocent-looking oper-only command
+2. Easy protocol violations (wallop) flooding
+3. Crash with oplevels
+Affecting 2.10.12.02 up to and including 2.10.12.04:
+4. DoS on server by creating many zannels
+Affecting 2.10.12.01 up to and including 2.10.12.04:
+5. Gaining ops on channels that get empty on one side of a netsplit
+6. Making clients think someone is on a (+D) channel, who isn't
+Affecting 2.10.12.03 and 2.10.12.04:
+7. Netriding with ops, using zannels
+Affecting very old up to and including 2.10.12.05:
+8. Timestamps in bounces ignored
+Affecting 2.10.12.01 up to and including 2.10.12.05:
+9. Any op setting or changing Apass when server restarts
+Affecting very old up to and including 2.10.12.05:
+10. Desync: unkick/deopable ops
+Affecting very old up to and including 2.10.12.05:
+11. Getting hidden IP's of +x users
+
+Background info
+===============
+To fully understand these bug descriptions, you'll need some knowledge of IRC
+and ircu-specific features like how timestamps (TS) work.
+Some of these vulnerabilities only affect servers with oplevels or zannels
+enabled, which was the default (but not anymore). Oplevels (A/Upass) is a
+feature that allows the creator of a new channel to set passwords on it that,
+when used to join, automatically give ops. Zannels is a feature introduced in
+2.10.12.02 that keeps empty channels alive for a while instead of destroying
+them immediately, to avoid A/U passwords being set on a channel that was only
+empty for a short time.
+Zannels was enabled on Undernet on some servers for a short time and then
+disabled because of the trouble it caused. Oplevels never were enabled.
+
+Details
+=======
+
+1. Crashing servers with an innocent-looking oper-only command
+--------------------------------------------------------------
+Servers crash when an oper tries to do a remote names -D
+(/names #foo -D some.server). This is an oper-only command, but still is a
+security problem because a user could trick an oper into doing it (because
+the command is supposed to just show info to the oper).
+
+
+2. Easy protocol violations triggering
+--------------------------------------
+/join #aa...aa and then #aa..aaa (one character longer) will cause a
+protocol violation. Too long channel names aren't cut off consistently (or
+at the wrong place). This could be abused to flood wallops.
+
+
+3. Crash with oplevels
+----------------------
+When a server receives a "J 0:#channel" (a server message indicating a join
+with apass), on a channel of which it thinks doesn't have an apass set, it
+crashes. This can be done for example by making such a join and a mode -A
+cross.
+
+
+4. DoS on server by creating many zannels
+-----------------------------------------
+The fact that channels don't die immediately (but become zannels) can be
+abused to create a lot of channels, probably enough to take any IRC network
+down with a not unusually big amount of clients.
+
+A quick experiment I did shows one client (constantly sending JOIN 
+0,#a,#b,#c,... different channels all the time, 20 channels per command) 
+can keep between 600 and 1200 channels alive. Besides using quite some 
+memory for 1 client, this also sends bursts of 600 DE (destroy) messages 
+across the network every few minutes.
+Now if 1000 drones would be doing this, that would mean more than a million 
+channels alive, and bursts of 600.000 DE messages every few minutes. I 
+guess this would probably take down a lot of servers.
+
+
+5. Gaining ops on channels that get empty on one side of a netsplit
+-------------------------------------------------------------------
+A bug in how channel TS is handled in .12 makes it possible to gain ops on a 
+channel if you're the only one in it, without lowering the TS. This could 
+be abused during a split to takeover a channel.
+This works with zannels disabled and enabled.
+
+Cause:
+A join (from a server) with an older TS lowers the TS on the channel, but does
+not remove ops.
+
+Exploit:
+2 servers, each one client: s1 and s2. c1 on s1, c2 on s2
+c1 the only client, not opped, on #chan.
+* c2 joins #chan, and parts immediately
+* at the same time (before the join and part arrive on s1), c1 parts and joins
+=> when the join and part of c2 arrive the TS is set back to the original one,
+   but c1 keeps his ops.
+
+
+6. Making clients think someone is on a (+D) channel, who isn't
+---------------------------------------------------------------
+A bug in when joins to +D channels are sent to clients can be abused to make 
+people think someone is on the channel, who isn't. It requires you to be an 
+op, so it isn't a big risk, but it could be used to confuse other ops, for 
+example, pretending you can make yourself unkickable.
+
+Cause:
+When a zombie gets opped, the mode is sent to clients (although they think 
+the zombie isn't on the channel). That's a bug, but on itself a small one.
+But when a delay-joined zombie on a +D channel gets kicked, that mode also 
+causes a join to be sent, which is worse.
+
+Example:
+client1 (opped) and ghost (join-delayed) on server1, client2 (opped) on 
+server2
+client2 kicks ghost, and at the same time client1 ops ghost.
+client2 will see ghost join and get kicked, followed by another join and 
+client1 opping ghost.
+If client2 tries to kick ghost again, he'll get a "They aren't on that 
+channel", although his (and others on his side of the net) client shows 
+ghost as opped on the channel.
+
+
+7. Netriding with ops, using zannels
+------------------------------------
+This one allows netriders to set or remove any mode on any channel that gets 
+empty on a split server with zannels enabled, except modes on users (ops, 
+voice).
+
+Cause:
+When joining a zannel you get opped by the server, but that mode doesn't 
+have a timestamp, so other servers accept it even if they have an older 
+version of the channel.
+
+Example:
+Suppose some server split leaving an invite-only channel empty. During the
+time it is linking again, someone joins the #chan zannel left on that server,
+and sets a mode +i and then -i. When the burst completes, he'll get netrider
+kicked, but his modes get accepted at the other side, because he got opped by
+his server.
+
+It may seem hard to time this right, but it's really easy actually, they can 
+constantly join, mode, part, join, mode, part,...
+
+Note:
+The same problem existed also for joining with the A/Upass, which could only
+be abused on a restarted server (which hasn't linked yet), but allows setting
+a new Apass, which means a total channel takeover. This was fixed with the
+same patch.
+
+
+8. Timestamps in bounces ignored
+--------------------------------
+Of all the bugs I discovered, this is the one that shocked me the most.
+
+Timestamps in bounces are just ignored. Causing a bounce while another server
+is linking which has an older version of the channel, causes the bounce to go
+from the new into to the old channel. This allows you to take over a channel
+during a netjoin.
+
+
+9. Any op setting or changing Apass when server restarts
+--------------------------------------------------------
+Modes set on a newer version of a channel during a netburst usually aren't 
+accepted because the client setting them isn't opped on that side. But they 
+are accepted if he gets opped fast enough. This doesn't matter for most 
+modes, because if you can op him, you can just as well set the mode. But it 
+does matter for +A.
+So if he has one client on the newly started server, which sets the mode 
+during the burst, and one on the other side, which ops the other client 
+just when he bursts in, before the mode has arrived, it is accepted on that 
+side, setting a (new) Apass, no matter how old the channel is, no matter 
+which oplevel he has.
+
+
+10. Desync: unkick/deopable ops
+-------------------------------
+If a kick and a kill or a nick collision of the kicker cross, the kick isn't
+propagated, leaving an unkickable/deopable (except on his own server or his
+side of the desync) op. It's pretty easy to make this happen.
+This situation can only be fixed by an op on his server (which he can 
+prevent), or an oper killing him (and all his other desynced clients, good 
+luck finding all those).
+
+So this makes an abuser look like he has some service/opmode power, and can 
+make it really hard to get a taken over channel back into order.
+
+
+11. Getting hidden IP's of +x users
+-----------------------------------
+The ip of an authenticated user with +x mode set is supposed to be hidden.
+But you can find out that IP with a trick. With /silence you can check if
+someone matches a certain mask or not: send them a ctcp ping, and see if
+you get a reply or not.
+
+Ircu .12 supports cidr masks in /silence, so it only takes (maximum) 32
+pings (there are 32 bits in an ip address). Without cidr, it takes more
+messages, but still less than 1000 (and if you do it smart, using tld and
+isp-wide silences for example, maybe even much less), so even then it's
+realistic.
+
+Similar things can be done with bans with people who have autorejoin on 
+kick and autojoin on invite on, but hardy anyone does that. On the contrary
+almost everyone replies to ctcp pings.
+
+
+
+Online version: http://wouter.coekaerts.be/site/security/ircu
+
+Note:
+I am affiliated with Undernet, but this report is about my own findings and
+from me personally, not representing Undernet or the ircu developers.

@@ -17,8 +17,13 @@ def ensure_dir(directory):
         os.makedirs(directory)
 
 
-def parse_mail_table_year(html):
-    soup = BeautifulSoup(html, 'html.parser')
+def parse_mail_table_year(url):
+    r = requests.get(url)
+    if r.status_code != 200:
+        print("[-] Failed to fetch oss-security page", file=sys.stderr)
+        return None
+
+    soup = BeautifulSoup(r.text, 'html.parser')
     table = soup.find('table', class_='cal_brief')
     
     result = {}
@@ -74,12 +79,7 @@ def fetch_msg_list_per_month(mail_year, mail_month):
 
 
 def fetch_msg_links(url, interval=5, print_result=sys.stdout):
-    r = requests.get(url)
-    if r.status_code != 200:
-        print("[-] Failed to fetch oss-security page", file=sys.stderr)
-        return
-
-    mail_table = parse_mail_table_year(r.text)
+    mail_table = parse_mail_table_year(url)
     if not mail_table:
         print("[-] Failed to parse mail table", file=sys.stderr)
         return
@@ -134,20 +134,84 @@ def download_messages(msg_links, interval=5, print_result=sys.stdout):
                     time.sleep(interval)
 
 
+def get_delta(msg_links, url, interval=5, print_result=sys.stdout):
+    delta = {}
+    # get the latest year/month/date from local msg_links
+    # sort the key in msg_links and get the last one
+    local_latest_year = sorted(msg_links.keys())[-1]
+    local_latest_month = sorted(msg_links[local_latest_year].keys())[-1]
+    # each item in msg_links[year][month] is a tuple (date, msg_num). sort the date and get the last one
+    local_latest_date, local_latest_date_num = sorted(msg_links[local_latest_year][local_latest_month])[-1]
+
+    # get the latest year/month/date from online website
+    mail_table = parse_mail_table_year(url)
+    online_latest_year = sorted(mail_table.keys())[-1]
+    online_latest_month = sorted(mail_table[online_latest_year].keys())[-1]
+    latest_month_list = fetch_msg_list_per_month(online_latest_year, online_latest_month)
+    online_latest_date, online_latest_date_num = sorted(latest_month_list)[-1]
+
+    # construct the date (yyyy-mm-dd) to compare the local and online latest date
+    local_date = f"{local_latest_year}-{local_latest_month}-{local_latest_date}"
+    online_date = f"{online_latest_year}-{online_latest_month}-{online_latest_date}"
+    if local_date == online_date and local_latest_date_num == online_latest_date_num:
+        return delta
+    if local_date > online_date or (local_date == online_date and local_latest_date_num > online_latest_date_num):
+        print("[!] Weird that local database is newer than the online website", file=sys.stderr)
+        return delta
+    
+    # get the delta
+    for year in mail_table:
+        if year < local_latest_year:
+            continue
+        if year == local_latest_year:
+            for month in mail_table[year]:
+                if month < local_latest_month:
+                    continue
+                specs = fetch_msg_list_per_month(year, month)
+                if not specs:
+                    print(f"[!] No message list for year {year}, month {month}", file=sys.stderr)
+                    continue
+                # if print_result:
+                #     print(f"{specs}", file=print_result, flush=True)
+                delta[year] = delta.get(year, {})
+                delta[year][month] = specs
+                time.sleep(interval)
+            # remove date that is less than local_latest_date
+            delta[year][local_latest_month] = [x for x in delta[year][local_latest_month] if x[0] >= local_latest_date]
+        else: # year > local_latest_year
+            for month in mail_table[year]:
+                specs = fetch_msg_list_per_month(year, month)
+                if not specs:
+                    print(f"[!] No message list for year {year}, month {month}", file=sys.stderr)
+                    continue
+                delta[year] = delta.get(year, {})
+                delta[year][month] = specs
+                time.sleep(interval)
+
+    return delta
+
+
+def update_index_with_delta(local_index, delta):
+    pass
+
+
 if __name__ == '__main__':
+    print("[*] Syncing oss-security database", file=sys.stderr)
     try:
-        # [TODO] currently, we fetch all the messages
-        # in the futrue, we calculate the delta between the online messages and the local messages
-        # and only fetch the new messages
-        delta = list()
+        # only fetch the new messages
         # check whether the link index file exists
-        # if it does, load the links from the file
+        # if it does, load the links from the file and calculate the delta
         # otherwise, fetch the links from the website
         if os.path.exists(link_index):
             print(f"[*] {link_index} found, loading links from the file", file=sys.stderr)
             with open(link_index, 'r') as f:
                 msg_links = json.load(f)
-                delta = msg_links
+            print(f"[*] Calculating the delta between local and online oss-security database", file=sys.stderr)
+            delta = get_delta(msg_links, oss_security_url, interval=1)
+            # update the msg_links and save it to the file
+            if delta:
+                print(f"[!] {link_index} is outdated, updating the link index", file=sys.stderr)
+                update_index_with_delta(msg_links, delta)
         else:
             print(f"[!] {link_index} found, fetching links from the website", file=sys.stderr)
             with open(link_index, 'w') as f:
@@ -155,7 +219,10 @@ if __name__ == '__main__':
                 f.write(json.dumps(msg_links))
             delta = msg_links
         # downloading the messages
-        download_messages(delta, interval=1, print_result=sys.stdout)
+        if delta:
+            download_messages(delta, interval=1, print_result=sys.stdout)
+        else:
+            print("[+] oss-security database is up-to-date", file=sys.stderr)
     except KeyboardInterrupt:
         print("[!] User interrupted", file=sys.stderr)
         sys.exit(1)

@@ -1,0 +1,116 @@
+
+Date: Mon, 24 Sep 2007 17:18:26 +0200
+From: Thierry Zoller <Thierry@...ler.lu>
+To: bugtraq@...urityfocus.com, full-disclosure@...ts.grok.org.uk
+Subject: Re: Oracle 11g Password algorithm revealed
+
+Dear Pete,
+
+Recurity Labs also reversed the algorythm, the things you write sound
+very similar.
+
+http://www.recurity-labs.com/head.html#n15
+
+Sent to mailing list without permission :
+
+Oracle 0xDEADF00D
+
+Alexander Kornbrust, CEO of Red Database Security GmbH and Oracle Database security expert noticed that Oracle recently released their Oracle Database 11g for Linux with a new password hashing algorithm. They do so, to improve security by introducing case-sensitive passwords in the year 2007! Alex asked us to figure out what kind of cryptographic algorithms and methods are actually used, because he'd like to update his Oracle Security Scanner.
+
+We did, regardless of the expected nightmares, Fear and Laughing in Oracle.
+
+Since Oracle is shipped as closed software and releases will be provided as binary/executable program only, we analyzed the Linux ELF binary executable files, because a windows version of Oracle 11g seems to be not released yet.
+
+This is, what we messed around with:
+
+setuid setgid ELF 32-bit LSB executable,
+Intel 80386, version 1 (SYSV), for GNU/Linux 2.2.5, dynamically linked (uses
+shared libs), not stripped
+
+OK, uses shared libs, right:
+
+-rwsr-s--x 1 oracle dba 145M Aug 31 16:42 oracle
+
+An almost 150 Megabyte sized executable program, using shared libraries. Actually it has 17 shared library dependencies. The other shared libraries provided by Oracle, which are actually linked dynamically by other executables shipped with Oracle 11g, were statically linked into the oracle executable at compile time. We are talking libraries of 30 Megabytes and more linked in as well as sitting next to the binary, just in case.
+
+The first approach of the analysis was to narrow down the relevant cryptographic algorithm and its implementation. Therefore, different techniques were used to find relevant methods and instructions within the executable. Most cryptographic algorithms like ciphers and checksum calculations expose some kind of "signature" or individual tokens like S-Boxes, transformation tables or constant values. Thus it might be easy to detect automatically within the binary, using tools like the FindCrypt IDA plugin or other scripts we developed for our own purposes.
+
+At least 57 places with crypto were found by FindCrypt: DES, MD4, MD5, SHA1, just to name a few. We found at least two independently implemented AES cipher constants, all algorithms were double and triple implemented.
+
+Another obstacle is the fact that the Intel Compiler, which was used to compile the Oracle executable, uses an optimization which led in having no cross references (XREFs) to code or data in several segments. Thus we could not see wherefrom for example an S-Box is accessed in the code. So we used the IDA API to implement a tool which automatically finds these PC-relative offset calculations and adds XREFs to the IDB. One can only assume that Oracle uses the Intel compiler because no other compiler would produce efficient enough code to run this behemoth of a binary in acceptable speed.
+
+We also combined the static analysis by disassembling the Oracle executable with a runtime analysis using ltrace and the precious GNU debugger GDB. Have you ever tried to attach more than two dozens processes with GDB and set a few hundred breakpoints in batch mode? It's real fun.
+
+Anyway, what were we looking for? We're looking for some kind of "create password hash" function, which generates and stores a 30 Byte ASCII-hex encoded sequence in table sys.user in a field called "spare4".
+
+After we ran into different hashing and cipher functions (Oracle actually does Kerberos, AES for TLS, etc) we found the appropriate hashing function.
+
+There is a function called ztv2ghashs, which takes the following arguments: a password, the password length, a salt value, the salt length, a hashing algorithm identifier and a structure which holds the calculated hash value as result.
+
+The "identifier" is a simple integer and is compared against constant values to decide which hashing algorithm to use:
+
+    * 0xf00d means: Use MD4
+    * 0xdead means: Use SHA1
+    * 0xbeaf [sic!] means: Use MD5
+
+text.hot:0E5A9038    call $+5
+text.hot:0E5A903D    pop  ebx
+text.hot:0E5A903E    add  ebx, 0EEA4C7h
+text.hot:0E5A9044    cmp  eax, 0F00Dh
+text.hot:0E5A9049    jz   short loc_E5A9072 ; MD4_Init
+text.hot:0E5A904B    cmp  eax, 0BEAFh  ; <- veggies ?!
+text.hot:0E5A9050    jnz  short loc_E5A9062 ; SHA1_Init
+text.hot:0E5A9052    push edx
+text.hot:0E5A9053    call ztchmd5i  ; MD5_Init
+
+So we found out that the final hash is calculated in the following way:
+
+hash_init( HASH_CTX, algorithm );
+hash_update( HASH_CTX, password, password_len );
+hash_update( HASH_CTX, salt, salt_len );
+hash_final( HASH_CTX, result_buf );
+
+Let's try this at home, kids!
+
+Connected to:
+Oracle Database 11g Enterprise Edition Release 11.1.0.6.0 - Production
+With the Partitioning, OLAP, Data Mining and Real Application Testing options
+
+SQL> create user FOOBAR identified by SHAlala;
+
+User created.
+
+SQL> select name,spare4 from sys.user$ where name='FOOBAR';
+
+NAME
+
+------------------------------
+
+SPARE4
+
+-------------------------------------------------------------------------------
+
+FOOBAR
+
+S:2BFCFDF5895014EE9BB2B9BA067B01E0389BB5711B7B5F82B7235E9E182C
+
+SQL> Disconnected from Oracle Database
+11g Enterprise Edition Release 11.1.0.6.0 - Production
+With the Partitioning, OLAP, Data Mining and Real Application Testing options
+
+$ echo -ne "SHAlala\x1B\x7B\x5F\x82\xB7\x23\x5E\x9E\x18\x2C" | sha1sum
+2bfcfdf5895014ee9bb2b9ba067b01e0389bb571  -
+
+We would like to thank Alex and Pete for this interesting challenge and all the helpful information regarding Oracle. Fun Inside. There is a lot of funny SQL, Kerberos, etc and definitively worth digging deeper.
+
+And we would like to welcome Oracle Corp. in the year 2007, the century of highly advanced, mixed-case passwords. :) It should be noted that Oracle, in fine tradition, makes the same mistake Microsoft did a decade ago when they put the insecure LANMAN hash next to the brand new NTLM one. The table sys.user$ still holds the case insensitive DES encrypted password version next to the new one.
+
+by THS
+
+
+
+-- 
+http://secdev.zoller.lu
+Thierry Zoller
+Fingerprint : 5D84 BFDC CD36 A951 2C45  2E57 28B3 75DD 0AC6 F1C7
+

@@ -1,0 +1,289 @@
+
+Date: Wed, 30 May 2007 23:27:53 +0100
+From: "James Youngman" <jay@....org>
+To: bugtraq@...urityfocus.com
+Cc: "bug-findutils mailing list" <bug-findutils@....org>,
+	rob@...ersepath.com
+Subject: GNU Findutils release 4.2.31 fixes CVE-2007-2452 (GNU locate heap buffer overrun)
+
+$Revision: 1.4 $; $Date: 2007/05/30 22:04:52 $
+
+
+I. BACKGROUND
+=============
+
+GNU findutils is a set of programs which search for files on Unix-like
+systems.  It is maintained by the GNU Project of the Free Software
+Foundation.  For more information, see http://www.gnu.org/software/findutils.
+
+
+II. DESCRIPTION
+===============
+
+When GNU locate reads filenames from an old-format locate database,
+they are read into a fixed-length buffer allocated on the heap.
+Filenames longer than the 1026-byte buffer can cause a buffer overrun.
+The overrunning data can be chosen by any person able to control the
+names of filenames created on the local system.  This will normally
+include all local users, but in many cases also remote users (for
+example in the case of FTP servers allowing uploads).
+
+III. ANALYSIS
+=============
+
+Findutils supports three different formats of locate database, its
+native format "LOCATE02", the slocate variant of LOCATE02, and a
+traditional ("old") format that locate uses on other Unix systems.
+
+When locate reads filenames from a LOCATE02 database (the default
+format), the buffer into which data is read is automatically extended
+to accommodate the length of the filenames.
+
+This automatic buffer extension does not happen for old-format
+databases.  Instead a 1026-byte buffer is used.  When a longer
+pathname appears in the locate database, the end of this buffer is
+overrun.  The buffer is allocated on the heap (not the stack).
+
+If the locate database is in the default LOCATE02 format, the locate
+program does perform automatic buffer extension, and the program is
+not vulnerable to this problem.  The software used to build the
+old-format locate database is not itself vulnerable to the same
+attack.
+
+Most installations of GNU findutils do not use the old database
+format, and so will not be vulnerable.
+
+
+IV. DETECTION
+=============
+
+Software:
+All existing releases of findutils are affected.
+
+
+Installations:
+To discover the longest path name on a given system, you can use the
+following command (requires GNU findutils and GNU coreutils):
+
+find / -print0 | tr -c '\0' 'x' | tr '\0' '\n' | wc -L
+
+
+V. EXAMPLE
+==========
+
+This section includes a shell script which determines which of a list
+of locate binaries is vulnerable to the problem.  The shell script has
+been tested only on glibc based systems having a mktemp binary.
+
+NOTE: This script deliberately overruns the buffer in order to
+determine if a binary is affected.  Therefore running it on your
+system may have undesirable effects.  We recommend that you read the
+script before running it.
+
+#! /bin/sh
+set +m
+if vanilla_db="$(mktemp nicedb.XXXXXX)" ; then
+    if updatedb --prunepaths="" --old-format --localpaths="/tmp" \
+	--output="${vanilla_db}" ; then
+	true
+    else
+	rm -f "${vanilla_db}"
+	vanilla_db=""
+	echo "Failed to create old-format locate database; skipping the
+sanity checks" >&2
+    fi
+fi
+
+make_overrun_db() {
+    # Start with a valid database
+    cat "${vanilla_db}"
+    # Make the final entry really long
+    dd if=/dev/zero  bs=1 count=1500 2>/dev/null | tr '\000' 'x'
+}
+
+
+
+ulimit -c 0
+
+usage() { echo "usage: $0 binary [binary...]" >&2; exit $1; }
+[ $# -eq 0 ] && usage 1
+
+bad=""
+good=""
+ugly=""
+if dbfile="$(mktemp nasty.XXXXXX)"
+then
+    make_overrun_db > "$dbfile"
+    for locate ; do
+      ver="$locate = $("$locate"  --version | head -1)"
+      if [ -z "$vanilla_db" ] || "$locate" -d "$vanilla_db" "" >/dev/null ; then
+	  "$locate" -d "$dbfile" "" >/dev/null
+	  if [ $? -gt 128 ] ; then
+	      bad="$bad
+vulnerable: $ver"
+	  else
+	      good="$good
+good: $ver"
+	  fi
+       else
+	  # the regular locate failed
+	  ugly="$ugly
+buggy, may or may not be vulnerable: $ver"
+       fi
+    done
+    rm -f "${dbfile}" "${vanilla_db}"
+    # good: unaffected.  bad: affected (vulnerable).
+    # ugly: doesn't even work for a normal old-format database.
+    echo "$good"
+    echo "$bad"
+    echo "$ugly"
+else
+  exit 1
+fi
+
+
+
+
+
+VI. VENDOR RESPONSE
+===================
+
+The GNU project discovered the problem while 'locate' was being worked
+on.  The GNU findutils maintainer has issued a patch as part of this
+announcement.  The patch appears below, but the relevant change is
+also included in findutils version 4.2.31, which is available by FTP
+at ftp://ftp.gnu.org/gnu/findutils/findutils-4.2.31.tar.gz.
+
+A release of findutils-4.3.x will follow and will also include the
+patch.
+
+
+VII. PATCH
+==========
+
+A version of findutils in which this problem has been addressed is
+available at ftp://ftp.gnu.org/gnu/findutils/findutils-4.2.31.tar.gz.
+
+This patch also fixes the problem and should apply to findutils-4.2.23
+and later.  Findutils-4.2.23 was released almost two years ago.
+
+Index: locate/locate.c
+===================================================================
+RCS file: /cvsroot/findutils/findutils/locate/locate.c,v
+retrieving revision 1.58.2.2
+diff -u -p -r1.58.2.2 locate.c
+--- locate/locate.c	22 Apr 2007 16:57:42 -0000	1.58.2.2
++++ locate/locate.c	28 May 2007 10:18:16 -0000
+@@ -124,9 +124,9 @@ extern int errno;
+
+ #include "locatedb.h"
+ #include <getline.h>
+-#include "../gnulib/lib/xalloc.h"
+-#include "../gnulib/lib/error.h"
+-#include "../gnulib/lib/human.h"
++#include "xalloc.h"
++#include "error.h"
++#include "human.h"
+ #include "dirname.h"
+ #include "closeout.h"
+ #include "nextelem.h"
+@@ -468,10 +468,36 @@ visit_justprint_unquoted(struct process_
+   return VISIT_CONTINUE;
+ }
+
++static void
++toolong (struct process_data *procdata)
++{
++  error (1, 0,
++	 _("locate database %s contains a "
++	   "filename longer than locate can handle"),
++	 procdata->dbfile);
++}
++
++static void
++extend (struct process_data *procdata, size_t siz1, size_t siz2)
++{
++  /* Figure out if the addition operation is safe before performing it. */
++  if (SIZE_MAX - siz1 < siz2)
++    {
++      toolong (procdata);
++    }
++  else if (procdata->pathsize < (siz1+siz2))
++    {
++      procdata->pathsize = siz1+siz2;
++      procdata->original_filename = x2nrealloc (procdata->original_filename,
++						&procdata->pathsize,
++						1);
++    }
++}
++
+ static int
+ visit_old_format(struct process_data *procdata, void *context)
+ {
+-  register char *s;
++  register size_t i;
+   (void) context;
+
+   /* Get the offset in the path where this path info starts.  */
+@@ -479,20 +505,35 @@ visit_old_format(struct process_data *pr
+     procdata->count += getw (procdata->fp) - LOCATEDB_OLD_OFFSET;
+   else
+     procdata->count += procdata->c - LOCATEDB_OLD_OFFSET;
++  assert(procdata->count > 0);
+
+-  /* Overlay the old path with the remainder of the new.  */
+-  for (s = procdata->original_filename + procdata->count;
++  /* Overlay the old path with the remainder of the new.  Read
++   * more data until we get to the next filename.
++   */
++  for (i=procdata->count;
+        (procdata->c = getc (procdata->fp)) > LOCATEDB_OLD_ESCAPE;)
+-    if (procdata->c < 0200)
+-      *s++ = procdata->c;		/* An ordinary character.  */
+-    else
+-      {
+-	/* Bigram markers have the high bit set. */
+-	procdata->c &= 0177;
+-	*s++ = procdata->bigram1[procdata->c];
+-	*s++ = procdata->bigram2[procdata->c];
+-      }
+-  *s-- = '\0';
++    {
++      if (procdata->c < 0200)
++	{
++	  /* An ordinary character. */	
++	  extend (procdata, i, 1u);
++	  procdata->original_filename[i++] = procdata->c;
++	}
++      else
++	{
++	  /* Bigram markers have the high bit set. */
++	  extend (procdata, i, 2u);
++	  procdata->c &= 0177;
++	  procdata->original_filename[i++] = procdata->bigram1[procdata->c];
++	  procdata->original_filename[i++] = procdata->bigram2[procdata->c];
++	}
++    }
++
++  /* Consider the case where we executed the loop body zero times; we
++   * still need space for the terminating null byte.
++   */
++  extend (procdata, i, 1u);
++  procdata->original_filename[i] = 0;
+
+   procdata->munged_filename = procdata->original_filename;
+
+
+
+
+
+VIII. THANKS
+============
+
+Thanks to Rob Holland <rob@...ersepath.com> and Tavis Ormandy.
+
+
+VIII. CVE INFORMATION
+=====================
+
+The identifier CVE-2007-2452 been assigned for this issue.

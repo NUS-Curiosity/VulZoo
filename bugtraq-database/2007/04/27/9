@@ -1,0 +1,327 @@
+
+Date: Fri, 27 Apr 2007 13:45:09 -0400
+From: VSR Advisories <advisories@...curity.com>
+To: vulnwatch@...nwatch.org, full-disclosure@...ts.grok.org.uk,
+	bugtraq@...urityfocus.com, forensics@...urityfocus.com
+Subject: AFFLIB(TM): Multiple Buffer Overflows
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+
+
+                     Virtual Security Research, LLC.
+                        http://www.vsecurity.com/
+                            Security Advisory
+
+- -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+Advisory Name: Multiple Buffer Overflows Discovered in AFFLIB
+ Release Date: 2007-04-27
+  Application: AFFLIB(TM)
+     Versions: 2.2.0 and likely earlier
+     Severity: High
+       Author: Timothy D. Morgan <tmorgan {at} vsecurity {dot} com>
+Vendor Status: Vendor Notified, Fix Available
+CVE Candidate: CVE-2007-2053
+    Reference: 
+      http://www.vsecurity.com/bulletins/advisories/2007/afflib-overflows.txt
+- -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+
+Product Description:
+
+> From the forensicswiki.org website[1]:
+
+  "The Advanced Forensics Format (AFF) is an extensible open format for
+   the storage of disk images and related forensic metadata. It was
+   developed by Simson Garfinkel and Basis Technology."
+
+AFFLIB(TM) is the reference implementation of the AFF(TM) format,
+written primarily by Simson Garfinkel.  It comes in the form of an open
+source library and a set of command line tools used to manipulate
+AFF(TM) files.
+
+
+
+Vulnerability Overview:
+
+In mid-March, 2007 Virtual Security Research, LLC (VSR) performed a
+security code review of AFFLIB(TM) as a part of an internal tool
+assessment process.  As a result, multiple vulnerabilities of varying
+severities were discovered. The most significant of these
+vulnerabilities are being announced publicly to raise awareness and help
+end-users secure themselves against potential attack.
+
+Multiple buffer overflows were found in AFFLIB(TM) which could allow an
+attacker to create a denial-of-service condition against a forensics
+examiner, or possibly to execute arbitrary code on the behalf of a
+victim.  One such overflow may be triggered remotely and may be
+relatively easy to exploit.  The other overflows identified appear to
+have medium to low severity, due to the low likelihood of an attacker
+having the ability to influence the vulnerable operations, at least in
+the typical use case scenarios.  However, because AFFLIB(TM) is in part
+a library, other applications may utilize it in unanticipated ways,
+which may expose these attack vectors.
+
+All identified overflows were fixed in version 2.2.6.  All line numbers 
+listed below are from version 2.2.0.
+
+
+Vulnerability Details:
+
+The following sections include detailed descriptions of the most severe
+overflows found during the assessment.
+
+
+* Remote Stack-based Buffer Overflow Through Use of LastModified *
+
+File: lib/s3.cpp
+Line: 113
+
+The LastModified string is copied to a fixed-length buffer using
+strcpy(3), but no length checking is apparently done when it is
+originally read from an XML response.  This could allow a malicious
+Amazon S3 server or a man-in-the-middle to execute code on the S3 client
+system.  (See [2] for more details on the Amazon S3 protocol.)  Lines
+111-115 illustrate the problem:
+
+  /* Make date nice */
+  char tstamp[64];
+  strcpy(tstamp,(*i)->LastModified.c_str());
+  tstamp[10] = ' ';
+  tstamp[19] = '\000';
+
+
+Note that the (*i)->LastModified string is drawn directly from an XML
+response in the endElement() callback function (lines 173-178 of
+lib/s3_glue.cpp):
+
+ case 3:
+  if(!strcmp(name,"Key")){    einfo->lbr->contents.back()->Key = einfo->cbuf; break;}
+  if(!strcmp(name,"LastModified")){einfo->lbr->contents.back()->LastModified = einfo->cbuf;break;}
+  if(!strcmp(name,"ETag")){   einfo->lbr->contents.back()->ETag = einfo->cbuf;break;}
+  if(!strcmp(name,"Size")){   einfo->lbr->contents.back()->Size = atoi(einfo->cbuf.c_str());break;}
+  break;
+
+An exploit of this would require that users decide to run the s3 binary
+program against an untrustworthy S3 server, or an attacker were able to
+conduct impersonation or man-in-the-middle attacks against the
+communications between the user and a valid S3 server.  Since the s3
+binary uses non-SSL HTTP connections by default, this may not be
+difficult.
+
+
+
+* Stack-based Buffer Overflows in S3 URL Parsing *
+File: lib/vnode_s3.cpp
+Lines: 80 & 81
+
+Description:
+
+A portion of a potentially untrustworthy parameter is copied into a
+buffer without sufficient length checking in a memcpy() call, which
+writes to a stack-based buffer. If this function receives URLs from an
+untrusted source, code execution would be a major risk.  Lines 66-81 are
+included below for illustration:
+
+    /* Separate out the bucket and the path */
+    const char *fn = af_filename(af);
+    regex_t re;
+    if(regcomp(&re,"^s3://([^/]*)/(.*)$",REG_EXTENDED)){
+    err(1,"regcomp");
+    }
+    regmatch_t match[3];
+    memset(match,0,sizeof(match));
+    if(regexec(&re,fn,3,match,0)!=0){
+    return -1; // can't parse URL; must not be a match
+    }
+    char bucket[1024]; memset(bucket,0,sizeof(bucket));
+    char path[1024];   memset(path,0,sizeof(path));
+
+    memcpy(bucket,fn+match[1].rm_so,match[1].rm_eo-match[1].rm_so);
+    memcpy(path,fn+match[2].rm_so,match[2].rm_eo-match[2].rm_so);
+
+The overflow occurs because the length specified to memcpy() is the
+length of the regular expression match, without regard to the size of
+the path buffer.  This may be exploitable in scenarios where an attacker
+could pass command line parameters to a privileged aimage program, or
+via a program written by a third-party developer.
+
+
+
+* Stack-based Buffer Overflow in libewf Vnode Wrapper *
+File: lib/vnode_ewf.cpp
+Line: 70
+
+Description:
+A potentially untrustworthy parameter is used without length checking in
+a strcpy() call which writes to a stack-based buffer. If this command
+receives parameters from an untrusted source, code execution would be a
+major risk.  Lines 59-70 are included to illustrate the problem:
+
+static int ewf_open(AFFILE *af)
+{
+
+    if(strchr(af->fname,'.')==0) return -1; // need a '.' in the filename
+
+    /* See how many files there are to open */
+    char **files = (char **)malloc(sizeof(char *));
+    int nfiles = 1;
+    files[0] = strdup(af->fname);
+
+    char fname[MAXPATHLEN+1];
+    strcpy(fname,af->fname);
+
+An overflow could occur because the af->fname string is provided by the
+user, and is not limited to MAXPATHLEN.  An attacker could use this in
+scenarios where a 3rd-party program incorporates AFFLIB(TM) into their
+program (which ultimately accepts file names from an untrusted source)
+or in situations where an AFFLIB(TM) binary is setuid/setgid or is
+executed remotely web applications.
+
+
+
+* Stack-based Buffer Overflow in AFD Vnode Wrapper *
+File: lib/vnode_afd.cpp
+Line: 405
+
+Description:
+A potentially untrustworthy parameter is used without length checking in
+a strcpy() call which writes to a stack-based buffer. If this command
+receives parameters from an untrusted source, code execution would be a
+major risk.  Lines 402-412 are included below for illustration:
+
+    while ((dp = readdir(dirp)) != NULL){
+    if (last4_is_aff(dp->d_name)){
+        char path[MAXPATHLEN+1];
+            strcpy(path,af->fname);
+                strlcat(path,"/",sizeof(path));
+                    strlcat(path,dp->d_name,sizeof(path));
+                        if(afd_add_file(af,path)){
+                        	return -1;
+                                    }
+                                    }
+    }
+
+The overflow would occur if a value for af->fname were specified by a
+user which was larger than 1025 bytes.  This is certainly plausible,
+since many systems allow pathnames to be as large as 4096 bytes.  As
+this is part of the core AFFLIB(TM), it could be exploited in 3rd party
+programs which include AFFLIB(TM) support, if an attacker were allowed
+to specify filenames.  In addition, it could be exploited if any
+AFFLIB(TM) binary were setuid/setgid, or if these programs were executed
+from a CGI script or similar remote connection.
+
+
+
+* Stack-based Buffer Overflow in aimage Input File Name *
+File: aimage/aimage.cpp
+Line: 554
+
+Description:
+A command line parameter is used without length checking in a sprintf()
+call, which writes to a stack-based buffer. If this command (or this
+function) receives parameters from an untrusted source, code execution
+would be a major risk.  Lines 548-554 are included for illustration:
+
+ int getlock(class imager *im)
+ {
+    /* If the file exists and the PID in the file is running,
+     * can't get the lock.
+     */
+    char lockfile[MAXPATHLEN];
+    sprintf(lockfile,"/tmp/aimge.%s.lock",im->infile);
+
+An attacker could exploit this problem if the aimage binary were
+setuid/setgid, or if the aimage program were executed in a CGI script or
+something similar.
+
+
+
+Vendor Response:
+
+Simson Garfinkel was first contacted on 2007-03-31. The following
+timeline outlines the responses from the vendor regarding this issue:
+
+ 2007-04-01 - Vendor provided details of all vulnerabilities
+              identified.  
+ 2007-04-03 - Continued vendor communication.
+ 2007-04-05 - Vendor released version 2.2.6, containing multiple
+              security fixes.
+ 2007-04-06 - Vendor notified VSR that fixes were released.
+ 2007-04-09 - VSR notified vendor that 9 vulnerability instances still 
+              remained in latest release.
+ 2007-04-12 - Vendor confirmed that remaining vulnerabilities would be
+              fixed in next release.
+ 2007-04-25 - Vendor released versions 2.2.7 and 2.2.8.  Vendor did not 
+              notify VSR.
+ 2007-04-27 - VSR discovered new versions were released.  VSR inspected 
+              version 2.2.8 and found that no additional vulnerabilities
+              were fixed.  VSR advisories published.
+ 
+
+Recommendation:
+
+AFFLIB(TM) users should upgrade to the newest version.  Third-party
+projects which rely on AFFLIB(TM) should encourage users to upgrade,
+and/or incorporate fixes into their distribution of the library.
+
+The update is available via:
+
+ http://www.afflib.org/downloads/
+
+- -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+Common Vulnerabilities and Exposures (CVE) Information:
+
+The Common Vulnerabilities and Exposures (CVE) project has assigned
+the following name to these issues.  This is a candidate for inclusion
+in the CVE list (http://cve.mitre.org), which standardizes names for
+security problems. 
+
+  CVE-2007-2053
+
+- -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+References:
+
+1. AFF - Forensics Wiki
+   http://www.forensicswiki.org/wiki/AFF
+
+2. Amazon Simple Storage Service (Amazon S3). 
+   http://www.amazon.com/gp/browse.html?node=16427261
+
+- -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+This advisory is distributed for educational purposes only, and comes
+with absolutely NO WARRANTY; not even the implied warranty of
+merchantability or fitness for a particular purpose.  Virtual Security
+Research, LLC nor the author accepts any liability for any direct,
+indirect, or consequential loss or damage arising from use of, or
+reliance on, this information.
+
+- -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+Vulnerability Disclosure Policy:
+
+  http://www.vsecurity.com/disclosurepolicy.html
+
+- -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+AFF(TM) and AFFLIB(TM) are trademarks of Simson Garfinkel and Basis
+Technology Corp.
+
+Included source code excerpts are copyright Simson Garfinkel and Basis
+Technology Corp.
+
+This advisory is copyright (C) 2007 Virtual Security Research, LLC. All
+rights reserved.
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.6 (GNU/Linux)
+
+iD8DBQFGMjalQ1RSUNR+T+gRAuNrAJ9VCrWv8Ir/Wi5j6y6OjH9vzFPupwCfWMcS
++Q3P10JutWw0NWpYNpuuIjc=
+=HanZ
+-----END PGP SIGNATURE-----

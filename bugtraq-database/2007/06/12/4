@@ -1,0 +1,151 @@
+
+Date: Mon, 11 Jun 2007 18:52:11 -0400
+From: Ken Raeburn <raeburn@....EDU>
+To: bugtraq@...urityfocus.com
+Subject: Re: Sudo: local root compromise with krb5 enabled
+
+Thor Lancelot Simon writes:
+> Widely distributed software using Kerberos for password authentication
+> (e.g. the original Merit RADIUS server code, as I disclosed in the mid
+> 1990s) has had a long and ugly history of failing to perform the  
+> second
+> step, usually because its authors didn't understand that it was  
+> necessary.
+
+Yes, this is the standard KDC spoofing attack, known since I think  
+the early 90s at least, maybe late 80s.
+
+> But sudo has a curious bug: it *tries* to do the second step,
+> but if that step fails because no local service keys are known, it  
+> lets
+> the user become root anyway, because the (potentially fake)  
+> Kerberos server
+> said so.  For example, on a host without a "keytab" file:
+
+In some MIT applications there was a conscious choice to that  
+effect.  The MIT library's interface for verifying credentials has a  
+flag that can be set to indicate whether it should return success or  
+failure for this specific case.  (Though personally, I think the  
+default should be the more paranoid one, it would be an incompatible  
+break from previous versions.)
+
+> Needless to say, this should be fixed.  Simply adding local keytabs
+> with service keys for every host that has a kerberos-enabled sudo
+> looks, from a cursory inspection of the code in auth/kerb5.c in the
+> latest sudo distribution (1.6.8pl12) like it will suffice: the other
+> errors appear to be correctly handled.  But woe betide any system
+> administrator who accidentally puts a Kerberos-enabled sudo on a host
+> that's configured as a Kerberos client only!
+
+There is the argument that you should have keytabs on any host with  
+resources you want to protect, and conversely, if there's no keytab,  
+it doesn't matter if you grant root access.  For some environments,  
+that's actually reasonably accurate, but not all environments by any  
+means.
+
+On a system without a keytab, Kerberos by itself -- any  
+implementation -- cannot verify much of anything at all.
+
+> Actually, if you link sudo to MIT krb5 (rather than Heimdal) it's  
+> worse
+> than that, I think: users can override the system keytab setting and
+> cause sudo to *think* there's no keytab when there actually is one,  
+> and
+> then have it ask their fake Kerberos servers, and make them root.
+
+Only because the sudo code is buggy.
+
+> The MIT library provides several different flavors of  
+> krb5_init_context
+
+I count two, unless you're looking at internal functions.
+
+> and only one of them (krb5_init_secure_context()) actually sets the
+> profile_secure flag.  But sudo uses the standard krb5_init_context()
+> which does *not* set profile_secure
+
+Like I said, sudo has a bug.  Any program or module that needs the  
+Kerberos code to not trust the environment must use  
+krb5_init_secure_context, or clean out the environment.  You wouldn't  
+call execvp (or system without an absolute path) from a privileged  
+part of a setuid program with $PATH supplied by the untrusted user,  
+would you?
+
+> and also doesn't call the obsolete
+> (and, I think, never documented) old krb5_secure_config_files()  
+> function,
+> which is the only other thing in the MIT library that would set
+> profile_secure and avoid this root compromise.
+
+That was the original way of dealing with this, until I pointed out  
+back around 1999 that krb5_init_context used $KRB5_CONFIG to read the  
+config file, and even reading some files that might be root-only  
+could have bad effects, like device files (rewind a tape drive while  
+the sysadmin is in between writing dump files to the current tape),  
+or in subtler cases, expose information only root should be privy  
+to.  (For example, does file X exist in that directory that I can't  
+read?  A missing config file produces different results from a file  
+found but not in krb5.conf format.)  So by the time you could call  
+krb5_secure_config_files, you might have already lost.
+
+The function still exists, and will set the "secure" flag, and throw  
+away the original config data and re-read just the files at compiled- 
+in pathnames, but now it also returns an error code saying it's  
+obsolete.
+
+> So the hole is worse than I thought.  It is probably simplest and best
+> to remove the current krb5 password validating code from sudo, and
+> use Heimdal's krb5_verify_user() instead, and make sudo thus no longer
+> work with MIT krb5, which is a terrible security accident just waiting
+> to happen.
+
+You might consider talking with the MIT Kerberos team about the issue.
+
+> Evidently modern MIT krb5 has krb5_verify_user too and though it pokes
+> around in the library internals it doesn't set profile_secure in the
+> context.
+
+Not in my source tree it doesn't.  Maybe you're looking at  
+krb5_verify_init_creds?
+
+As I described above, at this point in the process, if you've created  
+a normal context in a setuid process, you may have already had some  
+exposure.  Indeed, in future versions it's possible that creating a  
+normal context and calling get_init_creds could potentially load some  
+plugin modules indicated by the user's config file.  Calling  
+verify_init_creds after that and expecting the user to be unable to  
+subvert it is pointless.
+
+It might be a useful enhancement to have krb5_init_context create a  
+"secure" context when invoked with uid!=euid (and likewise check for  
+setgid, oh and check saved set-user-ID too).  But I think it would be  
+sloppy to rely on that for security.
+
+>   For that, with MIT krb5, one has to call krb5_init_context_secure()
+> instead of the standard krb5_init_context().
+
+Right.  We do want to be able to run servers in secure environments  
+with information passed in through environment variables.  Since  
+setuid programs are much more the exception than the rule, our  
+defaults are oriented towards programs running in environments that  
+can be trusted, and krb5_init_secure_context is for handling the  
+other cases.  (Not just programs when running with different real and  
+effective uids, but any such programs that have since set both ids  
+the same, or programs spawned from such processes without purging the  
+environment, etc.)
+
+> the initial patch
+> to sudo I posted won't protect against it (since one can override  
+> the keytab
+> and krb5.conf locations and just force a bogus keytab to be checked  
+> against
+> a bogus server).
+
+You should just make it call krb5_init_secure_context.
+
+People concerned about proper use of Kerberos in applications are  
+welcome to send mail to the kerberos@....edu list for discussion;  
+we'd be glad to help, and there are a lot of people besides the MIT  
+team on the list.
+
+Ken
