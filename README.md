@@ -16,7 +16,7 @@ This dataset is divided into two parts:
 Pre-requisites:
 
 - Python 3.6+
-- Disk space: 15GB+
+- Disk space: 30GB+
 
 VulZoo is composed of both git-based and non-git-based sources. The git-based sources are from upstream repositories and organized as git submodules in this repository. The non-git-based sources are crawled and maintained in this repository. To get started, clone the repository with the following command:
 

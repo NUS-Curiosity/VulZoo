@@ -1,0 +1,216 @@
+
+Date: Mon, 21 Feb 2005 15:39:01 -0500
+From: "iDEFENSE Labs" <labs-no-reply@...fense.com>
+To: <bugtraq@...urityfocus.com>, <vulnwatch@...nwatch.org>
+Subject: iDEFENSE Security Advisory 02.21.05: Multiple PuTTY SFTP Client Packet Parsing Integer Overflow Vulnerabilities
+
+
+Multiple PuTTY SFTP Client Packet Parsing Integer Overflow
+Vulnerabilities 
+
+iDEFENSE Security Advisory 02.21.05:
+www.idefense.com/application/poi/display?id=201&type=vulnerabilities
+February 21, 2005
+
+I. BACKGROUND
+
+PuTTY is a free implementation of Telnet and SSH for Win32 and Unix
+platforms, along with an xterm terminal emulator.
+
+More information is available on the vendor's website:
+http://www.chiark.greenend.org.uk/~sgtatham/putty/
+
+II. DESCRIPTION
+
+Remote exploitation of multiple integer overflow vulnerabilities in 
+Simon Tatham's PuTTY can allow attackers to execute arbitrary code.
+
+The first vulnerability specifically exists due to insufficient 
+validation of user-supplied data passed to a memcpy function. The PuTTY 
+sftp implementation allows attackers to supply arbitrary values for the 
+stored length of the string in the packet. This may be observed in the 
+sftp_pkt_getstring() function from sftp.c in PuTTY source code:
+
+static void sftp_pkt_getstring(struct sftp_packet *pkt,
+                               char **p, int *length)
+{                              
+    *p = NULL;
+    if (pkt->length - pkt->savedpos < 4)
+        return;        
+    /* length value is taken from user-supplied data */
+    *length = GET_32BIT(pkt->data + pkt->savedpos);
+    pkt->savedpos += 4;
+    /* this check will be passed if length < 0 */
+    if (pkt->length - pkt->savedpos < *length)  
+        return;                                  
+    *p = pkt->data + pkt->savedpos;
+    pkt->savedpos += *length;
+}
+
+This function is called from fxp_open_recv() and passes the returned 
+string pointer and string length to the mkstr() function:
+
+
+struct fxp_handle *fxp_open_recv(struct sftp_packet *pktin,
+                 struct sftp_request *req)
+{
+    ...
+    /* sftp_pkt_getstring call with controlled len value */
+    sftp_pkt_getstring(pktin, &hstring, &len);  
+    ...
+    handle = snew(struct fxp_handle);
+    /* heap corruption will occur if len == -1 */
+    handle->hstring = mkstr(hstring, len);      
+    handle->hlen = len;
+    sftp_pkt_free(pktin);
+    return handle;
+    ...
+}
+
+If length is passed as -1, a malloc(0) will occur when the snewn() macro 
+is called:
+
+static char *mkstr(char *s, int len)
+{
+    /* malloc(0) if len == -1 */
+    char *p = snewn(len + 1, char);  
+    /* user controlled heap corruption */
+    memcpy(p, s, len);
+    p[len] = '\0';
+    return p;
+}
+
+Finally, when the memcpy function is called heap corruption will occur
+leading to potential code execution.
+
+The second vulnerability specifically exists due to insufficient
+validation of user-supplied data passed to a malloc function. This may 
+be observed in the fxp_readdir_recv() function from PuTTY source code:
+
+struct fxp_names *fxp_readdir_recv(struct sftp_packet *pktin,
+                                   struct sftp_request *req) {
+        /* 32 bit value from packet */
+        ret->nnames = sftp_pkt_getuint32(pktin);
+        /*
+         * The integer overflow occurs when ret->nnames is referenced
+         * the snewn macro calls malloc() wrapper
+         * #define snewn(n, type) ((type *)smalloc((n)*sizeof(type)))
+         */
+        ret->names = snewn(ret->nnames, struct fxp_name);
+        for (i = 0; i < ret->nnames; i++) {
+            char *str;
+            int len;
+            sftp_pkt_getstring(pktin, &str, &len);
+            /* pointer to arbitrary data from packet */
+            ret->names[i].filename = mkstr(str, len);
+            sftp_pkt_getstring(pktin, &str, &len);
+            /* pointer to arbitrary data from packet */
+            ret->names[i].longname = mkstr(str, len);
+            /* pointer to arbitrary data from packet */
+            ret->names[i].attrs = sftp_pkt_getattrs(pktin);
+    }
+
+This function is called from scp_get_sink_action() in scp.c and 
+sftp_cmd_ls() in sftp.c and can lead to remote code execution via heap 
+corruption. Sample debugger output of heap corruption is shown below:
+
+psftp> ls
+Listing directory /home/test
+
+Program received signal SIGSEGV, Segmentation fault.
+0x4009173c in memcpy () from /lib/libc.so.6
+(gdb) bt
+#0  0x4009173c in memcpy () from /lib/libc.so.6
+#1  0x0805675f in mkstr (s=0x4e20 <Address 0x4e20 out of bounds>, len=0)
+#2  0x0805748e in fxp_readdir_recv (pktin=0x809bc10, req=0x4e20)
+#3  0x0804f7b8 in sftp_cmd_ls (cmd=0x4e20) at ../psftp.c:251
+#4  0x08051955 in do_sftp (mode=0, modeflags=0, batchfile=0x0)
+#5  0x080525f8 in psftp_main (argc=4, argv=0xbffff494)
+#6  0x08080500 in main (argc=20000, argv=0x4e20)
+(gdb) up 2
+#2  0x0805748e in fxp_readdir_recv (pktin=0x809bc10, req=0x4e20)
+952                 ret->names[i].filename = mkstr(str, len);
+(gdb) x/8x *(int)pktin
+0x80acc58:  0x01000068  0x66666600  0x00000067  0x42424208
+0x80acc68:  0x42424242  0x00000042  0x44444408  0x44444444
+(gdb) print (struct sftp_packet)pktin
+$2 = {data = 0x809bc10 "XÌ\n\bYF", length = 134885120,
+maxlen = -1073744968, savedpos = 134551097, type = 134885088} 
+
+
+III. ANALYSIS
+
+Successful exploitation allows remote attackers to execute arbitrary 
+code under the privileges of the user running PuTTY. The client must be 
+directed to connect to a malicious server in order to trigger the 
+vulnerability. It should be noted that this vulnerability may affect 
+applications which use PuTTY source code or binaries as a SSH protocol 
+backend. An example of one such product would be WinSCP3, a popular 
+graphical sftp/scp application for Windows.
+
+IV. DETECTION
+
+iDEFENSE has confirmed that PuTTY 0.56 is vulnerable. It is suspected 
+that earlier versions are also vulnerable. 
+
+The following vendors distribute susceptible PuTTY packages within 
+their respective operating system distributions: 
+
+* FreeBSD Project: 
+	FreeBSD 4.9, 4.10, 5.0, 5.1 and 5.2.1 
+
+* Gentoo Foundation Inc.: 
+	Gentoo Linux 1.1a, 1.2, 1.4, 2004.0, 2004.1 and 2004.2
+	
+V. WORKAROUND
+
+Use an alternate SSH client to connect to untrusted hosts until the 
+vendor releases a patch.
+
+VI. VENDOR RESPONSE
+
+Vendor advisories for these issues are available at:
+
+http://www.chiark.greenend.org.uk/~sgtatham/putty/wishlist/vuln-sftp-string.html
+
+http://www.chiark.greenend.org.uk/~sgtatham/putty/wishlist/vuln-sftp-readdir.html
+
+VII. CVE INFORMATION
+
+The Common Vulnerabilities and Exposures (CVE) project has assigned the
+names CAN-2005-0467 to these issues. This is a candidate for inclusion
+in the CVE list (http://cve.mitre.org), which standardizes names for
+security problems.
+
+VIII. DISCLOSURE TIMELINE
+
+02/18/2005  Initial vendor notification
+02/19/2005  Initial vendor response
+02/21/2005  Public disclosure
+
+IX. CREDIT
+
+Gaël Delalleau credited with this discovery. 
+
+Get paid for vulnerability research
+http://www.idefense.com/poi/teams/vcp.jsp
+
+X. LEGAL NOTICES
+
+Copyright © 2005 iDEFENSE, Inc.
+
+Permission is granted for the redistribution of this alert
+electronically. It may not be edited in any way without the express
+written consent of iDEFENSE. If you wish to reprint the whole or any
+part of this alert in any other medium other than electronically, please
+email customerservice@...fense.com for permission.
+
+Disclaimer: The information in the advisory is believed to be accurate
+at the time of publishing based on currently available information. Use
+of the information constitutes acceptance for use in an AS IS condition.
+There are no warranties with regard to this information. Neither the
+author nor the publisher accepts any liability for any direct, indirect,
+or consequential loss or damage arising from use of, or reliance on,
+this information.
+
+
