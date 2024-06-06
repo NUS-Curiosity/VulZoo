@@ -1,0 +1,251 @@
+
+Date: Fri, 25 Mar 2005 01:25:41 -0500
+From: sean <infamous41md@...pop.com>
+To: bugtraq <bugtraq@...urityfocus.com>
+Subject: smail remote and local root holes
+
+
+-- 
+I've been trying to send an email to greg woods, the maintainer of smail, to 3
+different email addresses now.  They have all bounced.  My email to the smail
+user list bounced as well.  I didn't want to just release this 0day, but I'm
+not hunting these people down, so here it is.  No exploit for you though
+kiddies.
+--
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Subject:
+
+smail remote root heap bof and local signal handling vulns.
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Product:
+
+Smail-3 is a Mail Transport Agent, i.e. a program used for sending and
+receiving electronic mail.
+
+Its job is to accept mail messages from sources on the local machine, or
+from remote hosts, and deliver those messages to the appropriate
+destinations, be they to remote hosts or to files or programs on the
+local machine.  It is not intended to be a user interface for reading
+and submitting mail.
+
+http://www.weird.com/~woods/projects/smail.html
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Vulnerable:
+
+smail-3.2.0.120 is latest and what I tested.
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Summary:
+
+There is a heap buffer overflow, and a signal handling related vulnerability.
+The heap buffer overflow can be exploited by remote users, or local users, and
+allows for code execution with root permissions.  The signal handling related
+vulnerability can possibly be exploited by a local user to execute code with
+root permissions.
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Details:
+
+-------------------------------------------------------------------------------
+Heap bof is exploitable by anyone who can connect to smail smtp server.  It
+happens in the MAIL FROM command, among others.
+ 
+-------------------------------------------------------------------------------
+file: addr.c +218
+-------------------------------------------------------------------------------
+
+	if (*ap == '@') {
+	    /* matched host!(host!)*@...te -- build the !-route */
+1]	    register char *p = xmalloc((size_t) strlen(address));
+	    DEBUG(DBG_ADDR_MID, "found host!(host!)*@...te form--ugh!\n");
+	    /* first part already !-route */
+2]	    strncpy(p, address, (size_t) (ap - address));   /* HOLE */
+	    if (mark_end) {
+		*mark_end++ = '>';	/* widden the original address */
+	    }
+3]	    ap = build_uucp_route(ap, error, 0); /* build !-route */
+	    if (ap == NULL) {
+		DEBUG1(DBG_ADDR_LO,
+		       "preparse_address(): build_uucp_route() failed: %s: returns:
+(null)\n",		       *error);
+		return NULL;
+	    }
+4]	    strcat(p, ap);		/* concatenate together */
+	    xfree(ap);
+	    DEBUG1(DBG_ADDR_HI, "preparse_address returns: %v\n", p);
+	    *rest = mark_end;
+	    return p;			/* transformed */
+	}
+
+    1) Here we allocate a buffer on the heap.  The address string is user
+    provided source email address.
+    2) Here we copy in (ap - address) bytes.  ap is a pointer into the address
+    buffer.  It's plain to see that with this copy we will not append a NULL
+    byte to the p string.
+    3) Here we build the route part of the address with more user supplied data.
+    4) Now the route gets appended to p string. Since the string was not
+    properly NULL terminated, we'll start appending from the first NULL byte
+    found past it on the heap.  In my testing I found we can easily trigger this
+    overflow condition with a wide variety of buffer sizes.  Furthermore, we   
+    can reliably create a known heap setup by first crashing process, and then  
+    using other commands to allocate buffers of a known size that will be freed,
+    and then triggering this allocation and grabbing one of the known previously
+    freed buffers.
+
+    Mitigating factors:
+
+    +the overflow buffer is limited to RFC 821 (Section 4.1.2. COMMAND SYNTAX)
+    characters, but we can inject shellcode into plenty of other places.  For
+    example, using the HELP command we can inject up to 1024 bytes of data into
+    a heap buffer that gets leaked and never freed.
+
+-------------------------------------------------------------------------------
+
+Signal handling vuln is exploitable by local console user.  Signal handlers are
+setup that do all sorts of dangerous things that signal handlers are not
+supposed to do.  One of the more serious crimes is allocating and freeing heap
+buffers.
+
+-------------------------------------------------------------------------------
+file: modes.c
+-------------------------------------------------------------------------------
+
+void
+input_signals()
+{
+    if (signal(SIGHUP, SIG_IGN) != SIG_IGN) {
+	if (signal(SIGHUP, sig_unlink) == SIG_ERR) {
+	    write_log(WRITE_LOG_SYS, "input_signals(): signal(SIGHUP) failed: %s.",
+strerror(errno));	    exitvalue = EX_OSERR;
+	}
+    }
+    if (signal(SIGINT, SIG_IGN) != SIG_IGN) {
+	if (signal(SIGINT, sig_unlink) == SIG_ERR) {
+	    write_log(WRITE_LOG_SYS, "input_signals(): signal(SIGINT) failed: %s.",
+strerror(errno));	    exitvalue = EX_OSERR;
+	}
+    }
+
+    ...snip...
+
+static void
+sig_unlink(sig) /* HOLE */
+    int sig;
+{
+    (void) signal(sig, SIG_IGN);
+    unlink_spool();
+    write_log(WRITE_LOG_TTY, "interrupt: mail message removed");
+    exit(EX_OSERR);
+}
+
+    ...snip...
+
+write_log(int who, char *fmt, ...)
+    int who;				/* mask of log files to be written */
+    char *fmt;				/* printf(3) format */
+    va_dcl                              /* arguments for printf */
+{
+    va_list ap;
+
+    ...snip...
+
+    if (errfile && ((who & WRITE_LOG_TTY) ||
+		   ((who & (WRITE_LOG_MLOG|WRITE_LOG_PANIC)) &&
+		    (error_processing == TERMINAL ||
+		     error_processing == ERROR_DEFAULT) && /* XXX ??? */
+		    fmt[0] != 'X'))) {
+	VA_START(ap, fmt);
+	write_log_va(WRITE_LOG_TTY, fmt, ap);
+	va_end(ap);
+    }
+
+    ...snip...
+
+static void
+write_log_va(who, fmt, ap)
+    int who;				/* mask of log files to be written */
+    char *fmt;				/* printf(3) format */
+    va_list ap;                         /* arguments for vfprintf() */
+{
+    static struct str logstr;
+    static int initialised = FALSE;
+
+    if (!initialised) {
+	STR_INIT(&logstr);
+	initialised = TRUE;
+    } else {
+	STR_CLEAR(&logstr);
+	STR_CHECK(&logstr);
+    }
+    str_printf_va(&logstr, fmt, ap);
+
+    ...snip...
+
+#define STR_INIT(sp)					\
+	(((sp)->a = STR_BUMP),				\
+	 ((sp)->i = 0),					\
+	 ((sp)->p = xmalloc((sp)->a)))
+
+     + You can see that xmalloc, which then calls malloc, is called from signal
+     handler. There are many other cases where this is present, as well as other
+     unsafe calls.  Since this is a local hole, we have a lot of control over
+     the evolution of the heap, such as through addresses we give on command
+     line, as well as other dynamic variables.  Interrupting a main thread call
+     to syslog(), malloc(), free(), or some other similar situation might yield
+     for local root if done correctly.  I haven't pursued this bug, so I'm not
+     sure if this is possible or not.
+
+-------------------------------------------------------------------------------
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+Workaround:
+
+None.  Patch or die.  Fixing the signal handling problems are more serious as
+they represent a design flaw.
+
+++++++++++++++++++++++++++++++++++++++++++++
+
+a patch for the overflow:
+
+--- addr.c	2004-08-27 01:46:17.000000000 -0500
++++ _addr.c	2005-03-25 01:00:44.423372480 -0500
+@@ -217,10 +217,12 @@
+ 	ap++;
+ 	if (*ap == '@') {
+ 	    /* matched host!(host!)*@...te -- build the !-route */
+-	    register char *p = xmalloc((size_t) strlen(address));
++        size_t  alen = strlen(address);
++	    register char *p = xmalloc((size_t) alen + 1);
+ 	    DEBUG(DBG_ADDR_MID, "found host!(host!)*@...te form--ugh!\n");
+ 	    /* first part already !-route */
+ 	    strncpy(p, address, (size_t) (ap - address));
++        p[(ap - address)] = '\0';
+ 	    if (mark_end) {
+ 		*mark_end++ = '>';	/* widden the original address */
+ 	    }
+@@ -231,7 +233,8 @@
+ 		       *error);
+ 		return NULL;
+ 	    }
+-	    strcat(p, ap);		/* concatenate together */
++	    strncat(p, ap, alen-strlen(p));		/* concatenate together */
++        p[alen] = '\0';    /* in case in wasn't NULL'd */
+ 	    xfree(ap);
+ 	    DEBUG1(DBG_ADDR_HI, "preparse_address returns: %v\n", p);
+ 	    *rest = mark_end;
+
+
+-- 
+[ sean ]
+
+
+
