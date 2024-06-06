@@ -1,0 +1,199 @@
+
+Date: Mon, 29 Jan 2007 13:21:55 +0100
+From: "Ralf S. Engelschall" <rse@...elschall.com>
+To: bugtraq@...urityfocus.com, full-disclosure@...ts.netsys.com
+Subject: CVSTrac 2.0.0 Denial of Service (DoS) vulnerability
+
+SECURITY ADVISORY
+=================
+
+Application:    CVSTrac
+Version:        2.0.0
+Vulnerability:  Denial of Service (DoS)
+Identification: CVE-2007-0347
+Date:           2007-01-29 12:00 UTC
+
+DESCRIPTION
+-----------
+
+A Denial of Service (DoS) vulnerability exists in CVSTrac
+(http://www.cvstrac.org/) version 2.0.0, a web-based bug and patch-set
+tracking system for the version control systems CVS, Subversion and Git.
+
+The vulnerability is in the Wiki-style text output formatter and is
+triggered by special text constructs in commit messages, tickets and
+Wiki pages. Only users with check-in permissions and Wiki or ticket edit
+permissions can perform an attack. But as the anonymous user usually
+is granted Wiki edit and ticket creation permissions, an attacker
+remotely and anonymously can cause a partial DoS (depending on the pages
+requested) on a CVSTrac installation by opening a new ticket or editing
+a Wiki page with an arbitrary text containing for instance the string
+"/foo/bar'quux".
+
+The result of an attack is an error of the underlying SQLite RDBMS:
+
+| Database Error
+| db_exists: Database exists query failed
+|     SELECT filename FROM filechng WHERE filename='foo/bar'quux'
+| Reason: near "quux": syntax error
+
+ANALYSIS
+--------
+
+The DoS vulnerability exists because the is_eow() function in "format.c"
+does NOT just check the first(!) character of the supplied string
+for an End-Of-Word terminating character, but instead iterates over
+string and this way can skip a single embedded quotation mark. The
+is_repository_file() function then in turn assumes that the filename
+string can never contain a single quotation mark and traps into an SQL
+escaping problem.
+
+An SQL injection via this technique is somewhat limited as is_eow()
+bails on whitespace. So while one _can_ do an SQL injection, one is
+limited to SQL queries containing only characters which get past the
+function isspace(3). This effectively limits attacks to SQL commands
+like "VACUUM".
+
+WORKAROUND
+----------
+
+Administrators can quickly workaround by revoking permissions on the
+users. Restoring those permissions, obviously, would require keeping
+vulnerable permissions on at least one infrequently used account like
+"setup" or using the CLI sqlite3(1) to manually add them back later.
+
+One can resurrect an attacked CVSTrac 2.0.0 by fixing the texts in the
+underlying SQLite database with the following small Perl script.
+
+##
+##  cvstrack-resurrect.pl -- CVSTrac Post-Attack Database Resurrection
+##  Copyright (c) 2007 Ralf S. Engelschall <rse@...elschall.com>
+##
+
+use DBI;           # requires OpenPKG perl-dbi
+use DBD::SQLite;   # requires OpenPKG perl-dbi, perl-dbi::with_dbd_sqlite=yes
+use DBIx::Simple;  # requires OpenPKG perl-dbix
+use Date::Format;  # requires OpenPKG perl-time
+
+my $db_file = $ARGV[0];
+
+my $db = DBIx::Simple->connect(
+    "dbi:SQLite:dbname=$db_file", "", "",
+    { RaiseError => 0, AutoCommit => 0 }
+);
+
+my $eow = q{\x00\s.,:;?!)"'};
+
+sub fixup {
+    my ($data) = @_;
+    if ($$data =~ m:/[^$eow]*/[^$eow]*'[^$eow]+:s) {
+        $$data =~ s:(/[^$eow]*/[^$eow]*)('[^$eow]+):$1 $2:sg;
+        return 1;
+    }
+    return 0;
+}
+
+foreach my $rec ($db->query("SELECT name, invtime, text FROM wiki")->hashes()) {
+    if (&fixup(\$rec->{"text"})) {
+        printf("++ adjusting Wiki page \"%s\" as of %s\n",
+            $rec->{"name"}, time2str("%Y-%m-%d %H:%M:%S", -$rec->{"invtime"}));
+        $db->query("UPDATE wiki SET text = ? WHERE name = ? AND invtime = ?",
+            $rec->{"text"}, $rec->{"name"}, $rec->{"invtime"});
+    }
+}
+foreach my $rec ($db->query("SELECT tn, description, remarks FROM ticket")->hashes()) {
+    if (&fixup(\$rec->{"description"}) or &fixup(\$rec->{"remarks"})) {
+        printf("++ adjusting ticket #%d\n",
+            $rec->{"tn"});
+        $db->query("UPDATE ticket SET description = ?, remarks = ? WHERE tn = ?",
+            $rec->{"description"}, $rec->{"remarks"}, $rec->{"tn"});
+    }
+}
+foreach my $rec ($db->query("SELECT tn, chngtime, oldval, newval FROM tktchng")->hashes()) {
+    if (&fixup(\$rec->{"oldval"}) or &fixup(\$rec->{"newval"})) {
+        printf("++ adjusting ticket [%d] change as of %s\n",
+            $rec->{"tn"}, time2str("%Y-%m-%d %H:%M:%S", $rec->{"chngtime"}));
+        $db->query("UPDATE tktchng SET oldval = ?, newval = ? WHERE tn = ? AND chngtime = ?",
+            $rec->{"oldval"}, $rec->{"newval"}, $rec->{"tn"}, $rec->{"chngtime"});
+    }
+}
+foreach my $rec ($db->query("SELECT cn, message FROM chng")->hashes()) {
+    if (&fixup(\$rec->{"message"})) {
+        printf("++ adjusting change [%d]\n",
+            $rec->{"cn"});
+        $db->query("UPDATE chng SET message = ? WHERE cn = ?",
+            $rec->{"message"}, $rec->{"cn"});
+    }
+}
+
+$db->commit();
+$db->disconnect();
+
+RESOLUTION
+----------
+
+Upgrade to the now available CVSTrac 2.0.1:
+http://www.cvstrac.org/cvstrac-2.0.1.tar.gz
+
+Or apply the following upstream vendor patch against CVSTrac 2.0.0:
+http://www.cvstrac.org/cvstrac/chngview?cn=852
+
+Index: cvstrac/format.c
+--- format.c	2006/07/05 01:06:50	1.87
++++ format.c	2006/08/16 23:02:14	1.88
+@@ -77,6 +77,8 @@
+ ** Return TRUE if *z points to the terminator for a word.  Words
+ ** are terminated by whitespace or end of input or any of the
+ ** characters in zEnd.
++** Note that is_eow() ignores zEnd characters _inside_ a word. They
++** only count if they're followed by other EOW characters.
+ */
+ int is_eow(const char *z, const char *zEnd){
+   if( zEnd==0 ) zEnd = ".,:;?!)\"'";
+@@ -123,6 +125,7 @@
+ ** somewhere inside. Spaces in filenames aren't supported.
+ */
+ int is_repository_file(const char *z){
++  char *s;
+   int i;
+   int gotslash=0;
+   if( z[0]!='/' ) return 0;
+@@ -132,13 +135,12 @@
+   if(!gotslash) return 0;
+
+   /* see if it's in the repository. Note that we strip the leading '/' from the
+-   * query. Note that the is_eow() check means there's no ' character.
++   * query.
+    */
+-  if( !db_exists("SELECT filename FROM filechng WHERE filename='%.*s'",
+-                 i-1, &z[1]) ){
+-    return 0;
+-  }
+-  return i;
++  s = mprintf("%.*s", i-1, &z[1]);
++  gotslash = db_exists("SELECT filename FROM filechng WHERE filename='%q'", s );
++  free(s);
++  return gotslash ? i : 0;
+ }
+
+ /*
+
+HISTORY
+-------
+
+2007-01-17 10:00 UTC: problem detected
+2007-01-17 11:30 UTC: vulnerability detected in format.c:is_eow()
+2007-01-17 12:15 UTC: vulnerability analized and first workaround patch created
+2007-01-17 12:45 UTC: database resurrection script written
+2007-01-17 13:00 UTC: upstream vendor notified
+2007-01-17 22:24 UTC: vendor confirmed vulnerability and provided official fix
+2007-01-18 09:22 UTC: vendor informed and CVE number requested from MITRE
+2007-01-18 20:08 UTC: received CVE number CVE-2007-0347 from MITRE
+2007-01-22 08:30 UTC: settled with vendor on an embargo date of 2007-01-29 12:00 UTC
+2007-01-22 09:00 UTC: pre-informed "vendor-sec"
+2007-01-29 12:00 UTC: send out RSE security advisory
+
+                                       Ralf S. Engelschall
+                                       rse@...elschall.com
+                                       www.engelschall.com
+

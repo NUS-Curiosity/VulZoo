@@ -1,0 +1,167 @@
+
+Date: Fri, 30 Oct 2009 18:22:21 +0100
+From: Marco Verschuur <marco@....nl>
+To: Jim Paris <jim@...n.com>
+Cc: Pavel Machek <pavel@....cz>, Dan Yefimov <dan@...htwave.net.ru>,
+	bugtraq@...urityfocus.com
+Subject: Re: /proc filesystem allows bypassing directory permissions on Linux
+
+Jim,
+
+Your assumption that the same file descriptor is being re-opened is  
+wrong!
+The file descriptor retrieved via /proc is a new one. It is not the  
+same as the
+initial read-only.
+
+Do a strace on your test and you will see that the 'file descriptor'  
+in /proc
+will be accessed as an ordinairy file. After checking the directory  
+permissions
+of that particular file an open will be performed on '/proc/self/fd/0'  
+and a new
+O_WRONLY file descriptor is being created.
+
+As Martin Rex already explained yesterday, /proc is all virtual.
+The item referred as fd in /proc is not a real file descriptor and as
+of that, that 'not-tfor-real file descriptor' is also not re-opend and  
+so does
+not become read-write.
+
+The entire discussion about the file descriptor behavior the past days,
+including your statement below is all based on false assumptions...
+I'll show you a snip out of my strace of the original scenario, being  
+performed by
+Pavel. But the same mechanism is being performed by you, Jim, in the  
+following step:
+		 # su nobody -c 'echo "hacked" >/proc/self/fd/0' < /dir/file.txt
+
+All you do is just open the FILE via the path of /proc, not via the  
+assumed
+path via /tmp (or /dir in your example) nor access the assumed read- 
+only fd being
+presented via /proc. Therefor it's totally of no influence what you do  
+with the original
+directory permission. File access has nothing to do with directory  
+permissions...!
+
+Imagen:
+- a house surrounded with a fence with all doors unlocked (file with  
+perm 0666)
+- a drive-way leads to the gate in the fence and the gate is unlocked  
+(dir with perms 777)
+- next we put a lock on the gate and don't give guest the key (dir  
+with perms 700)
+- guest cannot access the house because he can't pass the gate
+- now we take an airplane and parachute guest straight into the  
+perimeter of the fence (/proc access)
+- guest can access the house (write the file), because the house has  
+all doors unlocked
+
+There is no such mechanism that gives guest the ability to break the  
+lock / steel or duplicate
+the key of the lock on the gate (circumvent the original directory  
+permissions or
+upgrade the read-only fd to be read-write), because guest never takes  
+that path via the drive-way and gate
+if he accesses the file via /proc
+
+Please do your own strace of the mentioned scenario's, so you'll see  
+it with your own eyes.
+People tent to debate mechanisms, based on the assumption that a  
+certain mechanisme is
+being involved here. But the assumed mechanisms are not in play in  
+this particular case.
+
+Below you'll find the parts of the strace output that proves it all;
+
+7649  stat64("/proc", {st_mode=S_IFDIR|0555, st_size=0, ...}) = 0
+7649  stat64("/proc/self", {st_mode=S_IFDIR|0555, st_size=0, ...}) = 0
+7649  stat64("/proc/self/fd", {st_mode=S_IFDIR|0500, st_size=0, ...})  
+= 0
+7649  stat64("/proc/self/fd/3", {st_mode=S_IFREG|0666,  
+st_size=35, ...}) = 0
+<snip>
+7649  rt_sigaction(SIGINT, {0x8085067, [], 0}, {0x8085067, [], 0}, 8)  
+= 0
+7649  time(NULL)                        = 1256668021
+7649  open("/proc/self/fd/3", O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE,  
+0666) = 4
+7649  fcntl64(1, F_GETFD)               = 0
+7649  fcntl64(1, F_DUPFD, 10)           = 10
+7649  fcntl64(1, F_GETFD)               = 0
+7649  fcntl64(10, F_SETFD, FD_CLOEXEC)  = 0
+7649  close(1)                          = 0
+7649  dup2(4, 1)                        = 1
+7649  close(4)                          = 0
+7649  write(1, "got you\n", 8)          = 8
+7649  close(1)                          = 0
+
+
+Best regards,
+	Marco
+
+
+On 29 okt 2009, at 21:10, Jim Paris wrote:
+
+>>> 0700 mode from the origin, you would be right, and procfs wouldn't  
+>>> allow
+>>> opening files in that directory too, but if you let others to  
+>>> traverse
+>>> that directory and open your believed to be secure files from the  
+>>> origin,
+>>> it's your fault.
+>>
+>> I can do the example with fd passing and 700 directory, but it would
+>> be lot of C code. Feel free to play, my example was not nearly the
+>> only way to demonstrate it, and no, it was not racy.
+>
+> Here is an example that shows the behavior where a passed read-only fd
+> can become read-write by reopening it through /proc, when file
+> permissions allow it (but directory permissions do not):
+>
+>  $ sudo su
+>  # mkdir -m 0700 /dir
+>  # echo "safe" > /dir/file.txt
+>  # chmod 0666 /dir/file.txt
+>  # ls -al /dir
+>  total 12
+>  drwx------  2 root root 4096 2009-10-29 00:28 .
+>  drwxr-xr-x 27 root root 4096 2009-10-29 00:28 ..
+>  -rw-rw-rw-  1 root root    7 2009-10-29 00:43 file.txt
+>  # cat /dir/file.txt
+>  safe
+>
+> Now user "nobody" cannot read or write this file:
+>
+>  # su nobody -c 'cat /dir/file.txt'
+>  sh: /dir/file.txt: Permission denied
+>  # su nobody -c 'echo "hacked" > /dir/file.txt'
+>  sh: /dir/file.txt: Permission denied
+>  # cat /dir/file.txt
+>  safe
+>
+> If we provide an open read-only file descriptor (as stdin, fd 0), they
+> can read it:
+>
+>  # su nobody -c 'cat <&0' < /dir/file.txt
+>  safe
+>
+> But they still can't write to this descriptor:
+>
+>  # su nobody -c 'echo "hacked" >&0' < /dir/file.txt
+>  sh: line 0: echo: write error: Bad file descriptor
+>
+> Unless we re-open the file using the magic link in /proc:
+>
+>  # su nobody -c 'echo "hacked" >/proc/self/fd/0' < /dir/file.txt
+>  # cat /dir/file.txt
+>  hacked
+>
+> Again, debatable whether this is a bug, but it's certainly
+> non-obvious.  There is no other way (that I'm aware) for the "nobody"
+> user to gain write access to /dir/file.txt, even when given a
+> read-only fd, without using /proc.
+>
+> -jim
+

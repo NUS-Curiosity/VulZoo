@@ -1,0 +1,213 @@
+
+Date: Mon, 27 Jul 2009 17:27:17 +0100
+From: tixxDZ <tixxdz@...il.com>
+To: bugtraq@...urityfocus.com
+Subject: [DZC-2009-001] The Movie Player and VLC Media Player Real Data 
+	Transport parsing integer underflow.
+
+Advisory:
+        The Movie Player and VLC Media Player Real Data Transport
+        parsing integer underflow.
+
+Affected products:
+        The Movie player svn r29438 [1]
+        VLC media player <= 1.0.0 [2]
+        Possible others applications that use the xine lib code [3].
+
+Discovred by:
+        tixxDZ <tixxdz at gmail dot com>
+        DZCORE Labs, Algeria
+
+Date reported:
+        2009/07/25
+
+Release Date:
+        2009/07/27
+
+Solutions:
+        VLC: update to VLC media player 1.0.1 [2] [4].
+        Mplayer: please see Patches section.
+
+
+---------
+Abstract:
+---------
+
+Mplayer
+Source file:    stream/realrtsp/real.c
+function:       int real_get_rdt_chunk(rtsp_t *rtsp_session,
+                                       char **buffer,
+                                       int rdt_rawdata)
+
+
+VLC
+Source file:    modules/access/rtsp/real.c
+function:       int real_get_rdt_chunk_header(rtsp_client_t *rtsp_session,
+                                              rmff_pheader_t *ph)
+
+
+The original code is part of the xine library [3]:
+Source file:    src/input/libreal/real.c
+function:       int real_get_rdt_chunk(rtsp_t *rtsp_session,
+                                       unsigned char **buffer)
+
+
+Function real_get_rdt_chunk() calls rtsp_read_data() to read RDT
+(Real Data Transport) chunks headers from the network and after that it will
+parse them.
+A controled variable is used to allocate a buffer and later passed on to the
+rtsp_read_data() function in order to specify the length of an RDT chunk
+data to read from the network.
+An integer underflow can be triggered when parsing a malformed RDT header chunk,
+a remote attacker can exploit it to execute arbitrary code in the context of
+the application.
+
+
+The xine lib [3] seems not to be vulnerable due to an additional check in the
+xio_rw_abort() funcion (file: src/xine-engine/io_helper.c), which takes the
+length of an RDT packet as an off_t type and performs some comparison checks
+(line: 350) before reading chunks from the network.
+The Movie player [1] and the VLC media player [2] are vulnerable, the length
+of an RDT packet is passed as an unsigned int to their own network read
+functions.
+
+
+-----------
+Descripton:
+-----------
+xine-lib source file:   src/input/libreal/real.c
+
+int real_get_rdt_chunk(rtsp_t *rtsp_session, unsigned char **buffer) {
+
+        int n=1;
+        uint8_t header[8];
+        rmff_pheader_t ph;
+        int size;
+        int flags1;
+        int unknown1;
+        uint32_t ts;
+
+        n=rtsp_read_data(rtsp_session, header, 8);
+        if (n<8) return 0;
+        if (header[0] != 0x24)
+        {
+                lprintf("rdt chunk not recognized: got 0x%02x\n", header[0]);
+                return 0;
+        }
+[1]     size=(header[1]<<16)+(header[2]<<8)+(header[3]);
+        flags1=header[4];
+        if ((flags1!=0x40)&&(flags1!=0x42))
+        {
+                lprintf("got flags1: 0x%02x\n",flags1);
+                if (header[6]==0x06)
+                {
+                        lprintf("got end of stream packet\n");
+                        return 0;
+                }
+                ...
+[2]             size-=9;
+        }
+        unknown1=(header[5]<<16)+(header[6]<<8)+(header[7]);
+        n=rtsp_read_data(rtsp_session, header, 6);
+        if (n<6) return 0;
+        ts=_X_BE_32(header);
+
+        lprintf("ts: %u size: %u, flags: 0x%02x, unknown values: %u
+0x%02x 0x%02x\n",
+                ts, size, flags1, unknown1, header[4], header[5]);
+
+[3]     size+=2;
+        ph->object_version=0;
+[4]     ph->length=size;
+        ph->stream_number=(flags1>>1)&1;
+        ph->timestamp=ts;
+        ph->reserved=0;
+        ph->flags=0;      /* TODO: determine keyframe flag and insert here? */
+[5]     xine_buffer_ensure_size(*buffer, 12+size);
+        rmff_dump_pheader(&ph, *buffer);
+[6]     size-=12;
+[7]     n=rtsp_read_data(rtsp_session, (*buffer)+12, size);
+
+        return (n <= 0) ? 0 : n+12;
+}
+
+
+[1]     The signed int size variable is filled with data from the network.
+
+[2] [3] Some arithmetics operations, we assume that at the end size == 11.
+
+[4]     The value of the size variable is assigned to the ph->length.
+
+[5]     The size variable is used to allocate (realloc) space for the buffer.
+
+[6]     An integer underflow is triggered, size == 0xffffffff.
+
+[7]     The size variable is passed to the rtsp_read_data() function as an
+        unsigned integer in order to specify the length of an RDT packet.
+
+        Mplayer:
+        Mplayer is vulnerable, the rtsp_read_data() function passes the length
+        to the read_stream() function (file: stream/librtsp/rtsp.c) as a size_t
+        type which can lead to read a big amount of data from the network and
+        cause a heap overflow.
+
+        VLC:
+        VLC is vulnerable, the real_get_rdt_chunk_header() function will read
+        and parse the header, the vulnerable call to the rtsp_read_data()
+        function is made by the real_get_rdt_chunk() function, the length is
+        passed to the __net_Read() function (file: src/network/io.c) as a
+        size_t type which can lead to read a big amount of data from the
+        network and cause a heap overflow.
+
+
+--------
+Patches:
+--------
+
+VLC
+Official patch by the VideoLAN team (Patch development time: 2 hours) [4].
+
+Mplayer
+Unofficial patch by tixxDZ
+
+diff -Naur stream/realrtsp/real.c stream/realrtsp/real.c.new
+--- stream/realrtsp/real.c      2009-07-27 01:09:18.000000000 +0100
++++ stream/realrtsp/real.c.new  2009-07-27 01:12:35.000000000 +0100
+@@ -386,6 +386,7 @@
+     return (n <= 0) ? 0 : n;
+   }
+   rmff_dump_pheader(&ph, *buffer);
++  if (size<12) return 0;
+   size-=12;
+   n=rtsp_read_data(rtsp_session, (*buffer)+12, size);
+
+
+-----------
+References:
+-----------
+
+[1]     http://www.mplayerhq.hu/
+[2]     http://www.videolan.org/
+[3]     http://www.xine-project.org/
+[4]     http://git.videolan.org/?p=vlc.git;a=commitdiff;h=dc74600c97eb834
+        c08674676e209afa842053aca
+
+
+-----------
+Disclaimer:
+-----------
+
+The document is provided as is without warranty of any kind. The content
+may change without notice. In no event shall the author be liable for any
+special, direct or indirect damages, losses or unlawful offences.
+Use at your own risk.
+
+
+Copyright (c) 2009 tix tixxDZ, DZCORE Labs. All rights reserved.
+
+
+
+-- 
+tix or tixxDZ
+
+View attachment "dzcore-2009-001-advisory.txt" of type "text/plain" (5517 bytes)

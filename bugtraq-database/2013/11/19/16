@@ -1,0 +1,178 @@
+
+Date: Tue, 19 Nov 2013 17:38:39 GMT
+From: geinblues@...il.com
+To: bugtraq@...urityfocus.com
+Subject: XADV-2013003 Linux Kernel fbdev Driver arcfb_write() Overflow
+
++----------------------------------------------------------------+
+| XADV-2013003 Linux Kernel fbdev Driver arcfb_write() Overflow  |
++----------------------------------------------------------------+
+
+ Vulnerable versions:
+ - linux kernel 3.12 <=
+ - linux kernel 2.6.x
+
+ Testbed: linux kernel 2.6.18
+ Type: Local
+ Impact: Kernel Panic
+ Vendor: http://www.x90c.org
+ Author: x90c <geinblues *nospam* gmail dot com>
+ Site: x90c.org
+
+
+=========
+ABSTRACT:
+=========
+
+The fbdev driver is frame buffer driver for arc monochrome lcd
+board in the linux kernel. 
+
+The linux kernel driver has a overflow vulnerability because
+the codes at arcfb_write(). When if large value as the parameter
+to the arcfb_write() it will be overflow to lead the kernel panic.
+
+The large 0xffffffff copy_from_user() lead to the kernel panic. [1]
+
+* references:
+  [1] http://www.securityfocus.com/archive/1/362953/30/0/threaded
+  [2] http://zerryloveyou.blog.com/2010/12/27/linux-lcd-driver-writing/
+  [3] http://grsecurity.net/~spender/changelog-stable2-latest.txt
+  [4] http://grsecurity.net/~spender/changelog-stable2vserver.txt
+
+
+=========
+DETAILS:
+=========
+
+
+1. Vulnerable arcfb_write()
+
+Arbitrary user can control count, ppos variable both. The ppos must
+not be larger value than fbmemlength variable (exp cond 3) and
+the count + p also not be larger than fbmemlength (exp cond 4).
+a little value p, large value to 0xffffffff count can be reached
+the copy_from_user(). 0xffffffff bytes copied and kernel panic!
+
+[linux-2.6.18-kdb/drivers/video/arcfb.c]
+----
+/*
+ * this is the access path from userspace. they can seek and write to
+ * the fb. it's inefficient for them to do anything less than 64*8
+ * writes since we update the lcd in each write() anyway.
+ */
+static ssize_t arcfb_write(struct file *file, const char __user *buf, size_t count,
+                loff_t *ppos) // XXX unsigned count If exp cond 1) count==0xffffffff
+{
+    /* modded from epson 1355 */
+
+    struct inode *inode;
+    int fbidx;
+    struct fb_info *info;
+    unsigned long p;	// unsigned long.
+    int err=-EINVAL;
+    unsigned int fbmemlength,x,y,w,h, bitppos, startpos, endpos, bitcount;
+    struct arcfb_par *par;
+    unsigned int xres;
+
+    p = *ppos; // XXX p = *ppos	If exp cond2) p=0xfff
+    inode = file->f_dentry->d_inode;
+    fbidx = iminor(inode);
+    info = registered_fb[fbidx]; // XXX info = registered frame buffer.
+
+    if (!info || !info->screen_base)
+        return -ENODEV;
+
+    par = info->par;
+    xres = info->var.xres;
+    fbmemlength = (xres * info->var.yres)/8;
+
+    if (p > fbmemlength) // If exp cond3) fbmemlength > 0xfff.
+        return -ENOSPC;
+
+    err = 0;
+
+    /* XXX exp cond 4) 0xffffffff+0xfff=0xffe > fbmemlength? no. */
+    if ((count + p) > fbmemlength) {
+        count = fbmemlength - p;
+        err = -ENOSPC;
+    }
+
+    if (count) { // XXX count?
+        char *base_addr;
+
+        base_addr = info->screen_base;
+        count -= copy_from_user(base_addr + p, buf, count); // XXX 0xffffffff bytes copied. (kernel panic!)
+
+..
+
+}
+
+static struct fb_ops arcfb_ops = {
+    .owner      = THIS_MODULE,
+    .fb_open    = arcfb_open,
+    .fb_write   = arcfb_write,	// arcfb_write() for the driver's write.
+    .fb_release = arcfb_release,
+    .fb_pan_display = arcfb_pan_display,
+    .fb_fillrect    = arcfb_fillrect,
+    .fb_copyarea    = arcfb_copyarea,
+    .fb_imageblit   = arcfb_imageblit,
+    .fb_ioctl   = arcfb_ioctl,
+};
+----
+
+
+2. fb_info struct.
+
+----
+struct fb_info {
+    int node;
+
+..
+
+
+    char __iomem *screen_base;  /* Virtual address */
+
+    unsigned long screen_size;  /* Amount of ioremapped VRAM or 0 */ XXX
+    void *pseudo_palette;       /* Fake palette of 16 colors */
+#define FBINFO_STATE_RUNNING    0
+#define FBINFO_STATE_SUSPENDED  1
+    u32 state;          /* Hardware state i.e suspend */
+    void *fbcon_par;                /* fbcon use-only private area */
+    /* From here on everything is device dependent */
+    void *par;
+};
+----
+
+base_addr variable to copy dest pointer is the char __iomem *.
+and it can be overflowed.
+
+
+===============
+EXPLOIT CODES:
+===============
+-
+
+
+=============
+PATCH CODES:
+=============
+-
+
+
+===============
+VENDOR STATUS:
+===============
+2013/11/10 - I discovered the vulnerability.
+2013/11/11 - The advisory released.
+2013/11/11 - grsecurity spender's commit.
+             (http://grsecurity.net/~spender/changelog-stable2-latest.txt)
+
+============
+DISCLAIMER:
+============
+
+The authors reserve the right not to be responsible for the topicality,
+correctness, completeness or quality of the information provided in this
+document. Liability claims regarding damage caused by the use of any information
+provided, including any kind of information which is incomplete or incorrect,
+will therefore be rejected.

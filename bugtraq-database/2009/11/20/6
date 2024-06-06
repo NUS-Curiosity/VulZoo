@@ -1,0 +1,310 @@
+
+Date: Fri, 20 Nov 2009 14:01:27 +0200
+From: Bogdan Calin <bogdan@...netix.com>
+To: bugtraq@...urityfocus.com
+Subject: PHP "multipart/form-data" denial of service
+
+Description
+------------
+PHP version 5.3.1 was just released. This release contains a patch for a
+denial of service condition we've reported on 27 October 2009. The
+problem is related with PHP's handling of RFC 1867 (Form-based File
+Upload in HTML).
+
+When you send a POST request to a PHP script with the content-type of
+"multipart/form-data" and include a list of files in that request, PHP
+will create a temporary file for each file from the request. PHP will
+create those files regardless if the script can handle file uploading or
+not. After the script was executed, the temporary files will be deleted.
+
+The problem is that you can include a very large number of files in the
+request. PHP will need to create those files before the script is
+executed and delete them afterwards.
+
+The denial of service condition appears when you create a bunch of
+requests, each containing a large number (15000+) of files.
+When you send these requests to the web server, the web server collapses
+and stops responding because it has to process (create & delete) an
+insane number of files in a very short period of time.
+
+Any website that runs PHP and where file uploading is enabled (which is
+the default configuration) is vulnerable. You don't need to have a file
+upload script.
+
+PHP does include 2 configuration settings that are related to this
+situation: upload_max_filesize and post_max_size.
+However, these are not enough to protect us against this denial of
+service attack.
+
+Workarounds
+------------
+Currently, I'm aware of three workarounds for this problem:
+
+1. Disable file uploads
+If you don't need file uploading, you can disable this feature from
+php.ini.
+file_uploads = Off
+
+2. Install PHP 5.3.1
+If you cannot disable file uploading on your website, it's recommended
+to install the latest version of PHP.
+PHP 5.3.1 includes a patch for this problem:
+- Added "max_file_uploads" INI directive, which can be set to limit the
+number of file uploads per-request to 20 by default, to prevent possible
+DOS via temporary file exhaustion.
+
+3. Install Suhosin PHP extension
+The Suhosin PHP extension has an option named "suhosin.upload.max_uploads".
+This option defines the maximum number of files that may be uploaded
+with one request and by default is set to 25.
+Suhosin PHP extension should not be confused with the Suhosin Patch
+which does not protect against this attack.
+
+Quote from the hardened-php website:
+"Suhosin comes in two independent parts, that can be used separately or
+in combination.  The first part is a small patch against the PHP core,
+that implements a few low-level protections against bufferoverflows or
+format string vulnerabilities and the second part is a powerful PHP
+extension that implements all the other protections."
+
+It's recommended to apply one of the workarounds described above as soon
+as possible. Below are some conclusions I've gathered from testing this
+on different systems.
+
+Conclusions and real life results
+----------------------------------
+This attack can make the web server unresponsive in a short period of
+time (under 2 minutes) with a very small number of requests.
+Also, this attack doesn't leave any obvious tracks in the logs (only a
+bunch of POST requests) and can be executed through a proxy server.
+Some operating systems will handle this condition very badly.
+
+For example in one case (a FreeBSD 7.1), the network stack completely
+crashed and the server was unreachable from the local network.
+I had to manually restart it from the console.
+
+On Linux (Ubuntu), the web server will not be reachable for hours after
+being attacked for 1-2 minutes.
+
+Real life results:
+
+1. PHP on Linux (Ubuntu 8.10)
+=============================
+PHP Version 5.2.6-2ubuntu4.3
+
+Timeline:
+14:50 - started the attack
+14:51 : web server is no longer responsive.
+load average: 102.02, 30.68, 10.68
+14:52 :  web server is not responsive.
+load average: 129.95, 49.29, 18.05
+14:52 - attack is aborted
+
+14:53 - web server is not responsive.
+load average: 143.58, 67.90, 26.41
+14:54 - web server is not responsive.
+load average: 149.60, 89.58, 37.93
+16:05 - web server is not responsive.
+load average: 151.64, 120.91, 60.94
+
+I wanted to check how many temporary files were created:
+$ls -la /tmp/php* | wc -l
+-bash: /bin/ls: Argument list too long
+       0
+
+I've created a script to count the files:
+$php count_files_from_dir.php /tmp/php*
+2.419.649
+
+So, one hour later, the web server is not responsive and there are
+2.419.649 temporary files. If you restart the web server, these files
+are not deleted.
+
+2. PHP on FreeBSD 7.2
+======================
+PHP Version 5.2.9
+
+Timeline:
+14:00 - attack is started.
+14:01 - web server is no longer responsive (Chrome message: Error 101
+(net::ERR_CONNECTION_RESET): Unknown error.))
+load average: 87:22, 22.61, 9.9
+14:02 - attack is aborted.
+
+14:06 - web server is no longer responsive.
+load averages: 45.42, 42.35, 22.59
+
+14:11 - web server is not responsive.
+load averages: 26.77, 35.78, 23.49
+
+The system is slowed down to a crawl.
+Basically you cannot even write a command in a remote PUTTY session.
+
+14:17 - web server is not responsive.
+The console is continuously displaying kernel error messages like:
+swap_pager_getswapspace(2): failed
+swap_pager_getswapspace(16): failed
+swap_pager_getswapspace(3): failed
+...
+pid 61248 (httpd), uid 80 inumber 5 on /var: out of inodes
+pid 61251 (httpd), uid 80 inumber 5 on /var: out of inodes
+pid 61146 (httpd), uid 80 inumber 5 on /var: out of inodes
+pid 61103 (httpd), uid 80 inumber 5 on /var: out of inodes
+pid 61103 (httpd), uid 80 inumber 5 on /var: out of inodes
+pid 61063 (httpd), uid 80 inumber 5 on /var: out of inodes
+pid 61101 (httpd), uid 80 inumber 5 on /var: out of inodes
+...
+
+14:23 - web server is responsive.
+load averages:  0.79, 29.10, 37.13
+
+I was trying to count the number of temporary files from the server:
+$ls -la /var/tmp/php* | wc -l
+-bash: /bin/ls: Argument list too long
+       0
+
+$ls -la /var/tmp/php
+Display all 117490 possibilities? (y or n)
+
+So, there are 117490 temporary files left on the server.
+
+One another FreeBSD 7.1 server I've had a very weird situation:
+After one minute the network stack crashed and the server was
+unreachable from the local network.
+
+I had to manually restart the network interface from the console.
+The message log contains error messages like:
+
+Oct 23 10:55:17 daemon kernel: Approaching the limit on PV entries,
+consider increasing either the vm.pmap.shpgperproc or the
+vm.pmap.pv_entry_max tunable.
+Oct 23 10:56:17 daemon kernel: Approaching the limit on PV entries,
+consider increasing either the vm.pmap.shpgperproc or the
+vm.pmap.pv_entry_max tunable.
+Oct 23 10:57:17 daemon kernel: Approaching the limit on PV entries,
+consider increasing either the vm.pmap.shpgperproc or the
+vm.pmap.pv_entry_max tunable.
+Oct 23 10:58:17 daemon kernel: Approaching the limit on PV entries,
+consider increasing either the vm.pmap.shpgperproc or the
+vm.pmap.pv_entry_max tunable.
+Oct 23 10:59:17 daemon kernel: Approaching the limit on PV entries,
+consider increasing either the vm.pmap.shpgperproc or the
+vm.pmap.pv_entry_max tunable.
+Oct 23 11:00:17 daemon kernel: Approaching the limit on PV entries,
+consider increasing either the vm.pmap.shpgperproc or the
+vm.pmap.pv_entry_max tunable.
+Oct 23 11:01:17 daemon kernel: Approaching the limit on PV entries,
+consider increasing either the vm.pmap.shpgperproc or the
+vm.pmap.pv_entry_max tunable.
+Oct 23 11:02:17 daemon kernel: Approaching the limit on PV entries,
+consider increasing either the vm.pmap.shpgperproc or the
+vm.pmap.pv_entry_max tunable.
+
+
+3. PHP on Windows: XAMPP
+=========================
+XAMPP for Windows setup filename:  xampp-win32-1.7.2.exe
+PHP Version 5.3.0
+
+Timeline:
+12:30 - started the attack
+12:30 + few seconds: CPU usage => 100%
+
+In a few seconds, the web server is not responding anymore, 65535
+temporary files are created and no more files could be created anymore.
+On XAMPP for Windows, PHP is creating the temporary files in
+C:\xampp\tmp (if your XAMPP installation was in C:\xampp\)
+
+The files are named phpXXXX.tmp (where X's charset is 'a'-'z', 'A'-'Z',
+'0'-'9'). Example: php1A00.tmp
+
+This 4 char random number is a limitation of PHP on Windows.
+PHP on Unix is using 6 chars for its temporary filenames so it doesn't
+reach this condition.
+
+12:31 - attack is aborted
+12:39 - CPU usage is still 100%, web server is not responsive.
+13:08 - CPU usage is still 100%, web server is responsive.
+14:08 - CPU usage is 97%
+14:34 - CPU usage is 97%
+
+Two hours later the CPU usage didn't get back to normal.
+However, the web server is responding.
+
+After I manually restart the Apache process, CPU usage gets back to normal.
+However, those 65535 temporary files were not deleted.
+
+4. PHP on OpenBSD 4.6
+======================
+PHP Version 5.2.10
+
+Timeline:
+12:00 - started the attack
+12:00 + few seconds: CPU usage => 100%
+
+12:01 - attack is aborted
+12:01 - web server is no longer responsive.
+load averages: 120.42, 50.35, 20.59
+
+12:04 - web server is no longer responsive.
+load averages: 147.17, 80.74, 36.46
+
+The system is slowed down to a crawl.
+
+12:06 - web server is responsive.
+load averages: 122.59, 96.03, 48.31
+
+So, at this point the web server is working again but the system is
+still slowed down to a crawl. But it can serve web pages.
+
+12:07 - web server is responsive.
+load averages: 63.67, 85.01, 47.26
+
+12:10 - web server is responsive.
+load averages:  6.56, 52.75, 40.03
+
+12:12 - web server is responsive.
+load averages:  0.55, 16.36, 26.50
+
+The system is back to normal.
+OpenBSD recovered very well from this attack, the effect only lasted for
+a few minutes. Why is that? Because of the Suhosin PHP extension.
+OpenBSD has this extension enabled by default.
+
+LFI2RCE
+--------
+In some cases, this attack can be used to convert a local file inclusion
+exploit to remote code execution.
+Most operating systems don't delete the temporary files created by this
+attack even after you restart the web server.
+Therefore, a large number of temporary files are left in the temporary
+directory (usually /tmp for Unix systems).
+You can try to guess the name of one of these filenames and include it.
+
+For this to work, all the uploaded files should contain some PHP script
+like: <?php eval($_REQUEST[x]); ?>.
+On Windows systems there are only 4 characters used for generating
+temporary files (phpXXXX.tmp).
+After the web server is responsive again, there are 65.535 temporary
+files in the temporary directory.
+Therefore, it's possible to guess the name of one of those files and
+include it.
+
+On Unix, 6 characters are used for the temporary filenames and therefore
+it's almost impossible to guess the name of the temporary filename.
+Or at least, it could take a very long time. As a funny note, I managed
+to exploit this on a web server with 800.000 temporary files.
+After randomly guessing for 5 minutes I managed to guess the name of one
+of the temp files and execute PHP code.
+
+Proof of concept
+-----------------
+I'm not going to publish the proof of concept Python script.
+If you have a valid reason why you would need the proof of concept, you
+can contact me at this email address (bogdan [at] acunetix.com).
+
+-- 
+Bogdan Calin - bogdan@...netix.com
+CTO
+Acunetix Ltd. - http://www.acunetix.com
+Acunetix Web Security Blog - http://www.acunetix.com/blog

@@ -1,0 +1,598 @@
+
+Date: Thu, 16 Aug 2012 12:25:48 -0500
+From: ds.adv.pub@...il.com
+To: bugtraq@...urityfocus.com
+Subject: Internet Explorer Script Interjection Code Execution
+
+Internet Explorer Script Interjection Code Execution
+
+Derek Soeder
+ds.adv.pub@...il.com
+
+Reported:       January 26, 2012, to SecuriTeam Secure Disclosure
+                http://www.beyondsecurity.com/ssd.html
+Published:      August 16, 2012
+
+
+AFFECTED VENDOR
+---------------
+Microsoft Corporation
+
+
+AFFECTED ENVIRONMENTS
+---------------------
+Internet Explorer 7.0 on Windows XP and Windows Vista
+Internet Explorer 8.0 on Windows XP, Windows Vista, and Windows 7
+Internet Explorer 9.0.0 through 9.0.8 (MS12-044) on Windows Vista and Windows 7
+Other versions of Internet Explorer have not been tested.
+
+
+UNAFFECTED ENVIRONMENTS
+-----------------------
+Internet Explorer with MS12-052 hotfix applied
+
+
+IMPACT
+------
+The vulnerability described in this document can be exploited by a
+malicious Web page to execute arbitrary code with low integrity.
+Active scripting must be enabled, and the present exploitation
+techniques require that font downloading be set to "Enable" or
+"Prompt" and that the "mailto:" protocol be present.  (These
+requirements are satisfied by default on Windows XP, Windows Vista,
+and Windows 7.)  The user is presented with a message box which must
+be dismissed before code execution can occur.
+
+
+VULNERABILITY DETAILS
+---------------------
+Processing of events in Internet Explorer is typically driven by
+window messages originating both externally (for instance, due to user
+input or paint requests) and internally.  As with all window messages,
+these messages are retrieved from the current thread's message queue
+by a message loop, which dispatches each message to a window
+procedure.  The window procedure, in turn, invokes code to handle the
+associated event based on the type of window message.  If the event
+handling code can be made to display a message box or dialog, or
+otherwise enter a message loop, then another window message relating
+to a separate, second event may be dispatched during this "stacked,"
+second message loop, meaning the second event will be processed before
+the original event has been fully handled.  Processing of the original
+event continues only after the second message loop has ended (i.e.,
+when the displayed message box or dialog closes).  If the second event
+handling code can cause the program's state to become inconsistent
+with the first event handling code's expectations--for instance, by
+destroying objects referenced in variables local to the first event
+handling code--then it should be possible to cause memory corruption
+which can be exploited to achieve arbitrary code execution.
+
+A variety of events can result in script running during the event
+handler code.  Although it's simple for script to display a message
+box or dialog and thereby enter a message loop (e.g., using
+window.alert, window.prompt, or window.clipboardData.getData under
+default security settings), so far it does not appear that an
+interrupting, second event handler can then do anything to disrupt
+program state in a way that the first event handler will not
+accommodate.  This is understandable, since script must be able to
+handle other script running at any time and having arbitrary effects
+on program state.  Objects accessible to script should be properly
+reference-counted and garbage-collected, and any exception would
+constitute a separate vulnerability that could likely be exploited
+without use of the flaw described in this document.
+
+In some cases, it's also possible to make MSHTML.DLL enter a message
+loop while handling a page rendering event (as opposed to an event
+intended to run script).  For one, MSHTML!CMarkup::ProcessURLAction*
+is used to check a variety of security settings during page
+downloading and rendering; this function calls
+URLMON!ProcessUrlAction*, which may display a dialog if the queried
+setting's action is set to "Prompt".  Unfortunately, most of the
+security settings which default to prompting are now handled through
+the yellow security band or notification bar rather than a dialog.
+
+Other avenues for reaching a message loop may be discovered by
+backtracking from functions such as DispatchMessageW, MessageBoxW, and
+DialogBoxParamW.  One function call of particular interest is a call
+to MessageBoxW found in
+MSHTML!CMailtoProtocol::DisplayMailClientNotFoundError.  It was
+discovered that, if Internet Explorer attempts to download a very long
+(approximately 2,030-character) "mailto:" URL, then
+CMailtoProtocol::RunMailClient will fail and call
+CMailtoProtocol::DisplayMailClientNotFoundError to display a message
+box, thereby entering a message loop.  (The message reads, "Could not
+perform this operation because the default mail client is not properly
+installed.")  Furthermore, it was found that displaying this message
+box while downloading an embedded font (by specifying a long "mailto:"
+URL for the font's "src" property) will result in references to
+targetable objects remaining on the stack until the message box is
+closed.  Thus, a Web page can exploit this vulnerability by declaring
+an embedded font with a long "mailto:" source URL and ensuring that an
+event which destroys and replaces targetable objects occurs while the
+message box is open.  Although the particulars of the targetable
+objects are Internet Explorer version-dependent, exploitation should
+generally proceed as typical for an Internet Explorer use-after-free
+vulnerability.
+
+Events
+
+The most significant complexity of this vulnerability is understanding
+Internet Explorer's event handling.  As mentioned above, event
+handling is based on the processing of window messages.  Some window
+messages may arise from user input (such as keyboard and mouse
+messages), while others may be generated by the operating system (such
+as paint and resize messages), but most messages signaling events are
+generated interally by Internet Explorer.  These messages use a
+message identifier value of 0x8002 and are generated when a "method
+call" is added to a queue maintained in Thread Local Storage (TLS), if
+the queue is empty.  A method call is simply a function pointer and
+associated data representing a callback to be invoked by the event
+handling message loop (or any other message loop).  Method calls are
+queued using MSHTML!_GWPostMethodCallEx and handled by
+MSHTML!GlobalWndOnMethodCall, which the MSHTML!GlobalWndProc window
+procedure calls in response to a message 0x8002.
+
+It is important to note that a message 0x8002 will only be posted if
+the method call queue is empty and if a message 0x8002 is not
+outstanding (being processed or waiting to be processed).  Therefore,
+with possibly one minor exception, a second message 0x8002 cannot be
+pending while a first message 0x8002 is being processed, meaning a
+second method call-based event cannot be handled while a first method
+call-based event is being handled, even if the first enters a message
+loop.  When exploiting the vulnerability, one event may be based on a
+method call, but the other must correspond to user input or some other
+type of message.
+
+Although designing a Web page to provoke a user input message without
+user interaction is not difficult, Internet Explorer 9 offers another
+possibility by introducing asynchronous events.  If a Web page is
+viewed in IE9 standards mode, certain events (for example,
+body.onfocus) will instead be mediated by messages with an identifier
+value of 0x8003, which are generated via
+MSHTML!CEventMgr::QueueAsyncEvent ->
+MSHTML!CAsyncEventQueue::QueueEvent and processed when GlobalWndProc
+calls MSHTML!CAsyncEventQueue::DispatchAllEvents.  If the asynchronous
+event handling code enters a message loop, a message 0x8002 could then
+be dispatched and cause any queued method calls to be processed.
+
+Example (Internet Explorer 7 and 8)
+
+A simple example of how to reproduce this vulnerability in Internet
+Explorer versions 7 and 8 follows.  A Web page contains an empty style
+sheet link, a body with an "onmouseover" event handler, and a script
+element which creates a new script element and assigns it an
+"onreadystatechange" event handler.  The body also has a style which
+specifies a large height value, so that the body area will occupy the
+full height as well as width of the browser window.  The following
+HTML illustrates:
+
+[redacted for now]
+
+When the Web page loads, the presence of the mouse cursor over the
+window causes MSHTML!CServer::WndProc to receive a mouse window
+message, which it passes to MSHTML!CDoc::OnWindowMessage ->
+MSHTML!CDoc::OnMouseMessage.  Further up the call stack, the script of
+the body's "onmouseover" event handler runs, setting the empty style
+sheet link's "href" attribute to load "MyFont.css".  When the CSS
+defining the "MyFont" embedded font is parsed, the long "mailto:" URL
+will ultimately result in
+CMailtoProtocol::DisplayMailClientNotFoundError displaying an error
+message box, pausing execution of that thread except to process window
+messages.  Using the "onmouseover" event handler for this purpose
+ensures that the message box will appear during processing of a user
+input window message, rather than during processing of a method call
+(0x8002) window message, which leaves the method call avenue available
+for the second event.
+
+While the message box is showing, our attack server completes its
+intentionally delayed response to the request for "slow.js", causing
+the client to queue a method call which will run the new script
+element's "onreadystatechange" event handler.  Because a method call
+(message 0x8002) is not currently being processed--the event being
+processed originated instead as a mouse window message--this means the
+thread responsible for downloading "slow.js" is free to post a message
+0x8002 after it queues the method call.  The window message will then
+be dispatched by the message loop that drives the error message box,
+causing the "onreadystatechange" event handler to run.  In this
+example, the event handler tampers with the object representing the
+style sheet, which was still being interpreted at the time the message
+box was displayed.  The tampering provokes a crash once the message
+box closes and interpretation of the style sheet is allowed to
+continue.
+
+Example (Internet Explorer 9)
+
+Now a simple example specific to Internet Explorer 9 is presented.  A
+Web page contains a body with an "onfocus" event handler, a style
+sheet defining an embedded font and a class which uses it, a "div"
+element of the defined class, and a script element which creates a new
+script element and assigns it an "onreadystatechange" event handler.
+The document begins with a "DOCTYPE" declaration which ensures that
+the page will be rendered in IE9 standards mode.  The following HTML
+illustrates:
+
+[redacted for now]
+
+In IE9 standards mode, embedded fonts are not downloaded until they're
+needed to render the page, meaning that the embedded font's long
+"mailto:" URL is interpreted--and therefore the error message box is
+displayed--when the body's "onfocus" event fires.  Because
+body.onfocus is handled in IE9 standards mode as an asynchronous event
+(message 0x8003), method calls (message 0x8002) remain free to be
+dispatched while the message box message loop is on the call stack.
+In this example, we expect "slow.js" to finish downloading after
+body.onfocus fires and causes the error message box to appear.  The
+code in IE that manages the download will queue an
+"onreadystatechange" method call for the script, which will be
+dispatched by the message box message loop, allowing our Javascript to
+execute.  Since IE9 accesses embedded fonts on demand, there will be
+references to various object on the stack below the message box
+message loop, so if our Javascript tampers with these objects, a crash
+will result once the message box is closed.
+
+Walkthrough
+
+To help provide a visual understanding of the vulnerability, a
+chronological walkthrough of the Internet Explorer 9 example crash is
+presented here.  Following along in the example is recommended.  The
+symbols shown correspond to Internet Explorer 9.0.3 on Windows 7 SP1
+x86, with MSHTML.DLL version 9.0.8112.16437 loaded at 6D1C0000 and
+page heap enabled.
+
+When the example page is loading, a 0x54-byte CTreePos class instance
+is allocated on the heap:  (This CTreePos instance will be freed and
+its memory reused later.)
+
+  77365ae0 ntdll!RtlAllocateHeap+0x0000023a
+  6d423fe1 MSHTML!CHtmRootParseCtx::BeginElement+0x00000035
+  6d51b14b MSHTML!CHtmTextParseCtx::BeginElement+0x000000a1
+  6d4245a0 MSHTML!CHtmParse::BeginElement+0x00000151
+  6d4269aa MSHTML!CHtmParse::ParseBeginTag+0x00000199
+  6d422422 MSHTML!CHtmParse::ParseToken+0x00000100
+  6d42292a MSHTML!CHtmPost::Exec+0x00000233
+  6d427a10 MSHTML!CHtmPost::Run+0x00000041
+  6d42793c MSHTML!PostManExecute+0x000001a3
+  6d4278a1 MSHTML!PostManResume+0x000000dd
+  6d427801 MSHTML!CHtmPost::OnDwnChanCallback+0x00000010
+  6d40b4d5 MSHTML!CDwnChan::OnMethodCall+0x0000001f
+  6d5a9d09 MSHTML!GlobalWndOnMethodCall+0x00000115
+  6d5c9368 MSHTML!GlobalWndProc+0x00000302
+  7748c4e7 USER32!InternalCallWinProc+0x00000023
+  7748c5e7 USER32!UserCallWinProcCheckWow+0x0000014b
+  7748cc19 USER32!DispatchMessageWorker+0x0000035e
+  7748cc70 USER32!DispatchMessageW+0x0000000f
+  6e8e1b44 IEFRAME!CTabWindow::_TabWindowThreadProc+0x00000722
+  6e901a16 IEFRAME!LCIETab_ThreadProc+0x00000317
+  759315b0 iertutil!CIsoScope::RegisterThread+0x000000ab
+  6e8efd5b IEFRAME!Detour_DefWindowProcA+0x0000006c
+  75c4ed6c kernel32!BaseThreadInitThunk+0x0000000e
+  773737f5 ntdll!__RtlUserThreadStart+0x00000070
+  773737c8 ntdll!_RtlUserThreadStart+0x0000001b
+
+Next, the page's Javascript executes, creating a new script element
+with a source of "slow.js".  The idea is that the Web server will
+intentionally postpone serving this file for a second or two.  This
+arranges for an "onreadystatechange" event to fire after the delay
+elapses.
+
+Once the page finishes loading (but before the delay has elapsed), the
+"body.onfocus" event fires.  Because the document is in IE9 standards
+mode, "body.onfocus" will be queued as an asynchronous event, meaning
+it will be mediated by window message 0x8003.  The "body.onfocus"
+event handler changes a "div" element's class to a class that uses an
+embedded font.  This forces Internet Explorer to attempt to download
+the font, which fails due to the long "mailto:" URL.  Crucially, the
+failure triggers a "mailto"-specific message box to be displayed; this
+enters a new, top message loop during the original, bottom message
+loop's handling of the 0x8003 window message associated with the
+"body.onfocus" event.  The call stack, from top to bottom, now looks
+like this:
+
+  774a382a USER32!NtUserWaitMessage+0xc
+  774a3b27 USER32!DialogBox2+0x207
+  774ce0d5 USER32!InternalDialogBox+0xcb
+  774ce659 USER32!SoftModalMessageBox+0x68a
+  774ce78c USER32!MessageBoxWorker+0x2ca
+  774cea08 USER32!MessageBoxTimeoutW+0x7f
+  6ea15e86 USER32!MessageBoxExW+0x1b
+  774ceaa4 IEFRAME!Detour_MessageBoxExW+0x47
+  6db3ac94 USER32!MessageBoxW+0x45
+  6db3aaf1 MSHTML!CMailtoProtocol::DisplayMailClientNotFoundError+0x10b
+  6db3a2cc MSHTML!CMailtoProtocol::RunMailClient+0x12e
+  6db39def MSHTML!CMailtoProtocol::ParseAndBind+0x8b
+  76ab1c0b MSHTML!CMailtoProtocol::Start+0xcd
+  76a98fb3 URLMON!COInetProt::StartEx+0xf0
+  76a9a31f URLMON!CTransaction::StartEx+0x40b
+  76a8386c URLMON!CBinding::StartBinding+0x883
+  6d438507 URLMON!operator new+0x20
+  6d4383ed MSHTML!CTridentFilterHost::BindToMoniker+0xe4
+  6d4216f3 MSHTML!CDwnBindData::Bind+0x722
+  6d42153b MSHTML!NewDwnBindData+0x189
+  6d20c107 MSHTML!CDwnLoad::Init+0x25c
+  6d5c1f27 MSHTML!CBitsLoad::Init+0x52
+  6d421279 MSHTML!CDwnInfo::SetLoad+0x11e
+  6d451257 MSHTML!CDwnInfo::AddDwnCtx+0x67
+  6d42c695 MSHTML!CDoc::NewDwnCtx2+0x30a
+  6d953c33 MSHTML!CDoc::NewDwnCtx+0x5b
+  6d956222 MSHTML!CEmbeddedFontFace::EnsureStartDownload+0x120
+  6d955aee MSHTML!CFontFace::CFontFaceSrc::EnsureStartDownload+0x8a
+  6d682c20 MSHTML!CFontFace::AddToFamily+0x18c
+  6d52ceb2 MSHTML!CStyleSheetArray::BuildFontFaceRuleFamily+0x58
+  6d52cd28 MSHTML!ApplyClear+0x113
+  6d51bc41 MSHTML!ApplyFontFace+0x1d4
+  6d40e103 MSHTML!ApplyFormatInfoProperty+0x33bf
+  6d40e424 MSHTML!ApplyAttrArrayValues+0x2bd
+  6d5b5344 MSHTML!CStyleSheetArray::Apply+0x34a
+  6d47bad8 MSHTML!CMarkup::ApplyStyleSheets+0x6a
+  6d47b89e MSHTML!CElement::ApplyStyleSheets+0x4a2
+  6d4cddff MSHTML!CElement::ApplyDefaultFormat+0x8b
+  6d47b5a0 MSHTML!CBlockElement::ApplyDefaultFormat+0x379
+  6d47a5a3 MSHTML!CElement::ComputeFormatsVirtual+0x1a1e
+  6d47a4d6 MSHTML!CElement::ComputeFormats+0xe1
+  6d47bd39 MSHTML!CTreeNode::ComputeFormats+0xba
+  6d482d33 MSHTML!CTreeNode::ComputeFormatsHelper+0x40
+  6d360862 MSHTML!CTreeNode::GetFancyFormat+0x32
+  6d2d910f MSHTML!CElement::UpdateFormats+0x426
+  6d4ce10f MSHTML!CControlledFormatter::Init+0xcc
+  6d47fa14 MSHTML!CElement::OnPropertyChangeInternal+0x3fa
+  6d49b76b MSHTML!CElement::OnPropertyChange+0x1b
+  6d2da8db MSHTML!BASICPROPPARAMS::SetStringProperty+0x36a
+  6d0084d6 MSHTML!CFastDOM::CHTMLElement::Trampoline_Set_className+0x61
+  6d0cc04d JSCRIPT9!Js::JavascriptFunction::CallFunction+0xc4
+  6d0cc968 JSCRIPT9!Js::JavascriptExternalFunction::ExternalFunctionThunk+0x117
+  6d009a85 JSCRIPT9!Js::JavascriptOperators::SetProperty+0x8c
+  6d009a2c JSCRIPT9!Js::JavascriptOperators::OP_SetProperty+0x59
+  039507b8 JSCRIPT9!Js::JavascriptOperators::PatchPutValueNoLocalFastPath+0xbc
+  6d0084d6 0x39507b8
+  6d0083fb JSCRIPT9!Js::JavascriptFunction::CallFunction+0xc4
+  6d008332 JSCRIPT9!Js::JavascriptFunction::CallRootFunction+0xb6
+  6d0082be JSCRIPT9!ScriptSite::CallRootFunction+0x4f
+  6d0cf12c JSCRIPT9!ScriptSite::Execute+0x63
+  6d4f24d1 JSCRIPT9!ScriptEngine::Execute+0x11a
+  6d4f23fb MSHTML!CListenerDispatch::InvokeVar+0x12a
+  6d54ce40 MSHTML!CListenerDispatch::Invoke+0x40
+  6d44e624 MSHTML!CEventMgr::_InvokeListeners+0x187
+  6d54cf37 MSHTML!CEventMgr::_InvokeListenersOnWindow+0xcc
+  6d5db67d MSHTML!CEventMgr::Dispatch+0x3cc
+  6d53ba32 MSHTML!CEventMgr::DispatchFocusEvent+0x7d
+  6d5e6f74 MSHTML!COmWindowProxy::Fire_onfocus+0x84
+  6d5e6ff1 MSHTML!CAsyncEventQueue::DispatchAllEvents+0x7c
+  7748c4e7 MSHTML!GlobalWndProc+0x2ed
+  7748c5e7 USER32!InternalCallWinProc+0x23
+  7748cc19 USER32!UserCallWinProcCheckWow+0x14b
+  7748cc70 USER32!DispatchMessageWorker+0x35e
+  6e8e1b44 USER32!DispatchMessageW+0xf
+  6e901a16 IEFRAME!CTabWindow::_TabWindowThreadProc+0x722
+  759315b0 IEFRAME!LCIETab_ThreadProc+0x317
+  6e8efd5b IERTUTIL!CIsoScope::RegisterThread+0xab
+  75c4ed6c IEFRAME!Detour_DefWindowProcA+0x6c
+  773737f5 KERNEL32!BaseThreadInitThunk+0xe
+  773737c8 NTDLL!__RtlUserThreadStart+0x70
+  00000000 NTDLL!_RtlUserThreadStart+0x1b
+
+As long as the message box remains open, its message loop will
+dispatch new window message-mediated events, and control won't return
+to Internet Explorer's original message loop.  It doesn't matter which
+message loop is dispatching messages, because the same window
+procedure is executed in either case.  The only problem is that the
+code lower on the call stack was operating on various heap objects
+(such as the CTreePos allocated earlier) before control entered the
+MessageBox call and became stuck.  Now, if a window message-mediated
+event results in the execution of Javascript that modifies or destroys
+those heap objects, corruption manifesting as a use-after-free, for
+instance, may result.
+
+As belabored in the Vulnerability Details section, not every type of
+event can be "stacked" in every situation like this, but certain
+different events can.  An 0x8003 window message (for "body.onfocus")
+was being processed during the bottom message loop, so if an 0x8002
+window message is posted, it will be processed during the top message
+loop--and this is exactly what the example has arranged to happen.
+Once the delay in serving "slow.js" elapses, an 0x8002 window
+message-mediated event (referred to as a "method call") corresponding
+to the concluded download will be posted and subsequently processed
+during the top message loop.  This method call executes the created
+script element's "onreadystatechange" event handler, which destroys
+the very "div" element that was in the process of being rendered when
+Internet Explorer attempted to download the font and became stuck at
+the message box.  The following partial call stack shows "removeChild"
+being called from the "onreadystatechange" event handler:
+
+  6d2eb4e3 MSHTML!CElement::ie9_removeChild
+  6d0084d6 MSHTML!CFastDOM::CNode::Trampoline_removeChild+0x7b
+  6d0cc04d JSCRIPT9!Js::JavascriptFunction::CallFunction+0xc4
+  039501af JSCRIPT9!Js::JavascriptExternalFunction::ExternalFunctionThunk+0x117
+  6d0084d6 0x39501af
+  6d0083fb JSCRIPT9!Js::JavascriptFunction::CallFunction+0xc4
+  6d008332 JSCRIPT9!Js::JavascriptFunction::CallRootFunction+0xb6
+  6d0082be JSCRIPT9!ScriptSite::CallRootFunction+0x4f
+  6d0cf12c JSCRIPT9!ScriptSite::Execute+0x63
+  6d4f24d1 JSCRIPT9!ScriptEngine::Execute+0x11a
+  6d4f23fb MSHTML!CListenerDispatch::InvokeVar+0x12a
+  6d35a726 MSHTML!CListenerDispatch::Invoke+0x40
+  6d5db834 MSHTML!CEventMgr::Dispatch+0x537
+  6d4a5607 MSHTML!CEventMgr::DispatchEvent+0xc9
+  6d4a02ff MSHTML!CElement::Fire_onreadystatechange+0x99
+  6d5a9d09 MSHTML!CScriptElement::FireOnReadyStateChange+0x3e
+  6d5c9368 MSHTML!GlobalWndOnMethodCall+0x115
+  7748c4e7 MSHTML!GlobalWndProc+0x302
+  7748c5e7 USER32!InternalCallWinProc+0x23
+  7748cc19 USER32!UserCallWinProcCheckWow+0x14b
+  7748cc70 USER32!DispatchMessageWorker+0x35e
+  774a38d7 USER32!DispatchMessageW+0xf
+  774a3b27 USER32!DialogBox2+0x15a
+  774ce0d5 USER32!InternalDialogBox+0xcb
+  774ce659 USER32!SoftModalMessageBox+0x68a
+  774ce78c USER32!MessageBoxWorker+0x2ca
+  774cea08 USER32!MessageBoxTimeoutW+0x7f
+  6ea15e86 USER32!MessageBoxExW+0x1b
+  774ceaa4 IEFRAME!Detour_MessageBoxExW+0x47
+  6db3ac94 USER32!MessageBoxW+0x45
+  6db3aaf1 MSHTML!CMailtoProtocol::DisplayMailClientNotFoundError+0x10b
+  6db3a2cc MSHTML!CMailtoProtocol::RunMailClient+0x12e
+  6db39def MSHTML!CMailtoProtocol::ParseAndBind+0x8b
+  76ab1c0b MSHTML!CMailtoProtocol::Start+0xcd
+   ...
+
+The free actually happens in a subsequent method call, which is also
+processing during the MessageBox message loop, as shown in the
+following partial call stack:
+
+  75c4c3d4 kernel32!HeapFree+0x00000014
+  6d5eebed MSHTML!CTreePos::Release+0x00000046
+  6d5fdc69 MSHTML!CLayoutBlock::~CLayoutBlock+0x000000ba
+  6d5ff5da MSHTML!CFlexBoxBlock::`scalar deleting destructor'+0x00000013
+  6d559ee9 MSHTML!TSmartPointer<CPtsPelParaclient>::~TSmartPointer<CPtsPelParaclient>+0x00000014
+  6d5da773 MSHTML!HtmlLayout::SmartDispClient::Release+0x00000023
+  6d5da5fb MSHTML!HtmlLayout::FlowBox::ImplicitDestructor+0x0000001d
+  6d490144 MSHTML!HtmlLayout::CIE9DocumentLayout::FormatPage+0x00000065
+  6d48c517 MSHTML!CCssDocumentLayout::FindOrFormatPage+0x00000272
+  6d4872fb MSHTML!CCssDocumentLayout::GetPage+0x00000964
+  6d48e06f MSHTML!CMarkupPageLayout::CalcSize+0x0000028c
+  6d48de82 MSHTML!CMarkupPageLayout::CalcTopLayoutSize+0x00000101
+  6d48fba1 MSHTML!CMarkupPageLayout::DoLayout+0x00000056
+  6d47e65a MSHTML!CView::ExecuteLayoutTasks+0x00000034
+  6d476a85 MSHTML!CView::EnsureView+0x000003bf
+  6d498701 MSHTML!CView::EnsureViewCallback+0x000000b8
+  6d5a9d09 MSHTML!GlobalWndOnMethodCall+0x00000115
+  6d5c9368 MSHTML!GlobalWndProc+0x00000302
+  7748c4e7 USER32!InternalCallWinProc+0x00000023
+  7748c5e7 USER32!UserCallWinProcCheckWow+0x0000014b
+  7748cc19 USER32!DispatchMessageWorker+0x0000035e
+  7748cc70 USER32!DispatchMessageW+0x0000000f
+  774a38d7 USER32!DialogBox2+0x0000015a
+  774a3b27 USER32!InternalDialogBox+0x000000cb
+  774ce0d5 USER32!SoftModalMessageBox+0x0000068a
+  774ce659 USER32!MessageBoxWorker+0x000002ca
+  774ce78c USER32!MessageBoxTimeoutW+0x0000007f
+   ...
+
+At this point, a fully developed exploit might use Javascript to
+reallocate and overwrite the memory formerly belonging to the
+now-freed CTreePos.  For the sake of this walkthrough, it suffices to
+let page heap wipe the freed memory of the CTreePos with 0xF0.
+
+Finally, once the user closes the message box, execution of the
+interrupt font downloading and page rendering code continues, but the
+code fails to anticipate that the program state has changed during the
+MessageBox call.  A pointer on the stack to the destroyed CTreePos is
+dereferenced, resulting in an access violation.  The following
+register dump, disassembly, and call stack illustrate; notice that EBX
+points to stack memory from which a pointer to the destroyed CTreePos
+is taken:
+
+  Access violation - code c0000005 (first chance)
+  eax=005ba430 ebx=03b5c5c8 ecx=f0f0f0f0 edx=03b5c540 esi=00000000 edi=00557840
+  eip=6d47b5d7 esp=03b5c450 ebp=03b5c510 iopl=0 nv up ei pl zr na pe nc
+  cs=001b  ss=0023  ds=0023  es=0023  fs=003b  gs=0000     efl=00010246
+  MSHTML!CElement::ComputeFormatsVirtual+0x1a64:
+  6d47b5d7 0fbf4120        movsx   eax,word ptr [ecx+20h]
+ds:0023:f0f0f110=????
+
+  6d47b5c5 8b03            mov     eax,dword ptr [ebx]
+  6d47b5c7 8b8bd4000000    mov     ecx,dword ptr [ebx+0D4h]
+  6d47b5cd 89442420        mov     dword ptr [esp+20h],eax
+  6d47b5d1 894c242c        mov     dword ptr [esp+2Ch],ecx
+  6d47b5d5 8b08            mov     ecx,dword ptr [eax]
+  6d47b5d7 0fbf4120        movsx   eax,word ptr [ecx+20h]
+
+  6d47a5a3 MSHTML!CElement::ComputeFormatsVirtual+0x1a64
+  6d47a4d6 MSHTML!CElement::ComputeFormats+0xe1
+  6d47bd39 MSHTML!CTreeNode::ComputeFormats+0xba
+  6d482d33 MSHTML!CTreeNode::ComputeFormatsHelper+0x40
+  6d360862 MSHTML!CTreeNode::GetFancyFormat+0x32
+  6d2d910f MSHTML!CElement::UpdateFormats+0x426
+  6d4ce10f MSHTML!CControlledFormatter::Init+0xcc
+  6d47fa14 MSHTML!CElement::OnPropertyChangeInternal+0x3fa
+  6d49b76b MSHTML!CElement::OnPropertyChange+0x1b
+  6d2da8db MSHTML!BASICPROPPARAMS::SetStringProperty+0x36a
+  6d0084d6 MSHTML!CFastDOM::CHTMLElement::Trampoline_Set_className+0x61
+  6d0cc04d JSCRIPT9!Js::JavascriptFunction::CallFunction+0xc4
+  6d0cc968 JSCRIPT9!Js::JavascriptExternalFunction::ExternalFunctionThunk+0x117
+  6d009a85 JSCRIPT9!Js::JavascriptOperators::SetProperty+0x8c
+  6d009a2c JSCRIPT9!Js::JavascriptOperators::OP_SetProperty+0x59
+  039507b8 JSCRIPT9!Js::JavascriptOperators::PatchPutValueNoLocalFastPath+0xbc
+  6d0084d6 0x39507b8
+  6d0083fb JSCRIPT9!Js::JavascriptFunction::CallFunction+0xc4
+  6d008332 JSCRIPT9!Js::JavascriptFunction::CallRootFunction+0xb6
+  6d0082be JSCRIPT9!ScriptSite::CallRootFunction+0x4f
+  6d0cf12c JSCRIPT9!ScriptSite::Execute+0x63
+  6d4f24d1 JSCRIPT9!ScriptEngine::Execute+0x11a
+  6d4f23fb MSHTML!CListenerDispatch::InvokeVar+0x12a
+  6d54ce40 MSHTML!CListenerDispatch::Invoke+0x40
+  6d44e624 MSHTML!CEventMgr::_InvokeListeners+0x187
+  6d54cf37 MSHTML!CEventMgr::_InvokeListenersOnWindow+0xcc
+  6d5db67d MSHTML!CEventMgr::Dispatch+0x3cc
+  6d53ba32 MSHTML!CEventMgr::DispatchFocusEvent+0x7d
+  6d5e6f74 MSHTML!COmWindowProxy::Fire_onfocus+0x84
+  6d5e6ff1 MSHTML!CAsyncEventQueue::DispatchAllEvents+0x7c
+  7748c4e7 MSHTML!GlobalWndProc+0x2ed
+  7748c5e7 USER32!InternalCallWinProc+0x23
+  7748cc19 USER32!UserCallWinProcCheckWow+0x14b
+  7748cc70 USER32!DispatchMessageWorker+0x35e
+  6e8e1b44 USER32!DispatchMessageW+0xf
+  6e901a16 IEFRAME!CTabWindow::_TabWindowThreadProc+0x722
+  759315b0 IEFRAME!LCIETab_ThreadProc+0x317
+  6e8efd5b IERTUTIL!CIsoScope::RegisterThread+0xab
+  75c4ed6c IEFRAME!Detour_DefWindowProcA+0x6c
+  773737f5 KERNEL32!BaseThreadInitThunk+0xe
+  773737c8 NTDLL!__RtlUserThreadStart+0x70
+  00000000 NTDLL!_RtlUserThreadStart+0x1b
+
+
+EXPLOITATION
+------------
+Exploitation of this vulnerability is typical for a basic
+use-after-free condition in Internet Explorer, in that the exploit:
+(1) creates an object on the heap, (2) causes the object to be freed
+while references to it persist elsewhere, (3) replaces the contents of
+the heap memory formerly occupied by the object with arbitrary data,
+and (4) causes Internet Explorer to access a stale reference to the
+freed object.  In a prepared proof-of-concept EIP control exploit
+targeting Internet Explorer 9 (32-bit), these steps were accomplished
+by: including two nested, named "div" elements in the HTML; modifying
+the outer "div" element to destroy the inner "div" (while the mail
+client error message is on the screen); performing a typical heap
+spray to store known data at a known address; and creating a large
+number of CTreePos-size heap blocks containing specially crafted data
+to fill the hole left by the freed inner "div" element.  The specially
+crafted data includes a substitute vtable pointer which references
+heap-sprayed data at a hard-coded address, another feature typical of
+such exploits.  The only step that this exploit cannot accomplish
+entirely on its own is triggering Internet Explorer to access the
+stale inner "div" element reference--this access occurs only after the
+user dismisses the mail client error message.
+
+
+MITIGATION
+----------
+Setting the "Downloads" -> "Font download" security setting to
+"Disable" ("HKEY_CURRENT_USER\Software\Microsoft\CurrentVersion\Internet
+Settings\Zones\<zone-identifier>" -> "1604": REG_DWORD = "3") prevents
+exploitation of this vulnerability using the present technique.
+
+Deleting, renaming, or denying read access to the
+"HKEY_LOCAL_MACHINE\SOFTWARE\Classes\PROTOCOLS\Handler\mailto"
+registry key (and
+"HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Classes\PROTOCOLS\Handler\mailto"
+as appropriate) also prevents exploitation using the present
+technique; however, after implementing the workaround, confirm that
+clicking a "mailto:" link in any zone does not display a message box.
+
+
+CONCLUSION
+----------
+This document presents a long-lived vulnerability in Internet Explorer
+which permits arbitrary code execution given default security
+settings.  Although current exploitation involves a modest amount of
+user interaction and user notification in the form of a mail client
+error message, the message is not security-related, and the message
+box does not present the user with an option of aborting exploitation.
+ Further research into the vulnerability might reveal other means of
+exploitation which may change the presented message or reduce or
+eliminate the need for user interaction.
+
+
+GREETINGS
+---------
+www.thetomatopizza.com
+ ^ The best pizza anywhere near DFW; required eating for locals and remotes.

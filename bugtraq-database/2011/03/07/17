@@ -1,0 +1,188 @@
+
+Date: Mon, 7 Mar 2011 15:46:07 -0500 (EST)
+From: Wietse Venema <wietse@...cupine.org>
+To: bugtraq@...urityfocus.com
+Subject: Plaintext injection in STARTTLS (multiple implementations)
+
+This is a writeup about a flaw that I found recently, and that
+existed in multiple implementations of SMTP (Simple Mail Transfer
+Protocol) over TLS (Transport Layer Security) including my Postfix
+open source mailserver. I give an overview of the problem and its
+impact, how to find out if a server is affected, fixes, and draw
+lessons about where we can expect similar problems.  A time line
+is at the end.
+
+For further reading:
+http://www.kb.cert.org/vuls/id/555316 
+http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2011-0411
+http://www.postfix.org/CVE-2011-0411.html (extended writeup)
+
+	Wietse
+
+Problem overview and impact
+===========================
+
+The TLS protocol encrypts communication and protects it against
+modification by other parties. This protection exists only if a)
+software is free of flaws, and b) clients verify the server's TLS
+certificate, so that there can be no "man in the middle" (servers
+usually don't verify client certificates).
+
+The problem discussed in this writeup is caused by a software flaw.
+The flaw allows an attacker to inject client commands into an SMTP
+session during the unprotected plaintext SMTP protocol phase (more
+on that below), such that the server will execute those commands
+during the SMTP-over-TLS protocol phase when all communication is
+supposed to be protected.
+
+The injected commands could be used to steal the victim's email or
+SASL (Simple Authentication and Security Layer) username and password.
+
+This is not as big a problem as it may appear to be.  The reason
+is that many SMTP client applications don't verify server TLS
+certificates.  These SMTP clients are always vulnerable to command
+injection and other attacks. Their TLS sessions are only encrypted
+but not protected.
+
+A similar plaintext injection flaw may exist in the way SMTP clients
+handle SMTP-over-TLS server responses, but its impact is less
+interesting than the server-side flaw.
+
+SMTP is not the only protocol with a mid-session switch from plaintext
+to TLS.  Other examples are POP3, IMAP, NNTP and FTP. Implementations
+of these protocols may be affected by the same flaw as discussed here.
+
+Demonstration
+=============
+
+The problem is easy to demonstrate with a one-line change to the
+OpenSSL s_client command source code (I would prefer scripting, but
+having to install Perl CPAN modules and all their dependencies is
+more work than downloading a .tar.gz file from openssl.org, adding
+eight characters to one line, and doing "./config; make").
+
+The OpenSSL s_client command can make a connection to servers that
+support straight TLS, SMTP over TLS, or a handful other protocols
+over TLS. The demonstration with SMTP over TLS involves a one-line
+change in the OpenSSL s_client source code (with OpenSSL 1.0.0, at
+line 1129 of file apps/s_client.c).
+
+Old:		BIO_printf(sbio,"STARTTLS\r\n");
+New:		BIO_printf(sbio,"STARTTLS\r\nRSET\r\n");
+
+With this change, the s_client command sends the plaintext STARTTLS
+command ("let's turn on TLS") immediately followed by an RSET command
+(a relatively harmless protocol "reset"). Both commands are sent
+as plaintext in the same TCP/IP packet, and arrive together at the
+server. The "\r\n" are the carriage-return and newline characters;
+these are necessary to terminate an SMTP command.
+
+When an SMTP server has the plaintext injection flaw, it reads the
+STARTTLS command first, switches to SMTP-over-TLS mode, and only
+then the server reads the RSET command.  Note, the RSET command was
+transmitted during the plaintext SMTP phase when there is no
+protection, but the server reads the command as if it was received
+over the TLS-protected channel.
+
+Thus, when the SMTP server has the flaw, the s_client command output
+will show two "250" SMTP server responses instead of one. The first
+"250" response is normal, and is present even when the server is
+not flawed.  The second "250" response is for the RSET command, and
+indicates that the SMTP server has the plaintext injection flaw.
+
+ $ apps/openssl s_client -quiet -starttls smtp -connect server:port
+ [some server TLS certificate details omitted]
+ 250 some text here <=== Normal response, also with "good" server.
+ 250 more text here <=== RSET response, only with flawed server.
+
+Anatomy of the flaw: it's all about the plumbing
+================================================
+
+Whether a program may have the plaintext injection flaw depends on
+how it adjusts the plumbing, as it inserts the TLS protocol layer
+in-between the SMTP protocol layer and the O/S TCP/IP protocol
+layer. I illustrate this with examples from three open source MTAs:
+Postfix, Sendmail and Exim. The diagram below is best viewed with
+a fixed-width font, for example, from the Courier family.
+
+    Postfix MTA         Sendmail MTA          Exim MTA
+    before/after        before/after        before/after
+   switch to TLS       switch to TLS       switch to TLS
+
+    SMTP    SMTP        SMTP    SMTP        SMTP    SMTP   <= SMTP layer
+     ||      ||          ||      ||          ||      ||
+   stream  stream      stream  stream'       ||      ||
+  buffers  buffers    buffers  buffers'      rw     r'w'   <= stream layer
+     rw     r'w'         rw     r'w'         ||      ||
+     ||      ||          ||      ||          ||      ||
+     ||     TLS          ||     TLS          ||     TLS    <= TLS layer
+     ||      ||          ||      ||          ||      ||
+    O/S     O/S         O/S     O/S         O/S     O/S    <= TCP/IP layer
+
+As shown in the diagram, both Postfix and Sendmail use an application-
+level stream abstraction, where each stream has properties such as
+read/write buffers, read/write functions (indicated with rw), and
+other properties that are omitted for brevity.
+
+When Postfix switches to SMTP over TLS, it replaces the plaintext
+read/write functions (rw) with the TLS read/write functions (r'w').
+Postfix does not modify any of the other stream properties including
+the read/write buffers.  A patch for qmail that introduces TLS
+support uses the same approach.  This approach of replacing only
+the stream read/write functions, but not the buffers or other stream
+properties, can introduce the plaintext injection flaw.
+
+When Sendmail switches to SMTP over TLS, it replaces the entire
+stream, along with its read/write buffers and read/write functions.
+Exim, on the other hand, does not seem to have a stream abstraction
+like Postfix, Sendmail or qmail.  Instead of replacing streams or
+stream properties, Exim replaces plaintext read/write functions
+with TLS read/write functions.  Because of their program structure,
+Sendmail and Exim didn't suffer from the plaintext injection flaw.
+
+Fixing the problem
+==================
+
+There are two solutions to address the flaw, and both solutions can
+be used together.
+
+- Report an error when unexpected plaintext is received after the
+  STARTTLS command.  As documented in RFC 3207, STARTTLS must be
+  the last command in a pipelined group. If plaintext commands are
+  received after STARTTLS, then that is a protocol violation.  
+
+  This measure can also be implemented outside the MTA, for example
+  in a protocol-aware firewall.
+
+- If a program uses the same input buffer before and after the
+  switch to TLS, it should discard the contents of the input buffer,
+  just like it discards SMTP protocol information that it received
+  during the plaintext protocol phase.
+
+Conclusion
+==========
+
+This plaintext injection problem is likely to recur when some
+development moves the plaintext-to-ciphertext switch outside the
+application: for example, into the kernel, into the local hardware,
+into a proxy, or into other infrastructure.  This encourages
+applications to use the same application-level streams and buffers
+and read/write functions before and after the switch to ciphertext.
+When this migration happens, plaintext injection becomes once more
+a possibility.
+
+Time line
+=========
+
+Jan 5 2011: While finishing Postfix for its annual release, I found
+and fixed this flaw in the SMTP server and client implementations,
+where it had been sitting ever since TLS support was adopted.
+
+Jan 6-10 2011: As we investigated the scope of the problem, Victor
+Duchovni (co-developer) discovered that other implementations were
+also affected including security providers and security appliances.
+
+Jan 11 2011: Contact CERT/CC to help coordinate with the problem's
+resolution.
+
+Mar 7 2011: Public announcement, and Postfix legacy release updates.

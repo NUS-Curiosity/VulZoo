@@ -1,0 +1,108 @@
+
+Date: Thu, 26 Feb 2009 15:34:01 -0800
+From: Matthew Dempsky <matthew@...psky.org>
+To: bugtraq@...urityfocus.com
+Subject: djbdns misformats some long response packets; patch and example 
+	attack
+
+The DNS packet format allows names to be compressed by replacing the
+suffix of a name with an encoded offset to another location in the
+packet where the suffix already exists.  Because of the encoding
+scheme, valid offsets are limited to < 16384.
+
+In djbdns 1.05, response.c handles name compression.  Line 12 has a
+comment "each < 16384" on the name_ptr array, but response_addname()
+from the same file does not enforce this limitation.  The result is
+that when encoding names with a suffix that first appears >= 16384
+bytes into the packet, response_addname() incorrectly tries to encode
+an offset to that name and produces a misformatted response packet.
+(At the bottom of this email, there is a patch for this.)
+
+You can reproduce an exploit of this bug as follows:
+
+    # Download and build ucspi-tcp-0.88.
+    $ curl -O http://cr.yp.to/ucspi-tcp/ucspi-tcp-0.88.tar.gz
+    $ tar -zxf ucspi-tcp-0.88.tar.gz
+    $ echo 'gcc -include /usr/include/errno.h -O' > ucspi-tcp-0.88/conf-cc
+    $ make -C ucspi-tcp-0.88
+
+    # Download and build djbdns-1.05.
+    $ curl -O http://cr.yp.to/djbdns/djbdns-1.05.tar.gz
+    $ tar -zxf djbdns-1.05.tar.gz
+    $ echo 'gcc -include /usr/include/errno.h -O' > djbdns-1.05/conf-cc
+    $ make -C djbdns-1.05
+
+    # Use tcpclient and axfr-get to do a zone transfer for
+    # burlap.dempsky.org from shinobi.dempsky.org.
+    $ ./ucspi-tcp-0.88/tcpclient shinobi.dempsky.org 53 \
+          ./djbdns-1.05/axfr-get burlap.dempsky.org data data.tmp
+
+    # Use tinydns-data to compile data into data.cdb.
+    $ ./djbdns-1.05/tinydns-data
+
+    # Simulate an A query for www.x.burlap.dempsky.org using the data
+    # from the zone transfer.
+    $ ./djbdns-1.05/tinydns-get a www.x.burlap.dempsky.org
+
+The last command will include these two lines in the output:
+
+    additional: foo 8388608 NS a.ns.bar
+    additional: foo 8388608 NS b.ns.bar
+
+i.e., poisonous NS records for foo, delegating the domain to a.ns.bar
+and b.ns.bar; with my patch applied, only records within
+burlap.dempsky.org are output.  Also, there's significant freedom in
+what poisonous records the attacker can produce.
+
+The security hole here is that an administrator that uses djbdns 1.05
+to serve DNS content does not expect that configuring his name server
+as above will cause it to send records for names outside of
+burlap.dempsky.org.  I.e., an attacker can trick the administrator's
+name servers to include arbitrary DNS records in response to queries
+for names within domains he controls.  Note that axfr-get is doing the
+right thing here: it already strips out names from outside of the
+specified zone; it's just that tinydns-get (and so tinydns and
+axfrdns) misformat the response packet.  A direct NS query for foo
+would not generate these poisonous records.
+
+As a real life example, I registered burlap.dempsky.org as a secondary
+domain with EveryDNS pulling data from my server.  I was able to trick
+their name servers into serving the above poisonous NS records.
+EveryDNS's name servers have no authority over the hypothetical foo
+TLD, but I could have included poisonous NS records for everydns.net
+instead.  The DNS cache from djbdns 1.05, dnscache, would have
+rejected these records as poison, but it's possible other DNS caches
+might accept them.  (Either way, EveryDNS installed my patch earlier
+today, so this is no longer a risk.)
+
+As another example, I registered burlap.afraid.org as a secondary
+domain with FreeDNS (freedns.afraid.org).  They don't use djbdns, but
+if they had, this would have allowed me to include poisonous NS
+records for afraid.org that DNS caches like dnscache and BIND would
+have accepted.
+
+Some caveats: this bug only affects domains that serve DNS content
+using tinydns and axfrdns (only for DNS queries over TCP; clients do
+not need AXFR permissions) from djbdns 1.05 and allow untrusted users
+to include arbitrary records (at least about 100 records, totalling
+about 30KB of space) within some zone.
+
+In summary: if you use tinydns/axfrdns from djbdns 1.05 to serve
+authoritative DNS content and give untrusted users control over
+records you serve, I strongly suggest you install this patch.  I don't
+believe other users are at risk, but they are encouraged to install
+this patch as well to be safe.
+
+Finally, here's the promised patch:
+
+--- response.c.orig	2009-02-24 21:04:06.000000000 -0800
++++ response.c	2009-02-24 21:04:25.000000000 -0800
+@@ -34,7 +34,7 @@
+         uint16_pack_big(buf,49152 + name_ptr[i]);
+         return response_addbytes(buf,2);
+       }
+-    if (dlen <= 128)
++    if ((dlen <= 128) && (response_len < 16384))
+       if (name_num < NAMES) {
+ 	byte_copy(name[name_num],dlen,d);
+ 	name_ptr[name_num] = response_len;

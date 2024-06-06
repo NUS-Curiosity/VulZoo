@@ -1,0 +1,189 @@
+
+Date: Wed, 28 Feb 2007 00:14:41 +0100
+From: "Anonymous Hacker" <anohacker@...glemail.com>
+To: full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com
+Subject: Xbox 360 Hypervisor Privilege Escalation Vulnerability
+
+Security Advisory
+
+Xbox 360 Hypervisor Privilege Escalation Vulnerability
+
+
+Release Date:
+  February 28, 2007
+
+
+Author:
+  Anonymous Hacker <anohacker@...il.com>
+
+
+Timeline:
+  Oct 31, 2006 - release of 4532 kernel, which is the first version
+                 containing the bug
+  Nov 16, 2006 - proof of concept completed; unsigned code running in
+                 hypervisor context
+  Nov 30, 2006 - release of 4548 kernel, bug still not fixed
+  Dec 15, 2006 - first attempt to contact vendor to report bug
+  Dec 30, 2006 - public demonstration
+  Jan 03, 2007 - vendor contact established, full details disclosed
+  Jan 09, 2007 - vendor releases patch
+  Feb 28, 2007 - full public release
+  Patch Development Time (In Days): 6
+
+
+Severity:
+  Critical (Unsigned Code Execution in Hypervisor Mode)
+
+
+Vendor:
+  Microsoft
+
+
+Systems Affected:
+  All Xbox 360 systems with a kernel version of 4532 (released Oct 31,
+  2006) and 4548 (released Nov 30, 2006). Versions prior to 4532 are not
+  affected. Bug was fixed in version 4552 (released Jan 09, 2007 - not a
+  Patch Tuesday).
+
+
+Overview:
+  We have discovered a vulnerability in the Xbox 360 hypervisor that allows
+  privilege escalation into hypervisor mode. Together with a method to
+  inject data into non-privileged memory areas, this vulnerability allows
+  an attacker with physical access to an Xbox 360 to run arbitrary code
+  such as alternative operating systems with full privileges and full
+  hardware access.
+
+
+Technical details:
+  The Xbox 360 security system is designed around a hypervisor concept. All
+  games and other applications, which must be cryptographically signed with
+  Microsoft's private key, run in non-privileged mode, while only a small
+  hypervisor runs in privileged ("hypervisor") mode. The hypervisor
+  controls access to memory and provides encryption and decryption
+  services.
+
+  The policy implemented in the hypervisor forces all executable code to be
+  read-only and encrypted. Therefore, unprivileged code cannot change
+  executable code. A physical memory attack could modify code; however,
+  code memory is encrypted with a unique per-session key, making meaningful
+  modification of code memory in a broadly distributable fashion difficult.
+  In addition, the stack and heap are always marked as non-executable, and
+  therefore data loaded there can never be jumped to by unpriviledged code.
+
+  Unprivileged code interacts with the hypervisor via the "sc" ("syscall")
+  instruction, which causes the machine to enter hypervisor mode. The
+  vulnerability is a result of incomplete checking of the parameters passed
+  to the syscall dispatcher, as illustrated below.
+
+  Preconditions (registers set by unpriviledged code):
+
+  %r0      syscall no.
+  %r3-%r12 syscall arguments
+
+  Priviledged code:
+
+  13D8: cmplwi %r0, 0x61
+  13DC: bge illegal_syscall
+   ...
+  13F0: rldicr %r1, %r0, 2, 61
+  13F4: lwz %r4, syscall_table(%r1)
+  13F8: mtlr %r4
+   ...
+  1414: blrl
+
+  The problem is that the "cmplwi" instruction compares only the lower 32
+  bits of the given syscall number; the upper 32 bits are ignored. The
+  "rldicr" instruction, however, operates on the complete 64 bit register
+  value.
+
+  The syscall handler address is fetched from the syscall handler offset
+  table at 0x00000000.00001F68+%r0*4. Setting the upper 32 bits of %r0 to
+  something other than 0 will change the upper 30 bits of the address used
+  for the syscall handler offset table lookup. We will now explain how the
+  Xbox 360 security architecture interprets and aliases these upper bits.
+
+  When processing the syscall, the processor is running in "hypervisor real
+  mode", with the MMU switched off. However, when accessing memory
+  locations with the MSB cleared, an additional offset, the Hypervisor Real
+  Mode Offset (HRMO), will be applied to all memory addresses.
+
+  Due to the Xbox 360 security architecture, main memory is aliased to
+  different addresses with different properties, in order to conditionally
+  enable the security features (encryption and hashing). The hypervisor
+  sets the value of the HRMO special register so that the hypervisor code,
+  including the syscall jump table, resides in memory which is hashed as
+  well as encrypted, even when using zero-based addresses.
+
+  When accessing memory locations with the most significant address bit
+  set, the HRMOR setting is not applied. Due to the bug in the "cmplwi"
+  instruction, setting the corresponding bits in %r0 on syscall entry
+  allows setting the MSB, thereby overriding the HRMOR setting and tricking
+  the address lookup of the syscall handler to fetch from memory without
+  any security features.
+
+  With the syscall handler offset table aliased to unencrypted memory, the
+  syscall handler table can now be modified to direct the hypervisor to
+  jump to any location in code space that is designated for the hypervisor.
+  In the proof of concept implementation, a jump to existing hypervisor
+  code is used with a pre-loaded register value as a trampoline to force
+  the ultimate execution path to an arbitrary, unencrypted and executable
+  location in memory.
+
+Proof of Concept Details:
+  As it is not possible to directly overwrite even non-priviledged code,
+  existing code needs to be tricked into calling the hypervisor syscall
+  with the desired register set. This can be done by setting up a stack
+  frame and forcing a context switch to this stack frame. The bug can be
+  exploited using the following series of physical memory writes:
+
+  Setup context switch to stack @80130AF0:
+
+  00130390: 00000000 00000000 00000000 FDFFD7FF  MSR mask
+  00130360: 00000000 80130AF0 00000000 00000000  New stack pointer
+
+  Setup stack:
+
+  00130BD0: 00000000 80070190 00000000 00000000  NIP to context restore
+  00130C90: 00000000 00000000 80070228 80070228  NIP, LR after context
+                                                 restore point to syscall
+                                                 instruction in kernel
+  00130CA0: 00000000 00009030 00000000 00000000  MSR
+
+  00130B40: 20000000 00000046 00000000 80130af0  r0 = syscall nr
+                                                 r1 = stack
+  00130B60: 80000000 address1                    r4 = address to jump to
+
+  00002080: 00000350                             points to mtctr %r4,
+                                                 bctr in hypervisor code
+
+  Code to be executed should be placed at "address1", which can be an
+  arbitrary unused memory address.
+
+  Example code to output '!' to the on board serial port:
+
+  1:
+    li %r3, '!'
+    bl putc
+    b 1b
+
+  putc:
+    lis %r4, 0x8000
+    ori %r4, %r4, 0x200
+    rldicr %r4, %r4, 32, 31
+    oris %r4, %r4, 0xea00
+    slwi %r3, %r3, 24
+    stw %r3, 0x1014(%r4)
+  1:
+    lwz %r3, 0x1018(%r4)
+    rlwinm. %r3, %r3, 0, 6, 6
+    beq 1b
+    blr
+
+
+Vendor Status:
+  Vendor was notified anonymously, and after cordial discussions a patch
+  was promptly released.
+
+Recommendation:
+  Remove R6T3.

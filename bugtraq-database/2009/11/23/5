@@ -1,0 +1,463 @@
+
+Date: Sun, 22 Nov 2009 23:34:51 -0600
+From: ds.adv.pub@...il.com
+To: bugtraq@...urityfocus.com
+Subject: Code to mitigate IE STYLE zero-day
+
+/*
+
+This code is for a DLL that loads into Internet Explorer as a BHO and
+modifies MSHTML.DLL in memory to render attempts to exploit this new
+IE vulnerability inert.  It does that by forcing a "controlled crash"
+at a high address, instead of letting EIP reach an MSHTML-dependent
+address that could fall within the heap-sprayable zone.  It's not a
+patch, or a "fix" in any pure sense -- it's just a mitigation.
+
+The vulnerability details I've figured out are that
+MSHTML!CDispNode::SetExpandedClipRect ORs a CDispScroller instance's
+vtable pointer by 2, then MSHTML!CLayout::GetFirstContentDispNode
+tries to call a function (at +2Ch on IE 6, +30h on IE 7) from the
+vtable.  This makes exploitability completely dependent on the
+system's version of MSHTML.DLL, and all but rules out successful
+exploitation in 64-bit Internet Explorer.
+
+The mitigation works by replacing one function pointer in the vtable
+with a pointer for which the low 2 bytes are 0xCCCC, but at which the
+code is functionally equivalent.  Legitimate virtual function calls
+work will as usual, while exploitation attempts will arrive at EIP =
+0xCCCCxxxx (not exploitable) rather than 0xyyyyxxxx (exploitable for
+some yyyy).
+
+The following snippet is a pared-down, harmless proof-of-concept to
+illustrate the fundamental elements of the vulnerability.  < and >
+have been replaced by # to avoid setting off alarms.
+
+#!DOCTYPE#
+#STYLE#* { margin: 0; overflow: scroll }#/STYLE#
+#BODY ONLOAD="document.getElementsByTagName('STYLE')[0].outerHTML++"#
+
+The !DOCTYPE tag is necessary to cause
+MSHTML!CFlowLayout::CalcSizeCore to call
+CFlowLayout::CalcSizeCoreCSS1Strict (the vulnerable code path) instead
+of CFlowLayout::CalcSizeCoreCompat.  The STYLE needs to apply to the
+BODY, but the * illustrates that "body" appearing there shouldn't be
+relied upon when constructing any detection signatures.  The ++ works
+as well as anything to modify 'outerHTML'.
+
+This code has received minimal testing and is not guaranteed to stop
+all attacks.  Use it at your own risk.
+
+Thanks to MMM for the sacrificial system.  Greets to the November birthday crew.
+
+-- Derek
+
+*/
+
+////////////////////////////////////////////////////////////////
+// iebsfix1.cpp
+//==============================================================
+// Dirty mitigation for the Internet Explorer 6/7
+// getElementsByTagName Body Style zero-day.  Downgrades an
+// exploitation attempt to a harmless crash.
+//
+// This mitigation is for 32-bit (x86) Windows only -- it does
+// not work on 64-bit Windows, even though 64-bit Internet
+// Explorer is technically affected.
+//
+// To build:
+//
+//  1. Start Visual Studio 2008 (2005 should also work)
+//  2. File -> New -> Project
+//  3. Choose Visual C++: Win32: Win32 Project
+//  4. Enter "iebsfix1" for the name
+//  5. In the Win32 Application Wizard, choose an
+//     "Application type" of "DLL", and under "Additional
+//     options", check "Empty project"
+//  6. In the Solution Explorer, right-click on "Source Files",
+//     Add -> New Item
+//  7. Choose "C++ File (.cpp)" and enter "iebsfix1.cpp" for
+//     the name
+//  8. Paste all of this source code into the new .cpp file
+//  9. In the Solution Explorer, right-click again on "Source
+//     Files", Add -> New Item
+// 10. Choose "Module-Definition File (.def)" and enter
+//     "iebsfix1.def" for the name
+// 11. Paste everything in the block comment below (between the
+//     rows of ****'s) into the new .def file
+// 12. Build -> Configuration Manager; for "Active solution
+//     configuration", choose "Release"
+// 13. For maximum portability, Project -> Properties,
+//     Configuration Properties: C/C++: Code Generation: set
+//     "Runtime Library" to "Multi-threaded (/MT)"; this will
+//     keep iebsfix1.dll from requiring MSVCR*.DLL
+// 14. (While you're in there, Project -> Properties,
+//      Configuration Properties: Linker: Input, and make sure
+//      that "Module Definition File" contains "iebsfix1.def")
+// 15. Build -> Build Solution
+//
+// To use, copy "iebsfix1.dll" to the Windows SYSTEM32
+// directory and run "regsvr32 iebsfix1.dll" as an
+// administrator.
+//
+// To uninstall, run "regsvr32 /u iebsfix1.dll".
+//
+// The DLL self-registers as a Browser Helper Object, but it
+// doesn't actually do anything BHO-like -- it just hooks
+// MSHTML.DLL during DllGetClassObject, then "fails."  Being a
+// BHO is a convenient way to get loaded into Internet Explorer.
+// (Note that it may also load into Explorer.)  If it can't
+// hook the system's MSHTML.DLL, it will display a message box
+// informing the user of the failure.
+//
+// NO WARRANTIES.  Use at your own risk.  Redistribution of this
+// source code in its original, unmodified form is permitted.
+//
+// Derek Soeder - 11/22/2009
+////////////////////////////////////////////////////////////////
+
+/****  Paste the following into a new .def file:  *************
+
+LIBRARY "iebsfix1.dll"
+
+EXPORTS
+        DllCanUnloadNow PRIVATE
+        DllGetClassObject PRIVATE
+        DllRegisterServer PRIVATE
+        DllUnregisterServer PRIVATE
+
+***************************************************************/
+
+#define IEBSFIX1_CLSID_W L"{802af903-a984-4481-8376-c103ade582e6}"
+
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_NON_CONFORMING_SWPRINTFS
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <windows.h>
+#include <olectl.h>
+#include <stdio.h>
+
+////////////////////////////////////////////////////////////////
+// MSHTML!CDispScroller vtable hooking
+////////////////////////////////////////////////////////////////
+
+PVOID * find_vtable_slot(
+        HMODULE                 hmMSHTML )
+{
+        PIMAGE_DOS_HEADER       pmz;
+        PIMAGE_NT_HEADERS32     ppe;
+        UINT_PTR                codestart;
+        PBYTE                   pbcode;
+        SIZE_T                  cbremain;
+        UINT_PTR                ptr;
+        size_t                  i;
+        PVOID                   * ppfn;
+
+        pmz = (PIMAGE_DOS_HEADER)
+                ((UINT_PTR)hmMSHTML & ~(UINT_PTR)0xFFFFU);
+        if (pmz->e_magic != IMAGE_DOS_SIGNATURE || pmz->e_lfanew <= 0)
+                return NULL;
+
+        ppe = (PIMAGE_NT_HEADERS32)
+                ((LONG_PTR)pmz + pmz->e_lfanew);
+        if ( ppe->Signature != IMAGE_NT_SIGNATURE ||
+             ppe->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+             ppe->OptionalHeader.Magic !=
+                IMAGE_NT_OPTIONAL_HDR32_MAGIC )
+        {
+                return NULL;
+        }
+
+        codestart = (UINT_PTR)pmz + ppe->OptionalHeader.BaseOfCode;
+        pbcode = (PBYTE)codestart;
+
+        // find instructions that assign to memory at [reg] a pointer
+        // to constant data stored in the code section; vtable
+        // pointer initialization instructions are a subset of these
+
+        for ( cbremain = ppe->OptionalHeader.SizeOfCode;
+              cbremain >= 7; pbcode++, cbremain-- )
+        {       // C7/0x/vtableptr -- MOV [reg], vtableptr
+                if (pbcode[0] != 0xC7U) continue;
+                if ( pbcode[1] <= 0x03 ||       // [EAX/ECX/EDX/EBX]
+                     pbcode[1] == 0x06 ||       // [ESI]
+                     pbcode[1] == 0x07 )        // [EDI]
+                {
+                        ptr = *(DWORD *)(pbcode + 2);
+                }
+                // C7/45/00/vtableptr -- MOV [EBP+0], vtableptr
+                else if (pbcode[1] == 0x45 && pbcode[2] == 0x00)
+                        ptr = *(DWORD *)(pbcode + 3);
+                else    continue;
+
+                // pointer to pointers, must be machine word aligned
+
+                if ((ptr & 3) != 0) continue;
+
+                // if it doesn't point to at least 25 code-section
+                // pointers, we're not interested
+
+                for (i = 0; i < 25; i++)
+                {
+                        if ( ptr < codestart || (ptr - codestart) >=
+                             ppe->OptionalHeader.SizeOfCode )
+                        {
+                                break;
+                        }
+                }
+
+                if (i < 25) continue;
+
+                ppfn = (PVOID *)ptr;
+
+                // IE 6: [11], [12], and [14] return 1; [13] returns 0
+                // IE 7: [12], [13], and [15] return 1; [14] returns 0
+                //      (CalcDispInfoForViewport was inserted at [11])
+
+                if ( ppfn[11] == ppfn[12] && ppfn[11] != ppfn[13] &&
+                     ppfn[11] == ppfn[14] )
+                {
+                        ppfn += 11;
+                }
+                else if ( ppfn[12] == ppfn[13] &&
+                        ppfn[12] != ppfn[14] && ppfn[12] == ppfn[15] )
+                {
+                        ppfn += 12;
+                }
+                else    continue;
+
+                // 33/C0/40/C3 -- XOR EAX, EAX / INC EAX / RET
+                // 6A/01/58/C3 -- PUSH 1 / POP EAX / RET
+                if ( *(DWORD *)*ppfn == 0xC340C033U ||
+                     *(DWORD *)*ppfn == 0xC358016AU )
+                {
+                        return ppfn;
+                }
+        } //for(cbremain>=7)
+
+        return NULL;
+} //find_vtable_slot
+
+BOOL apply_mitigation(
+        PVOID                   * ppfnVTableSlot )
+{
+        PBYTE                   pbhook;
+        DWORD                   dwprot;
+
+        // we "hook" the next vtable slot and make sure the two low
+        // bytes of the function pointer are unusably high, so the
+        // call to [ppfnVTableSlot | 2] will always crash
+
+        pbhook = (PBYTE) VirtualAlloc( NULL, 0x10000,
+                MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE );
+
+        if (pbhook == NULL) return FALSE;
+
+        memset( pbhook, 0xF4U, 0x10000 );       // F4 -- HLT
+
+        // 33/C0/40/C3 -- XOR EAX, EAX / INC EAX / RET
+        *(DWORD *)(pbhook + 0xCCCCU) = 0xC340C033U;
+
+        // see?  now the virtual method does its "return 1" at address
+        // xxxxCCCC instead of at whatever address inside MSHTML.DLL;
+        // it'll still work fine, but those two low bytes of CCCC will
+        // "poison" the exploit
+
+        VirtualProtect( pbhook, 0x10000, PAGE_EXECUTE_READ, &dwprot );
+
+        FlushInstructionCache( GetCurrentProcess(), pbhook, 0x10000 );
+
+        // set the hook
+
+        if ( !VirtualProtect( ppfnVTableSlot + 1,
+                sizeof(ppfnVTableSlot[1]), PAGE_EXECUTE_READWRITE,
+                &dwprot ) )
+        {
+                VirtualFree( pbhook, 0, MEM_RELEASE );
+                return FALSE;
+        }
+
+        ppfnVTableSlot[1] = (pbhook + 0xCCCCU);
+
+        VirtualProtect( ppfnVTableSlot + 1, sizeof(ppfnVTableSlot[1]),
+                dwprot, &dwprot );
+
+        FlushInstructionCache( GetCurrentProcess(),
+                ppfnVTableSlot + 1, sizeof(ppfnVTableSlot[1]) );
+
+        return TRUE;
+} //apply_mitigation
+
+////////////////////////////////////////////////////////////////
+// Browser Helper Object DLL
+////////////////////////////////////////////////////////////////
+
+HINSTANCE               g_hinstMyself;
+BOOL                    g_fInitialized;
+CRITICAL_SECTION        g_csInit;
+
+HMODULE                 g_hmMSHTML;
+
+STDAPI DllUnregisterServer()
+{
+        HKEY                    hkey, hkey2, hkey3;
+
+        if ( RegOpenKeyW( HKEY_LOCAL_MACHINE, L"SOFTWARE\\"
+                L"Classes\\CLSID", &hkey ) == ERROR_SUCCESS )
+        {
+                if ( RegOpenKeyW( hkey, IEBSFIX1_CLSID_W,
+                        &hkey2 ) == ERROR_SUCCESS )
+                {
+                        if ( RegOpenKeyW( hkey2, L"InprocServer32",
+                                &hkey3 ) == ERROR_SUCCESS )
+                        {
+                                RegDeleteValueW( hkey3, NULL );
+                                RegCloseKey( hkey3 );
+                                RegDeleteKeyW( hkey2,
+                                        L"InprocServer32" );
+                        }
+
+                        RegCloseKey( hkey2 );
+                        RegDeleteKeyW( hkey, IEBSFIX1_CLSID_W );
+                }
+
+                RegCloseKey( hkey );
+        }
+
+        if ( RegOpenKeyW( HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\"
+                L"Windows\\CurrentVersion\\Explorer",
+                &hkey ) == ERROR_SUCCESS )
+        {
+                if ( RegOpenKeyW( hkey, L"Browser Helper Objects",
+                        &hkey2 ) == ERROR_SUCCESS )
+                {
+                        RegDeleteKeyW( hkey2, IEBSFIX1_CLSID_W );
+                        RegCloseKey( hkey2 );
+                        RegDeleteKeyW( hkey,
+                                L"Browser Helper Objects" );
+                }
+
+                RegCloseKey( hkey );
+        }
+
+        return S_OK;
+} //DllUnregisterServer
+
+STDAPI DllRegisterServer()
+{
+        HKEY                    hkey, hkey2;
+        WCHAR                   wszmod[1024];
+        LSTATUS                 lret;
+
+        if ( RegCreateKeyW( HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Classes\\CLSID\\" IEBSFIX1_CLSID_W
+                L"\\InprocServer32", &hkey ) != ERROR_SUCCESS )
+        {
+_fail:
+                DllUnregisterServer();
+                return SELFREG_E_CLASS;
+        }
+
+        GetModuleFileNameW( g_hinstMyself, wszmod,
+                (sizeof(wszmod) / sizeof(wszmod[0])) );
+
+        lret = RegSetValueW( hkey, NULL, REG_SZ, wszmod,
+                (wcslen( wszmod ) + 1) * sizeof(wszmod[0]) );
+
+        RegCloseKey( hkey );
+
+        if (lret != ERROR_SUCCESS) goto _fail;
+
+        if ( RegCreateKeyW( HKEY_LOCAL_MACHINE, L"SOFTWARE\\"
+                L"Microsoft\\Windows\\CurrentVersion\\Explorer\\"
+                L"Browser Helper Objects", &hkey ) != ERROR_SUCCESS )
+        {
+                goto _fail;
+        }
+
+        lret = RegCreateKeyW( hkey, IEBSFIX1_CLSID_W, &hkey2 );
+
+        RegCloseKey( hkey );
+
+        if (lret != ERROR_SUCCESS ) goto _fail;
+
+        RegCloseKey( hkey2 );
+
+        return S_OK;
+} //DllRegisterServer
+
+STDAPI DllCanUnloadNow()
+{
+        return S_OK;
+}
+
+STDAPI DllGetClassObject(
+        REFCLSID                rclsid,
+        REFIID                  riid,
+        LPVOID                  * ppv )
+{
+        PVOID                   * ppfn;
+        WCHAR                   wszbuf[256];
+
+        EnterCriticalSection( &g_csInit );
+
+    __try
+    {
+        if (!g_fInitialized)
+        {
+                // MSHTML should already be loaded; this extra
+                // reference will keep it from ever unloading
+                g_hmMSHTML = LoadLibraryW( L"mshtml.dll" );
+
+                ppfn = find_vtable_slot( g_hmMSHTML );
+
+                if (ppfn != NULL)
+                {
+                        swprintf( wszbuf,
+L"IEBSFix1: Found vtable slot at %p in MSHTML_%p\r\n",
+                                ppfn, g_hmMSHTML );
+                        OutputDebugStringW( wszbuf );
+
+                        apply_mitigation( ppfn );
+                }
+                else
+                {
+                        swprintf( wszbuf,
+L"IEBSFix1: FAILED to find vtable slot in MSHTML_%p\r\n",
+                                g_hmMSHTML );
+                        OutputDebugStringW( wszbuf );
+
+                        MessageBoxW( NULL,
+L"The Internet Explorer 6/7 getElementsByTagName Body Style zero-day "
+L"mitigation, also known as IEBSFix1, is not protecting your system "
+L"because it is incompatible with this version of Internet Explorer."
+L"\n\nTo remove IEBSFix1, run \"regsvr32 /u iebsfix1.dll\" as an "
+L"administrator.",
+                                L"IEBSFix1", MB_ICONWARNING|MB_OK );
+                }
+
+                g_fInitialized = TRUE;
+        }
+    }
+    __finally
+    {
+        LeaveCriticalSection( &g_csInit );
+    }
+
+        return CLASS_E_CLASSNOTAVAILABLE;
+} //DllGetClassObject
+
+BOOL WINAPI DllMain(
+        HINSTANCE               hinstDLL,
+        DWORD                   fdwReason,
+        LPVOID                  lpvReserved )
+{
+        if (fdwReason == DLL_PROCESS_ATTACH)
+        {
+                g_hinstMyself  = hinstDLL;
+                g_fInitialized = FALSE;
+                InitializeCriticalSection( &g_csInit );
+        }
+
+        return TRUE;
+} //DllMain

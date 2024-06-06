@@ -1,0 +1,114 @@
+
+Date: Wed, 30 Jun 2010 00:04:47 +0200
+From: Reversemode <advisories@...ersemode.com>
+To: bugtraq@...urityfocus.com
+Subject: [0day] Microsoft mshtml.dll CTimeoutEventList::InsertIntoTimeoutList
+ memory leak
+
+Nowadays, the days of ASLR and DEP, any memory leak is welcome.
+
+Yesterday, Stefano Di Paola posted the following tweet
+http://twitter.com/WisecWisec/status/17254776077. After elaborating that
+weird behaviour I discovered a flaw in mshtml.dll, exploitable via
+Internet Explorer. In VBScript/JScript there are at least two functions
+that make use of timers: setTimeout and setInterval. According to the
+documentation, the return value should be a Timer ID.In Chrome and FF
+this ID is pure sequential (1,2,3,4...) but in IE I was getting "weird"
+IDs. Later on I discovered that those IDs turned out to be a heap
+address plus a counter.
+
+
+We are leaking a pointer from a segment of the IE8's default process
+heap. But, what is that pointer? Why does it increment everytime I press
+the button? Let's see the technical analysis:
+
+Inside CWindow's constructor (mshtml's standard) a variable "IDEvent",
+is initialized to 1
+Module: mshtml.dll Vista SP2
+
+.text:7403EC0A                 mov     dword ptr [ecx+30h], 1 ;
+TimerID_Counter = 1
+
+
+Everytime a Timeout event (either created by setInterval or setTimeout )
+is created, it's inserted into a list via this function.
+Module: mshtml.dll Vista SP2
+
+text:741170E5 ; public: long __thiscall
+CTimeoutEventList::InsertIntoTimeoutList(struct TIMEOUTEVENTINFO *,
+unsigned int *, int)
+.text:741170E5
+?InsertIntoTimeoutList@...meoutEventList@@QAEJPAUTIMEOUTEVENTINFO@@PAIH@Z proc
+near
+.text:741170E5    ; CODE XREF: CWindow::AddTimeoutCode(tagVARIANT
+*,ushort *,long,long,uint *)+73.p
+.text:741170E5      ; CWindow::FireTimeOut(uint)+14DFB8.p
+
+Take a look at this code, this is the key:
+
+Module: mshtml.dll Vista SP2
+
+text:741170E5 ; public: long __thiscall
+CTimeoutEventList::InsertIntoTimeoutList
+
+[...]
+
+.text:74117100                 mov     eax, [esi+30h] ;  p->IDEvent
+.text:74117103                 mov     ecx, [ebp+arg_0] ; TimerEvent *t;
+.text:74117106                 add     eax, esi        ; s = p +
+p->IDEvent; // Oops!
+.text:74117108                 mov     [ecx+0Ch], eax   ; t->ID = s
+.text:7411710B                 inc     dword ptr [esi+30h] p->IDEvent++
+What's going on here?
+
+Well,my theory is that in an effort to not return a plain
+sequential/predictable ID, Microsoft decided to add a "magic" value.
+Unfortunately, this "magic" value is a pointer member of the CWindow
+object which ultimately represents an open browser's window. Thus we can
+define it as persistent in memory even after reloading, till the
+Browser's instance is closed.
+Taking into accout that IDEvent is predictable and we know the pointer
+offset, we can trivially infer the pointer to the persistent CWindow
+object(leakedPointer - ID_Counter - 0x3c). This fact brings us useful
+addresses for ROP/Anti-ASLR exploits. :)
+
+06930dd8  6b0253f8 mshtml!CWindow::`vftable'
+06930ddc  00000004
+06930de0  00000008
+06930de4  070f5720
+06930de8  00000000
+06930dec  6b028ad8 mshtml!CWindow::`vftable'
+06930df0  6b04de30 mshtml!CWindow::`vftable'
+06930df4  6aff257c mshtml!CWindow::`vftable'
+06930df8  6aff2220 mshtml!CWindow::`vftable'
+06930dfc  6aff25a0 mshtml!CWindow::`vftable'
+06930e00  068ee3b0
+06930e04  00000000
+06930e08  068f4aa8
+06930e0c  06926be0
+06930e10  00000000
+06930e14  6b01f5a4 mshtml!CDataAry::`vftable'
+06930e18  00000000
+06930e1c  00000000
+06930e20  00000000
+06930e24  6b01f5a4 mshtml!CDataAry::`vftable'
+06930e28  00000000
+06930e2c  00000000
+06930e30  00000000
+06930e34  6b01f5a4 mshtml!CDataAry::`vftable'
+06930e38  00000000
+06930e3c  00000000
+06930e40  00000000
+06930e44  00000001
+06930e48  00000000
+06930e4c  00000000
+06930e50  00000000
+06930e54  00000000
+
+
+Products affected: XP/Vista/Windows7 32/64 bit. IE8. IE9 is not vulnerable.
+
+Download PoC code
+http://www.reversemode.com/downloads/mshtml_leak_poc.zip
+
+Elaborate it as you desire and share it! Happy hunting!

@@ -1,0 +1,196 @@
+
+Date: Sat, 9 Nov 2013 22:31:27 GMT
+From: geinblues@...il.com
+To: bugtraq@...urityfocus.com
+Subject: XADV-2013003 Linux Kernel bt8xx Video Driver IOCTL Heap Overflow
+
+
++--------------------------------------------------------------------+
+| XADV-2013003 Linux Kernel bt8xx Video Driver IOCTL Heap Overflow   |
++--------------------------------------------------------------------+
+
+ Vulnerable versions:
+ - linux kernel 2.6.18 <=
+ Testbed: ubuntu
+ Type: Local
+ Impact: Critical
+ Vendor: http://www.kernel.org
+ Author: x90c <geinblues *nospam* gmail dot com>
+ Site: x90c.org
+
+
+=========
+ABSTRACT:
+=========
+
+The bt8xx video driver is a video capture driver. It supports Bt848
+Bt849, Bt878, and Bt879.
+
+The bt8xx video driver in the linux kernel has a vulnerability to
+occur kernel heap overflow. It's at do ioctl code for bt8xx and
+copy_from_user() larger user-supplied data to the kernel heap buffer
+than kmalloc'd kmem.
+
+
+=========
+DETAILS:
+=========
+
+(1) vulnerable reason: 8 bytes v4l2_clip struct. (sizeof v4l2_clip? 8 bytes)
+
+[~linux-2.6.18/include/linux/videodev2.h]
+----
+struct v4l2_clip
+{
+    struct v4l2_rect        c;
+    struct v4l2_clip    __user *next;
+};
+----
+
+v4l2_clip struct is 8 bytes!
+
+
+[~linux/2.6.18/include/linux/videodev.h]
+----
+struct video_window
+{
+    __u32   x,y;            /* Position of window */
+    __u32   width,height;       /* Its size */
+    __u32   chromakey;
+    __u32   flags;
+    struct  video_clip __user *clips;   /* Set only */
+    int clipcount;
+#define VIDEO_WINDOW_INTERLACE  1
+#define VIDEO_WINDOW_CHROMAKEY  16  /* Overlay by chromakey */
+#define VIDEO_CLIP_BITMAP   -1
+/* bitmap is 1024x625, a '1' bit represents a clipped pixel */
+#define VIDEO_CLIPMAP_SIZE  (128 * 625)
+};
+----
+
+*clips member varaible of video_window is a pointer.
+
+
+
+(2) Do exploit: bttv IOCTL!
+
+[~/linux-2.6.18/drivers/media/video/bt8xx/bttv-driver.c]
+----
+static int bttv_do_ioctl(struct inode *inode, struct file *file,
+             unsigned int cmd, void *arg)
+{
+
+    case VIDIOCSWIN:
+    {
+        struct video_window *win = arg; // XXX win = arg.
+        struct v4l2_window w2;
+
+        if (no_overlay > 0) {
+            printk ("VIDIOCSWIN: no_overlay\n");
+            return -EINVAL;
+        }
+
+        w2.field = V4L2_FIELD_ANY;
+        w2.w.left    = win->x;
+        w2.w.top     = win->y;
+        w2.w.width   = win->width;
+        w2.w.height  = win->height;
+        w2.clipcount = win->clipcount; // clipcount! (copy size / 8)
+        w2.clips     = (struct v4l2_clip __user *)win->clips; // clips! (to copy src)
+        retval = setup_window(fh, btv, &w2, 0); // XXX vulnerable setup_window() called!
+----
+
+The ioctl argument to win struct pointer and store the win->clipcount and
+win->clips to w2 struct for each. and called vulnerable setup_window().
+
+
+
+(3) Result: kernel heap overflow occured.
+
+[~/linux-2.6.18/drivers/media/video/bt8xx/bttv-driver.c]
+----
+static int setup_window(struct bttv_fh *fh, struct bttv *btv,
+            struct v4l2_window *win, int fixup)
+{
+    struct v4l2_clip *clips = NULL;
+    int n,size,retval = 0;
+
+    if (NULL == fh->ovfmt)
+        return -EINVAL;
+
+    if (!(fh->ovfmt->flags & FORMAT_FLAGS_PACKED))
+        return -EINVAL;
+
+    /* XXX no win.clipcount/clips validation. */
+    retval = verify_window(&bttv_tvnorms[btv->tvnorm],win,fixup);
+    if (0 != retval)
+        return retval;
+
+    /* copy clips  --  luckily v4l1 + v4l2 are binary
+       compatible here ...*/
+
+    n = win->clipcount; /* XXX win(ioctl arg)->clipcount! */
+
+    // (2) less size kmalloc'd. ( If clipcount = 0xffff, 0x4000c size kmalloc'd.)
+    size = sizeof(*clips)*(n+4); // 0xffff+4*4(0x4000C)
+    clips = kmalloc(size,GFP_KERNEL); // less size kmalloc'd!
+
+    if (NULL == clips)
+        return -ENOMEM;
+
+    /*
+     * (kernel heap overflow!) 
+     * XXX copied 8(sizeof struct v4l2_clip) * 0xffff=size(0x7FFF8) win->clips to 0x4000c heap buf!
+     */
+    if (n > 0) {
+        if (copy_from_user(clips,win->clips, sizeof(struct v4l2_clip)*n)) {
+            kfree(clips);
+            return -EFAULT;
+        }
+}
+----
+
+===============
+EXPLOIT CODES:
+===============
+-
+
+=============
+PATCH CODES:
+=============
+
+[bt8xx_heap_overflow.patch]
+-----
+        + if(n >= size) { // n >= size kmalloc'd?
+        +   kfree(clips);
+        +   return -EINVAL;
+        +}
+        if (copy_from_user(clips,win->clips, sizeof(struct v4l2_clip)*n)) {
+            kfree(clips);
+            return -EFAULT;
+        }
+----
+
+===============
+VENDOR STATUS:
+===============
+2013/11/10 - I discovered the security bug.
+2013/11/10 - The advisory released.
+
+
+========
+GREETS:
+========
+
+my stuffs are more favorite than rebel's stuffs.
+
+
+============
+DISCLAIMER:
+============
+
+The authors reserve the right not to be responsible for the topicality,
+correctness, completeness or quality of the information provided in this
+document. Liability claims regarding damage caused by the use of any information
+provided, including any kind of information which is incomplete or incorrect,
+will therefore be rejected.

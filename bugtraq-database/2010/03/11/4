@@ -1,0 +1,365 @@
+
+Date: Wed, 10 Mar 2010 22:15:26 +0100
+From: Luka Milkovic <milkovic.luka@...il.com>
+To: bugtraq@...urityfocus.com
+Subject: Multiple vulnerabilities in SUPERAntiSpyware and Super Ad Blocker
+
+ Title:                              Multiple vulnerabilities in
+SUPERAntiSpyware and Super Ad Blocker
+ Date of Discovery:         2 Feb 2010
+ Contact Date:                4 Feb.2010
+ Release Date:                10 Mar 2010
+ Author:                          Luka Milkovic
+ Mail:                              milkovic.luka at gmail.com
+ Software Link:               SUPERAntiSpyware -
+http://www.superantispyware.com/index.html
+                                      Super Ad Blocker -
+http://www.superadblocker.com/
+ Version:                         SUPERAntiSpyware 4.34.1000 (18 Feb
+2010) or older
+                                      Super Ad Blocker 4.6.1000 (not
+updated since 2007, pre-release exists) or older
+ Platform:                       Windows XP and later
+ Components affected:    Device drivers in both applications
+ Remote:                        No
+ Local:                           Yes
+ Vulnerability type:         DoS, Privilege Escalation
+
+
+VENDOR SOFTWARE DESCRIPTION:
+---------------
+
+SUPERAntiSpyware is the most thorough scanner on the market. Our
+Multi-Dimensional Scanning and Process Interrogation Technology will
+detect spyware that other products miss! SUPERAntiSpyware will remove
+ALL the Spyware, NOT just the easy ones!
+
+Super Ad Blocker™ is the first ad-blocker designed to block all new
+forms of advertising! Blocks all Rich Media, Flash, pop-ups,
+pop-unders, messenger ads, spyware ads, InVue, slide-in, fly-in ads
+and more! Block AND Remove Spyware such as SurfSideKick, LOP, Nail,
+Cydoor, Huntbar, Ezula, Sandboxer and more! The only ad-blocker you
+will ever need! Clear cache, cookies and other history trails to
+protect your privacy!
+
+
+VULNERABILITIES DESCRIPTION AND TECHNICAL DETAILS:
+---------------
+
+SUPERAntiSpyware and Super Ad Blocker have almost identical device
+drivers in order to set up hooks and perform other duties from kernel
+space. These device drivers suffer from lack of validation of
+parameters passed from user mode. Additionally, some of the functions
+accessible from user mode are inherently insecure and lead to easy
+privilege escalation. All vulnerabilities are applicable to both
+applications.
+
+Analysis and code was developed for SUPERAntiSpyware v4.33.1000, but
+the vendor released a new version of the product (v4.34.1000) - all
+differences will be addressed and emphasized in technical details
+below.
+
+Vulnerable drivers:
+SASENUM.sys - SUPERAntiSpyware, used just for an object name retieval
+SABProcEnum.sys - Super Ad Blocker, equivalent of the above driver
+SASKUTIL.sys - SUPERAntiSpyware, main driver (hooks, registry and
+process functions)
+SABKUTIL.sys - Super Ad Blocker, equivalent of the above driver
+
+--- 1. Issue: Local DoS in SABProcEnum.sys/SASENUM.sys ---
+
+Drivers SABProcEnum.sys/SASENUM.sys define two IOCTL codes for the
+device control.
+Both control codes are used for an object name retrieval, through
+ZwQueryObject() method or
+ObReferenceObjectByHandle()/ObQueryNameString() methods. Input buffers
+for both IRP packets include user mode pointers which are completely
+user-controllable. However, no checks regarding NULL pointers, invalid
+input buffer length, or otherwise invalid pointers are made - user can
+pass NULL input buffer and thus cause a BSOD.
+
+Vulnerable code disassembly excerpt:
+---
+.text:1000120B                 push    0
+.text:1000120D                 push    1000h
+.text:10001212                 mov     eax, [ebp+SystemBuffer]    ;
+EAX CAN BE NULL NOW
+.text:10001215                 mov     ecx, [eax+8]        ; CRASH HERE!
+.text:10001218                 push    ecx
+.text:10001219                 push    1
+.text:1000121B                 mov     edx, [ebp+SystemBuffer]
+.text:1000121E                 mov     eax, [edx]        ; OR HERE!
+.text:10001220                 push    eax
+.text:10001221                 call    ZwQueryObject   ; query object
+name information
+---
+
+Arbitrary code execution is probably impossible, since an attacker
+does not control content which will be written to the pointers under
+user's control.
+
+These drivers are only present after installation of the application -
+after reboot they are not loaded. There is strong possibility that
+these drivers are not used at all, as demonstrated by the most recent
+release of SUPERAntiSpyware...
+
+After vendor was contacted and informed about the vulnerabilities, new
+version was released, with all vulnerabilities supposedly fixed.
+
+Vulnerability explained above was fixed by adding
+ProbeForRead()/ProbeForWrite() calls in order to catch malformed
+requests.
+However, every affected driver uses METHOD_BUFFERED for all IOCTL
+calls. Buffer passed from user mode is first copied to kernel mode,
+and will always have kernel mode address (when accessed by the above
+function). Calling ProbeForRead()/ProbeForWrite() on kernel mode
+addresses raises exception which is appropriately handled, and the
+ZwQueryObject() call is never performed.
+Because of the added "fixes", even legitimate request cannot be
+fulfilled, so these drivers are very likely not used at all.
+
+--- 2. Issue: Local DoS by overwriting array of registered processes ---
+
+SABKUTIL.sys/SASKUTIL.sys have unique mechanism of
+connecting/registering with an application (i.e. user mode). Every
+application with intention to use these drivers must first register
+with the driver. Registration involves a modified variant of MD5 hash
+of current time which is calculated both by the application and the
+driver. If these two values match, application is successfully
+registered with the driver (otherwise, driver refuses to fulfill
+application's requests).
+Driver holds a constant length array of successfully registered
+applications and iterates through this array for every IRP packet
+(except the registration IRP with IOCTL
+IOCTL_SABKUTIL_REGISTER_PROCESS_WITH_DRIVER = 0x9c4028c). Array has
+256 DWORD elements which is enough for 256 application registrations
+(each DWORD is registered application's process ID).
+
+Sending more than 256 registration request will successfully overflow
+the array because no checks are made whether the current PID is
+already present in the array or whether all array elements are already
+used. Array overflow will cause the overwrite of certain critical
+driver structures or memory pages beyond the driver memory which will
+lead to access violation and BSOD.
+Possibility of arbitrary code execution is very low because user does
+not control the content which is going to be written beyond the array
+boundaries - an attacker cannot influence PIDs easily.
+
+New version adds ProbeForRead()/ProbeForWrite() calls in order to
+validate buffer passed from the user mode (completely unnecessary),
+checks whether the array is already filled and, if it is, restarts the
+array index thus overwriting the array from the beginning. If PID
+being added is already present in the array, it's not added again.
+It's obvious that if an attacker creates more than 256 registration
+request, each from its own process, the array will be overflowed, and
+initially registered application (i.e. legitimate SUPERAntiSpyware or
+Super Ad Blocker process) will be "unregistered" and all requests will
+fail.
+
+Consequences of this "driver hijack" are not directly obvious -
+malware scanner seems not to be affected, despite the application
+making driver calls which all fail - some parts of malware detection
+engine are obviously placed in user mode.
+Nevertheless, the application must be affected somehow (because all
+calls fail), but the specific details were not discovered.
+
+--- 3. Issue: local DoS by dereferencing invalid pointer used as a
+parameter for ZwOpenProcess() method ---
+
+SABKUTIL.sys and SASKUTIL.sys use IOCTL code 0x9c402090
+(IOCTL_SABKUTIL_ZWOPENPROCESS) as a wrapper around the ZwOpenProcess()
+method which creates the handle to the specified process (valid only
+in kernel mode).
+Parameters passed to the ZwOpenProcess() method are completely under
+attacker's control. The wrapper tries to restrict the handle usage to
+kernel mode by setting OBJECT_ATTRIBUTES.Attributes field to
+OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE values. Since this field is
+controllable by the user, user could pass invalid pointer which, when
+dereferenced, leads to BSOD. No check is made whether the pointer is
+valid.
+Possibility of arbitrary code execution is very low because only
+constant value (0x240) can be written to an arbitrary location
+(particular kernel address that could be somehow exploited could
+exist).
+
+Vulnerable code disassembly excerpt:
+---
+.text:0001572F                 mov     edx, [ebp+SystemBuffer]
+.text:00015732                 mov     eax,
+[edx+ObjectAttributesPointer] ; EAX IS OURS
+.text:00015735                 mov     dword ptr
+[eax+OBJECT_ATTRIBUTES.Attributes], 240h ; CRASH OR OVERWRITE HERE!
+.text:0001573C                 push    0
+.text:0001573E                 call    EmptyStub
+---
+
+New version adds ProbeForRead()/ProbeForWrite() checks for input
+buffer (or jumps over these checks, if input buffer resides in the
+kernel, as is the case here). Additionally, OBJECT_ATTRIBUTES pointer
+(part of the input buffer) is checked with the same calls, and if not
+readable/writable, exception is raised and handled appropriately
+(ZwOpenProcess() call is not performed). However, if this pointer
+points to kernel address, checks are not used - invalid address, such
+as 0xFFFFFFFF leads to crash.
+
+--- 4. Issue: Local DoS by dereferencing invalid pointer used as a
+parameter for ZwQueryValueKey() method ---
+
+SABKUTIL.sys and SASKUTIL.sys use IOCTL code 0x9c402064
+(IOCTL_SABKUTIL_QUERY_VALUE) as a wrapper around the ZwQueryValueKey()
+method which queries specified value of the given key. In order to use
+this function, user must first send IRP with IOCTL 0x9c402058
+(IOCTL_SABKUTIL_OPEN_KEY) which returns a handle to the specified
+registry key (valid only in kernel mode).
+This wrapper allocates kernel pool which will hold content of the
+specified value, queries the value of the given key and then copies
+content from the pool to the user mode buffer pointed to by the
+pointer passed in the input buffer (user-controlled).
+Inside the wrapper, this pointer is checked for NULL value - if the
+pointer is NULL, no content is copied back to the user mode buffer.
+Using other invalid address, 0x1 for example, will crash the system.
+
+New version adds ProbeForRead()/ProbeForWrite() calls for the input
+buffer and the "content pointer" inside the input buffer. Using
+invalid address such as 0xFFFFFFFF (must be in kernel space, in order
+to bypass probe-checks), just like in the vulnerability described
+previously, crashes the system.
+
+Possibility of arbitrary code execution is very high and is described
+further below.
+
+--- 5. Issue: Arbitrary code execution by using ZwQueryValueKey() wrapper ---
+
+ZwQueryValueKey() wrapper was described above. Since pointer to which
+contents of the specifed value of the given key in the registry will
+be written is completely controllable by the user, we can overwrite
+arbitrary memory location. Furthermore, contents which are going to be
+written to arbitrary memory location are also completely controllable
+by the user - they are registry values. An attacker could create
+registry value with malicious content (x86 code).
+
+Checks added in new version do not prevent this attack in any way.
+
+PoC for this vulnerability was not created since privilege escalation
+(most probable outcome/goal of arbitrary ring0 code execution) can be
+achieved much more easily with techniques described below.
+
+--- 6. Issue: Information leakage/privilege escalation by using
+registry/file functions ---
+
+Since registry and file access is done in kernel mode, every registry
+key/value and file can be accessed. Normally protected files like SAM
+database in registry or on disk can be easily accessed - NT/LM hashes
+or other sensitive information could be compromised.
+SABKUTIL.sys or SASKUTIL.sys drivers do not provide WriteFile()
+wrapper method and arbitrary content cannot be written to arbitrary
+files. This is not true for the registry access though, since all
+relevant registry method wrappers are present. Limited user account
+could thus not only read sensitive information (SAM database for
+example), but also write arbitrary content (disable passwords for
+certain accounts, add new Administrator group users, etc.).
+
+--- 7. Issue: Local DoS/privilege escalation by dereferencing invalid
+pointer(s) used as parameter(s) for SetVistaTokenInformation() method
+---
+
+SABKUTIL.sys and SASKUTIL.sys use IOCTL code 0x9c4020c0
+(IOCTL_SABKUTIL_SET_VISTA_TOKEN_INFORMATION) for writing arbitrary
+information to the token of the current process.
+Since all information being written to token is user-controllable,
+there are plenty of exploitation possibilities (including privilege
+escalation). Sending malformed packet (all NULLs or random data) will
+corrupt the token which leads to BSOD.
+Crash is not immediate - no pointer is dereferenced inside the driver
+instantly, but sooner or later, token will be manipulated (for
+example, when application which edited the token exits), crashing the
+system.
+This call works only in Windows Vista and later.
+
+Arbitrary code execution is improbable - privileges, user/groups and
+restricted SIDs are the variable parts of the token. It's much easier
+to cause privilege escalation by manipulating these structures, than
+to cause execution of arbitrary code (if at all possible).
+
+ProbeForRead()/ProbeForWrite() checks added in new version do not fix
+this vulnerability - only input buffer is checked (actually, since it
+comes from the kernel mode because of METHOD_BUFFERED transfer method,
+checks are bypassed).
+
+--- 8. Issue: Privilege escalation by adjusting token privileges ---
+
+SABKUTIL.sys and SASKUTIL.sys use IOCTL codes 0x9c4020b4
+(IOCTL_SABKUTIL_SET_VISTA_PRIVILEGES_FOR_CURRENT_PROCESS) and
+0x9c4020b8 (IOCTL_SABKUTIL_SET_VISTA_PRIVILEGES_BY_PID) for enabling
+all privileges for current process or the process with the given PID.
+Despite the presence, setting privileges for the process with the
+given PID does not work at all - method which tries to obtain the
+EPROCESS block of the process with the given PID fails for Vista OS or
+later. On OSes prior to Vista these functions are not usable because
+of the IsVista() check.
+This function is inherently insecure - limited user can gain all
+possible privileges for current process.
+
+Arbitrary code execution is not possible (not necessary, either).
+
+--- 9. Issue: Privilege escalation by adjusting token SIDs ---
+
+This vulnerability is very similar to the previous one - by adjusting
+token SIDs, one could gain administrator privileges.
+
+--- 10. Issue: Privilege escalation by replacing process token with
+System process token ---
+
+Issue 7 described SetVistaTokenInformation() method. SABKUTIL.sys and
+SASKUTIL.sys use IOCTL code 0x9c4020bc (IOCTL_SABKUTIL_GET_VISTA_
+TOKEN_INFORMATION) to obtain all relevant information about the token
+of the current process, or the process with the name passed as a
+parameter - this function will be called GetVistaTokenInformation().
+Using this method, an attacker can first obtain token of an arbitrary
+process (all token fields), for example "System" process. This token
+information can then be passed to SetVistaTokenInformation() method
+which will successfully replace token of the current process with the
+System process token, thus granting the process SYSTEM privileges.
+
+EXPLOIT/POC:
+---------------
+
+Visual Studio project is available here:
+http://www.4shared.com/file/238491842/ed3f7380/PoC.html and here:
+http://www.easy-share.com/1909510835/PoC.zip
+I am really sorry and appologize for using lame file uploading sites,
+but I don't own a domain:( I tried to attach ZIP archive, but it seems
+it's being filtered.
+Exploit code is a bit bloated, but because of the code repetition and
+redundancy, I decided to aggregate it together in a small application.
+Boost library is required for project compilation (read from BOOST
+environment variable).
+
+DISCLOSURE TIMELINE:
+---------------
+
+2 Feb 2010: Discovery of vulnerabilities
+4 Feb 2010: Initial contact through official forum, ask for secure contact
+4 Feb 2010: Initial vendor response, secure contact given
+4 Feb 2010: Ask for a PGP key, disclosure policy given
+4 Feb 2010: Vendor refuses encryption of e-mails, requests PoC
+5 Feb 2010: Sent PoC and details about vulnerabilities
+        [-] No response
+8 Feb 2010: Status update request, vendor is informed that the planned
+disclosure date is 15 Feb 2010 or other date which is mutually agreed
+upon by the vendor and me
+8 Feb 2010: Vendor response; Vendor is "currently reviewing the items
+to see if they represent an actual issue or simply a 'scare tactic'",
+requests confirmation that the advisory won't go public
+9 Feb 2010: Vendor is informed that advisory will be published, but
+specific dates of disclosure can be negotiated; Details about how
+issues are going to be addressed are requested
+       [-] No response
+8 Mar 2010: Status update request, requested details about fixes and
+advisory release dates
+8 Mar 2010: Vendor replies that all of the issues have been (silently)
+resolved since version 4.34.1000 of SUPERAntiSpyware (does not mention
+Super Ad Blocker)
+10 Mar 2010: Decided to publish this advisory, despite the fact that
+the new version seems to be plagued by the same problems as the
+previous one; Vendor notified

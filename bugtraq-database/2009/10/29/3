@@ -1,0 +1,160 @@
+
+Date: Thu, 29 Oct 2009 09:28:30 +1100
+From: CaT <cat@....com.au>
+To: Pavel Machek <pavel@....cz>
+Cc: Dan Yefimov <dan@...htwave.net.ru>, nomail@...ail.com,
+	bugtraq@...urityfocus.com
+Subject: Re: /proc filesystem allows bypassing directory permissions on
+	Linux
+
+On Wed, Oct 28, 2009 at 10:30:37PM +0100, Pavel Machek wrote:
+> On Tue 2009-10-27 11:49:32, CaT wrote:
+> > On Tue, Oct 27, 2009 at 12:29:09AM +0300, Dan Yefimov wrote:
+> > > and testing them. Remember the scenario from the original mail and try 
+> > > finding a window, during which creating a hardlink would still work thus 
+> > > evading directory permissions check.
+> > 
+> > The main thing this does is allow a hardlink-like attack to work across
+> > mountpoints afaics.
+> 
+> Yes, plus it allows "hardlinks" on deleted files, and this "strange
+
+Yup. Recovered many an 'oh fsck' situation that way.
+
+> hard links" can not be seen on link count.
+
+Aye.
+
+> > You can't actually use /proc/*/fd to gain access to files opened by
+> > processes you do not own. Only ones you do (at least in a mainline kernel)
+> > which is fair enough. This means that you can't have user a open a file
+> > owned by user b and then let user c have access to it via
+> > /proc/$pid/fd.
+> 
+> No, but you can upgrade file from read-only to read-write using /proc.
+
+Hmm.
+
+$ cd test
+4 echo moo >cow
+$ exec 3<cow
+$ ll /proc/self/fd
+total 0
+0 dr-x------ 2 ap users  0 2009-10-29 09:00 .
+0 dr-xr-xr-x 7 ap users  0 2009-10-29 09:00 ..
+0 lrwx------ 1 ap users 64 2009-10-29 09:00 0 -> /dev/pts/69
+0 l-wx------ 1 ap users 64 2009-10-29 09:00 1 -> pipe:[12574723]
+0 lrwx------ 1 ap users 64 2009-10-29 09:00 2 -> /dev/pts/69
+0 lr-x------ 1 ap users 64 2009-10-29 09:00 3 -> /home/cat/test/cow
+0 lr-x------ 1 ap users 64 2009-10-29 09:00 4 -> /proc/7652/fd
+
+$ cat cow
+moo
+$ echo meow >/proc/self/fd/3
+$ cat cow
+meow
+$ chmod 400 cow
+$ echo moo >/proc/self/fd/3
+bash: /proc/self/fd/3: Permission denied
+$ ll 
+total 24
+ 4 drwx------  2 ap users  4096 2009-10-29 08:51 .
+16 drwx------ 50 ap users 16384 2009-10-29 09:07 ..
+ 4 -rw-------  1 ap users     4 2009-10-29 09:04 cow
+$ chmod 000 .
+$ echo meow >cow
+bash: cow: Permission denied
+$ cd ..
+$ chmod 700 test
+$ cd -
+/home/cat/test
+$ chmod 600 .
+$ echo meow >cow
+bash: cow: Permission denied
+$ # this, to me, indicates that the failure is due to not being able to search
+$ # the directory rather than because the file is unwriteable
+$ cd ..
+$ chmod 700 test
+$ cd -
+/home/cat/test
+$ exec 4>cow
+$ ll /proc/self/fd
+total 0
+0 dr-x------ 2 ap users  0 2009-10-29 09:12 .
+0 dr-xr-xr-x 7 ap users  0 2009-10-29 09:12 ..
+0 lrwx------ 1 ap users 64 2009-10-29 09:12 0 -> /dev/pts/69
+0 l-wx------ 1 ap users 64 2009-10-29 09:12 1 -> pipe:[12575795]
+0 lrwx------ 1 ap users 64 2009-10-29 09:12 2 -> /dev/pts/69
+0 lr-x------ 1 ap users 64 2009-10-29 09:12 3 -> /home/cat/test/cow
+0 l-wx------ 1 ap users 64 2009-10-29 09:12 4 -> /home/cat/test/cow
+0 lr-x------ 1 ap users 64 2009-10-29 09:12 5 -> /proc/7825/fd
+$ # so fd3 is read-only and fd4 is write-only
+$ ll
+total 20
+ 4 drwx------  2 ap users  4096 2009-10-29 08:51 .
+16 drwx------ 50 ap users 16384 2009-10-29 09:07 ..
+ 0 -rw-------  1 ap users     0 2009-10-29 09:12 cow
+
+$ # file wiped to length zero as I did not do an append redirection
+$ echo moo >&3
+bash: echo: write error: Bad file descriptor
+$ echo moo >&4
+$ cat cow
+moo
+$ chmod 400 cow
+$ echo meow >&4
+$ cat cow
+moo
+meow
+$ echo woof >cow
+bash: cow: Permission denied
+$ echo bark >/proc/self/fd/3
+bash: /proc/self/fd/3: Permission denied        
+$ echo bark >/proc/self/fd/4
+bash: /proc/self/fd/4: Permission denied        
+$ chmod 600 cow
+$ echo bark >/proc/self/fd/3
+$ cat cow
+bark                                            
+$ echo quack >/proc/self/fd/4
+69 [29/10 09:16:47] ap@...elabs:/home/ap/test>> cat cow
+quack                                           
+
+>From this I conclude that it's not the file you upgrade from ro to rw but
+rather the file descriptor. There is a missing check in /proc that tests
+the file descriptor to see if it's ro, wo (or possible rw) and, instead,
+it only checks the inode info on the file. Since the fd is the intervening
+resources, a check should be done to see what it allows. The check for the
+inode permissions are more questionable. As can be seen above, using a fd
+directly ignores file permissions and only uses fd "permissions". Accessing
+via /proc is like accessing via fd so there is an argument to be had for
+keeping semantics the same (then again, there's an argument to be had
+for listening to file system permissions since that's also the context it's
+in).
+
+The directory permissions are irrelevant in the case of access via fd
+without the use of /proc. The directory permissions only control 3 things:
+
+1. wether you can list the dir
+2. wether you can modify the dir (add, remove, etc files)
+3. wether you can find stuff in the dir
+
+Once a fd is open the file is found and so the dir permissions are irrelevant
+and they correctly does not impact access by either the fd or via /proc.
+
+In short those "symlinks" are special and are probably used so that they
+can provide a backwards compatible way of a. using the fd via /proc and b.
+showing where it links to. Standard utils and all. I can't really see 
+another way of providing the same functionality without a new file type
+(but I may be wrong as I'm not that experienced).
+
+In the end, about the only thing that shows up, as far as I can see, is that
+the /proc interface does not check the permissions on the file descriptor
+itself to see what kind of access it should provide and, IMHO, it should.
+
+Hope all that made sense. :)
+
+-- 
+  "A search of his car uncovered pornography, a homemade sex aid, women's 
+  stockings and a Jack Russell terrier."
+    - http://www.news.com.au/story/0%2C27574%2C24675808-421%2C00.html

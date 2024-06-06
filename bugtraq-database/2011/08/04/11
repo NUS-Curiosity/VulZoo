@@ -1,0 +1,257 @@
+
+Date: Thu, 4 Aug 2011 08:07:57 GMT
+From: pi3@...ec.pl
+To: bugtraq@...urityfocus.com
+Subject: Useless OpenSSH resources exhausion bug via GSSAPI
+
+Name:                 Useless OpenSSH resources exhausion bug via GSSAPI
+Author:               Adam Zabrocki (<pi3@...ec.pl>)
+Date:                 2008-2009 (old useless bug ;P)
+
+
+   Description:
+
+	OpenSSH is a FREE version of the SSH connectivity tools
+that technical users of the Internet rely on. Users of telnet,
+rlogin, and ftp may not realize that their password is transmitted
+across the Internet unencrypted, but it is. OpenSSH encrypts all
+traffic (including passwords) to effectively eliminate eavesdropping,
+connection hijacking, and other attacks. Additionally, OpenSSH
+provides secure tunneling capabilities and several authentication
+methods, and supports all SSH protocol versions. 
+
+The Generic Security Services Application Program Interface (GSSAPI,
+also GSS-API) is an application programming interface for programs
+to access security services.
+The GSSAPI, by itself, does not provide any security. Instead,
+security service vendors provide GSSAPI implementations usually
+in the form of libraries installed with their security software. 
+
+
+   Details:
+
+	It is possible to provide any value to the xmalloc()
+function, which is simple wrapper to the malloc() function.
+This open an windows to force an application to alocate a huge
+amount of the memory (4GB?) and naturally exhause avaibale
+resources. Repeating this attack, by simple open many session,
+can kill the server.
+
+Implementation of the xmalloc() function can be found here:
+
+"xmalloc.c"
+void *
+xmalloc(size_t size)
+{
+        void *ptr;
+
+        if (size == 0)
+                fatal("xmalloc: zero size");
+        ptr = malloc(size);
+        if (ptr == NULL)
+                fatal("xmalloc: out of memory (allocating %lu bytes)", (u_long) size);
+        return ptr;
+}
+
+This wrapper check what is the return value from the malloc()
+- error supports, and check if it is not passed 0 (zero) value
+for the argument. Its very clever because a lot of bugs are
+based on misscalculation and passing 0 value for the argument
+can be exploited in some situation. Especially this is exploitable
+situation at Windows systems.
+
+The bug exists in this code:
+
+"./gss-serv.c"
+static OM_uint32
+ssh_gssapi_parse_ename(Gssctxt *ctx, gss_buffer_t ename, gss_buffer_t name)
+{
+        u_char *tok;
+        OM_uint32 offset;
+        OM_uint32 oidl;
+
+        tok = ename->value;
+..
+..
+
+        if (ename->length < 6 || memcmp(tok, "\x04\x01", 2) != 0)
+                return GSS_S_FAILURE;
+
+..
+..
+
+        oidl = get_u16(tok+2); /* length including next two bytes */
+        oidl = oidl-2; /* turn it into the _real_ length of the variable OID */
+
+..
+..
+        if (tok[4] != 0x06 || tok[5] != oidl ||
+            ename->length < oidl+6 ||
+            !ssh_gssapi_check_oid(ctx, tok+6, oidl))
+                return GSS_S_FAILURE;
+
+        offset = oidl+6;
+
+        if (ename->length < offset+4)
+                return GSS_S_FAILURE;
+
+ [1]    name->length = get_u32(tok+offset);
+        offset += 4;
+
+ [2]    if (ename->length < offset+name->length)
+                return GSS_S_FAILURE;
+
+ [3]    name->value = xmalloc(name->length+1);
+ [4]    memcpy(name->value, tok+offset, name->length);
+ [5]    ((char *)name->value)[name->length] = 0;
+
+        return GSS_S_COMPLETE;
+}
+
+It is possible to set a huge value at line [1] which can
+bypass len check at line [2] and cause to allocate our
+value +1 at line [3]. Function xmalloc() protect from
+the situation described before about passing 0 (zero)
+value to the argument a make nice working exploit via
+calling at line [4] and [5]. Anyway it is still possible
+to force an resources exhausion attack.
+
+Going furhter, definition of the structure which is
+interested for us is here:
+
+"/usr/include/gssapi/gssapi.h"
+      size_t length;
+      void *value;
+} gss_buffer_desc, *gss_buffer_t;
+
+Function ssh_gssapi_parse_ename() is called here:
+
+"./gss-serv.c"
+/* Privileged (called from accept_secure_ctx) */
+OM_uint32
+ssh_gssapi_getclient(Gssctxt *ctx, ssh_gssapi_client *client)
+{
+        int i = 0;
+
+        gss_buffer_desc ename;
+
+       ...
+       ...
+
+       if ((ctx->major = ssh_gssapi_parse_ename(ctx,&ename,
+            &client->exportedname))) {
+                return (ctx->major);
+        }
+
+       ...
+       ...
+}
+
+and this function is called here:
+
+"./gss-serv.c"
+OM_uint32
+ssh_gssapi_accept_ctx(Gssctxt *ctx, gss_buffer_desc *recv_tok,
+    gss_buffer_desc *send_tok, OM_uint32 *flags)
+{
+        OM_uint32 status;
+        gss_OID mech;
+
+ [1]    ctx->major = gss_accept_sec_context(&ctx->minor,
+            &ctx->context, ctx->creds, recv_tok,
+            GSS_C_NO_CHANNEL_BINDINGS, &ctx->client, &mech,
+            send_tok, flags, NULL, &ctx->client_creds);
+
+        if (GSS_ERROR(ctx->major))
+                ssh_gssapi_error(ctx);
+
+        if (ctx->client_creds)
+                debug("Received some client credentials");
+        else
+                debug("Got no client credentials");
+
+        status = ctx->major;
+
+        /* Now, if we're complete and we have the right flags, then
+         * we flag the user as also having been authenticated
+         */
+
+        if (((flags == NULL) || ((*flags & GSS_C_MUTUAL_FLAG) &&
+            (*flags & GSS_C_INTEG_FLAG))) && (ctx->major == GSS_S_COMPLETE)) {
+ [2]            if (ssh_gssapi_getclient(ctx, &gssapi_client))
+                        fatal("Couldn't convert client name");
+        }
+
+        return (status);
+}
+
+What is important here? Call for the vuln code is at line [2].
+Whole this code is reponsible for authentication. At line [1]
+is function which do REAL authentication. So vuln code is called
+directly after REAL auth. So (un)fortunately this bug is directly
+post-auth :( This is the reason why this bug is useless in fact
+and public now ;)
+
+Going furhter:
+
+"auth2-gss.c"
+static void
+input_gssapi_token(int type, u_int32_t plen, void *ctxt)
+{
+   ...
+
+   ...
+   ...
+        maj_status = PRIVSEP(ssh_gssapi_accept_ctx(gssctxt, &recv_tok,
+            &send_tok, &flags));
+   ...
+   ...
+}
+
+Next:
+
+/*
+ * We only support those mechanisms that we know about (ie ones that we know
+ * how to check local user kuserok and the like)
+ */
+static int
+userauth_gssapi(Authctxt *authctxt)
+{
+   ...
+
+   ...
+   ...
+        dispatch_set(SSH2_MSG_USERAUTH_GSSAPI_TOKEN, &input_gssapi_token);
+   ...
+   ...
+}
+
+and this methos is registered here:
+
+Authmethod method_gssapi = {
+        "gssapi-with-mic",
+        userauth_gssapi,
+        &options.gss_authentication
+};
+
+
+   Affected Software:
+
+	Any OpenSSH server which support "gssapi-with-mic" auth.
+In fact every modern Linux distro support it by default.
+
+
+   Greetz for Markus Friedl (openssh team).
+
+
+   Disclosure Timeline
+
+*) 01 Aug,  2011  -  release advisory
+*) 01 Aug,  2011  -  release patch
+*) 28 Jul,  2011  -  contact with vendor
+*) xx xxx,  2008  -  found bug
+
+
+--
+http://pi3.com.pl
+http://blog.pi3.com.pl/?p=159

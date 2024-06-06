@@ -1,0 +1,146 @@
+
+Date: Tue, 27 Oct 2009 20:15:31 +0100
+From: Tavis Ormandy <taviso@....lonestar.org>
+To: bugtraq@...urityfocus.com
+Subject: Invalid #PF Exception Code in VMware can result in Guest Privilege Escalation
+
+Invalid #PF Exception Code in VMware can result in Guest Privilege Escalation
+-----------------------------------------------------------------------------
+
+In protected mode, cpl is usually equal to the two least significant bits of
+the cs register. However, there is an exception: in Virtual-8086 mode, the
+cpl is always 3 (least privileged), regardless of the value of the cs
+register.
+
+When the processor raises a #PF (page fault) exception, an exception code is
+pushed onto the stack containing flags used by the operating system to
+determine the correct course of action. One of those flags is called U/S
+(user/supervisor), which is set if the fault was caused while the processor
+was in user mode.
+
+In Virtual-8086 mode, when VMware emulates a far call or far jmp instruction,
+it incorrectly pushes the return cs and ip on the stack using supervisory
+access, causing an incorrect exception code to be delivered to the guest
+kernel.
+
+As Virtual-8086 mode allows userland code to specify an arbitrary cs register,
+including the two least significant bits, an attacker can use this supervisory
+access to confuse the kernel, allowing escalation of privileges.
+
+The Common Vulnerabilities and Exposures project (cve.mitre.org) has
+assigned the name CVE-2009-2267 to this issue. 
+
+--------------------
+Affected Software
+------------------------
+
+- VMware Workstation
+- VMware Player
+- VMware ACE
+- VMware Server
+- VMware ESX
+- VMware Fusion
+- Etc.
+
+--------------------
+Consequences
+-----------------------
+
+We have successfully exploited this issue on Linux guests. Other guest
+operating systems may also be exploitable.
+
+Here is what happens on an up-to-date Ubuntu Linux 8.04 guest when the kernel
+handles the #PF exception with a spoofed supervisor bit in the exception code.
+
+(gdb) x/i $pc
+0x900:  call   0xaabb:0xccdd
+(gdb) si
+0xc031d000 in page_fault ()
+(gdb) x/x $esp
+0xdde15f08:     0x00000002
+(gdb) x/t $esp
+0xdde15f08:     00000000000000000000000000000010
+
+Examining the condition code (error_code in the snippet below), you can see it
+was caused by a data write (i.e. not an instruction fetch, the cs/eip push) in
+supervisor mode to a non-present page. This is incorrect.
+
+http://lxr.linux.no/linux+v2.6.24/arch/x86/mm/fault_32.c#L461
+
+ 461        /* User mode accesses just cause a SIGSEGV */
+ 462        if (error_code & 4) {
+ ...
+ 507no_context:
+ 508        /* Are we prepared to handle this kernel fault?  */
+ 509        if (fixup_exception(regs))
+ 510                return;
+
+With a spoofed cs register, this can lead to this path (see the
+SEGMENT_IS_PNP_CODE macro from segment_32.h), causing the kernel to
+reach the pnp_bios_is_utter_crap code, and attempting this recovery:
+
+http://lxr.linux.no/linux+v2.6.24/arch/x86/mm/extable_32.c#L20
+
+ 19                printk(KERN_CRIT "PNPBIOS fault.. attempting recovery.\n");
+ 20                __asm__ volatile(
+ 21                        "movl %0, %%esp\n\t"
+ 22                        "jmp *%1\n\t"
+ 23                        : : "g" (pnp_bios_fault_esp), "g" (pnp_bios_fault_eip));
+ 24                panic("do_trap: can't hit this");
+ 25        }
+
+pnp_bios_fault_eip and pnp_bios_fault_esp are both .bss objects, and
+will be initialised to NULL. Thus, line 22 will transfer execution to
+the first page.
+
+Therefore, incorrectly reporting the supervisor bit can lead to a local
+ring3->ring0 privilege escalation in guests.
+
+/* ... */
+    // Setup registers
+    vm.regs.eflags = EFLAGS_TF_MASK;
+    vm.regs.esp = 0xDEADBEEF;
+    vm.regs.eip = 0x00000000;
+    vm.regs.cs = 0x0090;
+    vm.regs.ss = 0xFFFF;
+
+    CODE16("call 0xaabb:0xccdd", code, codesize);
+
+    vm86(Vm86Enter, &vm);
+/* ... */
+
+The attached non-weaponised proof of concept demonstrates this by
+printing a message to the console from ring0.
+
+-------------------
+Solution
+-----------------------
+
+Updated software is available from the vendor at http://www.vmware.com/
+
+http://www.vmware.com/security/advisories/VMSA-2009-0015.html
+
+-------------------
+Credit
+-----------------------
+
+This bug was discovered by Tavis Ormandy and Julien Tinnes of the Google
+Security Team.
+
+-------------------
+Greetz
+-----------------------
+
+Greetz to Lcamtuf, LiquidK, redpig, Neel, pipacs, spoonm, asiraP,
+Jagger, and our other elite colleagues.
+
+Additional greetz to everyone at $1$K2XTi4ZA$H5Y197fbrMk85ZWzNw/Nm0.
+
+Enjoy some photography while at ring0 @ http://flickr.com/meder
+
+-- 
+-------------------------------------
+taviso@....lonestar.org | finger me for my gpg key.
+-------------------------------------------------------
+
+Download attachment "vmware86.tar.gz" of type "application/x-gzip" (2320 bytes)

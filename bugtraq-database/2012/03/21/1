@@ -1,0 +1,357 @@
+
+Date: Tue, 20 Mar 2012 23:40:02 +0000
+From: Security <security@...ynamics.com>
+To: GnuTLS Help <help-gnutls@....org>,
+  GnuTLS Development <gnutls-devel@....org>,
+  Libtasn1 List <help-libtasn1@....org>,
+  Packet Storm <submissions@...ketstormsecurity.org>,
+  Full Disclosure <full-disclosure@...ts.grok.org.uk>,
+  Bugtraq <bugtraq@...urityfocus.com>
+CC: Simon Josefsson <simon@...efsson.org>,
+  Nikos Mavrogiannopoulos <nmav@...tls.org>
+Subject: Mu Dynamics, Inc. Security Advisories MU-201202-01 and MU-201202-02
+ for GnuTLS and Libtasn1
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Mu Dynamics, Inc. Security Advisories MU-201202-01 and MU-201202-02 for GnuTLS and Libtasn1
+
+TLS record handling vulnerability in GnuTLS [MU-201202-01]
+ASN.1 length decoding vulnerability in Libtasn1 [MU-201202-02]
+
+20 March 2012
+
+http://blog.mudynamics.com/2012/03/20/gnutls-and-libtasn1-vulns/
+http://labs.mudynamics.com/advisories.html
+
+Affected Products/Versions:
+
+* libgnutls up to 3.0.16.
+* libtasn1 up to 2.11.
+
+Product Overview:
+
+GnuTLS is an open source implementation of SSL, TLS and DTLS, with APIs for 
+encrypted network communications, along with X.509, PKCS #12, OpenPGP, and 
+other security data types.
+
+Analysis:
+
+Details for TLS record handling vulnerability in GnuTLS [MU-201202-01]:
+
+The block cipher decryption logic in GnuTLS assumed that a record containing 
+any data which was a multiple of the block size was valid for further 
+decryption processing, leading to a heap corruption vulnerability.
+
+The bug can be reproduced in GnuTLS 3.0.14 by creating a corrupt 
+GenericBlockCipher struct with a valid IV, while everything else is stripped 
+off the end, while the handshake message length retains its original value:
+
+struct {
+    opaque IV[SecurityParameters.record_iv_length];
+    // corrupt: below items not sent
+    /*
+    block-ciphered struct {
+        opaque content[TLSCompressed.length];
+        opaque MAC[SecurityParameters.mac_length];
+        uint8 padding[GenericBlockCipher.padding_length];
+        uint8 padding_length;
+    };
+    */
+} GenericBlockCipher;
+
+This will cause a segmentation fault, when the ciphertext_to_compressed 
+function tries to give decrypted data to _gnutls_auth_cipher_add_auth for HMAC 
+verification, even though the data length is invalid, and it should have 
+returned GNUTLS_E_DECRYPTION_FAILED or GNUTLS_E_UNEXPECTED_PACKET_LENGTH 
+instead, before _gnutls_auth_cipher_add_auth was called.
+
+Since the error was not returned soon enough, all of the various operations 
+ciphertext_to_compressed performs: i.e. setting the IV, removing the padding, 
+setting the "true" data length with the padding stripped, checking the padding 
+size and padding payload and verifying HMAC could all reference undefined, 
+unallocated, or uninitialized memory.
+
+There could be similar ways to reproduce this for AEAD ciphers due to the 
+various flows through this code, but we did not attempt to do this, and see it 
+as a topic for further investigation.
+
+Below we trace the execution of the ciphertext_to_compressed function from 
+lib/gnutls_cipher.c. The unsafe operations and missed opportunities to return 
+before the heap corruption happens are marked with "***** ... *****" :
+
+ 433    static int
+ 434    ciphertext_to_compressed (gnutls_session_t session,
+ 435                              gnutls_datum_t *ciphertext, 
+ 436                              uint8_t * compress_data,
+ 437                              int compress_size,
+ 438                              uint8_t type, record_parameters_st * params, 
+ 439                              uint64* sequence)
+ 440    {
+...
+ 511        case CIPHER_BLOCK:
+ 512          if (ciphertext->size < MAX(blocksize, tag_size) || (ciphertext->size % blocksize != 0)) ***** UNSAFE *****
+ 513            return gnutls_assert_val(GNUTLS_E_UNEXPECTED_PACKET_LENGTH);
+ 514    
+ 515          /* ignore the IV in TLS 1.1+
+ 516           */
+ 517          if (explicit_iv)
+ 518            {
+ 519              _gnutls_auth_cipher_setiv(&params->read.cipher_state,
+ 520                ciphertext->data, blocksize);
+ 521    
+ 522              ciphertext->size -= blocksize;
+ 523              ciphertext->data += blocksize;
+ 524    
+ 525              if (ciphertext->size == 0) ***** UNSAFE *****
+ 526                {
+ 527                  gnutls_assert ();
+ 528                  return GNUTLS_E_DECRYPTION_FAILED;
+ 529                }
+ 530            }
+...
+ 537          if ((ret =
+ 538               _gnutls_cipher_decrypt (&params->read.cipher_state.cipher,
+ 539                 ciphertext->data, ciphertext->size)) < 0)
+ 540            return gnutls_assert_val(ret);
+ 541    
+ 542          pad = ciphertext->data[ciphertext->size - 1] + 1;   /* pad */
+ 543    
+ 544          if ((int) pad > (int) ciphertext->size - tag_size)
+ 545            {
+ 546              gnutls_assert ();
+ 547              _gnutls_record_log
+ 548                ("REC[%p]: Short record length %d > %d - %d (under attack?)\n",
+ 549                 session, pad, ciphertext->size, tag_size); ***** Message Appears During The Attack *****
+ 550              /* We do not fail here. We check below for the
+ 551               * the pad_failed. If zero means success.
+ 552               */
+ 553              pad_failed = GNUTLS_E_DECRYPTION_FAILED; ***** Execution Continues Anyway *****
+ 554              pad %= blocksize;
+ 555            }
+ 556    
+ 557          length = ciphertext->size - tag_size - pad;
+ 558    
+ 559          /* Check the padding bytes (TLS 1.x) */
+...
+ 577          /* Pass the type, version, length and compressed through
+ 578           * MAC.
+ 579           */
+ 580          preamble_size =
+ 581            make_preamble (UINT64DATA(*sequence), type,
+ 582                           length, ver, preamble);
+ 583          ret = _gnutls_auth_cipher_add_auth (&params->read.cipher_state, preamble, preamble_size);
+ 584          if (ret < 0)
+ 585            return gnutls_assert_val(ret);
+ 586    
+ 587          ret = _gnutls_auth_cipher_add_auth (&params->read.cipher_state, ciphertext->data, length); ***** UNSAFE, crashes here *****
+ 588          if (ret < 0)
+ 589            return gnutls_assert_val(ret); ***** Crashes Before Error Is Returned *****
+... 
+
+The segmentation fault appears as follows in GDB:
+
+Program received signal SIGSEGV, Segmentation fault.
+0x003b9946 in _nettle_sha256_compress (state=0x807f128, 
+    input=0x808f000 <Address 0x808f000 out of bounds>, k=0x3cdb60)
+    at sha256-compress.c:111
+111	sha256-compress.c: No such file or directory.
+	in sha256-compress.c
+(gdb) bt
+#0  0x003b9946 in _nettle_sha256_compress (state=0x807f128, 
+    input=0x808f000 <Address 0x808f000 out of bounds>, k=0x3cdb60)
+    at sha256-compress.c:111
+#1  0x003b961b in nettle_sha256_update (ctx=0x807f128, length=4294916861, 
+    data=0x808effc "") at sha256.c:92
+#2  0x003b336d in nettle_hmac_sha256_update (ctx=0x807f050, length=4294967280, 
+    data=0x8082b09 '\017' <repeats 16 times>) at hmac-sha256.c:43
+#3  0x0021a749 in wrap_nettle_hmac_update (_ctx=0x807f050, text=0x8082b09, 
+    textsize=4294967280) at mac.c:231
+#4  0x00158233 in _gnutls_hmac (handle=0x807ef9c, text=0x8082b09, 
+    textlen=4294967280) at ./gnutls_hash_int.h:73
+#5  0x00158b35 in _gnutls_auth_cipher_add_auth (handle=0x807ef78, 
+    text=0x8082b09, textlen=-16) at gnutls_cipher_int.c:190
+#6  0x001473de in ciphertext_to_compressed (session=0x807d810, 
+    ciphertext=0xbfffe8a4, compress_data=0x8083da4 "", compress_size=16384, 
+    type=22 '\026', params=0x807ed48, sequence=0x807efcc)
+    at gnutls_cipher.c:587
+#7  0x00145cdc in _gnutls_decrypt (session=0x807d810, 
+    ciphertext=0x8082af9 "\252\257C/7\301\362\352h|d\275#\312\027\312", '\017' <repeats 16 times>, ciphertext_size=32, data=0x8083da4 "", max_data_size=16384, 
+    type=GNUTLS_HANDSHAKE, params=0x807ed48, sequence=0x807efcc)
+    at gnutls_cipher.c:159
+...
+(gdb) 
+
+The segmentation fault appears as follows in Valgrind Memcheck:
+
+==29586== Invalid read of size 1
+==29586==    at 0x40274B9: memcpy (mc_replace_strmem.c:497)
+==29586==    by 0x42BC5A6: nettle_sha256_update (sha256.c:92)
+==29586==    by 0x42B636C: nettle_hmac_sha256_update (hmac-sha256.c:43)
+==29586==    by 0x411C748: wrap_nettle_hmac_update (mac.c:231)
+==29586==    by 0x405A232: _gnutls_hmac (gnutls_hash_int.h:73)
+==29586==    by 0x405AB34: _gnutls_auth_cipher_add_auth (gnutls_cipher_int.c:190)
+==29586==    by 0x40493DD: ciphertext_to_compressed (gnutls_cipher.c:587)
+==29586==    by 0x4047CDB: _gnutls_decrypt (gnutls_cipher.c:159)
+...
+==29586==  Address 0x4464411 is 0 bytes after a block of size 89 alloc'd
+==29586==    at 0x4024F12: calloc (vg_replace_malloc.c:467)
+==29586==    by 0x4049AE4: _mbuffer_alloc (gnutls_mbuffers.c:288)
+==29586==    by 0x4049C49: _mbuffer_linearize (gnutls_mbuffers.c:349)
+==29586==    by 0x40462FB: _gnutls_recv_in_buffers (gnutls_record.c:996)
+==29586==    by 0x404D01C: _gnutls_handshake_io_recv_int (gnutls_buffers.c:1174)
+==29586==    by 0x4050383: _gnutls_recv_handshake (gnutls_handshake.c:1260)
+...
+==29586== Invalid read of size 1
+...
+==29586==  Address 0x4464412 is 1 bytes after a block of size 89 alloc'd
+...
+==29586== Process terminating with default action of signal 11 (SIGSEGV)
+==29586==  Access not within mapped region at address 0x4779000
+==29586==    at 0x42BC946: _nettle_sha256_compress (sha256-compress.c:111)
+==29586==    by 0x42BC61A: nettle_sha256_update (sha256.c:92)
+==29586==    by 0x42B636C: nettle_hmac_sha256_update (hmac-sha256.c:43)
+==29586==    by 0x411C748: wrap_nettle_hmac_update (mac.c:231)
+==29586==    by 0x405A232: _gnutls_hmac (gnutls_hash_int.h:73)
+==29586==    by 0x405AB34: _gnutls_auth_cipher_add_auth (gnutls_cipher_int.c:190)
+==29586==    by 0x40493DD: ciphertext_to_compressed (gnutls_cipher.c:587)
+...
+Segmentation fault
+
+Details for ASN.1 length decoding vulnerability in Libtasn1 [MU-201202-02]:
+
+Various functions using the ASN.1 length decoding logic in Libtasn1 were 
+incorrectly assuming that the return value from asn1_get_length_der is always 
+less than the length of the enclosing ASN.1 structure, which is only true for 
+valid structures and not for intentionally corrupt or otherwise buggy 
+structures.
+
+Here is an example of unsafe asn1_get_length_der usage from 
+lib/minitasn1/decoding.c, in the asn1_der_decoding function:
+
+0812    asn1_retCode
+0813    asn1_der_decoding (ASN1_TYPE * element, const void *ider, int len,
+0814                       char *errorDescription)
+0815    {
+...
+1033                case TYPE_ENUMERATED:
+1034                  len2 =
+1035                    asn1_get_length_der (der + counter, len - counter, &len3);
+1036                  if (len2 < 0)
+1037                    return ASN1_DER_ERROR;
+1038                  if (len2 + len3 > len - counter)
+1039                    return ASN1_DER_ERROR;
+1040                  _asn1_set_value (p, der + counter, len3 + len2);
+1041                  counter += len3 + len2;
+1042                  move = RIGHT;
+1043                  break;
+
+The above call to asn1_get_length_der was returning an impossibly large value 
+of 2GB when the Mu analyzer generated corrupt lengths fields for versions, 
+serial numbers, public key info, and signature structures in X.509 client 
+certificates, but this could happen in any use of Libtasn1 that is relying 
+upon asn1_get_length_der, not just SSL, TLS, or GnuTLS.
+
+The asn1_der_decoding function failed to check for cases when 
+asn1_get_length_der returned a length larger than the enclosing structure's 
+(void* ider) own length (int len).
+
+When _asn1_set_value was called anyway, it contained a memcpy operation which 
+assumed the arguments are valid, which tried copy 2GB of memory, leading to a 
+heap corruption vulnerability.
+
+Simon Josefsson, Libtasn1 maintainer, described the patch as follows: "the 
+real bug was not in asn1_get_length_der() even if that is the function we 
+patch[ed]. The callers of that function that did not check that the return 
+values are sane were buggy. However, instead of fixing all callers, ... we 
+went for the simpler solution to let the function return an error for a 
+situation that is unlikely to occur without malicious interaction or data 
+corruption."
+
+The asn1_der_decoding function shown above is now safe, because 
+asn1_get_length_der was updated to "[return] -4 when the decoded length value 
+plus @len would exceed @der_len," so asn1_der_decoding returns ASN1_DER_ERROR 
+before it can call _asn1_set_value to trigger the segmentation fault.
+
+Abbreviated GDB Backtrace after the segmentation fault:
+
+(gdb) bt
+#0  __memcpy_ia32 () at ../sysdeps/i386/i686/multiarch/../memcpy.S:75
+#1  0x00000001 in ?? ()
+#2  0x0020eadc in _asn1_set_value (node=0x807ff50, value=0x807ed5c, 
+    len=2147483652) at parser_aux.c:228
+#3  0x0020a646 in asn1_der_decoding (element=0x8078000, ider=0x807ed4e, 
+    len=687, errorDescription=0x0) at decoding.c:1036
+#4  0x001bc7da in gnutls_x509_crt_import (cert=0x8078000, data=0xbfffeae8, 
+    format=GNUTLS_X509_FMT_DER) at x509.c:226
+#5  0x00176d16 in gnutls_pcert_import_x509_raw (pcert=0x807d610, 
+    cert=0xbfffeae8, format=GNUTLS_X509_FMT_DER, flags=0) at gnutls_pcert.c:201
+...
+(gdb) 
+
+Response / Solution:
+
+TLS record handling vulnerability in GnuTLS [MU-201202-01] is fixed in GnuTLS 
+3.0.15. For more details, see 
+http://article.gmane.org/gmane.comp.encryption.gpg.gnutls.devel/5912 .
+
+ASN.1 length decoding vulnerability in Libtasn1 [MU-201202-02] is fixed in 
+Libtasn1 2.12 and GnuTLS 3.0.16. For more details, see 
+http://lists.gnu.org/archive/html/help-libtasn1/2012-03/msg00000.html and 
+http://article.gmane.org/gmane.comp.encryption.gpg.gnutls.devel/5932 .
+
+History:
+
+Mon, 27 Feb 2012 14:13:45 -0800: TLS Record handling issue reported.
+Tue, 28 Feb 2012 10:29:46 +0100: TLS Record handling patch created.
+Fri, 02 Mar 2012 18:42:05 +0000: GnuTLS 3.0.15 release announced.
+Fri, 02 Mar 2012 14:04:31 -0800: ASN.1 length decoding issue reported.
+Wed, 14 Mar 2012 01:04:36 +0100: ASN.1 length decoding patch created.
+Mon, 19 Mar 2012 10:57:42 +0100: Libtasn1 2.12 release announced.
+Tue, 20 Mar 2012 23:40:00 +0000: Advisory released to the public.
+
+See also:
+
+http://article.gmane.org/gmane.comp.encryption.gpg.gnutls.devel/5912
+http://article.gmane.org/gmane.comp.encryption.gpg.gnutls.devel/5932
+http://lists.gnu.org/archive/html/help-libtasn1/2012-03/msg00000.html
+http://git.savannah.gnu.org/gitweb/?p=gnutls.git;a=commitdiff;h=b495740f2ff66550ca9395b3fda3ea32c3acb185
+http://git.savannah.gnu.org/gitweb/?p=libtasn1.git;a=commitdiff;h=6e534bf4fb3144be51c928ed3efcf9c36055c9c7
+
+Credit:
+
+These vulnerabilities were discovered by Matthew Hall <mhall@...ynamics.com>, 
+Senior Network Protocol Software Engineer at Mu Dynamics, via code inspection 
+and protocol fuzzing using a Mu 4000 security analyzer.
+
+http://blog.mudynamics.com/wp-content/uploads/2012/03/pgpkey.txt
+
+Mu Dynamics is the leading provider of solutions ensuring the performance and 
+security of both applications and network infrastructure. The company's 
+innovative solutions enable customers to confidently meet the challenges posed 
+by today's rapidly changing networks. This includes the ever-growing number of 
+applications and devices on the network, and the swift transition to mobile, 
+virtual and cloud environments. Hundreds of service providers, enterprises, 
+application developers and network equipment manufacturers count on its 
+purpose-built solutions, like Mu Studio and Blitz, to ensure their 
+applications and networks are scalable and secure. Mu Dynamics is 
+headquartered in Sunnyvale, California.
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG/MacGPG2 v2.0.18 (Darwin)
+Comment: GPGTools - http://gpgtools.org
+
+iQIcBAEBAgAGBQJPaRSqAAoJEEzdDa9po1UUuhkP/RnvCMvQwF+9UyZArKkEDVgu
+Z6NvZPcquXZhQ4MNLuIbfkikQnGg+9e7EnbKUzbxxNp7tsVN/ioVGWFHRZw3diSp
+Tknw8SZlMghz4Li/nw4ruPQcbT4r6EcDtlkJhTAtI+A2ZAlMkurMUAGIcPhX2CvU
+cpNHwGdTPqYcT4+07zzhbhf2M2MD5y1268PNEx9EN9VrZEriyDpFRBKlkkOTeti5
+LuSkhIUbiH0wChWGheM54rvsoi4LRSO8QEeeUED1kqBzNI5OJD7AB3g1RJ/K8vEB
+DjSkGmKg2siDHifNQUgwOcnED0qcUnN9LAp/1qV0Wn+DJvG3RC5hleJSHYPAW6sk
+/fmoOegRN+9TlXVI2ZBzF3ltCaDr8ktbwMUiOU/BZc0MAG2geUvGUyYGkZW0JLZN
+MZaJRMzqAS2DrKMapwDWUeNXf5rvQHU49eRweBjyE8lUA2cMtMsvgbFtTOtxAFhl
+JYytEI1e7Sh8Xo12GWUxsc6aMjIngFzs2VgfwQc283fnBjZWHZNsdX8gKcKoUY3f
+oN6IcQijxfOgCEiWkERsPtcX9GN2+9y2QLs79Z5uDeBJXCOLSzeZg93gWqjEGfcm
+64iJwKAWpGcHEr5Po3mxwA+9yREmrth+e6cax9LujiXAn1LrW2SkUXofCafYg8yd
+ym77p8ibkKLczxASVN2I
+=aqOg
+-----END PGP SIGNATURE-----

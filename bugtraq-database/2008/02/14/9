@@ -1,0 +1,148 @@
+
+Date: Wed, 13 Feb 2008 21:55:17 -0500
+From: Peter Watkins <peterw@....net>
+To: bugtraq@...urityfocus.com
+Subject: Apache web server 2.2: htpasswd predictable salt weakness
+
+Disclaimer:
+
+This is not the first time this issue has been discussed. Andreas
+Steinmetz posted about the problem for an Apache httpd release in 2003.
+  http://www.securityfocus.com/archive/1/339138
+  http://www.securityfocus.com/bid/8707
+Philipp Krammer reported that he notifed the vendor over five years
+ago, in January 2003. http://www.securityfocus.com/archive/1/339163
+
+What's new is
+  1) The vendor has released another major version of the 
+     affected software, Apache web server 2.2, with the same flaw.
+  2) While no official patch is available (due to the vendor's inaction),
+     an unofficial patch is now available.
+
+-Peter
+http://www.tux.org/~peterw/
+
+Background:
+
+Apache web server supports three different algorithms for 
+"encrypted" passwords for HTTP Basic authentication:
+ - Unix-style crypt() passwords: uses a 12 bit salt (4096
+   possible values) and only the first 8 characters of the 
+   cleartext password are used
+ - SHA hashes: no salt; any given password can have only one
+   {SHA} representation
+ - MD5 passwords: based on the BSD MD5 crypt routine, this
+   provides for 48 bits of salt, for a theoretical 281 trillion
+   (281,474,976,710,656) possible representations of any password
+
+Apache web server includes a command-line utility called 'htpasswd'
+for managing the files used for HTTP Basic authentication. It can be 
+used (depending on the host OS) to create encrypted passwords with 
+any of the supported algorithms. 
+
+Problem:
+
+The htpasswd utility uses predictable salts for the salted algoritms
+(Unix-style "CRYPT" and MD5). htpasswd uses the standard C rand()
+function to generate "random" salts. In order to use rand(), htpasswd
+seeds the random number generator with the srand() function. And that's
+where the Apache developers made a critical mistake -- htpasswd 
+merely uses the time of day (seconds since the Epoch, time(NULL)) to
+seed the random number generator. 
+
+As a result:
+ - Salts created by htpasswd are very predictable. 
+ - The universe of salts for htpasswd is far less than the MD5 algorithm
+   provides for -- 29 bits vs. 48, or 0.000191 percent of the range that
+   should be used for MD5.
+ - Any passwords encrypted by htpasswd within the same second of
+   system clock time will have the same salt, e.g.
+      $ htpasswd -nbm user1 pass1; htpasswd -nbm user2 pass2; \
+        htpasswd -nbm user3 pass2
+      user1:$apr1$7jv93/..$2J9qu4mN2zms5O42vw/XE.
+      user2:$apr1$7jv93/..$55cRqVaWTSB1YQpeD5uYe0
+      user3:$apr1$7jv93/..$55cRqVaWTSB1YQpeD5uYe0
+   All three users have the same salt, "7jv93/..", and user2 and user3 
+   have the same encrypted password representation. 
+
+Clearly, this is not good.
+
+Furthermore, as you can see in that example, and as Andreas Krennmair
+reported to the Apache Group in 2004, the htpasswd utility does not
+use the full 48 bits of salt for the MD5 algorithm -- the last two
+characters are always "..". So htpasswd tries creates 36-bit salt strings. 
+Given that the srand() problem both reduces the universe to something 
+like 29 bits[0] *and* makes the salt highly predictable, this 36-vs-48 
+distinction is a moot point -- as long as the srand() seeding is bad.
+
+The problem appears completely contained within the htpasswd utility;
+Apache web server handles all properly encrypted passwords as it should.
+
+Workarounds:
+
+1) If you are concerned about the possibilty of the vastly reduced 
+   salt space making your password tables vulnerable to pre-computed
+   dictionary attacks, use an updated htpasswd utility to re-encrypt
+   all MD5 or CRYPT passwords.
+
+2) Use an alternate tool for generating your password hashes. 
+   Implementations of the CRYPT and "apr1" MD5 algorithms are available
+   for various programming languages and platforms -- you don't need to
+   use the inferior tool from the Apache project.
+
+Solution:
+
+htpasswd should at least use a more random seed for the srand() calls
+so that rand() can produce less predictable salts. It should also, as
+Andreas Krennmair noted, make full use of the 48-bit-wide salt capability 
+of its "apr1" MD5 algorithm.
+
+Patches:
+
+Patches are available in Apache's "issues" database that correct both the 
+weak seeding of srand() and, thanks to Andreas, the 36/48 bit salt size 
+for MD5: 
+  http://issues.apache.org/bugzilla/show_bug.cgi?id=31440
+
+Here's sample output from a patched htpasswd utility:
+
+$ htpasswd -nbm user1 pass1; htpasswd -nbm user2 pass2; \
+  htpasswd -nbm user3 pass2
+user1:$apr1$wMdual6C$4.JZNIEfbWvF7OKvpsTGO0
+user2:$apr1$LCXYBrpM$6ypjd9FWcVjt6niwCHst71
+user3:$apr1$7vefL1ic$6WdQmN9sMUQvQvMGVyHU//
+
+The patch I submitted to the Apache group
+ 1) by default makes use of the /dev/urandom device that is available
+    on most modern open systems OSes 
+ 2) allows the user to specify another seed source (such as /dev/random)
+    via an environment variable
+ 3) prints a warning if it has to fall back to using time()
+
+Users of Microsoft Windows or other target platforms that lack /dev/urandom
+might want to improve on this approach with appropriate APIS such as
+RtlGenRandom on Windows. Also, the patch provides no updates to the htpasswd 
+man page documentation.
+
+History:
+
+Vulnerability reported via vendor's bug tracking database, and source
+code patch made available, on 25 January 2008.
+
+Vendor security contact notified via email on 4 February 2008.
+
+Vendor response: 
+
+None, as of 13 February 2008.
+
+----------------------------------------------------------------------
+[0] For any given PRNG. In theory, different machines could have 
+different PRNG algorithms, providing some additional security. But in
+my tests, most common Linux flavors (Linux being perhaps the most 
+popular platfor for Apache web server) use the same PRNG and physically
+different systems produce the same output from htpasswd for any given 
+clock time / time() value. 29 bits are enough to represent every time()
+value since before the first release of Apache web server. As noted in
+Bugzilla, the narrower the timeframe an attacker is interesetd in, the
+smaller the list of possible salts.
+
