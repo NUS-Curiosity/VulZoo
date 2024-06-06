@@ -1,0 +1,171 @@
+
+Date: 8 Dec 2006 20:59:52 -0000
+From: cxib@...urityreason.com
+To: bugtraq@...urityfocus.com
+Subject: PHP 5.2.0 session.save_path safe_mode and open_basedir bypass
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+[PHP 5.2.0 session.save_path safe_mode and open_basedir bypass]
+
+
+Author: Maksymilian Arciemowicz (SecurityReason)
+Date:
+- - Written: 02.10.2006
+- - Public: 08.12.2006
+SecurityAlert Id: 43
+CVE: CVE-2006-6383
+SecurityRisk: High
+Affected Software: PHP 5.2.0
+Advisory URL: http://securityreason.com/achievement_securityalert/43
+Vendor: http://www.php.net
+
+- --- 0.Description ---
+PHP is an HTML-embedded scripting language. Much of its syntax is borrowed from C, Java and Perl with a couple of unique PHP-specific features thrown in. The goal of the language is to allow web developers to write dynamically generated pages quickly.
+
+A nice introduction to PHP by Stig Sather Bakken can be found at http://www.zend.com/zend/art/intro.php on the Zend website. Also, much  of the PHP Conference Material is freely available. 
+
+Session support in PHP consists of a way to preserve certain data across subsequent accesses. This enables you to build more customized applications and increase the appeal of your web site.
+
+A visitor accessing your web site is assigned a unique id, the so-called session id. This is either stored in a cookie on the user side or is propagated in the URL.
+
+session.save_path defines the argument which is passed to the save handler. If you choose the default files handler, this is the path where the files are created. Defaults to /tmp. See also session_save_path().
+
+There is an optional N argument to this directive that determines the number of directory levels your session files will be spread around in. For example, setting to '5;/tmp' may end up creating a session file and location like /tmp/4/b/1/e/3/sess_4b1e384ad74619bd212e236e52a5a174If . In order to use N you must create all of these directories before use. A small shell script exists in ext/session to do this, it's called mod_files.sh. Also note that if N is used and greater than 0 then automatic garbage collection will not be performed, see a copy of php.ini for further information. Also, if you use N, be sure to surround session.save_path in "quotes" because the separator (;) is also used for comments in php.ini. 
+
+- --- 1. session.save_path safe mode and open basedir bypass ---
+session.save_path can be set in ini_set(), session_save_path() function. In session.save_path there must be path where you will save yours tmp file. But syntax for session.save_path can be:
+
+[/PATH]
+
+OR
+
+[N;/PATH]
+
+N - can be a string.
+
+EXAMPLES:
+
+1. session_save_path("/DIR/WHERE/YOU/HAVE/ACCESS")
+2. session_save_path("5;/DIR/WHERE/YOU/HAVE/ACCESS")
+
+and 
+
+3. session_save_path("/DIR/WHERE/YOU/DONT/HAVE/ACCESS\0;/DIR/WHERE/YOU/HAVE/ACCESS")
+
+
+- -1477-1493--- Code from PHP520 ext/session/session.c [START]
+PHP_FUNCTION(session_save_path)
+{
+	zval **p_name;
+	int ac = ZEND_NUM_ARGS();
+	char *old;
+
+	if (ac < 0 || ac > 1 || zend_get_parameters_ex(ac, &p_name) == FAILURE)
+		WRONG_PARAM_COUNT;
+	
+	old = estrdup(PS(save_path));
+
+	if (ac == 1) {
+		convert_to_string_ex(p_name);
+		zend_alter_ini_entry("session.save_path", sizeof("session.save_path"), Z_STRVAL_PP(p_name), Z_STRLEN_PP(p_name), PHP_INI_USER, PHP_INI_STAGE_RUNTIME);
+	}
+	
+	RETVAL_STRING(old, 0);
+}
+- -1477-1493--- Code from PHP520 ext/session/session.c [END]
+
+Values are set to hash_memory (but before that, safe_mode and open_basedir check this value).
+And if you are starting session (for example session_start()), that value from session.save_path is checked by function PS_OPEN_FUNC(files).
+
+- -242-300--- Code from PHP520 ext/session/mod_files.c [START]
+PS_OPEN_FUNC(files)
+{
+	ps_files *data;
+	const char *p, *last;
+	const char *argv[3];
+	int argc = 0;
+	size_t dirdepth = 0;
+	int filemode = 0600;
+
+	if (*save_path == '\0') {
+		/* if save path is an empty string, determine the temporary dir */
+		save_path = php_get_temporary_directory();
+	}
+	
+	/* split up input parameter */
+	last = save_path;
+	p = strchr(save_path, ';');
+	while (p) {
+		argv[argc++] = last;
+		last = ++p;
+		p = strchr(p, ';');
+		if (argc > 1) break;
+	}
+	argv[argc++] = last;
+
+	if (argc > 1) {
+		errno = 0;
+		dirdepth = (size_t) strtol(argv[0], NULL, 10);
+		if (errno == ERANGE) {
+			php_error(E_WARNING, 
+					"The first parameter in session.save_path is invalid");
+			return FAILURE;
+		}
+	}
+	
+	if (argc > 2) {
+		errno = 0;
+		filemode = strtol(argv[1], NULL, 8);
+		if (errno == ERANGE || filemode < 0 || filemode > 07777) {
+			php_error(E_WARNING, 
+					"The second parameter in session.save_path is invalid");
+			return FAILURE;
+		}
+	}
+	save_path = argv[argc - 1];
+
+	data = emalloc(sizeof(*data));
+	memset(data, 0, sizeof(*data));
+	
+	data->fd = -1;
+	data->dirdepth = dirdepth;
+	data->filemode = filemode;
+	data->basedir_len = strlen(save_path);
+	data->basedir = estrndup(save_path, data->basedir_len);
+	
+	PS_SET_MOD_DATA(data);
+	
+	return SUCCESS;
+}
+- -242-300--- Code from PHP520 ext/session/mod_files.c [END]
+
+Because in session.save_path there is a NULL byte before ";", strchr() doesn't see ";" and path is /DIR/WHERE/YOU/DONT/HAVE/ACCESS.
+
+Problem exists because safe_mode and open_basedir check what is after ;. And it is needed to set correct path after ";".
+
+- --- 2. How to fix ---
+http://cvs.php.net/viewcvs.cgi/php-src/NEWS
+
+- --- 3. Greets ---
+
+For: sp3x
+and
+l5x, p_e_a, lorddav, pi3
+
+- --- 4. Contact ---
+Author: SecurityReason.Com [ Maksymilian Arciemowicz ( cXIb8O3 ) ]
+Email: cxib [at] securityreason [dot] com
+GPG: http://securityreason.com/key/Arciemowicz.Maksymilian.gpg
+
+Regards 
+SecurityReason
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.2.2 (FreeBSD)
+
+iD8DBQFFedKL3Ke13X/fTO4RAms1AKCTSc8CNZmHWhXvOdjtTBcIgdHTuwCgkvrz
+9KnewH0rOVFfmPRx2f1x5W4=
+=YAP9
+-----END PGP SIGNATURE-----

