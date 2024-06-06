@@ -1,0 +1,394 @@
+
+Date: Fri, 7 Apr 2006 19:04:52 +0400
+From: Alexey Dobriyan <adobriyan@...il.com>
+To: Luigi Auriemma <aluigi@...istici.org>
+Cc: vuln@...unia.com, bugs@...uritytracker.com,
+	full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com,
+	news@...uriteam.com
+Subject: Re: Format string in Doomsday 1.8.6
+
+
+On Mon, Apr 03, 2006 at 11:20:34PM +0200, Luigi Auriemma wrote:
+> Application:  Doomsday engine
+
+> The Doomsday engine contains many functions used for the visualization
+> of the messages in the console.
+> Both Con_Message and conPrintf are vulnerable to a format string
+> vulnerability which could allow an attacker to execute malicious code
+> versus the server or the clients.
+> The first function calls a "Con_Printf(buffer)" while the second one
+> calls a "SW_Printf(prbuff)" if SW_IsActive is enabled (which means
+> ever).
+>
+> >From Src/con_main.c:
+>
+> void Con_Message(const char *message, ...)
+> {
+> 	va_list argptr;
+> 	char   *buffer;
+>
+> 	if(message[0])
+> 	{
+> 		buffer = malloc(0x10000);
+>
+> 		va_start(argptr, message);
+> 		vsprintf(buffer, message, argptr);
+
+Duh!
+
+> 		va_end(argptr);
+>
+> #ifdef UNIX
+> 		if(!isDedicated)
+> 		{
+> 			// These messages are supposed to be visible in the real console.
+> 			fprintf(stderr, "%s", buffer);
+> 		}
+> #endif
+>
+> 		// These messages are always dumped. If consoleDump is set,
+> 		// Con_Printf() will dump the message for us.
+> 		if(!consoleDump)
+> 			printf("%s", buffer);
+>
+> 		// Also print in the console.
+> 		Con_Printf(buffer);
+>
+> 		free(buffer);
+> 	}
+> 	Con_DrawStartupScreen(true);
+> }
+>
+> ...
+>
+> void conPrintf(int flags, const char *format, va_list args)
+> {
+> 	unsigned int i;
+> 	int     lbc;				// line buffer cursor
+> 	char   *prbuff, *lbuf = malloc(maxLineLen + 1);
+> 	cbline_t *line;
+>
+> 	if(flags & CBLF_RULER)
+> 	{
+> 		Con_AddRuler();
+> 		flags &= ~CBLF_RULER;
+> 	}
+>
+> 	// Allocate a print buffer that will surely be enough (64Kb).
+> 	// FIXME: No need to allocate on EVERY printf call!
+> 	prbuff = malloc(65536);
+>
+> 	// Format the message to prbuff.
+> 	vsprintf(prbuff, format, args);
+>
+> 	if(consoleDump)
+> 		fprintf(outFile, "%s", prbuff);
+> 	if(SW_IsActive())
+> 		SW_Printf(prbuff);
+
+> 4) Fix
+> ======
+>
+>
+> No fix.
+
+C'mon! Just how hard it to do something like this:
+
+diff -uprN Src.orig/con_main.c Src/con_main.c
+--- Src.orig/con_main.c	2005-01-08 19:11:54.000000000 +0300
++++ Src/con_main.c	2006-04-07 18:22:55.000000000 +0400
+@@ -988,7 +988,7 @@ static void printcvar(cvar_t *var, char
+ 	if(var->flags & CVF_PROTECTED)
+ 		equals = ':';
+ 
+-	Con_Printf(prefix);
++	Con_Printf("%s", prefix);
+ 	switch (var->type)
+ 	{
+ 	case CVT_NULL:
+@@ -2782,7 +2782,7 @@ void Con_Message(const char *message, ..
+ 			printf("%s", buffer);
+ 
+ 		// Also print in the console.
+-		Con_Printf(buffer);
++		Con_Printf("%s", buffer);
+ 
+ 		free(buffer);
+ 	}
+diff -uprN Src.orig/sys_master.c Src/sys_master.c
+--- Src.orig/sys_master.c	2004-06-13 16:46:30.000000000 +0400
++++ Src/sys_master.c	2006-04-07 18:23:56.000000000 +0400
+@@ -171,7 +171,7 @@ int N_MasterSendAnnouncement(void *parm)
+ 	   memset(buf, 0, sizeof(buf));
+ 	   while(recv(s, buf, sizeof(buf) - 1, 0) > 0)
+ 	   {
+-	   Con_Printf(buf);
++	   Con_Printf("%s", buf);
+ 	   memset(buf, 0, sizeof(buf));
+ 	   }
+ 	 */
+
+Or even better:
+
+diff -uprN Src.orig/Common/m_multi.c Src/Common/m_multi.c
+--- Src.orig/Common/m_multi.c	2004-10-23 16:42:46.000000000 +0400
++++ Src/Common/m_multi.c	2006-04-07 18:09:21.000000000 +0400
+@@ -312,7 +312,7 @@ int Executef(int silent, char *format, .
+ 	char    buffer[512];
+ 
+ 	va_start(argptr, format);
+-	vsprintf(buffer, format, argptr);
++	vsnprintf(buffer, sizeof(buffer), format, argptr);
+ 	va_end(argptr);
+ 	return Con_Execute(buffer, silent);
+ }
+diff -uprN Src.orig/Common/p_xgline.c Src/Common/p_xgline.c
+--- Src.orig/Common/p_xgline.c	2004-12-23 17:48:56.000000000 +0300
++++ Src/Common/p_xgline.c	2006-04-07 18:09:15.000000000 +0400
+@@ -81,7 +81,7 @@ void XG_Dev(const char *format, ...)
+ 	if(!xgDev)
+ 		return;
+ 	va_start(args, format);
+-	vsprintf(buffer, format, args);
++	vsnprintf(buffer, sizeof(buffer), format, args);
+ 	strcat(buffer, "\n");
+ 	Con_Message(buffer);
+ 	va_end(args);
+diff -uprN Src.orig/con_main.c Src/con_main.c
+--- Src.orig/con_main.c	2005-01-08 19:11:54.000000000 +0300
++++ Src/con_main.c	2006-04-07 18:22:55.000000000 +0400
+@@ -988,7 +988,7 @@ static void printcvar(cvar_t *var, char 
+ 	if(var->flags & CVF_PROTECTED)
+ 		equals = ':';
+ 
+-	Con_Printf(prefix);
++	Con_Printf("%s", prefix);
+ 	switch (var->type)
+ 	{
+ 	case CVT_NULL:
+@@ -1304,7 +1304,7 @@ int Con_Executef(int silent, const char 
+ 	char    buffer[4096];
+ 
+ 	va_start(argptr, command);
+-	vsprintf(buffer, command, argptr);
++	vsnprintf(buffer, sizeof(buffer), command, argptr);
+ 	va_end(argptr);
+ 	return Con_Execute(buffer, silent);
+ }
+@@ -1966,7 +1966,7 @@ void conPrintf(int flags, const char *fo
+ 	prbuff = malloc(65536);
+ 
+ 	// Format the message to prbuff.
+-	vsprintf(prbuff, format, args);
++	vsnprintf(prbuff, sizeof(prbuff), format, args);
+ 
+ 	if(consoleDump)
+ 		fprintf(outFile, "%s", prbuff);
+@@ -2765,7 +2765,7 @@ void Con_Message(const char *message, ..
+ 		buffer = malloc(0x10000);
+ 
+ 		va_start(argptr, message);
+-		vsprintf(buffer, message, argptr);
++		vsnprintf(buffer, sizeof(buffer), message, argptr);
+ 		va_end(argptr);
+ 
+ #ifdef UNIX
+@@ -2782,7 +2782,7 @@ void Con_Message(const char *message, ..
+ 			printf("%s", buffer);
+ 
+ 		// Also print in the console.
+-		Con_Printf(buffer);
++		Con_Printf("%s", buffer);
+ 
+ 		free(buffer);
+ 	}
+@@ -2806,7 +2806,7 @@ void Con_Error(const char *error, ...)
+ 		fprintf(outFile, "Con_Error: Stack overflow imminent, aborting...\n");
+ 
+ 		va_start(argptr, error);
+-		vsprintf(buff, error, argptr);
++		vsnprintf(buff, sizeof(buff), error, argptr);
+ 		va_end(argptr);
+ 		Sys_MessageBox(buff, true);
+ 
+@@ -2821,7 +2821,7 @@ void Con_Error(const char *error, ...)
+ 	Dir_ChDir(&ddRuntimeDir);
+ 
+ 	va_start(argptr, error);
+-	vsprintf(err, error, argptr);
++	vsnprintf(err, sizeof(err), error, argptr);
+ 	va_end(argptr);
+ 	fprintf(outFile, "%s\n", err);
+ 
+diff -uprN Src.orig/dd_pinit.c Src/dd_pinit.c
+--- Src.orig/dd_pinit.c	2004-06-01 20:11:38.000000000 +0400
++++ Src/dd_pinit.c	2006-04-07 18:17:27.000000000 +0400
+@@ -82,7 +82,7 @@ void DD_ErrorBox(boolean error, char *fo
+ 	va_list args;
+ 
+ 	va_start(args, format);
+-	vsprintf(buff, format, args);
++	vsnprintf(buff, sizeof(buff), format, args);
+ 	va_end(args);
+ #ifdef WIN32
+ 	MessageBox(NULL, buff, "Doomsday " DOOMSDAY_VERSION_TEXT,
+diff -uprN Src.orig/dpMapLoad/glBSP/system.c Src/dpMapLoad/glBSP/system.c
+--- Src.orig/dpMapLoad/glBSP/system.c	2004-07-25 00:05:32.000000000 +0400
++++ Src/dpMapLoad/glBSP/system.c	2006-04-07 18:16:37.000000000 +0400
+@@ -54,7 +54,7 @@ void FatalError(const char *str, ...)
+   va_list args;
+ 
+   va_start(args, str);
+-  vsprintf(message_buf, str, args);
++  vsnprintf(message_buf, sizeof(message_buf), str, args);
+   va_end(args);
+ 
+   (* cur_funcs->fatal_error)("\nError: *** %s ***\n\n", message_buf);
+@@ -68,7 +68,7 @@ void InternalError(const char *str, ...)
+   va_list args;
+ 
+   va_start(args, str);
+-  vsprintf(message_buf, str, args);
++  vsnprintf(message_buf, sizeof(message_buf), str, args);
+   va_end(args);
+ 
+   (* cur_funcs->fatal_error)("\nINTERNAL ERROR: *** %s ***\n\n", message_buf);
+@@ -82,7 +82,7 @@ void PrintMsg(const char *str, ...)
+   va_list args;
+ 
+   va_start(args, str);
+-  vsprintf(message_buf, str, args);
++  vsnprintf(message_buf, sizeof(message_buf), str, args);
+   va_end(args);
+ 
+   (* cur_funcs->print_msg)("%s", message_buf);
+@@ -100,7 +100,7 @@ void PrintWarn(const char *str, ...)
+   va_list args;
+ 
+   va_start(args, str);
+-  vsprintf(message_buf, str, args);
++  vsnprintf(message_buf, sizeof(message_buf), str, args);
+   va_end(args);
+ 
+   (* cur_funcs->print_msg)("Warning: %s", message_buf);
+@@ -122,7 +122,7 @@ void PrintMiniWarn(const char *str, ...)
+   if (cur_info->mini_warnings)
+   {
+     va_start(args, str);
+-    vsprintf(message_buf, str, args);
++    vsnprintf(message_buf, sizeof(message_buf), str, args);
+     va_end(args);
+ 
+     (* cur_funcs->print_msg)("Warning: %s", message_buf);
+@@ -132,7 +132,7 @@ void PrintMiniWarn(const char *str, ...)
+ 
+ #if DEBUG_ENABLED
+   va_start(args, str);
+-  vsprintf(message_buf, str, args);
++  vsnprintf(message_buf, sizeof(message_buf), str, args);
+   va_end(args);
+ 
+   PrintDebug("MiniWarn: %s", message_buf);
+diff -uprN Src.orig/dpMapLoad/maploader.c Src/dpMapLoad/maploader.c
+--- Src.orig/dpMapLoad/maploader.c	2004-10-23 16:42:48.000000000 +0400
++++ Src/dpMapLoad/maploader.c	2006-04-07 18:17:05.000000000 +0400
+@@ -202,7 +202,7 @@ static void fatal_error(const char *str,
+ 	va_list args;
+ 
+ 	va_start(args, str);
+-	vsprintf(buffer, str, args);
++	vsnprintf(buffer, sizeof(buffer), str, args);
+ 	va_end(args);
+ 
+ 	Con_Error(buffer);
+@@ -218,7 +218,7 @@ static void print_msg(const char *str, .
+ 	va_list args;
+ 
+ 	va_start(args, str);
+-	vsprintf(buffer, str, args);
++	vsnprintf(buffer, sizeof(buffer), str, args);
+ 	va_end(args);
+ 
+ 	Con_Message(buffer);
+diff -uprN Src.orig/drD3D/main.cpp Src/drD3D/main.cpp
+--- Src.orig/drD3D/main.cpp	2004-12-23 18:52:48.000000000 +0300
++++ Src/drD3D/main.cpp	2006-04-07 18:09:43.000000000 +0400
+@@ -75,7 +75,7 @@ void DP(const char *format, ...)
+ 	va_list args;
+ 	char buf[2048];
+ 	va_start(args, format);
+-	vsprintf(buf, format, args);
++	vsnprintf(buf, sizeof(buf), format, args);
+ 	va_end(args);
+ 	Con_Message("%s\n", buf);
+ }
+diff -uprN Src.orig/m_string.c Src/m_string.c
+--- Src.orig/m_string.c	2004-06-01 20:11:40.000000000 +0400
++++ Src/m_string.c	2006-04-07 18:17:58.000000000 +0400
+@@ -185,7 +185,7 @@ void Str_Appendf(ddstring_t * ds, const 
+ 
+ 	// Print the message into the buffer.
+ 	va_start(args, format);
+-	vsprintf(buf, format, args);
++	vsnprintf(buf, sizeof(buf), format, args);
+ 	va_end(args);
+ 	Str_Append(ds, buf);
+ }
+diff -uprN Src.orig/sys_master.c Src/sys_master.c
+--- Src.orig/sys_master.c	2004-06-13 16:46:30.000000000 +0400
++++ Src/sys_master.c	2006-04-07 18:23:56.000000000 +0400
+@@ -171,7 +171,7 @@ int N_MasterSendAnnouncement(void *parm)
+ 	   memset(buf, 0, sizeof(buf));
+ 	   while(recv(s, buf, sizeof(buf) - 1, 0) > 0)
+ 	   {
+-	   Con_Printf(buf);
++	   Con_Printf("%s", buf);
+ 	   memset(buf, 0, sizeof(buf));
+ 	   }
+ 	 */
+diff -uprN Src.orig/sys_musd_win.c Src/sys_musd_win.c
+--- Src.orig/sys_musd_win.c	2004-06-01 20:11:50.000000000 +0400
++++ Src/sys_musd_win.c	2006-04-07 18:17:44.000000000 +0400
+@@ -779,7 +779,7 @@ int DM_WinCDCommand(char *returnInfo, in
+ 	MCIERROR error;
+ 
+ 	va_start(args, format);
+-	vsprintf(buf, format, args);
++	vsnprintf(buf, sizeof(buf), format, args);
+ 	va_end(args);
+ 
+ 	if((error = mciSendString(buf, returnInfo, returnLength, NULL)))
+diff -uprN Src.orig/sys_sock.c Src/sys_sock.c
+--- Src.orig/sys_sock.c	2004-06-01 20:11:50.000000000 +0400
++++ Src/sys_sock.c	2006-04-07 18:15:13.000000000 +0400
+@@ -95,7 +95,7 @@ void N_SockPrintf(socket_t s, const char
+ 
+ 	// Print the message into the buffer.
+ 	va_start(args, format);
+-	length = vsprintf(buf, format, args);
++	length = vsnprintf(buf, sizeof(buf), format, args);
+ 	va_end(args);
+ 
+ 	if(length > sizeof(buf))
+diff -uprN Src.orig/sys_stwin.c Src/sys_stwin.c
+--- Src.orig/sys_stwin.c	2005-01-03 16:08:50.000000000 +0300
++++ Src/sys_stwin.c	2006-04-07 18:13:25.000000000 +0400
+@@ -137,7 +137,7 @@ void SW_Printf(const char *format, ...)
+ 		return;
+ 
+ 	va_start(args, format);
+-	printedChars += vsprintf(buf, format, args);
++	printedChars += vsnprintf(buf, sizeof(buf), format, args);
+ 	va_end(args);
+ 
+ 	if(printedChars > 32768)
+
+
+Even more better is to apply rm(1).
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
+
+

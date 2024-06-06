@@ -1,0 +1,516 @@
+
+Date: 18 Apr 2006 15:01:18 -0000
+From: Roy.Batty@...eaker.net
+To: bugtraq@...urityfocus.com
+Subject: Ad-Aware Revisited
+
+
+--------
+
+[Abstract]
+Ad-Aware is anti-spyware program from Lavasoft. Running 
+it gives you a false sense of safeness. There can be done numerous attacks 
+against this software. I'll show some of the problems and attacks in this 
+write-up. Here's just a summary of the most visible problems I've run into.
+
+1.   Definition file
+1.1. "Encrypted" with xor                  \ 
+1.2. Packed with ZIP with simple password  - trivial to intercept def 
+                                             updates and change the defs 
+                                             to make the malware invisible
+1.3. No checksum in the def file           /
+1.4. Big redundancy in the def file
+1.5. !!! Multiplying the number of entries in the def file with constant
+     1.46 to make it look it has more definitions !!!
+
+2.   Program
+2.1. Poorly written checksum algo
+2.2. Poorly written scanning algo
+2.3. CSI works only for in-memory images
+
+You want the proofs? Read the following text ...
+
+---------------------------------------------------------------------------
+
+1. [Intro]
+"Lavasoft is the industry leader and most respected provider of 
+anti-spyware solutions. Lavasoft develops and delivers the highest quality 
+antispyware solutions to keep your computer or network free of 
+compromising and intrusive threats to your privacy."
+
+--
+
+This write-up reviews the industry leading antispyware solution from the most 
+respected provider of anti-spyware solutions - Ad-Aware from Lavasoft. I 
+will show that this software simply doesn't do what what the PR tells.
+
+2. [Ad-Aware SE]
+"Ad-Aware SE is the latest version of our award winning and industry 
+leading line of antispyware solutions and represents the next generation 
+in Spyware detection and removal. It is quite simply the most advanced 
+solution available to protect your privacy. With the all new Code Sequence 
+Identification (CSI) technology that we have developed, you will not only 
+be protected from known content, but will also have advanced protection 
+against many of their unknown variants. "
+
+--
+
+2.1. "Encrypted" with xor
+The reference file defs.ref is just a plain ZIP file that is then 
+"encrypted" using following algo.
+
+void decode_mem(char *b, unsigned int b_s)
+{
+  static char decode_string[] = "\x00\x50\x50\x50\x50\x50\x50\x50\x68\x69\x73\x20\x70\x67\x67\x67\x67\x67\x67\x20\x6d\x75\x73\x74\xe0\xe0\xe0\xe0\xe0\xe0\x6e";
+
+  int unsigned y = 0;
+  for(unsigned int x = 0; x < b_s; x++)
+  {
+    b[x] ^= decode_string[y];
+    if(++y == (sizeof(decode_string) - 1))
+      y = 0;
+  }
+}
+
+Pointer b points to memory with the content of defs.ref and b_s is just 
+size of the buffer.
+
+2.2. Packed with ZIP with simple password
+After "decrypting" there is a ZIP file with file 29388543757543549 inside. 
+The file name is visible in ad-aware.exe. The ZIP file is password 
+protected and the password is "This program ^u@...streams145681902". First 
+part of the password [This program ^u@...streams] is in plaintext inside 
+ad-aware.exe, second part is created runtime.
+
+2.3. No checksum in the def file
+After "decrypting" and decompressing there is a definition file with 
+following structure.
+
+[header]
+[family names]
+[www names]
+[family descriptions]
+[obj_stream]
+
+offset   size                    description
+ 32h     WORD?                   internal build
+ 80h     ????                    version of ref file, ends with 0ffh
+100h     ????                    family names, separated by 0ffh, ends with 0ffffh
+????     ????                    www names, separated with 0ffh, ends with 0ffffh
+                                 and content of ini file 
+                                 (comments for family names)
+                                 gets stored to description.ini
+
+????     ????                    stream of objects ... starts with word OBJ_STREAM(n)[x]
+                                 where n is prolly number of the stream streamu (1 for now)
+                                 - IMHO preparation for incremental updates -
+                                 and x is nunmber of objects in the stream
+                                 at the end of stream there is 0ffffh again
+
+[Example of reference file, info gives ad-aware directly]
+Definitions File Loaded:
+Reference Number : SE1R47 24.05.2005            offet 80h
+Internal build : 55                             offst 32h
+File location : G:\nada\nada\defs.ref           ...
+File size : 435074 Bytes                        file size before decompression
+Total size : 1439523 Bytes                      file size after decompression
+Signature data size : 1408291 Bytes             sizeof(family descriptions) + sizeof(obj_stream)
+Reference data size : 30720 Bytes               family names size
+Signatures total : 40174                        [x] * 1.46 + www names
+CSI Fingerprints total : 886                    entries in OBJ_STREAM with type 0f0h
+CSI data size : 30371 Bytes                     sizeof entries with type 0f0h
+Target categories : 15                          known before
+Target families : 679                           count of family names
+
+There is no checksum of the content of the definition file nor is the file 
+signed. It is trivial to modify the content of the file, for example 
+modifying checksums of malware binaries by malware that wants to hide 
+itself from Ad-aware is thus really _very_ easy.
+
+2.4. Big redundancy in the def file
+The definitions consist of registry keys, www sites, file names and the 
+most visible part form the checksums of malware binaries.
+
+[ Snippet from defs.ref]
+...
+3830397280 . 10842529196097280 . 97280.  . .
+3657194622 . 106199918742094622 . 94622.  . .
+3830994208 . 1059056701129094208 . 94208.  . .
+3697194208 . 105862934264094208 . 94208.  . .
+3697194210 . 1058568963132094210 . 94210.  . .
+...
+
+Every checksum entry consists of a header, reference to family name and 
+three ASCII numbers. Two of the numbers are checksums concatenated with file
+size and the third one is the file size.
+
+...
+38303[97280]
+108425291960[97280]
+[97280]
+...
+
+2.5. Poorly written checksum algo
+Computation of first level checksum
+unsigned int compute_first_level_fingerprint(unsigned char *b)
+{
+  unsigned int checksum = 0;
+
+  for(unsigned int x = 0; x < 0x600; x += 0x20)
+  {
+    checksum += b[x];
+    checksum += x;
+  }
+
+  return checksum;
+}
+
+Computation of second level checksum
+unsigned int compute_second_level_fingerprint(unsigned char *b, int l)
+{
+  unsigned int checksum = 0;
+  unsigned int x = 0;
+
+  for(; x < 0x2000; x += 0x2)
+  {
+    checksum += b[x];
+    checksum += x;
+
+    if(x >= (l - 2))
+      break;
+  }
+
+  for(x = (l >> 1); x < (l >> 1) + 0x7ffc; x += 0x2)
+  {
+    checksum += b[x];
+    checksum += x;
+
+    if(x >= (l - 2))
+      break;
+  }
+
+  return checksum;
+}
+
+Pointer b points to buffer holding content of the file, l is the 
+buffer/file size.
+
+  ...
+  sprintf(size, "%d", x);
+  sprintf(first_level, "%d%d", compute_first_level_fingerprint(b), x);
+  sprintf(second_level, "%d%d%d%d", compute_second_level_fingerprint(b, x), (unsigned char) b[x >> 1], (unsigned char) b[x - 4], x);
+  ...
+
+  first_level  now holds the first level checksum
+  second_level now holds the second leve checksum
+  size         now holds the file size
+
+Now we can just do a string compare against checksum entries in data file. 
+If match is found, the fourth word is a index into family names string 
+list. There are also entries that have description incorporated, but the 
+entry structure is very easy to guess - feel free to explore it on your 
+own.
+
+As you can see, the checksum is really very basic one and could be easily 
+spoofed. Colisions are easy to find. Next thing is the ASCII format of the 
+checksums and file size concatenating. 
+
+Lavasoft claims "Now Ad-Aware and Ad-Watch Use much smaller 
+reference files" and I just have to say: there is a big redundancy and 
+inefficiency in their reference files.
+
+2.6. !!! Multiplying the number of entries in the def file with constant
+     1.46 to make it look it has more definitions !!!
+And the last and the worst thing about definition file. They take the x 
+number from OBJ_STREAM (ie. the real object/entries count in the 
+definition file) and MULTIPLY it with number 1.46 and this value is then 
+showed to the user as REAL number of definitions in the file. 
+
+2.7. Poorly written scanning algo
+"Scanning speed increased" is what LavaSoft claims. Let's look at the reality.
+
+The pseudo-C code of Ad-Aware file scan algo follows.
+for entry from entries
+{
+  alloc_mem(file_size);
+  
+  read_file_to_memory();      // no memory mapped files, ReadFile()
+  count_checksums();
+
+  if(does_match_entry(entry, checksums))
+    break;
+
+  free_mem();
+}
+
+The real "Scanning speed increased" algo follows.
+  map_file_to_memory();
+  count_checksums();
+
+for entry from entries
+{
+  if(does_match_entry(entry, checksums))
+    break;
+}
+  unmap_file_from_memory();
+
+So if you run the Ad-Awares file scan and you hear disk making noisy 
+sounds, it's not like Ad-Aware is doing a good job finding the malware on 
+your drive. It's just it uses very poorly written algo, that makes a lot 
+of unnecessary disk reads thus wasting resources of your computer.
+
+2.7. CSI works only for in-memory images and is useless
+"Uses our all new CSI (Code Sequence Identification) technology to 
+identify new and unknown variants of known targets"
+
+Oh. What a technology! I wondered how they're doing this, I was thinking 
+about some emulation engine, code shrinker, advanced pattern matching ... 
+I also thought (everyone must think that based on the docs) that CSI is used on file 
+scanning basis. It's not. CSI scanning is used only when scanning in-memory 
+modules and thus ... is useless even if the algo would be the best one in the 
+world - and it ain't.
+
+3. [Outro]
+"Lavasoft's Ad-Aware SE, the world's leading brand in antispyware 
+solutions, has been acknowledged and awarded in variety of distunguished 
+magazines and publications all over the world."
+
+
+This text was written in the city of Sofia
+(C) 1999-06 Roy Batty, who is a stranger in the world he was made to live in
+roy.batty@...eaker.net
+
+Eddie lives...somewhere in time
+
+---------------------------------------------------------------------------
+
+[decode.cpp]
+#include <stdio.h>
+#include <stdlib.h>
+#include <windows.h>
+
+void decode_mem(char *b, unsigned int b_s)
+{
+  static char decode_string[] = "\x00\x50\x50\x50\x50\x50\x50\x50\x68\x69\x73\x20\x70\x67\x67\x67\x67\x67\x67\x20\x6d\x75\x73\x74\xe0\xe0\xe0\xe0\xe0\xe0\x6e";
+
+  int unsigned y = 0;
+  for(unsigned int x = 0; x < b_s; x++)
+  {
+    b[x] ^= decode_string[y];
+    if(++y == (sizeof(decode_string) - 1))
+      y = 0;
+  }
+}
+
+
+void main(int argc, char *argv[])
+{
+  if(argc < 2)
+  {
+    printf("Syntax: decrypt_def_file.exe <def_file>\n");
+    return;
+  }
+
+  HANDLE h = CreateFile(argv[1], GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, 0);
+  if(h == INVALID_HANDLE_VALUE)
+    return;
+
+  DWORD s = SetFilePointer(h, 0, 0, FILE_END);
+  SetFilePointer(h, 0, 0, FILE_BEGIN);
+
+  HANDLE m = CreateFileMapping(h, NULL, PAGE_READWRITE, 0, 0, NULL);
+  CloseHandle(h);
+
+  if(h == INVALID_HANDLE_VALUE)
+    return;
+
+  char *b = (char *) MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+  CloseHandle(m);
+  if(!b)
+    return;
+
+  decode_mem(b, s);
+
+  UnmapViewOfFile(b);
+  
+  return;
+}
+[decode.cpp]
+
+
+{Just a signatures loader (copy the part of reference files with numbers) and 
+ file scanner. Poorly coded, just testing code to prove my talk.}
+[signatures.cpp]
+#include "signatures.hpp"
+
+AV_ENTRY *pos_head  = NULL;
+int sigs;
+
+void load_sigs(unsigned char *b)
+{
+  int sigs = 0;
+
+  while(*b != 0xff)
+  {
+    int ref, l;
+    char *first;
+    char *snd;
+    char *len;
+    char *desc;
+
+    ref = 0;
+    desc = NULL;
+
+    if(*b != 1)
+      return;
+
+    b += 3;
+    if(*(b - 2))
+    {
+      l = (*(WORD *) (b - 2));
+      desc = new char[l + 1];
+      memset(desc, '\x0', l + 1);
+      strncpy(desc, b, l);
+
+      b += l;
+    }
+
+    if(*b == 0x3)
+    {
+      ref = *(WORD *) (b + 2);
+      b += 9;
+    }
+    else
+      b += 4;
+
+    l = (*(WORD *) (b - 2));
+    first = new char[l + 1];
+    memset(first, '\x0', l + 1);
+    strncpy(first, b, l);
+    b += l;
+    b += 3;
+
+    l = (*(WORD *) (b - 2));
+    snd = new char[l + 1];
+    memset(snd, '\x0', l + 1);
+    strncpy(snd, b, l);
+    b += l;
+    b += 3;
+
+    l = (*(WORD *) (b - 2));
+    len = new char[l + 1];
+    memset(len, '\x0', l + 1);
+    strncpy(len, b, l);
+    b += l;
+
+    AV_ENTRY *av = new AV_ENTRY;
+    av->first_level = first;
+    av->second_level = snd;
+    av->length = len;
+    av->description = desc;
+    av->family_ref = ref;
+
+    av->next = pos_head;
+    pos_head = av;
+
+    sigs++;
+  }
+}
+
+unsigned int compute_first_level_fingerprint(unsigned char *b)
+{
+  unsigned int checksum = 0;
+
+  for(unsigned int x = 0; x < 0x600; x += 0x20)
+  {
+    checksum += b[x];
+    checksum += x;
+  }
+
+  return checksum;
+}
+
+unsigned int compute_second_level_fingerprint(unsigned char *b, int l)
+{
+  unsigned int checksum = 0;
+  unsigned int x = 0;
+
+  for(; x < 0x2000; x += 0x2)
+  {
+    checksum += b[x];
+    checksum += x;
+
+    if(x >= (l - 2))
+      break;
+  }
+
+  for(x = (l >> 1); x < (l >> 1) + 0x7ffc; x += 0x2)
+  {
+    checksum += b[x];
+    checksum += x;
+
+    if(x >= (l - 2))
+      break;
+  }
+
+  return checksum;
+}
+
+int scan_file(char *ff)
+{
+  FILE *f = fopen(ff, "rb");
+  if(!f)
+    return FALSE;
+
+  int x = fseek(f, 0, SEEK_END);
+  if(x)
+  {
+    fclose(f);
+    return FALSE;
+  }
+
+  x = ftell(f);
+  fseek(f, 0, SEEK_SET);
+
+  char *b = new char[x];
+  fread(b, sizeof(unsigned char), x, f);
+  fclose(f);
+
+  char first_level[256];
+  char second_level[256];
+  char size[256];
+
+  memset(first_level, '\x0', sizeof(first_level));
+  memset(second_level, '\x0', sizeof(second_level));
+  memset(size, '\x0', sizeof(size));
+
+  sprintf(size, "%d", x);
+  sprintf(first_level, "%d%d", compute_first_level_fingerprint(b), x);
+  sprintf(second_level, "%d%d%d%d", compute_second_level_fingerprint(b, x), (unsigned char) b[x >> 1], (unsigned char) b[x - 4], x);
+
+  for(AV_ENTRY *av = pos_head; av; av = av->next)
+  {
+    if(strcmp(size, av->length))
+      continue;
+
+    if(strcmp(first_level, av->first_level))
+      continue;
+
+    if(strcmp(second_level, av->second_level))
+      continue;
+
+    printf("[%d]->[%s]->[%s]", av->family_ref, first_level, second_level);
+
+    delete b;
+    return av->family_ref;
+  }
+
+  delete b;
+  return 0;
+}
+
+[signatures.cpp]
+
+---------------------------------------------------------------------------
+
+

