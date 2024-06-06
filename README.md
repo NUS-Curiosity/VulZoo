@@ -6,6 +6,11 @@
 
 VulZoo is a vulnerability intelligence dataset that integrates various sources of structured and unstructured data. It is designed to be used by security researchers, penetration testers, and security analysts to get a comprehensive view of vulnerabilities and their associated data.
 
+This dataset is divided into two parts: 
+
+- `raw-data/`: contains the raw data from different sources.
+- `vulzoo/`: contains the processed data that is more structured and easier to use.
+
 ## How to Use
 
 Pre-requisites:
@@ -33,7 +38,7 @@ cd VulZoo/
 ./update-databases.sh
 ```
 
-## Integrated Sources
+## Data Sources
 
 ### Structural
 
@@ -56,4 +61,3 @@ cd VulZoo/
 ### Hybrid
 
 - [Linux Kernel Vulns](https://git.kernel.org/pub/scm/linux/security/vulns.git)
-
