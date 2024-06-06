@@ -1,0 +1,274 @@
+
+Date: Sat, 4 Jun 2005 21:46:07 -0700 (PDT)
+From: "C.J. Steele, CISSP" <coreyjsteele@...oo.com>
+To: bugtraq@...urityfocus.com
+Subject: `tattle` -- automatic reporting of SSH brute-force attacks
+
+
+Inspired by a post to the SANS Intrusions list, I have written `tattle`
+to automate the reporting of SSH brute-force attacks.  
+
+`tattle` is a perl script that crawls through your sshd logs
+(/var/log/messages, or wherever you tell it to look) and finds hosts
+who've connected to your SSH server.  All hosts who connect to your
+box, and that are not accounted for in the exception list, are reported
+to the point-of-contact for the domain the host is registered too
+(where available.)  Long story-short, if you stick `tattle` in your
+cron-tab, you can automate the reporting of ssh brute-force attacks.  
+
+If you're interested, you can download `tattle` from
+http://sodaphish.com/files/tattle (its also pasted to the end of this
+email.)
+
+Ciao,
+-C
+
+
+
+
+#!/usr/bin/perl
+# tattle by C.J. Steele, CISSP <coreyjsteele@...oo.com>
+#	 (C)opyright 2005, C.J. Steele, all rights reserved.
+#
+# NOTICE: you're on your own with whatever 'messes' reporting this sort
+of
+# activity may create...you've been warned.
+# 
+# This script processes log files and attempts to automatically notify
+domain
+# authorities of machines in their domain that are actively performing
+SSH
+# brute-force attacks.  Mangle the variables above the warning to your
+liking,
+# but it would be adviseable not to venture past the warning unless you
+know a
+# bit of perl and are comfortable doing so.
+#
+#
+use strict;
+use MIME::Lite;
+use File::MkTemp;
+
+my $logfile = "/var/log/messages"; #the place where ssh logs to
+my $tmpdir = "/tmp"; #for use when we write out our logs
+my @exceptions = ( "10.10.10.10", "your.net" );  #domains not to notify
+of ssh attacks, i.e. your domains
+my $smtp_host = "localhost";  #your mail server
+my $smtp_sendas = "your\@email.com"; #a VALID e-mail address to send
+the e-mails out as
+my $smtp_message = "An attempt to brute-force account passwords over
+SSH has been detected by a machine in your domain.  Attached are logs
+indicating the times and dates of the activity.  Please take the
+necessary action(s) to stop this activity.  If you have any questions,
+please reply to this email or contact me at $smtp_sendas."; #the
+nasty-gram
+
+
+########################################################################
+# DO NOT MUCK AROUND BELOW THIS POINT UNLESS YOU KNOW WHAT YOU'RE DOING
+########################################################################
+
+my @offenders = getoffenders( $logfile ); 
+
+foreach my $offender ( @offenders )
+{
+	my $tld = gettld( $offender );
+	my @addies = getemails( $tld );
+	if( scalar( @addies ) )
+	{
+		my $logpath = writelogs( getlogs( $offender ) );
+		foreach my $addie ( @addies )
+		{
+			#create the email...
+			my $email = MIME::Lite->new(
+				From	=> "$smtp_sendas",
+				To		=> "$addie",
+				Cc		=> "$smtp_sendas",
+				Subject	=> "SSH Brute-force Attack",
+				Type	=> "TEXT",
+				Data	=> "$smtp_message"
+				);
+			#attach our log files/evidence...
+			$email->attach(
+				Type	=> 'text/plain',
+				Path	=> $logpath,
+				Filename => "$offender.txt"
+				);
+			$email->send( 'smtp', "$smtp_host" );
+			print "I: e-mail sent to $addie ($offender)\n";
+		} #end foreach
+	} else {
+		print "E: no e-mail addresses found for $tld\n";
+	} #endif
+} #end foreach
+
+exit( 0 );
+
+
+
+
+sub getlogs
+# this routine parses the log file and finds entries that match the
+$mark,
+# which is passed in as a parameter, and creates an array, each element
+of
+# which is a matching line of the log, the single array is returned.
+{
+	my $mark = shift; 
+	my @logentries = (); 
+	open( LOG, $logfile ) or die( "$!" );
+	while( <LOG> )
+	{
+		chomp();
+		if( $_ =~ /$mark/ )
+		{
+			push( @logentries, $_ ); 
+		} #endif
+	} #end while
+	close( LOG );
+	return @logentries; 
+} #end getlogs()
+
+
+
+
+sub writelogs
+# this writes the array of log entries passed via args to a randomly
+created
+# temporary file, the name of which is returned as a single scalar
+value, with
+# fully-qualified path.
+{
+	my @logs = @_;
+	my $tmpfile = mktemp( "$tmpdir/rptbdgys.XXXXXX" );
+	open( OUT, ">$tmpfile" ) or die( "$!" );
+	foreach( @logs )
+	{
+		print OUT $_, "\n"; 
+	}
+	close( OUT );
+	return $tmpfile;
+} #end writelogs
+
+
+
+
+sub getoffenders
+# this returns an array of offending hostnames from the logfile, except
+those
+# who are listed in the @exceptions array.  
+{
+	my $log = shift;
+	my @offs;
+	open( LOG, $log ) or die( "$!" );
+	while( <LOG> )
+	{
+		chomp( $_ );
+		if( $_ =~ /sshd/ and $_ =~ /rhost/ )
+		{
+			my @e = split( /\s/, $_ );
+			my $off = $e[12];  
+			$off =~ s/rhost\=//; 
+			$off =~ s/ruser\=//; #why do I need this?
+			if( $off ne "" )
+			{
+				push( @offs, $off ) if( ! isin( $off, @offs ) and ! isin( $off,
+@exceptions ) );
+			} #endif
+		} #endif
+	} #endwhile
+	close( LOG );
+	return( @offs );
+} #end getoffenders()
+
+
+
+
+sub gettld
+# this returns a single scalar value containing the top-level domain or
+# the ip address fed in.  This won't work for a site who's address is
+# dom.com.co
+{
+	my $in = shift;
+	if( $in =~ /[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/ )
+	{
+		# its an IP address... try reverse lookup, if that fails, return IP
+		return $in;
+	} else {
+		# its a hostname
+		my @bits = split( /\./, $in );
+		my $bitslen = scalar( @bits );
+		if( $bitslen > 2 )
+		{
+			if( length( $bits[$bitslen-1] ) == 2 )
+			{
+				# country-level tld
+				if( length( $bits[$bitslen-2] ) > 3 ){
+					return "$bits[$bitslen-2].$bits[$bitslen-1]";
+				} else {
+					return "$bits[$bitslen-3].$bits[$bitslen-2].$bits[$bitslen-1]";
+				} #endif
+			} else {
+				# tld
+				return "$bits[$bitslen-2].$bits[$bitslen-1]";
+			} #endif
+		} else {
+			return $in;
+		} #endif
+	} #endif
+} #end gettld()
+
+
+
+
+sub getemails
+# gets a list of unique email addresses that were returned for as part 
+# of the domain's `whois` records.  The results are returned as a 
+# singular array.
+{
+	my $tld = shift;
+	my $whois = `/usr/bin/whois $tld`;
+	my @emailaddies;
+	foreach( split( /\n/, $whois ) )
+	{
+		chomp();
+		if( $_ =~ /[a-zA-Z0-9]*\@[a-zA-Z0-9]*/ )
+		{
+			# the line had an e-mail address in it... 
+			my @bits = split( /\s/, $_ ); 
+			foreach my $bit ( @bits )
+			{
+				if( $bit =~ /[a-zA-Z0-9]*\@[a-zA-Z0-9]*/ and $bit !~
+/\@apnic\.net$/ )
+				{
+					push( @emailaddies, $bit ) if( ! isin( $bit, @emailaddies ) );
+				} #endif 
+			} #end foreach
+		} #endif
+	}#end foreach
+	return @emailaddies;
+} #end getemails
+
+
+
+
+sub isin
+# this boolean function simply checks to see if an element ($e) is in
+the
+# supplied array (@a) -- it returns 1 if the element is in the array
+and 0 
+# otherwise.
+{
+	my( $e, @a ) = @_;
+	foreach( @a )
+	{
+		return 1 if( $e eq $_ );
+	}
+	return 0;
+} #end isin()
+
+
+--
+C.J. Steele, CISSP <coreyjsteele@...oo.com>
+
+

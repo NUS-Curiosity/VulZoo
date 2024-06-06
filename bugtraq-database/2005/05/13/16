@@ -1,0 +1,153 @@
+
+Date: Thu, 12 May 2005 08:39:44 +0200 (CEST)
+From: Lars Olsson <jlo@...d.luth.se>
+To: BUGTRAQ@...urityfocus.com
+Subject: 32-bit qmail fun (qmail-pop3d) (fwd)
+
+
+
+
+---------- Forwarded message ----------
+Date: Sat, 7 May 2005 16:37:22 +0200 (CEST)
+From: Lars Olsson <jlo@...d.luth.se>
+To: full-disclosure@...ts.grok.org.uk
+Cc: bugtraq@...urityfocus.com, djb@...yp.to
+Subject: 32-bit qmail fun (qmail-pop3d)
+
+As noted in my previous mail, there's a potential problem in alloc() in
+alloc.c in the qmail package. Similar routines are also used in djbdns.
+
+To reiterate:
+
+#define ALIGNMENT 16 /* XXX: assuming that this alignment is enough */
+#define SPACE 4096 /* must be multiple of ALIGNMENT */
+
+typedef union { char irrelevant[ALIGNMENT]; double d; } aligned;
+static aligned realspace[SPACE / ALIGNMENT];
+#define space ((char *) realspace)
+static unsigned int avail = SPACE; /* multiple of ALIGNMENT; 0<=avail<=SPACE */
+
+/*@...l@...*@out@...har *alloc(n)
+unsigned int n;
+{
+   char *x;
+   n = ALIGNMENT + n - (n & (ALIGNMENT - 1)); /* XXX: could overflow */
+   if (n <= avail) { avail -= n; return space + avail; }
+   x = malloc(n);
+   if (!x) errno = error_nomem;
+   return x;
+}
+
+As noted in the sourcecode (and why wasn't this fixed if it was noticed, I
+wonder?), an overflow is indeed possible if n >= 0xfffffff0. This causes n
+to truncate to 0 and the function will return a valid pointer that points
+to somewhere in the static realspace buffer.
+
+As noted by Guninski, qmail can be made to crash on 64-bit architectures
+with lots of memory. One of the examples he provided was of qmail-smtpd
+crashing in the commands() loop. I believe this is due to the overflow
+listed above as I had theoretically mapped out just this scenario:
+
+from commands()
+...
+     for (;;) {
+       if (!stralloc_readyplus(&cmd,1)) return -1;
+       i = substdio_get(ss,cmd.s + cmd.len,1);
+       if (i != 1) return i;
+       if (cmd.s[cmd.len] == '\n') break;
+       ++cmd.len;
+     }
+
+stralloc_readyplus() allocates one extra byte via alloc_re() which in
+turn uses alloc() and then byte_copy(). With a 64-bit arch and enough
+memory this will trigger the alloc() overflow eventually and byte_copy()
+will then overwrite the realspace buffer and beyond until it hits an
+invalid memory address and crashes (thus not exploitable, I don't think.)
+
+The problem with alloc() is rather fundamental though and it's not related
+to 64-bit architectures or lots of memory.
+
+However, it's not as easy to trigger as it may first seem. I've found
+several instances where at first it appeared it would lead to an
+exploitable overwrite but various obstacles turned out to prevent it. For
+example, stralloc_* calls like the one in commands() are of less interest
+since they seem to inevitably lead to a crash (which means DoS at most,
+right?) Focusing on direct *alloc() calls, I found that there were
+usually sanity checks on the size argument or else something else
+prevented the attacker from specifying arbitrary numbers.
+
+However, I think I might have possibly found something in qmail-pop3d.c:
+
+struct message {
+   int flagdeleted;
+   unsigned long size;
+   char *fn;
+} *m;
+int numm;
+
+int last = 0;
+
+void getlist()
+{
+   struct prioq_elt pe;
+   struct stat st;
+   int i;
+
+   maildir_clean(&line);
+   if (maildir_scan(&pq,&filenames,1,1) == -1) die_scan();
+
+   numm = pq.p ? pq.len : 0;
+   m = (struct message *) alloc(numm * sizeof(struct message));
+   if (!m) die_nomem();
+
+   for (i = 0;i < numm;++i) {
+     if (!prioq_min(&pq,&pe)) { numm = i; break; }
+     prioq_delmin(&pq);
+     m[i].fn = filenames.s + pe.id;
+     m[i].flagdeleted = 0;
+     if (stat(m[i].fn,&st) == -1)
+       m[i].size = 0;
+     else
+       m[i].size = st.st_size;
+   }
+}
+
+if numm is made large enough, the call to alloc() will return a pointer to
+somewhere in the realspace buffer. The m[i].* assignments can then be made
+to overwrite interesting memory locations.
+
+numm is the number of files (= mails) in the user's Maildir. This is
+controllable by an attacker (but the number of files must be >=
+(0xfffffff0 / sizeof(struct message)) which needs quite a lot of memory to
+hold the required structures and could also put some strain on the
+filesystem, I guess?)
+
+To break out of the loop before hitting invalid memory, either the
+prioq_min() must be made to fail or numm could be overwritten with a
+smaller number, provided that the variable is located after realspace
+(depends on the compiler I guess.)
+
+Then there's the question of what to overwrite, provided that the above
+actually works (of which I'm far from certain.)
+
+A good candidate would be ssmsg, once again with the proviso that it's
+been placed after realspace, since it contains a function pointer.
+
+Then there's the question of how to spawn a shell. I'm not even going to
+touch that at all....
+
+Also, qmail-pop3d is only run after the user has been authenticated by
+qmail-popup so an attacker must have at least a POP3 account.
+
+This is but a sketch of an attack scenario and it's quite complex. I
+wouldn't be the least surprised if it turns out to be a non-issue; like I
+said, I have found things before that weren't exploitable because some
+pesky details...And it's quite possible that I have misunderstood
+something that invalidates the above scenario. I trust that someone will
+point this out :)
+
+
+Cheers,
+Lars
+
+

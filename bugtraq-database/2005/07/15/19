@@ -1,0 +1,183 @@
+
+Date: Fri, 15 Jul 2005 01:52:51 +0200 (CEST)
+From: Leon Juranic <ljuranic@....hr>
+To: bugtraq@...urityfocus.com
+Subject: LSS Security Advisory: Winamp remote buffer overflow vulnerability
+
+
+
+
+					LSS Security Advisory #LSS-2005-07-14
+ 					       http://security.lss.hr
+
+
+
+ 
+Title: Winamp remote buffer overflow vulnerability
+Advisory ID: LSS-2005-07-14
+Date: 2005-07-14
+Advisory URL: http://security.lss.hr/index.php?page=details&ID=LSS-2005-07-14
+Impact: Remote and local code execution
+Risk Level: High
+Vulnerability Type: Remote and local
+Vendors Status: Vendor was contacted on 22. Juny, 2005
+
+
+
+
+
+ 
+==[ Overview
+
+Winamp is a skinnable, multi-format, freeware audio player made by Nullsoft.
+It is available for free download from http://www.winamp.com/. Due to its
+popularity, winamp has got into "Hall of Fame" on CNET's www.download.com.
+The vulnerability described in this advisory could be used to spread malicious
+code such as a virus within mp3 files, which are commonly very trusted.
+
+
+
+==[ Vulnerability
+
+Winamp is vulnerable to a buffer overflow vulnerability when processing ID3v2 
+tags of mp3 files. To exploit this vulnerability, a user has to add malformed 
+mp3 file to the Winamp playlist, and play it.
+When playing mp3 file is finished, playlist is updated, and if some part of
+the ID3v2 tag (e.g. ARTIST or TITLE) is too long, it is possible to overflow
+value that is later used as the source address in the strcpy() function. 
+The strcpy() call can overflow a value (in the DATA segment) that will later,
+in jump instruction, point code execution to some attacker-supplied buffer,
+where malicious code can be executed.
+
+Before it is possible to overflow important value in the DATA segment, 
+a simple "sanity check" has to be passed. In the next piece of asm code,
+we control the EAX register (because of the first overflow), and after 
+returning from the function, that EAX is used as source address for 
+strcpy().
+
+This "sanity check" code will test if there is a value 0x00000001 (ECX) 
+in memory on offset 0x9B4 from EAX address. 
+If that condition is true, then after returning from the function, the same
+EAX content will be used as the source address in strcpy(). 
+If the condition is false, EAX is set to a value that is located on offset 
+0x9B8 from current EAX register address, and the program will jump to the 
+begining of the loop. 
+
+--------------------------------------------------------
+004371FA  /$ 8B4424 04      MOV EAX,DWORD PTR SS:[ESP+4]
+004371FE  |> 85C0           /TEST EAX,EAX
+00437200  |. 74 14          |JE SHORT Winamp.00437216
+00437202  |. 8B88 B4090000  |MOV ECX,DWORD PTR DS:[EAX+9B4]
+00437208  |. 3B4C24 08      |CMP ECX,DWORD PTR SS:[ESP+8]
+0043720C  |. 74 0D          |JE SHORT Winamp.0043721B
+0043720E  |. 8B80 B8090000  |MOV EAX,DWORD PTR DS:[EAX+9B8]
+00437214  |.^EB E8          \JMP SHORT Winamp.004371FE
+00437216  |> B8 DC124600    MOV EAX,Winamp.004612DC  ;  ASCII "No Entry"
+0043721B  \> C3             RETN
+--------------------------------------------------------
+
+Here is that asm code roughly reversed:
+
+--------------------------------------------------------
+char *check (char *arg, int val)  // val = 0x00000001
+{
+	while (arg != NULL)
+	{ 
+	   if (*((int*)&arg[2484]) == val) // 0x9b4 = dec. 2484
+		return arg;
+	   else arg = (char*)*((long*)&arg[2488]);  // 0x9b8 = dec. 2488
+	}  
+	arg = "No Entry";
+	return arg;
+}
+--------------------------------------------------------
+
+To bypass that check, EAX (arg) has to be set to the address of string buffer 
+where on address EAX+9B4 is value 0x00000001 (val), and that string has to be
+still long enough to overflow onto the "jump address". The string needs to be at 
+least 284 bytes long to overflow onto the "jump address" in the DATA segment.  
+The ID3v2 data resides in the DATA segment (that is static), and there are a lot 
+of 0x00000001 values in it, so it is possible to determine a static address that 
+will work every time for some Winamp and Windows versions.
+
+Due to the fact that if condition EAX+9B4=0x00000001 isn't met, EAX is
+set to value at address EAX+9B8 and condition would be tested again, 
+maybe it is even possible to create some brute-force buffer(s) that 
+will "scan" the memory for 0x00000001, but this is purely theoretical,
+and probably unlikely.
+
+When the "sanity check" is bypassed, strcpy() will be executed, and the "jump
+address" will be overflowed. That strcpy() code is presented below.
+
+--------------------------------------------------------
+00438D59  |. 50             PUSH EAX     ; /src = "FFFFFFFFFFFFFFFFFFFF..."
+00438D5A  |. FF75 08        PUSH DWORD PTR SS:[EBP+8]        ; |dest
+00438D5D  |. E8 60D20100    CALL <JMP.&MSVCRT.strcpy>        ; \strcpy
+--------------------------------------------------------
+
+The destination address for strcpy() is 280 bytes away from the "jump address" 
+that has to be overflowed to redirect code execution. In this particular example,
+it is 0x00470D40.
+
+After that is done, next piece of code will take the overflowed "jump address" 
+from address 0x00470E58 and point code execution onto it.
+
+--------------------------------------------------------
+0041D440  /$ A1 580E4700    MOV EAX,DWORD PTR DS:[470E58]
+0041D445  |. 85C0           TEST EAX,EAX
+0041D447  |. 74 03          JE SHORT winamp.0041D44C
+0041D449  |. FF60 48        JMP DWORD PTR DS:[EAX+48] <- 0wnZ Winamp
+0041D44C  \> C3             RETN
+--------------------------------------------------------
+
+
+We have tried and managed to reliably exploit this vulnerability on Windows XP 
+SP1 and windows 2000 SP0, with Winamp versions 5.03a, 5.09 and 5.091.
+
+It is important to say that this vulnerability is not easy to exploit, but
+with the help of static addresses from the DATA segment, it is possible to create
+reliable exploit. Beside, there are few possible exploitation vectors for this 
+vulnerability, depending on what actions are performed by user on malformed mp3
+file. 
+For example - in version 5.03a, if the malformed mp3 file is added to the playlist 
+with 'add-folder' option, it isn't needed to bypass the previously mentioned 
+"sanity check".
+
+
+
+ 
+==[ Affected Version
+
+The vulnerability was tested on Winamp versions 5.03a, 5.09 and 5.091.
+
+
+ 
+==[ Fix
+
+A patched version should be soon available for download from www.winamp.com. 
+Thanks to the winamp development team for good cooperation and a quick response.
+
+
+
+==[ PoC Exploit
+
+PoC mp3 file can be downloaded at http://security.lss.hr/PoC/demo.mp3.
+
+
+ 
+==[ Credits
+
+Credits for this vulnerability goes to Leon Juranic <ljuranic@....hr>.
+
+
+ 
+==[ LSS Security Contact
+ 
+LSS Security Team, 
+
+WWW : http://security.lss.hr
+E-mail : security@....hr
+Tel : +385 1 6129 775 
+
+
+

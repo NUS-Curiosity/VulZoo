@@ -1,0 +1,343 @@
+
+Date: Tue, 13 Sep 2005 23:55:17 -0400
+From: Martin Roesch <roesch@...rcefire.com>
+To: "Ferguson, Justin (IARC)" <FergusonJ@...doe.gov>
+Cc: "'snort-devel@...ts.sourceforge.net'" <snort-devel@...ts.sourceforge.net>,
+	"'snort-users@...ts.sourceforge.net'" <snort-users@...ts.sourceforge.net>,
+	"'bugtraq@...urityfocus.com'" <bugtraq@...urityfocus.com>
+Subject: Re: [Snort-users] Snort DoS Fallacies
+
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Ok, I'll put aside all assumptions about your motives and just lay it  
+out as straight as I'm able.
+
+On Sep 13, 2005, at 7:43 PM, Ferguson, Justin (IARC) wrote:
+
+>  As for whether the other tcp options can cause the same problem I
+> am not sure, you are correct in that I did not go that far into it,  
+> however
+> because the pointer was not checked, it feasibly *could* happen,
+
+If you can't execute a code path that could result in an execution  
+fault then it's not a bug.  For example, we don't validate that the  
+Packet pointer that gets passed into the decoder is valid because the  
+design of the program.  Anyway...
+
+> I will take your word on it, and you are correct I did not bother  
+> to check
+> through the entire source tree, believe it or not, that's your job,  
+> not
+> mine--
+
+It becomes your job when you speak up, pundits add no value to open  
+source projects and when you stepped up to "set the record straight"  
+with incorrect or incomplete data you don't get to get off the hook  
+by saying "it's not my job".
+
+Let's go thru the code:
+
+First off, check out in spo_alert_fast.c:
+
+     208     if(p && data->packet_flag)
+     209     {
+     210         fputc('\n', data->file);
+     211
+     212         if(p->iph)
+     213             PrintIPPkt(data->file, p->iph->ip_proto, p);
+     214         else if(p->ah)
+     215             PrintArpHeader(data->file, p);
+     216     }
+
+So we only hit this code if data->packet_flag is set.  Where are we  
+getting data->packet_flag from?  Let's grep for it in the file:
+
+     134 void AlertFast(Packet *p, char *msg, void *arg, Event *event)
+     135 {
+     136     char timestamp[TIMEBUF_SIZE];
+     137     SpoAlertFastData *data = (SpoAlertFastData *)arg;
+
+So data is SpoAlertFastData, the config options for the plugin.  Ok,  
+where does it get set?  Grep again for packet_flag:
+
+     237 SpoAlertFastData *ParseAlertFastArgs(char *args)
+     238 {
+     239     char **toks;
+     240     int num_toks;
+     241     char *filename;
+     242     SpoAlertFastData *data;
+     243
+     244     data = (SpoAlertFastData *)SnortAlloc(sizeof 
+(SpoAlertFastData));
+                 :
+                 :
+     263     if(num_toks > 1)
+     264     {
+     265         if(strcasecmp(toks[1], "packet") == 0)
+     266         {
+     267             data->packet_flag = 1;
+     268         }
+     269         else
+     270         {
+     271             FatalError("Unrecognized alert_fast option: %s 
+\n", toks[1]);
+     272         }
+     273     }
+
+It only gets set if the "packet" argument is  passed in.   
+Traditionally (~always) and by default, it's not set.  How about when  
+we come in from the command line with the -A switch?  Command line  
+stuff is found easily in snort.c by grepping for getopt:
+
+     948     while((ch = getopt(argc, argv, valid_options)) != -1)
+     949     {
+     950         DEBUG_WRAP(DebugMessage(DEBUG_INIT, "Processing cmd  
+line switch: %c\n", ch););
+     951         switch(ch)
+     952         {
+     953             case 'A':                /* alert mode */
+     954                 if(!strcasecmp(optarg, "none"))
+     955                 {
+     956                     pv.alert_mode = ALERT_NONE;
+     957                 }
+     958                 else if(!strcasecmp(optarg, "full"))
+     959                 {
+     960                     pv.alert_mode = ALERT_FULL;
+     961                 }
+     962                 else if(!strcasecmp(optarg, "fast"))
+     963                 {
+     964                     pv.alert_mode = ALERT_FAST;
+     965                 }
+
+So let's grep for ALERT_FAST and see who's using it:
+
+    2081 static int ProcessAlertCommandLine()
+    2082 {
+    2083
+    2084     if(!pv.alert_cmd_override)
+    2085     {
+    2086         /* Setup the default output plugin */
+    2087         ActivateOutputPlugin("alert_full", NULL);
+    2088     }
+    2089     else
+    2090     {
+    2091         switch(pv.alert_mode)
+    2092         {
+    2093             case ALERT_FAST:
+    2094                 ActivateOutputPlugin("alert_fast", NULL);
+    2095                 break;
+
+Ok, so now we know that ActivateOutputPlugin is using it, grep for it  
+and we see it's in plugbase.c:
+
+     596 int ActivateOutputPlugin(char *plugin_name, char  
+*plugin_options)
+     597 {
+     598     OutputKeywordNode *plugin;
+     599
+     600     if(!plugin_name)
+     601         return -1;
+     602
+     603     /* get the output plugin node */
+     604     if(!(plugin = GetOutputPlugin(plugin_name)))
+     605         return -1;
+     606
+     607     switch(plugin->node_type)
+     608     {
+     609         case NT_OUTPUT_SPECIAL: /* both alert & logging in  
+one plugin */
+     610             plugin->func(plugin_options);
+     611             break;
+     612         case NT_OUTPUT_ALERT:
+     613             plugin->func(plugin_options);
+     614             break;
+     615         case NT_OUTPUT_LOG:
+     616             plugin->func(plugin_options);
+     617             break;
+     618     }
+     619
+     620     return 0;
+     621 }
+
+So plugin_options is the argument string that gets passed in to the  
+setup function for the output plugin.  It's being set to NULL when  
+it's passed in from snort.c, so it's in the default configuration and  
+not vulnerable.
+
+Case closed on that one, don't use the "packet" option if you're  
+using "output alert_fast" in snort.conf and otherwise you're set at  
+the command line with "-A fast".
+
+>> For the record, NO PRODUCTION SNORT DEPLOYMENT SHOULD EVER
+>> (EVER!!!) RUN WITH ASCII LOGGING!!!  Everyone should be using
+>> unified, database or binary (pcap) logging for production sensors,
+>> period end of story.  ASCII logging is suitable only for testing and
+>> lab environments, that's it.
+>>
+>
+> While I will not disagree with you, I have seen this in several  
+> production
+> environments.
+
+Ok, we'll make it easy for people and remove it in 2.5.  Been meaning  
+to do that for years now anyway, just was trying to maintain  
+backwards compatibility.  People don't tune Snort properly either,  
+that's why we're going to be target-based someday.
+
+> Regardless of whether someone should be doing this or not is
+> beside the point, here is another execution path that could lead to  
+> the same
+> result. You arguing that no one should be doing this is akin to DJB  
+> arguing
+> that because people should be using ulimits that there isn't a bug in
+> qmail-- the point still remains that there is/was a bug.
+
+If you run with ASCII logging you can be DoS'd at any time (fairly  
+trivially) and that code will not be fixed because it works as  
+designed.  This problem pales in comparison IMO.
+
+>> That's debug code there, we (developers) only enable that when we're
+>> testing stuff out.  If you turn on all Snort's debug code you aren't
+>> running an IDS anymore, you're running chargen. :)
+>>
+>
+>    snort/src/preprocessors/spp_frag3.c
+> 2929 Frag3Rebuild()
+>      [...]
+> 3117 #ifdef DEBUG_FRAG3
+>      [...]
+> 3122     if (DEBUG_FRAG & GetDebugLevel())
+> 3123     {
+>      [...]
+> 3126         PrintIPPkt(stdout, defrag_pkt->iph->ip_proto,  
+> defrag_pkt);
+>      [...]
+> 3129     }
+> 3130 #endif
+>       [...]
+> 3133         PrintIPPkt(stdout, defrag_pkt->iph->ip_proto,  
+> defrag_pkt);
+>
+> Re-read the code snippet, developer. Notice the closing curly bracket
+> follwed by the #endif. You have two identical pieces of code, one  
+> is wrapped
+> in a #ifdef and a if (DEBUG ...) and the other isn't. So, one is  
+> only there
+> if debugging is enabled, the other exists in the preprocessor  
+> regardless.
+
+I pointed out that developers use the DEBUG statements because you  
+didn't seem to be familiar with how that code is used and why it's  
+there.  If you really dig into it you'll see that not only do you  
+have to --enable-debug when you run ./configure but you also have to  
+set an environment variable (export SNORT_DEBUG=131072) even if debug  
+mode is enabled.
+
+Regardless, that's not the way the code is in 2.4.0 or CVS nor in any  
+of the initial development versions from when I wrote it.  I don't  
+know where you got that code from but it looks like a bad CVS merge  
+on your end.  Download 2.4.0 or CVS on the SNORT_2_4 branch to see  
+the actual code (I did).
+
+> This may be the case, and I won't argue the point as I didn't  
+> research into
+> the feasibility of whether it was possible to cause a null pointer  
+> there,
+> just that it *could* happen, as I said.
+
+There's no logical code path that would get you there.  My point is  
+that it can't happen under any circumstance outside a debugger.  The  
+code could be written more safely, that's for sure, but the bug won't  
+manifest itself for any other option/length combination.  For giggles  
+I rigged the POC to try every possible value of TCP option and length  
+with a variety of option sizes, it didn't cause any problems so I'd  
+say that the code is conclusively not vulnerable to this issue  
+outside of the SACK option in TCP option processing.
+
+>> BTW, you missed that we also call PrintTCPHeader in spo_alert_full.c,
+>> which is actually done in the default config case, so this is
+>> something you might want to worry about if you're using full alerting
+>> for whatever reason.  For the record, the recommended alerting modes
+>> for a production sensor are unified, syslog or database.
+>>
+>
+> Thank you for adding to my point. This makes what 3 possible routes of
+> execution + the -v route for a total of 4 without debugging, and 6 if
+> debugging was to be enabled. Still quite a long ways from the 'only  
+> if you
+> are using -v'.
+
+I was merely pointing out the real actual issue as I saw it, you  
+didn't make the point when in fact it was the most serious one.  The  
+DEBUG code is only called if you manually enable debug mode at  
+compile time and set an appropriate environment variable so that's a  
+complete non-issue as far as this is concerned.
+
+> Is this about saving face or what? I mean, I can understand writing a
+> function that somewhere in it doesn't check that a pointer is not  
+> null, it
+> happens from time to time. What I cannot see is telling everyone  
+> that uses
+> your product that there is only one way to get into the bug when in  
+> fact
+> there is at least a few.
+
+Saving face has nothing to do with it.  You made claims to be  
+pointing out other issues that were incorrect  or required  
+expansion.  The one real issue that people were likely to run into  
+with the default configuration of a relatively commonly used option  
+was missed.  You also made several assumptions without testing them  
+and proposed to broaden the scope of the vulnerability to different  
+inputs without any proof or, ultimately, merit.
+
+To recap, your claims were:
+
+1) The DoS effects "-A fast"  - this was wrong, it only effects the  
+output directive with a little used optional argument
+2) ASCII logging also has the problem - right, but if you run with  
+ASCII logging you're subject to other DoS's as well that are endemic  
+to the configuration
+3) Other TCP options can cause the same DoS  - this was wrong
+4) The DoS effects frag3 and stream4 - this was wrong, there's no  
+practical configuration that  will result in a DoS with frag3/stream4
+
+The really important one was "-A full" can exercise the DoS, which is  
+important to people running that mode, which you didn't mention.
+
+We payed attention to the initial data from the original reporter and  
+said "yep, -v is a problem" and left it at that.  Once you pointed  
+out that there are some other paths in there it spurred me to take a  
+look (we haven't really done much with that code in years, it really  
+should not be used for production as I've said) and the full analysis  
+is as I described in this email and the last.  The fixes in CVS fix  
+all the problems just like the fix the original problem, so if you  
+absolutely must have a fix today then do as I said and grab log.c  
+from CVS and recompile.
+
+It doesn't appear that there's anything more to say on this topic  
+unless you have some more observations you'd like to make.
+
+- --
+Martin Roesch - Founder/CTO, Sourcefire Inc. - +1-410-290-1616
+Sourcefire - Discover.  Determine.  Defend.
+roesch@...rcefire.com - http://www.sourcefire.com
+Snort: Open Source Network IDS - http://www.snort.org
+
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.1 (Darwin)
+
+iD8DBQFDJ58mqj0FAQQ3KOARAqG8AJ9EHTNZV/KOenCPokngDsdDmVhsbQCePrui
+jdCJUZlUlEHHfOCQK8cydXk=
+=63Jh
+-----END PGP SIGNATURE-----
+
+
+-------------------------------------------------------
+SF.Net email is sponsored by:
+Tame your development challenges with Apache's Geronimo App Server. Download
+it for free - -and be entered to win a 42" plasma tv or your very own
+Sony(tm)PSP.  Click here to play: http://sourceforge.net/geronimo.php
+

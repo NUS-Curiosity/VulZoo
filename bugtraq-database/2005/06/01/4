@@ -1,0 +1,186 @@
+
+Date: Wed, 1 Jun 2005 20:33:46 +0100
+From: John Cartwright <johnc@...k.org.uk>
+To: full-disclosure@...ts.grok.org.uk
+Cc: bugtraq@...urityfocus.com
+Subject: HP Radia Notify Daemon: Multiple Buffer Overflow
+	Vulnerabilities
+
+
+HP Radia Notify Daemon: Multiple Buffer Overflow Vulnerabilities
+John Cartwright <johnc@...k.org.uk>
+1st June 2005
+
+Introduction
+------------
+Hewlett-Packard's (formerly Novadigm) Radia contains a component known 
+as the Radia Notify Daemon. This RADEXECD component is a small server
+process that listens for commands via a TCP socket and executes them 
+on behalf of an administrator or other Radia process. A total of three
+remotely-exploitable overflows have been found in various versions of
+this software.
+
+Overview
+--------
+The 'nvd_exec' function contains two remotely-exploitable stack-based
+overflows in version 3.1.2.0. The vulnerability occurs when a crafted 
+command is sent to a RADEXECD process with parameters of a greater 
+length than the buffer used to store them via an unbounded strcpy 
+operation. In a typical configuration this vulnerability may be 
+exploited remotely by an unauthenticated attacker to gain the 
+privileges of the RADEXECD component, observed to be 
+NT_AUTHORITY\SYSTEM during testing.
+
+In addition, the earlier version of 3.1.0.0 has a similar flaw 
+involving a malformed file extension. This bug was reported via 
+development contacts to Novadigm (pre-HP) approximately 12 months ago 
+but the status and availability of the fix was unknown at the time of
+writing.
+
+Analysis
+--------
+The nvd_exec (as labelled in disassembly from embedded 'comments') 
+function is designed as a wrapper to the Windows CreateProcess API
+call. Upon validation of its arguments, nvd_exec creates the relevant
+StartupInfo structures, executes the target process, and waits for
+it to terminate. This function accepts five parameters, beginning with
+the application name to execute and its parameters. 
+
+Although generic restrictions on string lengths exist in the protocol 
+definition (see below), there is no specific check for an overly-long 
+parameter string at this stage in execution. A stack-based parameter 
+buffer of approximately 512 characters is used to store this 
+information during parsing, which can be overrun by one of two 
+unbounded strcpy calls inside nvd_exec:
+
+.text:00406193  mov   ecx,  [ebp+arg_params]  ; attacker-supplied
+.text:00406196  push  ecx                     ; char *
+.text:00406197  lea   edx   [ebp+parambuf]    ; actually 516 chars
+.text:0040619D  push  edx                     ; char *
+.text:0040619E  call  _strcpy                 ; overflow here
+
+The second instance has the same bug:
+
+.text:004061AE  mov   ecx,  [ebp+arg_params]  ; attacker-supplied
+.text:004061B1  push  ecx                     ; char *
+.text:004061B2  lea   edx,  [ebp+parambuf]    ; actually 516 chars
+.text:004061B8  push  edx                     ; char *
+.text:004061B9  call  _strcpy                 ; overflow here
+
+Due to the positioning of the stack variables it is possible to 
+overwrite the return address of the function by overflowing the buffer:
+
+FFFFFDF0  parambuf      db 516 dup(?)         ; buffer to overflow
+FFFFFFF4  rc            dd                    ;
+FFFFFFFC  pBuf          dd                    ;
+00000000   s            db 4 dup(?)           ; saved stack ptr
+00000004   r            db 4 dup(?)           ; return address
+00000008  arg_app       dd ?                  ; application name
+00000008  arg_params    dd ?                  ; parameter information
+
+By default, nvd_exec can be accessed by unauthenticated users by 
+crafting an appropriate request and submitting it to the RADEXECD port.
+
+The older version of this software is vulnerable to a sprintf-based 
+overflow caused by poor error handling logic: in this instance it is 
+the extension of the command variable which causes the problem:
+
+.text:00405B46  cmp    [ebp+ext_ptr], 0       ; have we found the '.' ?
+.text:00405B4D  jz     short loc_405B9F       ; no extension (safe)
+.text:00405B4F  mov    edx, [ebp+ext_ptr]     ;
+.text:00405B55  push   edx                    ; char *
+.text:00405B56  call   _strlen                ; calc extension length
+.text:00405B5B  add    esp, 4                 ;
+.text:00405B5E  cmp    eax, 4                 ; should be 4 eg '.foo'
+.text:00405B61  jz     short local_405B9F     ; OK, continue
+.text:00405B63  mov    eax, [ebp+arg_app]     ; the *complete* argument
+.text:00405B66  push   eax                    ;
+.text:00405B67  push   offset aFileExtMsg     ; "File extension ... %s"
+.text:00405B6C  lea    ecx, [ebp+buffer]      ; fixed size buffer
+.text:00405B72  push   ecx                    ;
+.text:00405B73  call   _sprintf               ; overflow here
+
+Therefore supplying a string of the form ".AAAAAAAAAAAAAA..." is 
+sufficient to overflow this fixed-size buffer.
+
+Exploitation
+------------
+Exploitation requires that the following steps be followed:
+
+1) Attacker connects to RADEXECD port on target host
+2) Attacker sends crafted remote execution request
+3) Target host connects back to callback port on attacker
+4) Target overflows buffer and executes shellcode
+
+In order to craft a remote execution request, the protocol must be 
+analysed. RADEXECD employs a text-based protocol with requests 
+taking the form of:
+
+<callback port>\0<username>\0<password>\0<command>\0
+(where \0 is a NULL delimiter/terminator).
+
+<callback port> is an attacker-supplied port which must be ready to
+accept incoming connections. Testing has not revealed the purpose of
+this port, and no data has been observed to travel over the connection
+once established. Therefore from an exploitation point of view, it is
+sufficient to place a netcat listener or similar on this port.
+
+<username> and <password> are only checked if the corresponding global
+configuration has specifically enabled security. Therefore in a typical
+setup the strings 'user' and 'pass' are sufficient for exploitation
+purposes.
+
+<command> is a NULL-terminated ASCII string that contains the actual
+command to be executed, with parameters. In order to exploit this 
+particular vulnerability, the command itself is not important, but we
+use this part of the buffer to hold our return address and shellcode.
+This must contain a '.' character to denote the extension portion of
+the parameter.
+
+So, in summary, a crafted request of this form is sufficient to exploit
+this vulnerability:
+
+<callback port>\0<username>\0<password>\0 
+"LIST " . (0x90 x <offset>) . <ret_addr> . "." . <shellcode>
+
+Shellcode cannot include NULLs, dots, newlines, path components, etc. 
+In the test environment, <offset> was found to be 532 bytes for the 
+strcpy-based overflow and 454 bytes for the sprintf-based one.
+
+When successfully overflowed, esp points to the extension component, so
+<ret_addr> should be the address of a 'jmp esp' or 'call esp' 
+instruction. In a test XPSP1 environment, address 0x77E2EF63 was used 
+('call esp' from ADVAPI32.DLL.)
+
+Workaround
+----------
+Disabling RADEXECD is impractical as it is essentially a core component
+of the Radia suite. Access control lists on network devices should be
+used to filter access to the configured RADEXECD port to mitigate this
+attack vector until a patch is available. 
+
+Timeline
+--------
+3rd May 2005  
+- Vulnerabilities disclosed to Hewlett Packard.
+- HP confirm and log as 'SSRT5962 Radia Notify Daemon buffer overflows'
+
+17th May 2005
+- HP reports that patches are under development.
+
+1st June 2005
+- Co-ordinated release.
+
+Notes
+-----
+Versions under test (from .exe version resource) were RADEXECD.EXE  
+3.1.2.0 (strcpy-based overflow) and 3.1.0.0 (sprintf-based overflow)
+
+This advisory will be archived at 
+http://www.grok.org.uk/advisories/radexecd.html
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
+
+

