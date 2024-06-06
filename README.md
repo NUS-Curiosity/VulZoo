@@ -8,6 +8,11 @@ VulZoo is a vulnerability intelligence dataset that integrates various sources o
 
 ## How to Use
 
+Pre-requisites:
+
+- Python 3.6+
+- Disk space: 15GB+
+
 VulZoo is composed of both git-based and non-git-based sources. The git-based sources are from upstream repositories and organized as git submodules in this repository. The non-git-based sources are crawled and maintained in this repository. To get started, clone the repository with the following command:
 
 ```bash
