@@ -26,5 +26,10 @@ cd -
 wget https://d3fend.mitre.org/ontologies/d3fend.json -O d3fend-database/d3fend_ontology.json
 wget https://d3fend.mitre.org/ontologies/d3fend.csv -O d3fend-database/d3fend.csv
 
+# oss-security
+cd scripts
+python3 sync-oss-security.py
+cd -
+
 echo "database update | ts: `date '+%s'`" >> CHANGELOG
 
