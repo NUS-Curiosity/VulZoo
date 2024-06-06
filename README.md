@@ -31,11 +31,18 @@ cd VulZoo/
 pip install -r requirements.txt
 ```
 
-You can run the `update-databases.sh` script to incrementally update the local dataset:
+You can run the `sync-raw-data.sh` script to incrementally update the local raw data:
 
 ```bash
 cd VulZoo/
-./update-databases.sh
+./sync-raw-data.sh
+```
+
+TODO: You can run the `sync-vulzoo.sh` script to incrementally update the processed data:
+
+```bash
+cd VulZoo/
+./sync-vulzoo.sh
 ```
 
 ## Data Sources

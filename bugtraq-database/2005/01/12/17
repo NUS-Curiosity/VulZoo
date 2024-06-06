@@ -1,0 +1,190 @@
+
+Date: Wed, 12 Jan 2005 13:22:57 +0100 (CET)
+From: Paul Starzetz <ihaquer@...c.pl>
+To: vulnwatch@...nwatch.org, <bugtraq@...urityfocus.com>
+Subject: Linux kernel i386 SMP page fault handler privilege escalation
+
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Synopsis:  Linux kernel i386 SMP page fault handler privilege escalation
+Product:   Linux kernel
+Version:   2.2 up to and including 2.2.27-rc1, 2.4 up to and including
+           2.4.29-rc1, 2.6 up to and including 2.6.10
+Vendor:    http://www.kernel.org/
+URL:       http://isec.pl/vulnerabilities/isec-0022-pagefault.txt
+CVE:       CAN-2005-0001
+Author:    Paul Starzetz <ihaquer@...c.pl>
+Date:      Jan 12, 2005
+
+
+Issue:
+======
+
+Locally  exploitable flaw has been found in the Linux page fault handler
+code  that  allows  users  to  gain  root  privileges  if   running   on
+multiprocessor machine.
+
+
+Details:
+========
+
+The  Linux  kernel is the core software component of a Linux environment
+and is responsible  for  handling  of  machine  resources.  One  of  the
+functions  of  an operating system kernel is handling of virtual memory.
+On Linux virtual memory is provided on demand if an application accesses
+virtual memory areas.
+
+One  of  the core components of the Linux VM subsystem is the page fault
+handler that is called if applications  try  to  access  virtual  memory
+currently not physically mapped or not available in their address space.
+
+The page fault handler has the function to properly identify the type of
+the  requested  virtual memory access and take the appropriate action to
+allow or deny application's VM request. Actions taken may also include a
+stack expansion if the access goes just below application's actual stack
+limit.
+
+An exploitable race condition exists in the page fault  handler  if  two
+concurrent  threads  sharing the same virtual memory space request stack
+expansion at the same time. It is  only  exploitable  on  multiprocessor
+machines (that also includes systems with hyperthreading).
+
+
+Discussion:
+===========
+
+The   vulnerable   code   resides   for   the   i386   architecture   in
+arch/i386/mm/fault.c in your kernel source code tree:
+
+[186]  down_read(&mm->mmap_sem);
+
+       vma = find_vma(mm, address);
+       if (!vma)
+              goto bad_area;
+       if (vma->vm_start <= address)
+              goto good_area;
+       if (!(vma->vm_flags & VM_GROWSDOWN))
+              goto bad_area;
+       if (error_code & 4) {
+              /*
+               * accessing the stack below %esp is always a bug.
+               * The "+ 32" is there due to some instructions (like
+               * pusha) doing post-decrement on the stack and that
+               * doesn't show up until later..
+               */
+[*]           if (address + 32 < regs->esp)
+                     goto bad_area;
+       }
+       if (expand_stack(vma, address))
+              goto bad_area;
+
+where the line number has been given for the kernel 2.4.28 version.
+
+Since the page fault handler is executed  with  the  mmap_sem  semaphore
+held  for  reading  only,  two  concurrent threads may enter the section
+after the line 186.
+
+The checks following line 186 ensure that the VM request is valid and in
+case  it  goes  just below the actual stack limit [*], that the stack is
+expanded  accordingly.  On  Linux  the  notion  of  stack  includes  any
+VM_GROWSDOWN  virtual memory area, that is, it need not to be the actual
+process's stack.
+
+The exploitable race condition scenario looks as follows:
+
+
+A. thread_1 accesses a VM_GROWSDOWN area just below its actual  starting
+address, lets call it fault_1,
+
+B.  thread_2  accesses  the same area at address fault_2 where fault_2 +
+PAGE_SIZE <= fault_1, that is:
+
+[   NOPAGE    ] [fault_1      ] [     VMA     ]  --->  higher  addresses
+[fault_2      ] [   NOPAGE    ] [     VMA     ]
+
+where  one  [] bracket pair stands for a page frame in the application's
+page table.
+
+C. if thread_2 is slightly faster than thread_1 following happens:
+
+[   PAGE2     ] [PAGE1                VMA     ]
+
+
+that is, the stack is first expanded inside the expand_stack()  function
+to  cover  fault_2,  however  it is right after 'expanded' to cover only
+fault_1 since the necessary checks have already been  passed.  In  other
+words,  the process's page table includes now two page references (PTEs)
+but only one is covered by the virtual memory  area  descriptor  (namely
+only page1). The race window is very small but it is exploitable.
+
+Once  the  reference  to page2 is available in the page table, it can be
+freely read or written by both threads. It will also not be released  to
+the virtual memory management on process termination. Similar techniques
+like in
+
+http://www.isec.pl/vulnerabilities/isec-0014-mremap-unmap.txt
+
+may be further used to inject these  lost  page  frames  into  a  setuid
+application  in  order  to gain elevated privileges (due to kmod this is
+also possible without any executable setuid binaries).
+
+
+Impact:
+=======
+
+Unprivileged local users can gain  elevated  (root)  privileges  on  SMP
+machines.
+
+
+Credits:
+========
+
+Paul  Starzetz  <ihaquer@...c.pl>  has  identified the vulnerability and
+performed further research. RedHat reported that a customer also pointed
+out  some  problems  with the page fault handler on SMP about 20.12.2004
+and they  already  included  a  patch  for  this  vulnerability  in  the
+kernel-2.4.21-27.EL  release,  however  the  bug  did not make it to the
+security division.
+
+COPYING, DISTRIBUTION, AND MODIFICATION OF INFORMATION PRESENTED HERE IS
+ALLOWED ONLY WITH EXPRESS PERMISSION OF ONE OF THE AUTHORS.
+
+
+Disclaimer:
+===========
+
+This  document and all the information it contains are provided "as is",
+for educational purposes only, without warranty  of  any  kind,  whether
+express or implied.
+
+The  authors reserve the right not to be responsible for the topicality,
+correctness, completeness or quality of  the  information   provided  in
+this  document.  Liability  claims regarding damage caused by the use of
+any information provided, including any kind  of  information  which  is
+incomplete or incorrect, will therefore be rejected.
+
+
+Appendix:
+=========
+
+A proof of  concept code won't be disclosed now.  Special thanks goes to
+OSDL and Marcelo Tosatti for providing a SMP testbed.
+
+- --
+Paul Starzetz
+iSEC Security Research
+http://isec.pl/
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.0.7 (GNU/Linux)
+
+iD8DBQFB5RakC+8U3Z5wpu4RAvdWAKDV1BKNP79FTdQndsacDrbBdnnCXQCg5Dd9
+VBbPtRVVhmlzmoGx0DfHgCU=
+=2VKr
+-----END PGP SIGNATURE-----
+
+
+
+

@@ -1,0 +1,188 @@
+
+Date: Fri, 7 Jan 2005 22:19:04 +0100 (CET)
+From: Paul Starzetz <ihaquer@...c.pl>
+To: bugtraq@...urityfocus.com
+Subject: Linux kernel uselib() privilege elevation, corrected
+
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Hi all,
+
+first of all I must comply about the handling of this vulnerability that I 
+reported to vendorsec. Obviously my code posted there has been stolen and 
+plagiarized in order to put the blame on Stefan Esser from Ematters and 
+disturb the security community. 
+
+I really apologize to Stefan Esser for the inconvenience and thank him 
+for his cool reaction - the plagiarism did work.
+
+Further steps must be taken to investigate the security leak on vendorsec.
+
+- ---------------------------------------------------------------------------
+
+Synopsis:  Linux kernel uselib() privilege elevation
+Product:   Linux kernel
+Version:   2.4 up to and including 2.4.29-pre3, 2.6 up to and including 
+	   2.6.10
+Vendor:    http://www.kernel.org/
+URL:       http://isec.pl/vulnerabilities/isec-0021-uselib.txt
+CVE:       CAN-2004-1235
+Author:    Paul Starzetz <ihaquer@...c.pl>
+Date:      Jan 07, 2005
+
+
+Issue:
+======
+
+Locally  exploitable  flaws  have  been found in the Linux binary format
+loaders'  uselib()  functions  that  allow  local  users  to  gain  root
+privileges.
+
+
+Details:
+========
+
+The Linux kernel provides a binary format loader layer to load (execute)
+programs of different binary formats like ELF or  a.out  and  more.  The
+kernel   also   provides   a  function  named  sys_uselib()  to  load  a
+corresponding library.  This  function  is  dispatched  to  the  current
+process's binary format handler and is basicaly a simplified mmap() code
+coupled with some header parsing code.
+
+An analyse of the uselib function load_elf_library()  from  binfmt_elf.c
+revealed a flaw in the handling of the library's brk segment (VMA). That
+segment is created with the  current->mm->mmap_sem  semaphore  NOT  held
+while  modyfying  the  memory layout of the calling process. This can be
+used to disturb the memory management and gain elevated privileges. Also
+the binfmt_aout binary format loader code is affected in the same way.
+
+
+Discussion:
+=============
+
+The  vulnerable  code  resides  for  example  in fs/binfmt_elf.c in your
+kernel source code tree:
+
+static int load_elf_library(struct file *file)
+{
+[904]  down_write(&current->mm->mmap_sem);
+       error = do_mmap(file,
+                     ELF_PAGESTART(elf_phdata->p_vaddr),
+                     (elf_phdata->p_filesz +
+                      ELF_PAGEOFFSET(elf_phdata->p_vaddr)),
+                     PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_FIXED | MAP_PRIVATE | MAP_DENYWRITE,
+                     (elf_phdata->p_offset -
+                      ELF_PAGEOFFSET(elf_phdata->p_vaddr)));
+       up_write(&current->mm->mmap_sem);
+       if (error != ELF_PAGESTART(elf_phdata->p_vaddr))
+              goto out_free_ph;
+
+       elf_bss = elf_phdata->p_vaddr + elf_phdata->p_filesz;
+       padzero(elf_bss);
+
+       len = ELF_PAGESTART(elf_phdata->p_filesz + elf_phdata->p_vaddr + ELF_MIN_ALIGN - 1);
+       bss = elf_phdata->p_memsz + elf_phdata->p_vaddr;
+       if (bss > len)
+              do_brk(len, bss - len);
+
+The line numbers are all valid for the 2.4.28 kernel version. As can  be
+seen  the  mmap_sem  is  released  prior to calling do_brk() in order to
+create the data section of the ELF library. On the other  hand,  looking
+into  the code of sys_brk() from mm/mmap.c reveals that do_brk() must be
+called with the semaphore held.
+
+A short look into the code of do_brk() shows that:
+
+[1094] vma = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
+       if (!vma)
+              return -ENOMEM;
+
+       vma->vm_mm = mm;
+       vma->vm_start = addr;
+       vma->vm_end = addr + len;
+       vma->vm_flags = flags;
+       vma->vm_page_prot = protection_map[flags & 0x0f];
+       vma->vm_ops = NULL;
+       vma->vm_pgoff = 0;
+       vma->vm_file = NULL;
+       vma->vm_private_data = NULL;
+
+       vma_link(mm, vma, prev, rb_link, rb_parent);
+
+where   rb_link   and   rb_parent   were   both   found    by    calling
+find_vma_prepare().  Obviously,  if  the kmem_cache_alloc() call sleeps,
+the newly created VMA descriptor  may  be  inserted  at  wrong  position
+because the process's VMA list and the VMA RB-tree may have been changed
+by another thread. This is absolutely enough to gain root privileges.
+
+We  have  found  at  least  three  different  ways   to   exploit   this
+vulnerability.  The  race condition can be easily won by consuming a big
+amount of memory. A proof  of  concept  code  exists  but  will  not  be
+released yet.
+
+
+Impact:
+=======
+
+Unprivileged local users can gain elevated (root) privileges.
+
+
+Credits:
+========
+
+Paul  Starzetz  <ihaquer@...c.pl>  has  identified the vulnerability and
+performed further research. COPYING, DISTRIBUTION, AND  MODIFICATION  OF
+INFORMATION  PRESENTED  HERE  IS ALLOWED ONLY WITH EXPRESS PERMISSION OF
+ONE OF THE AUTHORS.
+
+
+Disclaimer:
+===========
+
+This document and all the information it contains are provided "as  is",
+for  educational  purposes  only,  without warranty of any kind, whether
+express or implied.
+
+The authors reserve the right not to be responsible for the  topicality,
+correctness,  completeness  or  quality  of the information  provided in
+this document. Liability claims regarding damage caused by  the  use  of
+any  information  provided,  including  any kind of information which is
+incomplete or incorrect, will therefore be rejected.
+
+
+Appendix:
+=========
+
+Code attached.
+
+- ------------------------------------------------------------------------
+
+- --
+Paul Starzetz
+iSEC Security Research
+http://isec.pl/
+
+    [ Part 2, ""  Text/PLAIN (Name: "elflbl_v108.c")  421 lines. ]
+    [ Unable to print this part. ]
+
+
+- -- 
+Paul Starzetz
+iSEC Security Research
+http://isec.pl/
+
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.0.7 (GNU/Linux)
+
+iD8DBQFB3vzMC+8U3Z5wpu4RAl8vAKCRizpidQ7QGGzZud1sj3IhFly7MACdGBvc
+51ofDJ/YVnJq/RYdikTCiog=
+=kDVW
+-----END PGP SIGNATURE-----
+
+
+
+
