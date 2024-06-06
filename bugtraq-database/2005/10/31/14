@@ -1,0 +1,144 @@
+
+Date: Mon, 31 Oct 2005 01:01:53 -0500 (EST)
+From: v9 <v9@...ehalo.us>
+To: info@...nvpn.net
+Cc: bugtraq@...urityfocus.com
+Subject: OpenVPN[v2.0.x]: foreign_option() formart string vulnerability.
+
+
+v9@...ehalo.us: OpenVPN[v2.0.x]: foreign_option() format string vulnerability.
+
+1. BACKGROUND
+
+OpenVPN is a robust and highly configurable VPN (Virtual Private Network) daemon which
+can be used to securely link two or more private networks using an encrypted tunnel over
+the Internet. OpenVPN's principal strengths include wide cross-platform portability,
+excellent stability, support for dynamic IP addresses and NAT, adaptive link compression,
+single TCP/UDP port usage, a modular design that offloads most crypto tasks to the
+OpenSSL library, and relatively easy installation that in most cases doesn't require a
+special kernel module.
+
+
+2. DESCRIPTION
+
+OpenVPN(v2.0.x) contains a remotely exploitable format string bug in the processing of
+its command-line/config arguments.
+
+the vulnerable function is located in options.c in the foreign_option() function.  this
+function uses the buf_printf() function to improperly write to a buffer(typical printf()
+format string-style).  the only option that appears to use the foreign_option() function
+is "dhcp-option".
+
+this, by itself, seems relatively useless.  however, since the OpenVPN server is
+allowed to "push" some command options ("dhcp-option" being one of those) to its clients
+this becomes remotely exploitable to OpenVPN clients.  an example/demonstration of this
+would be to insert the following line into a malicious OpenVPN server config file:
+
+ push "dhcp-option <format string>"
+
+or, namely to test for validity/crash of an OpenVPN client:
+
+ push "dhcp-option %n%n%n%n%n%n"
+
+it should be noted that WIN32 versions of OpenVPN are NOT affected by this, the
+following code snippets will highlight the above.
+
+----------------------------------------------------------------------------------------
+openvpn/options.c:
+...
+static void
+foreign_option (struct options *o, char *argv[], int len, struct env_set *es)
+{
+  if (len > 0)
+    {
+      struct gc_arena gc = gc_new();
+      struct buffer name = alloc_buf_gc (OPTION_PARM_SIZE, &gc);
+      struct buffer value = alloc_buf_gc (OPTION_PARM_SIZE, &gc);
+      int i;
+      bool first = true;
+
+      buf_printf (&name, "foreign_option_%d", o->foreign_option_index + 1);
+      ++o->foreign_option_index;
+      for (i = 0; i < len; ++i)
+	{
+	  if (argv[i])
+	    {
+	      if (!first)
+		buf_printf (&value, " ");
+! ->	      buf_printf (&value, argv[i]);
+	      first = false;
+	    }
+	}
+      setenv_str (es, BSTR(&name), BSTR(&value));
+      gc_free (&gc);
+    }
+}
+
+...
+
+static int
+add_option (...){
+...
+#ifdef WIN32
+...
+#else
+...
+  else if (streq (p[0], "dhcp-option") && p[1])
+    {
+      ++i;
+      VERIFY_PERMISSION (OPT_P_IPWIN32);
+      if (p[2])
+	++i;
+! ->    foreign_option (options, p, 3, es);
+    }
+...
+#endif
+...
+----------------------------------------------------------------------------------------
+
+it should also be noted the OpenVPN manpage states:
+
+----------------------------------------------------------------------------------------
+ --push option
+        Push  a  config file option back to the client for remote execu-
+        tion.  Note that option must be enclosed in double quotes  ("").
+        The  client  must specify --pull in its config file.  The set of
+        options which can be pushed is limited by both  feasibility  and
+        security.   Some  options  such  as  those  which  would execute
+        scripts are banned, since they would effectively allow a compro-
+        mised server to execute arbitrary code on the client.  Other op-
+        tions such as TLS or MTU parameters cannot be pushed because the
+        client  needs  to  know them before the connection to the server
+        can be initiated.
+
+        This is a partial list of options which can currently be pushed:
+        --route,   --route-gateway,  --route-delay,  --redirect-gateway,
+        --ip-win32,  --dhcp-option,  --inactive,  --ping,   --ping-exit,
+        --ping-restart, --setenv, --persist-key, --persist-tun, --echo
+----------------------------------------------------------------------------------------
+
+however, when testing i did NOT have to have the "pull" option in my clients config
+file to allow the "push"ed dhcp-option request as it states above.
+
+while testing i found that user-supplied data was reachable (about ~90 pops away for me)
+for writing to, and addresses (within pop/"direct parameter access" range) already in memory
+were viable to write to to gain control of the program.  however, OpenVPN filters many
+characters, which causes problems for standard exploitation using the user-supplied method
+and insertion of (non-alnum) shellcode.  this does not stop exploitation using this method,
+but does make it more involved.
+
+the 1.6 version branch does not appear to have the vulnerable code present, the first
+occurance i found of the code was in 2.0beta11(the earliest version i could find of the
+2.0 branch)
+
+
+3. ANALYSIS
+
+successful exploitation of this vulnerability will result in the ability of malicious or
+compromised OpenVPN servers to run arbitrary code on OpenVPN clients.
+
+
+
+vade79 -> v9@...ehalo.us -> fakehalo.us
+
+

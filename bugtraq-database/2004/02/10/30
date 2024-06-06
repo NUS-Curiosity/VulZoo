@@ -1,0 +1,178 @@
+
+Date: Tue, 10 Feb 2004 10:18:54 -0800
+From: "Marc Maiffret" <mmaiffret@...e.com>
+To: <BUGTRAQ@...URITYFOCUS.COM>
+Subject: EEYE: Microsoft ASN.1 Library Bit String Heap Corruption
+
+
+Microsoft ASN.1 Library Bit String Heap Corruption
+
+Release Date:
+February 10, 2004
+
+Date Reported:
+September 25, 2003
+
+Severity:
+High (Remote Code Execution)
+
+Systems Affected:
+Microsoft Windows NT 4.0
+Microsoft Windows 2000
+Microsoft Windows XP
+Microsoft Windows Server 2003
+
+Description:
+eEye Digital Security has discovered a second critical vulnerability in
+Microsoft's ASN.1 library (MSASN1.DLL) that allows an attacker to
+overwrite heap memory with data he or she controls and cause the
+execution of arbitrary code.  ASN.1 is an industry standard used in a
+variety of binary protocols, and as a result, this flaw in Microsoft's
+implementation can be reached through a number of Windows applications
+and services.  Ironically, the security-related functionality in Windows
+is especially adept at rendering a machine vulnerable to this attack,
+including Kerberos (UDP/88) and NTLMv2 authentication (TCP/135, 139,
+445).
+
+Technical Description:
+Thanks to another pair of integer overflows, software that uses MSASN1
+directly or indirectly is again vulnerable to a complete overwrite of a
+large portion of its heap memory.  This time, the attack is specific to
+bit string values (tags 03h and 23h), but the outcome is the same as
+with the heap corruption involving large data lengths.
+
+To recap, ASN.1 BER encoding is a representation for binary data that
+encapsulates pieces of that data into a hierarchy of typed values,
+analogous to "binary XML."  If a value consists of other values, then it
+is considered constructed (or compound); if it contains only raw data,
+then the value is described as simple.  The format of a BER-encoded
+value is a tag number that gives the type and attributes of the value,
+and then the length of the value data, followed by the data itself.  If
+bit 5 (20h) of the tag byte is set, this indicates that the value is
+constructed, and MSASN1 will decode the following data as its own
+BER-encoded block.
+
+In the case of a bit string, the first byte of data is the number of
+bits (from 0 to 7) to exclude from the end of the bit string value data,
+since the data is naturally given in bytes.  The remaining bytes, then,
+contain the (8 * (value_length - 1) - number_of_unused_bits) bits that
+compose the bit string.
+
+As the reader might guess, there's an interesting integer overflow here
+when a bit string is given a length of one byte (only the "number of
+unused bits" field, with no data bits following), and a non-zero number
+of unused bits.  (We consider this an integer overflow, rather than a
+signedness issue, because the number of bits is always treated as a
+strictly unsigned value.)  ASN1BERDecBitString() and
+ASN1BERDecBitString2() will both report that the length in bits of such
+a bit string is (0 - number_of_unused_bits), a number that can fall in
+the range 0xFFFFFFF9 (-7) to 0xFFFFFFFF (-1), although neither will
+attempt to copy an amount of data based on this count.  The former
+function will attempt to copy the length of the original data minus one
+byte -- in this case, zero -- and doesn't hurt anything.  The latter
+just returns a pointer into the original BER-encoded block and the
+length in bits of the data, and is also harmless.
+
+While it's possible that some client application somewhere might misuse
+this number of bits and create an exploitable condition, it doesn't
+really matter because there's another integer overflow in MSASN1 that
+definitely will.  ASN1BERDecBitString() has a special way of handling
+constructed bit strings (tag 23h), in that it concatenates each of the
+simple bit strings that the compound one comprises.  By supplying a
+valid constructed bit string that contains a single, simple bit string
+with length 1 and 7 unused bits, a second integer overflow occurs while
+adding the number of bits in the bit string to the cumulative total.
+The following code from BERDecBitString() performs the vulnerable
+arithmetic:
+
+76195338  mov     eax, [ebp-18h]        ; = length of simple bit string
+7619533B  cmp     eax, ebx              ; (EBX = 0)
+7619533D  jz      short 7619539A        ; skip this bit string if empty
+7619533F  cmp     [ebp+14h], ebx        ; = no-copy flag
+76195342  jnz     short 761953AF        ; don't concatenate if no-copy
+76195344  mov     ecx, [esi]            ; = count of accumulated bits
+76195346  lea     eax, [ecx+eax+7]      ; *** INTEGER OVERFLOW ***
+7619534A  shr     eax, 3                ; div by 8 to get size in bytes
+7619534D  push    eax
+7619534E  push    dword ptr [esi+4]
+76195351  push    dword ptr [ebp-4]
+76195354  call    DecMemReAlloc         ; allocates a zero-byte block
+
+If the first simple bit string encountered has a length of 0xFFFFFFF9
+(-7) bits, then the arithmetic at 0x76195346 will add the total number
+of accumulated bits (0), the length of the bit string being concatenated
+(-7), and then an additional 7 for the purpose of rounding up, to arrive
+at a total length of zero.  This sum is passed to DecMemReAlloc() to
+allocate a zero-length heap block, but then the bit strings' original
+lengths in [ESI] and [EBP-18h] are passed on to a function named
+ASN1bitcpy() (not shown here), which in this case performs a typical
+memcpy() and overwrites a whole bunch of heap memory as a result.
+
+To demonstrate this vulnerability, all that's necessary is a constructed
+bit string with length 3, then a simple bit string with length 1 and an
+unused bits field set to 7, all of which BER-encodes to the following
+bytes:
+
+23h/03h         ; constructed bit string (tag bit 5 = 1), length = 3
+03h/01h/07h     ; simple bit string, length = 1, 7 unused bits, no data
+
+Normal Kerberos packets already have bit strings available, but to get
+LSASS to accept a bit string within SPNEGO, it takes just a bit of
+crafting.  If we provide a NegTokenInit token (tag A0h) containing a
+ContextFlags value (tag A1h), then we can pass a bit string that does
+get decoded using the vulnerable function.  (See RFC 2478 Section 3.2.1
+for more details.)  This leaves us with the byte sequence below:
+
+A0h/09h         ; NegotiationToken: negTokenInit, length = 9
+30h/07h         ; sequence, length = 7
+A1h/05h         ; reqFlags (ContextFlags), length = 5
+23h/03h         ; constructed bit string, length = 3
+03h/01h/07h     ; simple bit string, length = 1, 7 unused bits, no data
+
+Note: Due to the technical nature of the vulnerability described above,
+this advisory may contain disassembly and/or hexadecimal byte codes.
+This information is in no way related to "exploit code", "payloads", or
+"shell code".
+
+Protection:
+Retina Network Security Scanner has been updated to identify this
+vulnerability:
+http://www.eeye.com/html/Products/Retina/index.html
+
+Vendor Status:
+Microsoft has released a patch for this vulnerability. The patch is
+available at:
+http://www.microsoft.com/technet/security/bulletin/MS04-007.asp
+
+Credit:
+Discovery: Derek Soeder
+More Additional Research: Yuji Ukai (this guy rocks!)
+
+Greetings:
+Dah and Murr; 14540253; fuzen; recurring thoughts, flashback humor,
+deja-vu, and all the other sensations that go along with releasing
+Windows advisories; people who read long advisories
+
+Copyright (c) 1998-2004 eEye Digital Security
+Permission is hereby granted for the redistribution of this alert
+electronically. It is not to be edited in any way without express
+consent of eEye. If you wish to reprint the whole or any part of this
+alert in any other medium excluding electronic medium, please e-mail
+alert@...e.com for permission.
+
+Disclaimer
+The information within this paper may change without notice. Use of this
+information constitutes acceptance for use in an AS IS condition. There
+are NO warranties with regard to this information. In no event shall the
+author be liable for any damages whatsoever arising out of or in
+connection with the use or spread of this information. Any use of this
+information is at the user's own risk.
+
+Feedback
+Please send suggestions, updates, and comments to:
+
+eEye Digital Security
+http://www.eEye.com
+info@...e.com
+
+

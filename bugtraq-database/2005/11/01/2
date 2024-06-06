@@ -1,0 +1,353 @@
+
+Date: Tue, 1 Nov 2005 03:57:03 +0000
+From: Ben Hutchings <ben@...adentplace.org.uk>
+To: bugtraq@...urityfocus.com, full-disclosure@...ts.grok.org.uk
+Subject: readdir_r considered harmful
+
+readdir_r considered harmful
+============================
+
+Issued by Ben Hutchings <ben@...adentplace.org.uk>, 2005-11-01.
+
+Background
+----------
+
+The POSIX readdir_r function is a thread-safe version of the readdir
+function used to read directory entries.  Whereas readdir returns a
+pointer to a system-allocated buffer and may use global state without
+mutual exclusion, readdir_r uses a user-supplied buffer and is
+guaranteed to be reentrant.  Its use is therefore preferable or even
+essential in portable multithreaded programs.
+
+Problem Description
+-------------------
+
+The length of the user-supplied buffer passed to readdir_r is
+implicit; it is assumed to be long enough to hold any directory entry
+read from the given directory stream.  The length of a directory entry
+obviously depends on the length of the name, and the maximum name
+length may vary between filesystems.  The standard means to determine
+the maximum name length within a directory is to call
+pathconf(dir_name, _PC_NAME_MAX).  This method unfortunately results
+in a race condition between the opendir and pathconf calls, which
+could in some cases be exploited to cause a buffer overflow.  For
+example, suppose a setuid program "rd" includes code like this:
+
+    #include <dirent.h>
+    #include <unistd.h>
+
+    int main(int argc, char ** argv)
+    {
+        DIR * dir;
+        long name_max;
+        struct dirent * buf, * de;
+
+        if ((dir = opendir(argv[1]))
+            && (name_max = pathconf(argv[1], _PC_NAME_MAX)) > 0
+            && (buf = (struct dirent *)malloc(
+                    offsetof(struct dirent, d_name) + name_max + 1))
+        {
+            while (readdir_r(dir, buf, &de) == 0 && de)
+            {
+                /* process entry */
+            }
+        }
+    }
+
+Then an attacker could run:
+
+    ln -sf exploit link && (rd link &; ln -sf /fat link)
+
+where the "exploit" directory is on a filesystem that allows a maximum of
+255 bytes in a name whereas the "/fat" directory is the root of a FAT
+filesystem that allows a maximum of 12 byes.
+
+Depending on the timing of operations, "rd" may open the "exploit" directory
+but allocate a buffer only long enough for names in the "/fat" directory. 
+Then names of entries in the "exploit" directory may overflow the allocated
+buffer by up to 243 bytes.  Depending on the heap allocation behaviour of
+the target program, it may be possible to construct a name that will
+overwrite sensitive data following the buffer.  If the target program uses
+alloca or a variable length array to create the buffer, a classic stack
+overflow exploit is possible.
+
+A similar attack could be mounted on a daemon that reads user-
+controllable directories, for example a web server.
+
+Attacks are easier where a program assumes that all directories will
+have the same or smaller maximum name length than, for instance, its
+initial current directory.
+
+Impact
+------
+
+This depends greatly on how an application uses readdir_r and on the
+configuration of the host system.  At the worst, a user with limited
+access to the local filesystem could cause a privileged process to
+execute arbitrary code.  However there are no known exploits.
+
+Mitigation
+----------
+
+Many systems don't have any variation in maximum name lengths among
+mounted and user-mountable filesystems.
+
+Directory entry buffers for readdir_r are usually allocated on the
+heap, and it is relatively hard to inject code into a process through
+a heap buffer overflow, though denial-of-service may be more easily
+achievable.
+
+Many programmers that use readdir_r erroneously calculate the buffer
+size as sizeof(struct dirent) + pathconf(dir_name, _PC_NAME_MAX) + 1
+or similarly.  On Linux (with glibc) and most versions of Unix, struct
+dirent is large enough to hold maximum-length names from most
+filesystems, so this is safe (though wasteful).  This is not true of
+Solaris and BeOS, where the d_name member is an array of length 1.
+
+Affected software
+-----------------
+
+The following software appears to be exploitable when compiled for a
+system that defines struct dirent with a short d_name array, such as
+Solaris or BeOS:
+
+- gcj (all versions to date)
+
+The run-time library functions java.io.File.list and
+java.io.File.listFiles call a private function written in C++ that
+calls readdir_r using a stack buffer and has a race condition as
+described above.
+
+- KDE (versions 3.3.0 to 3.3.2 inclusive; not present in version 3.4.0)
+
+The library function KURLCompletion::listDirectories, used for
+interactive URL completion, may start a thread that calls readdir_r
+using a stack buffer of type struct dirent (no extra bytes).  This
+behaviour can be disabled by defining the environment variable
+KURLCOMPLETION_LOCAL_KIO.
+
+- libwww (at least versions 3.1 to 5.3.2 inclusive; not yet fixed)
+
+The library functions HTMulti, HTBrowseDirectory (version 3.1) and
+HTLoadFile (version 4.0 onwards, when called for a directory)
+indirectly call readdir_r using a stack buffer of type struct dirent
+(no extra bytes).  These functions are used in the process of
+loading file: URLs.
+
+- Rudiments library (versions 0.27 to 0.28.2 inclusive; not yet fixed)
+
+The library function directory::getChildName calls readdir_r using
+a stack buffer of type struct dirent (no extra bytes).
+
+- teTeX (versions 1.0 to 2.0 inclusive; not present in version 3.0)
+
+The xdvi program included in these versions of teTeX use libwww to
+read resources specified by URLs.
+
+- xmail (at least versions 1.0 to 1.21 inclusive; fixed in version 1.22)
+
+Uses readdir_r with variously allocated buffers of type struct dirent
+(no extra bytes) when listing mail directories.
+
+The following software may also be exploitable:
+
+- bfbtester (versions 2.0 and 2.0.1; not fixed)
+
+Uses readdir_r with a stack buffer of size struct dirent (no extra
+bytes) to list the contents of /tmp (or a specified temporary
+directory) and directories in $PATH.  (Oh, the irony.)
+
+- insight
+
+Uses Tcl.
+
+- ncftp (at least versions 3.1.8 and 3.1.9, but not version 2.4.3;
+         not fixed)
+
+Uses readdir_r with a heap buffer with
+min(pathconf(gLogfileName, _PC_NAME_MAX), 512) + 8 extra bytes
+(where gLogFileName is the path to the log file).
+
+- netwib (versions 5.1.0 to 5.30.0 inclusive; fixed in version 5.3.1.0)
+      
+Uses readdir_r with a heap buffer with extra bytes: if pathconf is
+available, pathconf("/", _PC_NAME_MAX)+1; otherwise, if NAME_MAX is
+available, NAME_MAX+1; otherwise 256.
+
+- OpenOffice.org (at least version 1.1.3)
+
+The code that enumerates fonts and plugins in the appropriate
+directories uses a stack buffer of type
+long[sizeof(struct dirent) + _PC_NAME_MAX + 1].  I can only assume
+this is the result of a programmer cutting his crack with aluminium
+filings.
+
+- Pike (versions 0.4pl8 to 7.4.327, 7.6.0 to 7.6.35, 7.7.0 to 7.7.21,
+        all inclusive; fixed in versions 7.4.328, 7.6.36 and 7.7.22)
+
+Uses readdir_r with a heap buffer with
+max(pathconf(path, _PC_NAME_MAX), 1024) + 1 or NAME_MAX + 1025, or 2049
+extra bytes, depending on which of these functions and macros are
+available.  In addition to the race condition described above, there
+is a second race condition in the evaluation of the greater of
+pathconf(...) or 1024.
+
+- reprepro
+
+Uses readdir_r with a stack buffer of type struct dirent (no extra
+bytes).  (Also misuses errno following the call.)
+
+- Roxen (versions 1.1.1a2 to 4.0.402 inclusive; fixed in version 4.0.403)
+
+Uses Pike.
+
+- saods9
+
+Uses Tcl.
+
+- Tcl (versions 8.4.2 to 8.5a2 inclusive; fixed in version 8.5a3)
+
+Uses readdir_r with a thread-specific heap buffer padded to a size of
+at least MAXNAMLEN+1 bytes.  This can be a few bytes too short, though
+the heap manager may pad the allocation sufficiently to make up for
+this.
+
+- xgsmlib
+
+Uses stack buffer with no extra bytes when listing device directories.
+
+Some proprietary software may also be vulnerable, but I have no way of
+testing this.  I provided a draft of this advisory to Sun Security
+earlier this year on the basis that applications running on Solaris
+are most likely to be exploitable, but I have not received any
+substantive response.  A brief search through the OpenSolaris source
+code suggests that it may include exploitable applications, but
+apparently no-one at Sun could spare the time to investigate this.
+
+Recommendations
+---------------
+
+Many POSIX systems implement the dirfd function from BSD, which
+returns the file descriptor used by a directory stream.  This allows
+pathconf(dir_name, _PC_NAME_MAX) to be replaced by
+fpathconf(dirfd(dir), _PC_NAME_MAX), eliminating the race condition.
+
+Some systems, including Solaris, implement the fdopendir function
+which creates a directory stream from a given file descriptor.  This
+allows the opendir,pathconf sequence to be replaced by
+open,fpathconf,fdopendir.  However this function is much less widely
+available than dirfd.
+
+Programs using readdir_r may be able to use readdir.  According to POSIX the
+buffer readdir uses is not shared between directory streams.  However
+readdir is not guaranteed to be thread-safe and some implementations may use
+global state, so for portability the use of readdir in a multithreaded
+program should be controlled using a mutex.
+
+Suggested code for calculating the required buffer size for readdir_r
+follows.
+
+    #include <sys/types.h>
+    #include <dirent.h>
+    #include <limits.h>
+    #include <stddef.h>
+    #include <unistd.h>
+    
+    /* Calculate the required buffer size (in bytes) for directory       *
+     * entries read from the given directory handle.  Return -1 if this  *
+     * this cannot be done.                                              *
+     *                                                                   *
+     * If you use autoconf, include fpathconf and dirfd in your          *
+     * AC_CHECK_FUNCS list.  Otherwise use some other method to detect   *
+     * and use them where available.                                     */
+    
+    size_t dirent_buf_size(DIR * dirp)
+    {
+        long name_max;
+    #   if defined(HAVE_FPATHCONF) && defined(HAVE_DIRFD) \
+           && defined(_PC_NAME_MAX)
+            name_max = fpathconf(dirfd(dirp), _PC_NAME_MAX);
+            if (name_max == -1)
+    #           if defined(NAME_MAX)
+                    name_max = NAME_MAX;
+    #           else
+                    return (size_t)(-1);
+    #           endif
+    #   else
+    #       if defined(NAME_MAX)
+                name_max = NAME_MAX;
+    #       else
+    #           error "buffer size for readdir_r cannot be determined"
+    #       endif
+    #   endif
+        return (size_t)offsetof(struct dirent, d_name) + name_max + 1;
+    }
+
+An example of how to use the above function:
+
+    #include <errno.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    
+    int main(int argc, char ** argv)
+    {
+        DIR * dirp;
+        size_t size;
+        struct dirent * buf, * ent;
+        int error;
+    
+        if (argc != 2)
+        {
+            fprintf(stderr, "Usage: %s path\n", argv[0]);
+            return 2;
+        }
+    
+        dirp = opendir(argv[1]);
+        if (dirp == NULL)
+        {
+            perror("opendir");
+            return 1;
+        }
+        size = dirent_buf_size(dirp);
+        printf("size = %lu\n" "sizeof(struct dirent) = %lu\n",
+               (unsigned long)size, (unsigned long)sizeof(struct dirent));
+        if (size == -1)
+        {
+            perror("dirent_buf_size");
+            return 1;
+        }
+        buf = (struct dirent *)malloc(size);
+        if (buf == NULL)
+        {
+            perror("malloc");
+            return 1;
+        }
+        while ((error = readdir_r(dirp, buf, &ent)) == 0 && ent != NULL)
+            puts(ent->d_name);
+        if (error)
+        {
+            errno = error;
+            perror("readdir_r");
+            return 1;
+        }
+        return 0;
+    }
+
+The Austin Group should amend POSIX and the SUS in one or more of the
+following ways:
+
+1.  Standardise the dirfd function from BSD and recommend its use in
+    determining the buffer size for readdir_r.
+2.  Specify a new variant of readdir in which the buffer size is explicit
+    and the function returns an error code if the buffer is too small.
+3.  Specify that NAME_MAX must be defined as the length of the longest
+    name that can be used on any filesystem.  (This seems to be what many
+    or most implementations attempt to do at present, although POSIX
+    currently specifies otherwise.)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (190 bytes)
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

