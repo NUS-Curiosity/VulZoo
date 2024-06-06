@@ -1,0 +1,224 @@
+
+Date: Thu, 15 Nov 2007 20:43:39 +0100 (MET)
+From: "Tobias Klein" <tk@...pkit.de>
+To: bugtraq@...urityfocus.com
+Cc: full-disclosure@...ts.grok.org.uk
+Subject: [TKADV2007-001] Mac OS X TIOCSETD IOCTL Kernel Memory Corruption Vulnerability
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Advisory:               Mac OS X TIOCSETD IOCTL Kernel 
+                        Memory Corruption Vulnerability
+Advisory ID:            TKADV2007-001
+Revision:               1.0              
+Release Date:           2007/11/15 
+Last Modified:          2007/11/15 
+Date Reported:          2007/03/19
+Author:                 Tobias Klein (tk at trapkit.de)
+Affected Software:      Mac OS X xnu kernel <= version 
+                        8.10.1 (xnu-792.22.5~1)
+                        Mac OS X v10.4 through v10.4.10, 
+                        Mac OS X Server v10.4 through v10.4.10
+Remotely Exploitable:   No
+Locally Exploitable:    Yes 
+Vendor URL:             http://www.apple.com 
+Vendor Status:          Vendor has released an updated version
+CVE-ID:                 CVE-2007-4686         
+Patch development time: 241 days
+
+                    
+======================
+Vulnerability details: 
+======================
+
+The xnu kernel of Mac OS X contains a vulnerability in the code that 
+handles TIOCSETD ioctl requests. Exploitation of this vulnerability 
+can result in:
+
+1) local execution of arbitrary code at the kernel level (complete system 
+   compromise), or
+
+2) local denial of service attacks (system crash due to a kernel panic)
+
+The issue can be triggered by sending a specially crafted ioctl request.
+
+
+======================
+Technical description:
+======================
+
+Kernel source file: bsd/kern/tty.c 
+(from http://www.opensource.apple.com/darwinsource/10.4.8.x86/xnu-792.13.8/)
+
+ 822 int
+ 823 ttioctl(register struct tty *tp,
+ 824         u_long cmd, caddr_t data, int flag,
+ 825         struct proc *p)
+ 826 {       
+
+[...]
+
+1085            bcopy(t->c_cc, tp->t_cc, sizeof(t->c_cc));
+1086            splx(s);
+1087            break;
+1088    }
+1089    case TIOCSETD: {                /* set line discipline */
+1090           register int t = *(int *)data;   <--- (1)
+1091           dev_t device = tp->t_dev;
+1092 
+1093           if (t >= nlinesw)   <--- (2)
+1094                   return (ENXIO);
+1095           if (t != tp->t_line) {
+1096                   s = spltty();
+1097                   (*linesw[tp->t_line].l_close)(tp, flag);
+1098                   error = (*linesw[t].l_open)(device, tp); <--- (3)
+1099                   if (error) {
+1100                         (void)(*linesw[tp->t_line].l_open)(device, tp);
+1101                          splx(s);
+1102                          return (error);
+1103                   }
+1104                   tp->t_line = t;
+1105                   splx(s);
+1106          }
+1107          break;
+1108    }
+
+In line 1090 the user supplied "data" of the type caddr_t (char *) gets 
+stored in the variable "t" of the type signed int (see (1)). Then in line 
+1093 the value of "t" is compared with "nlinesw". As "data" is supplied 
+by the user it is possible to provide a string value >= 0x80000000. If so, 
+"t" gets a negative value due to the type conversion error (see (1)) and 
+the check in line 1093 will always be passed (see (2)). In line 1098 the user 
+supplied value "t" is used to reference and call "l_open". This leads to full 
+control of the kernel execution flow.
+
+Corresponding assembler code snippet:
+
+__text:00356C08 loc_356C08:    
+__text:00356C08    mov     eax, [ebp+arg_8]
+__text:00356C0B    mov     ebx, [eax] <--- (1)
+__text:00356C0D    mov     edx, [ebp+arg_0]                       
+__text:00356C10    mov     edx, [edx+64h]                       
+__text:00356C13    mov     [ebp+var_58], edx                         
+__text:00356C16    cmp     ebx, ds:457880h <--- (2)
+__text:00356C1C    jl      short loc_356C28
+__text:00356C1E    mov     esi, 6                       
+__text:00356C23    jmp     loc_356F70                                 
+__text:00356C28 ; --------------------------------
+__text:00356C28
+__text:00356C28 loc_356C28:                        
+__text:00356C28    mov     ecx, [ebp+arg_0]                         
+__text:00356C2B    cmp     ebx, [ecx+60h]                             
+__text:00356C2E    jz      loc_356633                                
+__text:00356C34    call    _spltty                               
+__text:00356C39    mov     edi, eax                       
+__text:00356C3B    mov     esi, [ebp+arg_0]                         
+__text:00356C3E    mov     eax, [esi+60h]                                 
+__text:00356C41    shl     eax, 5                       
+__text:00356C44    mov     edx, [ebp+arg_C]                 
+__text:00356C47    mov     [esp+0B8h+var_B4], edx                 
+__text:00356C4B    mov     [esp+0B8h+var_B8], esi                     
+__text:00356C4E    call    ds:off_4578A4[eax]
+__text:00356C54    mov     eax, ebx    <--- (3)
+__text:00356C56    shl     eax, 5      <--- (4)
+__text:00356C59    mov     [esp+0B8h+var_B4], esi
+__text:00356C5D    mov     ecx, [ebp+var_58]
+__text:00356C60    mov     [esp+0B8h+var_B8], ecx
+__text:00356C63    call    ds:_linesw[eax]   <--- (5)
+
+(1) The user supplied data is copied into EBX 
+(2) EBX is compared with nlinesw 
+(3) The user supplied data in EBX is copied into EAX
+(4) Slightly modification of EAX
+(5) The user supplied value in EAX is used as a reference in this call
+
+
+=================
+Proof of Concept:
+=================
+
+Due to the severity of this issue no proof of concept exploit code 
+will be released.
+
+
+========= 
+Solution: 
+=========
+
+  Upgrade to Mac OS X (Server) v10.4.11 or apply the Security Update 2007-008.
+  
+  http://www.apple.com/support/downloads/
+  
+
+======== 
+History: 
+========
+
+  2007/03/19 - Vendor notified
+  2007/03/19 - Automated reply from vendor
+  2007/03/26 - Vendor asks for more details
+  2007/04/01 - Provided vendor with more details
+  2007/04/04 - Status update from vendor
+  2007/04/06 - Vendor confirms the vulnerability
+  2007/05/11 - Status update request
+  2007/06/22 - Status update from vendor 
+  2007/11/14 - Update released by the vendor 
+  2007/11/15 - Full technical details released to general 
+               public
+
+
+======== 
+Credits: 
+========
+
+  Vulnerability found and advisory written by Tobias Klein.
+
+
+=========== 
+References: 
+===========
+
+  [1] http://docs.info.apple.com/article.html?artnum=307041
+  [2] http://www.trapkit.de/advisories/TKADV2007-001.txt
+
+
+======== 
+Changes: 
+========
+
+  Revision 0.1 - Initial draft release to the vendor
+  Revision 1.0 - Public release
+  
+
+===========
+Disclaimer:
+===========
+
+The information within this advisory may change without notice. Use
+of this information constitutes acceptance for use in an AS IS
+condition. There are no warranties, implied or express, with regard
+to this information. In no event shall the author be liable for any
+direct or indirect damages whatsoever arising out of or in connection
+with the use or spread of this information. Any use of this
+information is at the user's own risk.
+
+
+================== 
+PGP Signature Key: 
+==================
+
+  http://www.trapkit.de/advisories/tk-advisories-signature-key.asc
+
+  
+Copyright 2007 Tobias Klein. All rights reserved.
+
+
+-----BEGIN PGP SIGNATURE-----
+Version: PGP 8.1
+
+iQA/AwUBRzydRZF8YHACG4RBEQJHeQCePEAADwvFB/zfastphFcL+UAZkJ0An28f
+TELICn1MGteOiFrhKudTyAtw
+=+x0c
+-----END PGP SIGNATURE-----
+

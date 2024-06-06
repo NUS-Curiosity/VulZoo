@@ -154,10 +154,10 @@ def get_delta(msg_links, url, interval=5, print_result=sys.stdout):
     local_date = f"{local_latest_year}-{local_latest_month}-{local_latest_date}"
     online_date = f"{online_latest_year}-{online_latest_month}-{online_latest_date}"
     if local_date == online_date and local_latest_date_num == online_latest_date_num:
-        return delta
+        return delta, local_latest_year, local_latest_month, local_latest_date
     if local_date > online_date or (local_date == online_date and local_latest_date_num > online_latest_date_num):
         print("[!] Weird that local database is newer than the online website", file=sys.stderr)
-        return delta
+        return delta, local_latest_year, local_latest_month, local_latest_date
     
     # get the delta
     for year in mail_table:
@@ -188,11 +188,23 @@ def get_delta(msg_links, url, interval=5, print_result=sys.stdout):
                 delta[year][month] = specs
                 time.sleep(interval)
 
-    return delta
+    return delta, local_latest_year, local_latest_month, local_latest_date
 
 
-def update_index_with_delta(local_index, delta):
-    pass
+def update_index_with_delta(local_index, delta, lly, llm, lld):
+    for year in delta:
+        for month in delta[year]:
+            local_index[year] = local_index.get(year, {})
+            local_index[year][month] = local_index[year].get(month, [])
+            if year == lly and month == llm:
+                local_month_dates = [x[0] for x in local_index[year][month]]
+                delta_month_dates = [x[0] for x in delta[year][month]]
+                if lld in delta_month_dates:
+                    local_index[year][month].pop(local_month_dates.index(lld))
+
+            local_index[year][month].extend(delta[year][month])
+    with open(link_index, 'w') as f:
+        f.write(json.dumps(local_index))
 
 
 if __name__ == '__main__':
@@ -207,11 +219,11 @@ if __name__ == '__main__':
             with open(link_index, 'r') as f:
                 msg_links = json.load(f)
             print(f"[*] Calculating the delta between local and online oss-security database", file=sys.stderr)
-            delta = get_delta(msg_links, oss_security_url, interval=1)
+            delta, lly, llm, lld = get_delta(msg_links, oss_security_url, interval=1)
             # update the msg_links and save it to the file
             if delta:
                 print(f"[!] {link_index} is outdated, updating the link index", file=sys.stderr)
-                update_index_with_delta(msg_links, delta)
+                update_index_with_delta(msg_links, delta, lly, llm, lld)
         else:
             print(f"[!] {link_index} found, fetching links from the website", file=sys.stderr)
             with open(link_index, 'w') as f:
