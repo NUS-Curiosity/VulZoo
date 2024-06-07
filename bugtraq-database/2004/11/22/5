@@ -1,0 +1,138 @@
+
+Date: Mon, 22 Nov 2004 10:05:04 -0800
+From: Martin Buchholz <Martin.Buchholz@....COM>
+To: James Youngman <bugtraq@...ession.spiral-arm.org>
+Cc: bug-findutils@....org, parimiv@...haw.com, srevilak@...akeasy.net,
+	bugtraq@...urityfocus.com, levon@...ementarian.org
+Subject: Re: Changes to the filesystem while find is running - comments?
+
+
+All:
+
+The guarantee `find' makes that symlinks are not followed is
+an important one, for the sanity of users, especially sysadmins.
+
+Replacing a directory with a symlink is a common operation.
+  rmdir bin; ln -s ~fred/bin
+should be innocuous.
+
+So something like find's current sanity check is valuable.
+
+Here's an idea to make this more robust in the face of
+symlinks and automounters.
+
+Before a chdir to "foo", take stock:
+- record stat(".");  DOTFD = open("."); (get a fd to ".")
+- record stat("foo"); (make sure foo is a regular directory)
+Then
+- chdir "foo"
+- stat("."); compare dev, inode with recorded stat("foo")
+- if different, we suspect either symlinks or automounter.
+In this case, go back to original directory.
+- if we have fchdir, then
+  fchdir(DOTFD); and try again.  give up if we fail a second
+  time.  This means that a very rare collision with an
+  asynchronous symlink creation will not be fatal; in my opinion
+  it doesn't even need a warning.
+- If we don't have fchdir, getting back to the parent might be
+  tougher.  In the case of the automounter, we can do chdir(".."),
+  then stat(".") and check that we're back in original directory.
+  If that doesn't work, we chdir("/absolute/real/path/to/parent"),
+  again stat(".") and compare dev/inode with saved stat of parent
+  directory.
+
+If we have fchdir, I see find as maintaining a stack of
+file descriptors to directories that have been chdir'ed into.
+
+Another idea:
+
+If we *always* use fchdir in place of chdir, we should
+never risk chdir'ing into a symlink, since we always
+check that the fd we get from open is a dir and not
+a symlink.
+
+In general, use fchdir and fstat whenever possible.
+
+The functional programming people might suggest,
+instead of a stack of open fd, forking and chdiring
+whenever a subdir is explored.  In this case
+getting back to the parent is simply exit().
+But this is very likely to be too inefficient
+in the Real World.
+
+Martin
+
+James Youngman wrote:
+> Hello,
+> 
+> GNU find does a sanity check before and after calling chdir().  It
+> stats the directory it's about to move into, and stats "." after
+> chdir() succeeds.  It then compares the device numbers and inode
+> numbers returned by he two stat() calls.  This is done in a function
+> called wd_sanity_check().  If these are different, find prints an
+> error and exits fatally (in versions up to and including GNU findutils
+> 4.2.5.
+> 
+> The intent here is to detect the situation when someone is moving
+> directories about while find is running.  This could be done with
+> malicious intent.  The thinking behind this is that (for example)
+> there is a risk that find be persuaded to search a part of the
+> filesystem which it hadn't planned to (e.g. find /foo -depth -delete).
+> 
+> If you are running an automounter, it will often mount a filesystem
+> when triggered by the fact that a process chdir()s into a mount point.
+> This will obviously trigger a failure in the check that
+> wd_sanity_check() performs.  Hence for many versions of findutils,
+> find will not be able to search a directory hierarchy containing an
+> automountd mount point.   That's obviously undesirable.
+> 
+> I have recently started trying to figure out a way to solve this
+> problem without entirely disabling wd_sanity_check().   
+> 
+> As of findutils 4.2.6/4.2.7, find will read /etc/mtab (/etc/mnttab, or
+> whatever it is called on the current system) to determine if the
+> directory it has just moved into has recently been either mounted or
+> unmounted.  It does this by reading the mount table at startup and
+> again when wd_sanity_check() detects a problem (if the filesystem
+> appears in one list but not the other, it has either been mounted or
+> unmounted).  If ...
+> 
+> 1. the relevant directory has recently been mounted or unmounted
+> AND
+> 2. find is travelling down the directory hierarchy, not up
+> 
+> ... then wd_sanity_check() allows the program to continue but prints a
+> warning.  Otherwise, it will exit fatally as before.  The rationale
+> behind being sensitive to the direction of the chdir() is that
+> chdir("..") shouldn't cause a filesystem to become mounted and
+> although the automountd might time a filesystem out and unmount it,
+> this only happens after a period of inactivity, and find will have
+> just been using this particular filesystem.  The check in
+> wd_sanity_check() doesn't pay attention to the actual type of the
+> filesystem (though it does report the type in the error message).
+> 
+> I have run into a problem as of findutils-4.2.7.  This is simply that
+> there seem to be cases where automountd on Solaris works by exchanging
+> one mounted filesystem for another.  I could support/allow this
+> behaviour by noticing that the device number for the filesystem has
+> changed and allow the wd_sanity_check() test to succeed, but then the
+> effect of this change is that almost any combination of changes to the
+> filesystem device number is permitted.  Hence my question is :-
+> 
+>     Is it worthwhile at all to perform this "sanity check" or is it of 
+>     insufficient benefit?
+> 
+> If there is some benefit in making a test of this type, what scenarios
+> should find watch out for?  What tests are useful and practical to
+> help find determine if someone is trying to exploit or mislead it?
+> 
+> I'm not considering here cases where the find command line is
+> specified by an untrusted data source - for the purposes of this
+> discussion the source of untrusted data is the directory hierarchy
+> that find is traversing.
+> 
+> I'd be grateful for your thoughts.
+> 
+> Regards,
+> James.
+

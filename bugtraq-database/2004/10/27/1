@@ -1,0 +1,178 @@
+
+Date: Mon, 25 Oct 2004 20:53:46 -0400
+From: infamous41md@...pop.com
+To: bugtraq <bugtraq@...urityfocus.com>
+Subject: pppd out of bounds memory access, possible DOS
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Subject:
+
+pppd remote DOS.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Product Description:
+
+ppp is an implementation of (PPP) Point-to-Point Protocol for Unix systems.
+
+http://www.samba.org/ppp/features.html
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Vulnerable:
+
+ppp-2.4.1 was audited.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Summary:
+
+Improper verification of header fields lets an attacker make the pppd server
+access memory it isn't allowed to, and crash the server.  There is no
+possibility of code execution, as there is no data being copied, just a pointer
+dereferenced.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Details:
+
+The actual vulnerable code appears in the file /pppd/cbcp.c, line 334.  A brief
+walkthrough of how it is reached:  Starting in the /pppd directory, in main.c we
+have the function get_input(), which is called when there is data ready on the
+network.  It reads in the packet at line 932, at most 1500 + PPP header sized
+bytes into a static packet buffer called inpacket_buf.  Depending on the
+protocol, a handler is picked out of an array of handlers by matching the
+protocol field of the PPP header.  We are interested in when the protocol is
+CBCP, Callback Control Protocol.  A snip from that function is shown here:
+
+/* process an incomming packet */
+static void
+cbcp_input(unit, inpacket, pktlen)
+    int unit;
+    u_char *inpacket;
+    int pktlen;
+{
+    u_char *inp;
+    u_char code, id;
+    u_short len;
+
+    cbcp_state *us = &cbcp[unit];
+
+    inp = inpacket;
+
+    if (pktlen < CBCP_MINLEN) {
+        error("CBCP packet is too small");
+	return;
+    }
+
+    GETCHAR(code, inp);
+    GETCHAR(id, inp);
+    GETSHORT(len, inp);
+
+#if 0
+    if (len > pktlen) {
+        error("CBCP packet: invalid length");
+        return;
+    }
+#endif
+
+1]  len -= CBCP_MINLEN/*4*/; /* HOLE */
+ 
+    switch(code) {
+    case CBCP_REQ:
+        us->us_id = id;
+2]  cbcp_recvreq(us, inp, len);
+	break;
+
+    1)len has not been validated yet, if it is < 4, the subtraction will wrap
+    around to a large 2 byte unsigned number.
+    2)this len is passed to the request processsing function, which now thinks
+    that packet is longer than it really is.
+
+    We then move onto the cbcp_recvreq() function to process the request, this
+    function is in /pppd/cbcp.c
+
+/* received CBCP request */
+static void
+cbcp_recvreq(us, pckt, pcktlen)
+    cbcp_state *us;
+    char *pckt;
+    int pcktlen;
+{
+    u_char type, opt_len, delay, addr_type;
+    char address[256];
+    int len = pcktlen;
+
+    address[0] = 0;
+
+1]  while (len) {
+        dbglog("length: %d", len);
+
+	GETCHAR(type, pckt);
+2]  GETCHAR(opt_len, pckt);
+
+	if (opt_len > 2)
+	    GETCHAR(delay, pckt);
+
+	us->us_allowed |= (1 << type);
+
+	switch(type) {
+	case CB_CONF_NO:
+	    dbglog("no callback allowed");
+	    break;
+
+	case CB_CONF_USER:
+	    dbglog("user callback allowed");
+	    if (opt_len > 4) {
+	        GETCHAR(addr_type, pckt);
+		memcpy(address, pckt, opt_len - 4);
+		address[opt_len - 4] = 0;
+		if (address[0])
+		    dbglog("address: %s", address);
+	    }
+	    break;
+
+	case CB_CONF_ADMIN:
+	    dbglog("user admin defined allowed");
+	    break;
+
+	case CB_CONF_LIST:
+	    break;
+	}
+3]  len -= opt_len; /* HOLE */
+    }
+
+    cbcp_resp(us);
+}
+
+    1)The loop continues processing the packet as long as len is != 0.  Each
+    iteration the packet pointer is moved forward in the GET_ macros.
+    2)The option length is retrieved from the packet, and is not validated in
+    any way.
+    3)The option length is subtracted from the len variable, which controls the
+    loop.  There are a number of ways to exploit this calculation.  Actually,
+    _any_ malformed packet will screw up that loop.  It relies on the opt_len
+    values in the packet all summing to len, if they don't, the loop won't stop,
+    unless by pure luck of encountering the right value somewhere in the .data
+    section (the packet buffer is global).  Net result, is that eventually in
+    the GET_ macros, the packet pointer will be advanced to far, and hit
+    unmapped memory and crash the server.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Exploit:
+
+I don't have a PPP link, so I didn't write a sploit.  Some people I've spoken to
+have said causing a DOS will be hard to due to slowness of PPP links.  I haven't
+verified this myself.  Regardless, it's a bug that should be fixed.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+-- 
+-sean
+
+
+

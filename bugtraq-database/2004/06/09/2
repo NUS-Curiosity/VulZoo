@@ -1,0 +1,245 @@
+
+Date: Tue, 8 Jun 2004 22:02:11 +0100 (BST)
+From: Shaun Colley <shaunige@...oo.co.uk>
+To: bugtraq@...urityfocus.com
+Subject: Aspell 'word-list-compress' stack overflow vulnerability
+
+
+_________________________________________________________
+
+Product:      word-list-compress / part of aspell 
+              package
+Versions:     All
+Bug:          Stack overflow
+Impact:       Run arbitrary code with privs of target
+              user
+Risk:         Low
+Date:         June 8, 2004
+Author:       shaun2k2
+              http://www.nettwerked.co.uk
+_________________________________________________________
+
+
+
+Introduction
+#############
+
+Aspell was intended as a more accurate and robust
+replacement for the popular ispell package, and was
+written by GNU.  Aspell includes a small utility for
+compressing and decompressing wordlists before
+processing by aspell, namely 'word-list-compress'.
+
+Due to insufficient bounds checking, a malformed
+wordlist can cause for a stack based buffer overflow
+to occur, possibly allowing execution of arbitrary
+code with the privileges of the invoking user.
+
+
+Details
+########
+
+The word-list-compress utility provides two options --
+decompression of wordlists and compression of
+wordlists.  When processing wordlists supplied with
+either option, due to lack of bounds checking, a
+buffer overflow could occur, should a word exceeding
+256 bytes be present in the user-supplied wordlist.
+
+The offending code lays below.
+
+--- vulnerable code ---
+else if (argv[1][0] == 'c') {
+
+    char s1[256];
+    char s2[256];
+    char * prev = s2;
+    char * cur = s1;
+    *prev = '\0';
+
+    SETBIN (stdout);
+
+  /* BUG 1: no checks are made to prevent getting
+     more than 256 bytes via get_word() */
+    while (get_word(stdin, cur)) {
+      int i = 0;
+      /* get the length of the prefix */
+      while (prev[i] != '\0' && cur[i] != '\0' &&
+prev[i] == cur[i])
+	++i;
+      if (i > 31) {
+	putc('\0', stdout);
+      }
+      putc(i+1, stdout);
+      fputs(cur+i, stdout);
+      if (cur == s1) {
+	prev = s1; cur = s2;
+      } else {
+	prev = s2; cur = s1;
+      }
+    }
+    return 0;
+
+  } else if (argv[1][0] == 'd') {
+    
+    char cur[256];
+    int i;
+    int c;
+
+    SETBIN (stdin);
+
+    i = getc(stdin);
+    while (i != -1 ) {
+      if (i == 0)
+	i = getc(stdin);
+      --i;  
+
+      /* BUG 2: no check is made to prevent against
+         writing more than 256 bytes into the fixed
+         length buffers */
+      while ((c = getc(stdin)) > 32)
+	cur[i++] = (char)c;
+      cur[i] = '\0';
+      fputs(cur, stdout);
+      putc('\n', stdout);
+      i = c;
+    }
+    return 0;
+--- EOF ---
+
+The get_word() routine is called continually when
+acting upon 'c' (compress) until the user-supplied
+string ends.  In option 'd' (decompress), characters
+are written into a fixed length buffer ('cur'). 
+However, no checks in the while() loops are present to
+ensure that the number of characters in each 'word'
+exceed 256 bytes, thus resulting in a potential buffer
+overflow, such should a condition arise.
+
+If a user was able to influence the contents of
+another users wordlist/dictionary file, the user could
+craft a malicious word entry exceeding 256 bytes to
+execute arbitrary code.  When word-list-compress is
+then called by a targetted user, the malicious
+wordlist entry would trigger to overflow, optionally
+running arbitrary code with the privileges of the
+user.
+
+
+Exploitation
+##############
+
+Assuming a user had sufficient privileges to influence
+the contents of a users wordlist, a malicious word
+entry could be crafted in the form of a normal exploit
+buffer.
+
+To reproduce the issues described above, issue the
+below commands.
+
+--- 
+bash$ echo `perl -e 'print "a"x1000'` |
+word-list-compress c
+
+bash$ echo `perl -e 'print "a"x1000'` |
+word-list-compress d
+---
+
+Each subsequent command should produce a segmentation
+fault.  By examining the core file, it should be
+apparent that influence of program flow is easily
+possible.
+
+The major mitigating factor is the access the
+malicious user requires to a users dictionary file. 
+However, if a malicious user could social engineer a
+user into using their specially crafted wordlist with
+word-list-compress, an issue would still exist.
+
+
+
+Solution
+#########
+
+Kevin Atkinson, package maintainer, was contacted a
+significant amount of time ago, but no reply was
+received, and the issues still exist in the latest
+release of aspell.
+
+The below patch file fixes the issues.
+
+--- aspell-bug.patch ---
+--- compress.orig.c	2004-06-08 16:37:00.000000000
++0100
++++ compress.c	2004-06-08 16:34:35.000000000 +0100
+@@ -28,6 +28,9 @@
+ 
+ #endif
+ 
++int count; 
++
++
+ void usage () 
+ {
+   fputs("Compresses or uncompresses sorted word
+lists.\n"     , stderr);
+@@ -47,6 +50,7 @@
+     *w++ = (char)(c);
+   } while (c = getc(in), c != EOF && c > 32);
+   *w = '\0';
++  count++;
+   ungetc(c, in);
+   if (c == EOF) return 0;
+   else return 1;
+@@ -69,6 +73,7 @@
+ 
+     SETBIN (stdout);
+ 
++    while(count < 256) {
+     while (get_word(stdin, cur)) {
+       int i = 0;
+       /* get the length of the prefix */
+@@ -85,6 +90,7 @@
+ 	prev = s2; cur = s1;
+       }
+     }
++    }
+     return 0;
+ 
+   } else if (argv[1][0] == 'd') {
+@@ -100,8 +106,11 @@
+       if (i == 0)
+ 	i = getc(stdin);
+       --i;  
+-      while ((c = getc(stdin)) > 32)
++      while ((c = getc(stdin)) > 32 && count < 256) {
+
+ 	cur[i++] = (char)c;
++	count++;
++    }
++      
+       cur[i] = '\0';
+       fputs(cur, stdout);
+       putc('\n', stdout);
+--- EOF ---
+
+Apply the patch, and rebuild aspell.
+
+
+
+
+Thank you for your time.
+Shaun.
+
+
+
+
+	
+	
+		
+____________________________________________________________
+Yahoo! Messenger - Communicate instantly..."Ping" 
+your friends today! Download Messenger Now 
+http://uk.messenger.yahoo.com/download/index.html
+
+

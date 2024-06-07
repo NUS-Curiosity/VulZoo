@@ -1,0 +1,177 @@
+
+Date: Sun, 3 Oct 2004 00:00:41 +0400
+From: Solar Designer <solar@...nwall.com>
+To: "Greg A. Woods" <woods@...nix.com>
+Cc: "Jason T. Miller" <jasomill@...ffstall.com>,
+	"D.r Andrew C. Aitchison" <A.C.Aitchison@...ms.cam.ac.uk>,
+	"BUGTRAQ: Full Disclosure Security Mailing List" <bugtraq@...urityFocus.com>
+Subject: Re: cdrecord local root exploit
+
+
+On Sat, Oct 02, 2004 at 02:50:56PM -0400, Greg A. Woods wrote:
+> [ On Saturday, October 2, 2004 at 10:07:51 (+0400), Solar Designer wrote: ]
+> > Subject: Re: cdrecord local root exploit
+> >
+> > Actually, you can do it by creating an auxiliary directory and placing
+> > the configuration file in it:
+> > 
+> > /etc/program.d - root.progrun 750
+> > 
+> > /etc/program.d/program.conf - root.proguser 664
+> > 
+> > Then grant your program group progrun, and your trusted users - groups
+> > proguser and progrun.
+> 
+> That assumes the program doesn't need specific group privileges for some
+> other purpose as well (or for its primary purpose).
+
+Not if the program is a daemon initially started by root (it can then
+setup multiple supplementary groups for itself before dropping root)
+or from its dedicated pseudo-user account (it could be setup with the
+supplementary groups).
+
+In the context of SUID/SGID programs, yes, there's this limitation.
+In Openwall GNU/*/Linux, we're using a really nasty kludge to get
+around it:
+
+host!root:~# ls -la /usr/bin/screen /usr/libexec/screen
+-rwx--s--x    1 root     screen     272028 Jul 17 05:03 /usr/bin/screen
+
+/usr/libexec/screen:
+total 24
+drwx--x---    2 root     screen       4096 Jul 17 08:44 .
+drwxr-xr-x    9 root     root         4096 Jul 17 08:44 ..
+-rwx--s--x    2 root     shadow       4592 Jul 17 05:07 tcb_chkpwd
+-rwx--s--x    2 root     utmp         4204 Jul 17 04:45 utempter
+
+Notice the restricted permissions on /usr/libexec/screen (it's made
+available only to the screen program) and the nlink=2 on the two
+helper binaries.  Yes, the helper binaries are hard-linked from their
+respective directories:
+
+host!root:~# ls -la /usr/libexec/{chkpwd,utempter}
+/usr/libexec/chkpwd:
+total 24
+drwx--x---    2 root     chkpwd       4096 Jul 17 08:42 .
+drwxr-xr-x    9 root     root         4096 Jul 17 08:44 ..
+-rwx--s--x    2 root     shadow       4592 Jul 17 05:07 tcb_chkpwd
+
+/usr/libexec/utempter:
+total 16
+drwx--x---    2 root     utempter     4096 Jul 17 08:44 .
+drwxr-xr-x    9 root     root         4096 Jul 17 08:44 ..
+-rwx--s--x    2 root     utmp         4204 Jul 17 04:45 utempter
+
+Basically, we wanted to give screen both privileges (of group chkpwd
+and of group utempter), but clearly we couldn't have it SGID to two
+groups.  We also did not want to make either tcb_chkpwd or utempter
+available to the world, and we didn't want to combine them into one
+privilege for the rest of the system (screen needs both, but some
+other program might not).  Hence the hard link solution.
+
+To make this fit in with packages (yes, we're using a package manager
+and the three binaries above all come from different packages), we're
+using triggers in the screen package which get, well, triggered on
+installation, update, or removal of the two other packages:
+
+%triggerin -- tcb >= 0.9.7.1
+ln -f %_libexecdir/chkpwd/tcb_chkpwd %_libexecdir/screen/
+
+%triggerin -- libutempter >= 1.1.0-owl1
+ln -f %_libexecdir/utempter/utempter %_libexecdir/screen/
+
+%triggerpostun -- tcb
+if [ ! -e %_libexecdir/chkpwd/tcb_chkpwd ]; then
+	rm -f %_libexecdir/screen/tcb_chkpwd
+fi
+
+%triggerpostun -- libutempter
+if [ ! -e %_libexecdir/utempter/utempter ]; then
+	rm -f %_libexecdir/screen/utempter
+fi
+
+Too much complexity for little gain, you'd say?  Honestly, I don't
+know if it was worth it, even for a "secured" distribution such as
+ours.  Many other distributions make helper binaries equivalent to
+these available to the world (thereby not protecting them from direct
+attacks like we do).  And screen likely contains multiple yet
+undiscovered bugs allowing to get ahold of its SGID privileges.  And a
+single kernel bug, lots of which are yet to be discovered, makes it
+all irrelevant.  (Why do we keep using monolithic kernels?)
+
+So I am not bragging about our solution.  I merely want to point out
+that this is once again possible on traditional Unix, albeit at a
+level of complexity which might outweigh the advantage gained with
+fine-grained separation of privileges.
+
+> The problem with setuid, when it is used to gain the privileges of any
+> user other than root, is that the owner of the setuid program file can
+> change the permissions on that file (e.g. to make it possible to write
+> to the setuid program file), and thus any vulnerability that allows
+> arbitrary code execution as the privileged non-root user will allow the
+> integrity of the TCB to be breached even further with permanent changes,
+> such as the introduction of a semi-privileged trojan.
+
+This is very true.  We avoid SUID-non-root for that reason entirely.
+There's simply no reason to do that: a non-root pseudo-user won't be
+able to do anything which can't also be achieved with SGID and proper
+group permissions.
+
+> Such changes can
+> probably be detected with audits, but they cannot be prevented given
+> current unix-like filesystem semantics.
+
+This is not a part of the traditional Unix semantics, but on *BSD and
+Linux with native filesystems the immutable flag could be used.  Of
+course, that has many problems (not portable, filesystem-specific
+flags often not (re)stored by backup software, etc.)
+
+> I.e. this means setgid is the only really safe way to grant privileges
+> to non-root services
+
+Correct.  To non-root programs which may be invoked by a user, that
+is.  System services (daemons) don't have that limitation and can run
+as a non-root pseudo-user without introducing the risk you describe.
+
+> and thus without the ability to give multiple group
+> and/or multiple user ownership to a file the only option is yet another
+> setuid program that's even more directly vulnerable to attack by an
+> untrusted subsystem admin.
+
+No, that is not the only option.  I've just outlined another one,
+although it doesn't really grant multiple groups to a program, but
+rather combines their privileges into a third group.
+
+> Maybe it should be made impossible for the owner of a setuid file to
+> change the permissions on that file thus allowing the admin to protect a
+> setuid (non-root) program from its owner.  I don't know if that would be
+> sufficient though.  (and it assumes the file is put in a place where the
+> owner could not replace it -- i.e. in a root-owned directory)
+
+I've been toying with that idea some years back.  Yes, we could make
+it such that files with S_ISUID set but S_IWUSR not set can't be
+chmod'ed by non-root.  But the disadvantage is that the user would
+then be able to make an irreversible chmod.  (Yes, some kernels
+already allow for similar irreversible actions to be performed: chown
+giveaway and hard links to non-owned files.  I find these problematic
+too.)
+
+Luckily, there's no really good reason to do that.  SGID and group
+permissions can always be used to achieve the same.
+
+To summarize: I do indeed agree with you that the traditional Unix
+filesystem permissions are very limited and obsolete.  But they
+generally do not make it impossible to do cool things, they just force
+us to use ugly kludges or give up.  But we do have that choice. :-)
+
+And we do not strictly have to accept additional security risks such
+as those associated with sudo or other SUID root wrapper binaries,
+although that might be easier to integrate into an existing system
+where you wouldn't want to move files around and change permissions.
+
+-- 
+Alexander Peslyak <solar at openwall.com>
+GPG key ID: B35D3598  fp: 6429 0D7E F130 C13E C929  6447 73C3 A290 B35D 3598
+http://www.openwall.com - bringing security into open computing environments
+
+

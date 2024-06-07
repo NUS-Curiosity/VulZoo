@@ -1,0 +1,138 @@
+
+Date: Sat, 20 Sep 2003 19:53:45 +0400
+From: Gleb Smirnoff <glebius@...l.sick.ru>
+To: bugtraq@...urityfocus.com
+Subject: Multiple Security Issues in Netup UTM
+
+
+Name               : Multiple Security Issues in Netup UTM
+Software Package   : Netup UserTraffManager
+Vendor Homepage    : http://www.netup.biz, http://www.netup.ru
+Vulnerable Versions: 3.0, 4.0
+Platforms          : Linux, FreeBSD
+Vulnerability Type : SQL injections, remote shell command execution
+
+Introduction
+-------
+  As it is postulated on vendor's website www.netup.biz: "NetUP UserTraffManager
+  is a universal ISP billing system for Internet Service Providers of any size,
+  from small offices to global companies".
+
+  Actually, UTM is a traffic accounting suite, which consist of 
+  1) scripts for collecting traffic statistics from different devices, and
+     storing them in MySQL database.
+  2) web interface for administrators and end-users.
+
+-------
+Issue 1: Session hijacking using SQL injection
+
+  Web interface of UTM consist of 3 executables: aaa, admin and utm_stat. aaa
+handles authentication of user or administrator, and generates unique session
+id. After that admin or utm_stat identifies user by session id, which is
+passed as a parameter sid in HTTP GET string.
+  It appears that session data is stored in MySQL, and sid parameter is checked
+with simple SELECT, and special characters in parameter sid are not escaped,
+so sessions can be easily hijacked with queries altering where-clause,
+for example sid='q" OR 1=1 OR "q"="q'. This will give an access to first
+currently open session. The resulting query will be:
+
+https://somehost/cgi-bin/utm/admin?cmd=full_view&sid=q%22%20OR%201=1%20OR%20%22q%22=%22q
+https://somehost/cgi-bin/utm/utm_stat?cmd=user_report&sid=q%22%20OR%201=1%20OR%20%22q%22=%22q
+
+The attacker can switch between sessions altering the SQL query, for example:
+sid=q" OR 1=1 AND uid!=10 OR "q"="q
+Once the attacker has found needed session he can stick to it, adding uid=X 
+(where X is users ID) to the query.
+
+If no sessions are currently active a message "Access denied" is displayed,
+however nothing is written to UTM_logs table.
+
+Once the administrator's session is hijacked, attacker can do anything that
+this administrator can: alter users' settings, add users, erase logs, steal
+UTM registration key and else...
+
+-------
+Issue 2: Altering user's parameters using SQL injection
+
+  All user's information is stored in a single SQL row. Users can change their
+password and language via web interface given by /cgi-bin/utm/user_stat.
+Data from HTTP query passes to SQL UPDATE query not escaped. So, using SQL
+injection user can alter all his parameters, and amount of money on his
+account as well.
+  Logged in user can alter his information, and in case of session hi-jacking,
+attacker can alter session owner's info.
+  For example, setting lang to 'ru", bill=10000, lang="ru', will put 10000
+rubles on user's money bill. And the example query will be:
+
+https://somehost/cgi-bin/utm/utm_stat?cmd=change_lang&lang=ru%22,%20bill=10000,%20lang=%22ru&sid=XXXXX
+
+(where XXXXX is valid sid, or an SQL injection described in issue 1).
+
+-------
+
+  Really all UTM's code suffers from SQL injections. Two most bad where already
+described above. So I will skip others, and will go on describing worse bugs.
+
+-------
+Issue 3: Executing shell commands
+
+  UTM allows its administrators to setup firewall rules. Administrator enters
+the parameters for ipchains (in case if Linux) or ipfw (FreeBSD) into
+webform, and they are stored in MySQL, and executed with help of sudo. A
+malicious administrator can add semicolon and any shell commands to the
+firewall rule, and this commands will be executed with uid of httpd process
+owner.
+  However, altering firewall rules is disabled in UTM by default. In this case
+an attacker can use more complicated way to execute commands:
+  The problem is that UTM configuration options from /netup/utm/utm.cfg are
+exported to global variables after parsing. This happens on each startup of
+aaa, admin or utm_stat. After this, dictionary data for corresponding language
+is selected from table dict. This data is also exported to global variables.
+Column "variable" becomes variable name, and column "value" its value. So, if
+one has access to table dict, he can override configuration options from
+/netup/utm/utm.cfg. Overriding option sudo_path allows an attacker to
+execute shell commands on server running UTM.
+  Web interface /cgi-bin/utm/admin allows only to change column value of table
+dict. But, further examination shows that admin?cmd=dict_change, is subject
+to SQL injection similar to utm_stat?cmd=change_lang, described above.
+Passing parameter like
+
+value506='touch /tmp/hacked; /usr/local/bin/sudo", variable="sudo_path'
+
+to admin?cmd=dict_change will rewrite global variable sudo_path, and
+'touch /tmp/hacked' will be executed with next call to sudo. The HTTP query
+itself is very big, because all rows in table dict are changed with one
+query (stupid!), so the query won't be shown here.
+
+-------
+Issue 4: Gaining root access
+
+  Once an attacker can execute shell commands with uid of httpd process
+owner (usually nobody), in most cases he can gain a root shell. The problem
+is that in all boxes running UTM sudoers file contains a line:
+
+nobody  ALL= NOPASSWD: /bin/mv
+
+So moving from httpd uid to uid 0 is quite easy.
+
+(I don't really know reason for this, but it is even suggested to do it
+on vendor's website http://www.netup.ru/?fid=31)
+
+-------
+Known workarounds:
+
+1. Change database_login in utm.cfg to non-root value (default root).
+2. Remove "nobody  ALL= NOPASSWD: /bin/mv" from sudoers.
+3. Disallow changing dictionary and adding firewall rules for all
+   administrators. Set tables actions and dict read-only for
+   UTM mysql account.
+4. Deny access to /cgi-bin/utm from outer networks via .htaccess.
+5. Deny access to /cgi-bin/utm/admin.pl from any hosts except of
+   administrators' ones via .htaccess.
+6. Deny POST method in .htaccess. Track access_log for SQL injections.
+
+-- 
+Totus tuus, Glebius.
+GLEBIUS-RIPN GLEB-RIPE
+
+

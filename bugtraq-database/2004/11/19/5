@@ -1,0 +1,258 @@
+
+Date: Wed, 17 Nov 2004 17:17:08 -0800
+From: Bryan Burns <bburns@...iper.net>
+To: bugtraq@...urityfocus.com
+Subject: A Brief Analysis of Bofra/MyDoom.AG/AH
+
+
+Overview of Bofra
+==============
+
+Bofra (AKA MyDoom.AG/AH) is a worm that was first discovered on November
+8th circulating in the wild.  Bofra spreads by sending e-mail to victims
+with a URL pointing back to a special webserver running on the infected
+machine.  Bofra runs this small webserver on port 1639[1] (0x666 + 1)
+and provides two pieces of content:
+
+1. A request for /reactor will return a copy of the worm
+2. A request for anything else will return an HTML document that
+attempts to exploit the recent and unpatched IE iframe/frame/embed name
+overflow vulnerability[2].
+
+The payload of the IE exploit causes the /reactor URL to be downloaded
+and executed, thereby infecting the host.
+
+Upon infection, an infected host will do the following:
+
+1. Add keys in the registry to start Bofra at startup
+2. Start the infection web server on port 1639[1]
+3. Gather e-mail addresses from the host's hard-drive and send e-mails
+to them to spread the infection.
+4. Connect to a random IRC server[3] and join a specific channel, based
+on the date.
+
+The IRC connection acts as a simple backdoor into the system, allowing
+the author of the worm to further control the infected hosts.
+
+IRC Backdoor
+============
+
+Machines infected with Bofra will select a random IRC server from a
+provided list[3] and join a channel determined by passing the current
+date into a channel name generation algorithm (detailed below).  Once
+joined to the channel, the backdoor will accept a handful of commands
+provided via PRIVMSG (either to the channel or to the client directly.)
+
+Each command sent to the IRC backdoor needs to be prefixed with a
+command word and is obfuscated with a key, both of which are changed
+daily along with the channel.  Someone who knows the command word, key,
+and obfuscation algorithm can send commands to the backdoor to gather
+information about the infected host or instruct the backdoor to download
+and execute an arbitrary executable from the internet.  The executable
+download capability can be used to re-infect a host with the latest
+Bofra variant, or install any additional malware the author desires.
+
+By idling in one of the Bofra channels, I was able to catch someone
+"upgrading" the bots using the execute command.  The URL provided (after
+de-obfuscation) pointed to an executable with a jpg extension hosted on
+a russian webserver (http://kjh0.narod.ru/pic9.jpg).  ClamAV identified
+the executable as being MyDoom.AD.
+
+Channel/Key Generation Algorithm
+================================
+
+In order to avoid easy containment, Bofra picks a new IRC channel,
+command word and key every day.  Bofra uses the GetSystemTime function,
+which uses UTC time, to determine the date, so instead of switching at
+midnight, infected machines gradually migrate to the new channel over
+the course of the day based on the local timezone.
+
+The algorithm uses the year, month and day passed through some
+trigonometric functions as a seed to srand, then uses the output of
+rand() in series to generate:
+
+1. channel name length (at most 8 chars)
+2. channel name
+3. command word (always 8 chars)
+4. key (int between 0 and 25)
+
+The input to srand is (sin(month) * cos(day)) + sin(1/year) interpreted
+as an int.  Due to the particulars of the compiler used to generate the
+Bofra executable, this portion of the algorithm is expressed in assembly
+language in order for VC++ to generate equivalent code.
+
+Here is functionally equivalent C code for generating the channel name,
+command word and key:
+
+-----------------------------------------------------------------------
+void random_string(char *buf, int len){
+         int i;
+
+         for(i = 0; i < len; i++){
+                 buf[i] = (rand() % 26) + 'a';
+         }
+
+         buf[len] = 0;
+}
+
+void get_chan_word_and_key(){
+         SYSTEMTIME t;
+         GetSystemTime(&t);
+
+         double x = 1.0;
+         double d;
+         unsigned int n;
+
+         // (sin(month) * cos(day)) + sin(1/year)
+         _asm {
+                 FILD t.wMonth
+                 FSIN
+                 FILD t.wDay
+                 FCOS
+                 FMULP ST(1), ST
+                 FILD t.wYear
+                 FDIVR x
+                 FSIN
+                 FADDP ST(1), ST
+                 FSTP QWORD PTR d
+                 MOV ECX, DWORD PTR d
+                 MOV n, ECX
+         };
+
+         srand(n);
+
+         int len = rand() & 0x80000003;
+         if(len < 0){
+                 len--;
+                 len |= 0xFFFFFFFC;
+                 len++;
+         }
+
+         len += 5;
+
+         char chan[9];
+         random_string(chan, len);
+
+         char command[9];
+         random_string(command, 8);
+
+         int key = rand() % 26;
+
+         printf("%hd/%hd/%hd: #%s %s %d\n", t.wYear, t.wMonth, t.wDay,
+	chan, command, key);
+}
+-----------------------------------------------------------------------
+
+Some example values:
+11/17/2004: channel: #ygufwz command word: ahxvvnyx key: 14
+11/18/2004: channel: #gjfuzg command word: htcyswlz key: 12
+11/19/2004: channel: #eysyrtc command word: hdhcxqus key: 14
+
+A list of channel names has already been provided to dalnet and undernet
+OPERs and future Bofra channels have been disabled on both networks.
+
+Obfuscation Algorithm
+=====================
+
+All commands and their arguments (if any) are obfuscated using a simple
+algorithm.  The daily "key" determines the first character's
+transformation.  Each subsequent character is transformed by the
+previous character.  There is a small flaw in this algorithm: while you
+do need to know the key to obfuscate a string, you do not need to know
+they key to return it to the original text, as only the first character
+requires knowledge of the key to transform.  Of course, with a total of
+26 different keys, this is certainly not a robust algorithm anyway.
+
+Here is functionally equivalent C code for obfuscating/de-obfuscating a
+string:
+
+-----------------------------------------------------------------------
+char transform(char c, int key){
+   char *uppers = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+   char *lowers = "abcdefghijklmnopqrstuvwxyz";
+   char *idx;
+
+   if(key < 0)
+     key += 26;
+
+   if(idx = strchr(uppers, c)){
+     return uppers[(idx - uppers + key) % 26];
+   } else if(idx = strchr(lowers, c)){
+     return lowers[(idx - lowers + key) % 26];
+   } else {
+     return c;
+   }
+}
+
+void decrypt(int key, char *s, char *d){
+
+   while(*s){
+     char c = *s;
+
+     *d = transform(c, -key);
+
+     if(c >= 'a' && c  <= 'z')
+       key = ((int)c) - 'a';
+     else if(c >= 'A' && c <= 'Z')
+       key = ((int)c) - 'A';
+
+     s++;
+     d++;
+   }
+}
+
+void encrypt(int key, char *s, char *d){
+
+   while(*s){
+     char c = *s;
+
+     *d = transform(c, key);
+
+     c = *d;
+
+     if(c >= 'a' && c  <= 'z')
+       key = ((int)c) - 'a';
+     else if(c >= 'A' && c <= 'Z')
+       key = ((int)c) - 'A';
+
+     s++;
+     d++;
+   }
+}
+-----------------------------------------------------------------------
+
+A sample obfuscated URL: vohw://sok.lzseewptk.mam/yyjffwa.ebf
+
+Even though this URL was encoded with the key 14, the de-obfuscation
+with the wrong key (in this case 1) is still obvious:
+
+URL above de-obfuscated w/ key 1: uttp://www.botmaster.com/malware.exe
+
+----------
+[1] Bofra attempts to bind to port 1639 first, but if that fails it will
+try 1640, 1641, etc.
+[2] http://secunia.com/advisories/12959/
+[3] Bofra picks a random IRC server from the following list to connect
+to:
+    broadway.ny.us.dal.net
+    brussels.be.eu.undernet.org
+    caen.fr.eu.undernet.org
+    ced.dal.net
+    coins.dal.net
+    diemen.nl.eu.undernet.org
+    flanders.be.eu.undernet.org
+    graz.at.eu.undernet.org
+    london.uk.eu.undernet.org
+    los-angeles.ca.us.undernet.org
+    lulea.se.eu.undernet.org
+    ozbytes.dal.net
+    qis.md.us.dal.net
+    vancouver.dal.net
+    viking.dal.net
+    washington.dc.us.undernet.org
+
+
+-Bryan
+
+
+

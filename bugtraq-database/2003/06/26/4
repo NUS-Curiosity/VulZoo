@@ -1,0 +1,98 @@
+
+Date: Thu, 26 Jun 2003 19:24:23 +0200
+From: Paul Starzetz <paul@...rzetz.de>
+To: bugtraq@...urityfocus.com, vendor-sec <vendor-sec@....de>,
+	full-disclosure@...ts.netsys.com
+Subject: Linux 2.4.x execve() file read race vulnerability
+
+Hi people,
+
+again it is time to discover a funny bug inside the Linux execve() 
+system call.
+
+
+Details:
+---------
+
+While looking at the execve() code I've found the following piece of 
+code (from fs/binfmt_elf.c):
+
+static int load_elf_binary(struct linux_binprm * bprm, struct pt_regs * 
+regs)
+{
+    struct file *interpreter = NULL; /* to shut gcc up */
+
+[...]
+
+    retval = kernel_read(bprm->file, elf_ex.e_phoff, (char *) 
+elf_phdata, size);
+    if (retval < 0)
+        goto out_free_ph;
+
+    retval = get_unused_fd();
+    if (retval < 0)
+        goto out_free_ph;
+    get_file(bprm->file);
+    fd_install(elf_exec_fileno = retval, bprm->file);
+
+
+So, during the execution of new binary, the opened file descriptor to 
+the executable is put into the file table of the current (the caller of 
+execve()) process. This can be exploited creating a file sharing 
+parent/child pair by means of the clone() syscall and reading the file 
+descriptor from one of them.
+
+Further, the check for shared files structure (in compute_creds() from 
+exec.c) is made to late, so even the parent can successfully exit after 
+playing games on that file descriptor and the child (if setuid) is 
+executed under full privileges. I wrote a simple setuid binary dump 
+utility so far, but further implications (due to the complexity of the 
+execve() syscall) may be possible...
+
+
+Lets illustrate the vulnerability:
+
+paul@...gy:~> ls -l /bin/ping
+-rws--x--x    1 root     root        29680 Oct 25  2001 /bin/ping
+
+so the setuid ping binary can be only executed by anyone, but not read.
+
+Now we start the suid dumper (while playing with the disk on another 
+console like cat /usr/bin/* >/dev/null) :
+
+paul@...gy:~> while true ; do ./suiddmp /bin/ping -c 1 127.0.0.1 ; if 
+test $? -eq 1 ; then exit 1 ; fi; done 2>/dev/null | grep -A5 suc
+
+and after few seconds:
+
+Parent success stating:
+uid 0 gid 0 mode 104711 inode 9788 size 29680
+PING 127.0.0.1 (127.0.0.1) from 127.0.0.1 : 56(84) bytes of data.
+64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=94 usec
+
+--- 127.0.0.1 ping statistics ---
+
+paul@...gy:~> ls -l
+total 7132
+-rwxr-xr-x    1 paul     users       29680 Jun 26 19:17 suid.dump
+[...]
+
+paul@...gy:~> ./suid.dump
+Usage: ping [-LRUbdfnqrvVaA] [-c count] [-i interval] [-w deadline]
+            [-p pattern] [-s packetsize] [-t ttl] [-I interface or address]
+            [-M mtu discovery hint] [-S sndbuf]
+            [ -T timestamp option ] [ -Q tos ] [hop1 ...] destination
+
+
+Obviously the setuid binary has been duplicated :-) (but with no setuid 
+flag of course).
+
+
+Source also available at:
+
+http://www.starzetz.com/paul/suiddmp.c
+
+/ih
+
+
+View attachment "suiddmp.c" of type "text/plain" (2706 bytes)

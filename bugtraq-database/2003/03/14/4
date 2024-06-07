@@ -1,0 +1,448 @@
+
+Date: 14 Mar 2003 00:17:55 +0200
+From: Timo Sirainen <tss@....fi>
+To: bugtraq@...urityfocus.com
+Subject: Buffer overflows in ircII-based clients
+
+
+After seeing the BitchX "DoS" problem mentioned the n'th time already, I
+decided to finally audit ircII based clients to show some worse problems
+they have. I had been pretty sure for years that malicious servers can
+exploit them in multiple ways, and I think many others have known it as
+well. EPIC and ircII authors have been working to fix these, but looks like
+their job isn't yet finished.
+
+Let's state this clearly first: Regular USERS CANNOT EXPLOIT these bugs.
+This means that these clients are safe when they're connected to standard
+IRC servers. Connecting to special servers can cause problems though. So it
+requires user to type /SERVER evil.server.org to exploit these bugs. I
+don't think it's too difficult with a bit of social engineering though.
+
+Of course, man-in-the-middle can also exploit these.
+
+There may be more problems than what I list below. ircII wasn't originally
+written to be safe against malicious servers, so there's a lot of code that
+needed fixing. My audit was only a quick look at the clients, you may well
+find more.
+
+So, the safest fix is to not connect to untrusted servers, and not IRC over
+insecure network links. (Or just switch to some safe non-ircII based
+client.)
+
+
+BitchX 1.0c19
+-------------
+
+Full of sprintf() calls and relying on BIG_BUFFER_SIZE being large enough.
+There's multiple ways to exploit it by giving near-BIG_BUFFER_SIZE strings
+in various places.
+
+1)
+
+---
+#define IRCD_BUFFER_SIZE 512
+#define BIG_BUFFER_SIZE IRCD_BUFFER_SIZE*4
+
+extern	void	send_ctcp (int type, char *to, int datatag, char *format, ...)
+{
+	char putbuf [BIG_BUFFER_SIZE + 1],
+	     *putbuf2;
+	int len;
+	len = IRCD_BUFFER_SIZE - (12 + strlen(to));
+	putbuf2 = alloca(len);
+...
+		snprintf(putbuf2, len, "%c%s %s%c", 
+				CTCP_DELIM_CHAR, 
+				ctcp_cmd[datatag].name, putbuf, 
+				CTCP_DELIM_CHAR);
+...
+	putbuf2[len - 2] = CTCP_DELIM_CHAR;
+	putbuf2[len - 1] = 0;
+---
+
+The len part looks interesting. Especially if strlen(to) is larger than
+IRCD_BUFFER_SIZE-12, which gives alloca() a negative value (actually casted
+into large size_t). alloca() is pretty stupid function and doesn't perform
+any bounds checking, so what actually happens is that it returns a pointer
+to somewhere inside the stack already in use. You should be able to
+overwrite function's return address with a little testing. I didn't bother
+enough to verify that, but I got close enough:
+
+Send: ":A*502 PRIVMSG a :^APING X*151^A"
+
+Program received signal SIGSEGV, Segmentation fault.
+0x08079e90 in send_ctcp (type=1, to=0xbfffee91 'A' <repeats 200 times>..., 
+    datatag=312, format=0x58585858 <Address 0x58585858 out of bounds>)
+    at ctcp.c:1513
+1513            putbuf2[len - 2] = CTCP_DELIM_CHAR;
+(gdb) p /x len
+$79 = 0x58585858
+
+Which gives the possibility to write ASCII 1+0 anywhere in memory. That may
+be enough for exploit.
+
+2) cannot_join_channel() allows writing one of 6 predefined texts past
+buffer in stack if channel name is large enough.
+
+3) cluster() is called by several autokick/userlist/etc. functions.
+static char result[] can be overflowed by around 1500 bytes by giving a long
+hostname.
+
+4) BX_compress_modes() allows overflowing char nmodes[16] if
+/set compress_modes on (default is off)
+
+5) handle_oper_vision(): Looks like feeding invalid "Client connecting"
+line could overflow sprintf() in it. Didn't verify.
+
+6) ban_it() uses static char banstr[BIG_BUFFER_SIZE/4+1]. Very likely
+overflowable.
+
+Above ones were found just by grepping strcat and sprintf, there might be
+more. In general, just think what happens if nick name, host name or channel
+name is near BIG_BUFFER_SIZE.
+
+No official fixes yet, but I've attached a patch below that fixes these
+(well, untested but compiles). I've limited the input buffer size to only
+half of BIG_BUFFER_SIZE, that should fix most of the potential problems.
+
+
+ircii 20020912
+--------------
+
+The code was much better than I expected. snprintf() was used everywhere,
+only problem that I found was a few my_strcat() calls:
+
+1) "PRIVMSG a a*4080^ASED^A" or "^AUTC 1^A" overflows ctcp_buffer, but not
+by much and there doesn't seem to be anything important right after it
+
+2) cannot_join_channel() allows writing one of 5 predefined texts past
+buffer in stack. I was able to modify %ebp by with it, but couldn't get
+anything useful out of it. It just crashed while trying to read memory. I
+didn't try too hard though, so exploiting might be possible with other
+ways.
+
+3) Statusbar drawing has several buffer overflows. Usually it gets
+truncated to screen width, but a few control characters aren't counted, so
+we can stuff the buffer nearly full of it.
+
+Next thing that happens is that the last character is filled until the
+screen width is full. That alone can overflow the buffer. Then it appends
+\017 + \0 without overflow checks.
+
+status_make_printable() is called next. It has a check for pos <
+BIG_BUFFER_SIZE, but that can still overflow buffer by two bytes (our
+control char and \026) if last character is one the control chars.
+
+I got this far with exploiting:
+
+print SOCKET ":i 001 ".("\002"x3880).("X"x40).("\002"x140)." :\n";
+
+Program received signal SIGSEGV, Segmentation fault.
+0x08079f8a in make_status (window=0x58585858)
+    at /home/cras/src/ircii-20020912/source/status.c:803
+803                             if (window->status_line[k] && (SG == -1))
+
+I think you'd get a real exploit out of that by properly setting the local
+variables.
+
+4) Some of the other my_strcat() calls may overflow buffer as well (eg.
+create_server_list()), but they can't be exploited by (a single) server.
+
+ircii-20030313 fixes these.
+
+
+EPIC4 1.1.7.20020907
+--------------------
+
+Note that this is an ALPHA version, and the author strongly recommends not
+to use it. However at least Debian is still distributing it instead of
+1.0.1 (which is why I audited that - I just did "apt-get source epic4").
+
+It contained one user (eg. regular PRIVMSG) exploitable heap buffer
+overflow if mangle_inbound setting contained ANSI. Because the overflowable
+bytes were limited to only few specific characters, I'm not sure if it's
+more than a remote crash.
+
+It also contained the same two problems as 1.0.1 below, and a few more
+potential ones.
+
+20030314 snapshot should fix these.
+
+
+EPIC4 1.0.1
+-----------
+
+This is the PRODUCTION release which you should be using.
+
+1) EPIC has grown max. input line of server from the old 4096 to 8192, but
+without growing BIG_SERVER_BUFFER from 4096. There's at least one place
+where you can overflow it:
+
+---
+void	userhost_cmd_returned (UserhostItem *stuff, char *nick, char *text)
+{
+	char	args[BIG_BUFFER_SIZE + 1];
+
+	/* This should be safe, though its playing it fast and loose */
+	strcpy(args, stuff->nick ? stuff->nick : empty_string);
+	strcat(args, stuff->oper ? " + " : " - ");
+	strcat(args, stuff->away ? "+ " : "- ");
+	strcat(args, stuff->user ? stuff->user : empty_string);
+	strcat(args, space);
+	strcat(args, stuff->host ? stuff->host : empty_string);
+	parse_line(NULL, text, args, 0, 0);
+}
+---
+
+Exploiting that requires that the client calls /USERHOST nick -CMD
+<command>, but I think that's quite widely used in EPIC scripts.
+
+2) Statusbar writing isn't fully safe:
+
+---
+			/*
+			 * XXXXX This is a bletcherous hack.
+			 * If i knew what was good for me id not do this.
+			 */
+			else if (*ptr == 9)	/* TAB */
+			{
+				fillchar[0] = ' ';
+				fillchar[1] = 0;
+				do
+					*cp++ = ' ';
+				while (++(*prc) % 8);
+				ptr++;
+			}
+---
+
+Giving TAB at the end of nearly full buffer would overflow it. Normally
+EPIC doesn't allow buffer to get wider than screen, but we can use several
+control characters to fill the buffer without consuming screen width.
+
+Now, the only problem is how do you get large enough string into statusbar.
+I didn't find any way to do it automatically by default. %C is largest at
+512 bytes. strip_ansi() can grow the string, but we'd still need 2700 bytes
+or so. Some user-defined statusbar variables could be used though, again
+requiring some script that uses them.
+
+NOTE: I did only a quick check to see if the problems I found from ALPHA
+version were still there. There's quite a lot of changes between these
+versions, so there may be more and I'm too busy now to go through it.
+
+1.0.2 will not be released to fix server based exploits. 1.1.x series
+intends to fully fix it, so in the mean time just don't connect to
+untrusted servers. Growing BIG_BUFFER_SIZE to 8192 (and maybe a few hundred
+bytes larger) should make you pretty safe though.
+
+
+XChat 2.0.1
+-----------
+
+This isn't ircII-based, but I thought I'd check it as well.
+
+Nothing usable found. A few minor potential buffer overflows here and
+there, requiring conditions that currently don't exist. One thing I don't
+understand is why does it bother playing around with unsafe buffers while
+it could use GLIB's GStrings just as easily? This bothers me a bit:
+
+---
+	char outbuf[4096];
+	char pdibuf_static[522]; /* 1 line can potentially be 512*6 in utf8 */
+---
+
+outbuf is commonly treated as "large enough" to contain most of pdibuf.
+This gives it around 1024 bytes of extra space. Is it enough? Seems to be
+currently, but all you need for an overflow is to get two different
+non-truncated server given strings written into it.
+
+
+BitchX Patch
+------------
+
+diff -ru BitchX-old/source/banlist.c BitchX/source/banlist.c
+--- BitchX-old/source/banlist.c	2002-02-28 06:22:46.000000000 +0200
++++ BitchX/source/banlist.c	2003-03-13 20:09:01.000000000 +0200
+@@ -277,30 +277,30 @@
+ 		case 7:
+ 			if (ip)
+ 			{
+-				sprintf(banstr, "*!*@%s", cluster(ip));
++				snprintf(banstr, sizeof(banstr), "*!*@%s", cluster(ip));
+ 				break;
+ 			}
+ 		case 2: /* Better 	*/
+-			sprintf(banstr, "*!*%s@%s", t1, cluster(host));
++			snprintf(banstr, sizeof(banstr), "*!*%s@%s", t1, cluster(host));
+ 			break;
+ 		case 3: /* Host 	*/
+-			sprintf(banstr, "*!*@%s", host);
++			snprintf(banstr, sizeof(banstr), "*!*@%s", host);
+ 			break;
+ 		case 4: /* Domain	*/
+-			sprintf(banstr, "*!*@*%s", strrchr(host, '.'));
++			snprintf(banstr, sizeof(banstr), "*!*@*%s", strrchr(host, '.'));
+ 			break;
+ 		case 5: /* User		*/
+-			sprintf(banstr, "*!%s@%s", t, cluster(host));
++			snprintf(banstr, sizeof(banstr), "*!%s@%s", t, cluster(host));
+ 			break;
+ 		case 6: /* Screw 	*/
+ 			malloc_sprintf(&tmpstr, "*!*%s@%s", t1, host);
+-			strcpy(banstr, screw(tmpstr));
++			strmcpy(banstr, screw(tmpstr), sizeof(banstr)-1);
+ 			new_free(&tmpstr);
+ 			break;
+ 		case 1:	/* Normal 	*/
+ 		default:
+ 		{
+-			sprintf(banstr, "%s!*%s@%s", nick, t1, host);
++			snprintf(banstr, sizeof(banstr), "%s!*%s@%s", nick, t1, host);
+ 			break;
+ 		}
+ 	}
+diff -ru BitchX-old/source/ctcp.c BitchX/source/ctcp.c
+--- BitchX-old/source/ctcp.c	2002-02-28 06:22:47.000000000 +0200
++++ BitchX/source/ctcp.c	2003-03-13 19:59:35.000000000 +0200
+@@ -1482,6 +1482,7 @@
+ 	     *putbuf2;
+ 	int len;
+ 	len = IRCD_BUFFER_SIZE - (12 + strlen(to));
++	if (len <= 2) return;
+ 	putbuf2 = alloca(len);
+ 
+ 	if (format)
+diff -ru BitchX-old/source/misc.c BitchX/source/misc.c
+--- BitchX-old/source/misc.c	2002-03-24 11:31:07.000000000 +0200
++++ BitchX/source/misc.c	2003-03-13 20:02:13.000000000 +0200
+@@ -3121,19 +3121,19 @@
+ 	{
+ 		if (*hostname == '~')
+ 			hostname++;
+-		strcpy(result, hostname);
++		strmcpy(result, hostname, sizeof(result)-1);
+ 		*strchr(result, '@') = '\0';
+ 		if (strlen(result) > 9)
+ 		{
+ 			result[8] = '*';
+ 			result[9] = '\0';
+ 		}
+-		strcat(result, "@");
++		strmcat(result, "@", sizeof(result)-1);
+ 		if (!(hostname = strchr(hostname, '@')))
+ 			return NULL;
+ 		hostname++;
+ 	}
+-	strcpy(host, hostname);
++	strmcpy(host, hostname, sizeof(host)-1);
+ 
+ 	if (*host && isdigit(*(host + strlen(host) - 1)))
+ 	{
+@@ -3154,8 +3154,8 @@
+                 for (i = 0; i < count; i++)
+                         tmp = strchr(tmp, '.') + 1;
+                 *tmp = '\0';
+-                strcat(result, host);
+-                strcat(result, "*");
++                strmcat(result, host, sizeof(result)-1);
++                strmcat(result, "*", sizeof(result)-1);
+ 	}
+ 	else
+ 	{
+@@ -3177,10 +3177,10 @@
+ 			else
+ 				return (char *) NULL;
+ 		}
+-		strcat(result, "*");
++		strmcat(result, "*", sizeof(result)-1);
+ 		if (my_stricmp(host, temphost))
+-			strcat(result, ".");
+-		strcat(result, host);
++			strmcat(result, ".", sizeof(result)-1);
++		strmcat(result, host, sizeof(result)-1);
+ 	}
+ 	return result;
+ }
+diff -ru BitchX-old/source/names.c BitchX/source/names.c
+--- BitchX-old/source/names.c	2002-03-25 22:47:30.000000000 +0200
++++ BitchX/source/names.c	2003-03-13 20:10:26.000000000 +0200
+@@ -572,7 +572,7 @@
+ 
+    	*nmodes = 0;
+    	*nargs = 0;
+-	for (; *modes; modes++) 
++	for (; *modes && strlen(nmodes) < sizeof(nmodes)-2; modes++)
+ 	{
+ 		isbanned = isopped = isvoiced = 0;
+ 		switch (*modes) 
+@@ -742,7 +742,7 @@
+ 
+    /* modes which can be done multiple times are added here */
+ 
+-	for (tucm = ucm; tucm; tucm = tucm->next) 
++	for (tucm = ucm; tucm && strlen(nmodes) < sizeof(nmodes)-2; tucm = tucm->next)
+ 	{
+ 		if (tucm->o_ed) 
+ 		{
+diff -ru BitchX-old/source/notice.c BitchX/source/notice.c
+--- BitchX-old/source/notice.c	2002-02-28 06:22:50.000000000 +0200
++++ BitchX/source/notice.c	2003-03-13 20:07:39.000000000 +0200
+@@ -422,10 +422,10 @@
+ 	{
+ 		char *q = strchr(line, ':');
+ 		char *port = empty_string;
+-		int conn = !strncmp(line+7, "connect", 7) ? 1 : 0;
++		int conn = strlen(line) > 7 && !strncmp(line+7, "connect", 7) ? 1 : 0;
+ 		int dalnet = 0, ircnet = 0;
+ 
+-		if (*(line+18) == ':')
++		if (strlen(line) > 18 && *(line+18) == ':')
+ 			q = NULL;
+ 		else
+ 			dalnet = (q == NULL);
+@@ -462,7 +462,7 @@
+ 		    else sscanf(p, "%s was %s from %s", for_, fr, temp);
+ 
+ 		    q = p;
+-		    sprintf(q, "%s@%s", fr, temp);
++		    snprintf(q, strlen(q)+1, "%s@%s", fr, temp);
+ 		    if (!conn) 
+ 		    {
+ 			port = strstr(temp2, "reason:");
+diff -ru BitchX-old/source/server.c BitchX/source/server.c
+--- BitchX-old/source/server.c	2002-03-25 07:21:24.000000000 +0200
++++ BitchX/source/server.c	2003-03-13 20:10:00.000000000 +0200
+@@ -474,11 +474,11 @@
+ 					}
+ 					else
+ #endif
+-						junk = dgets(bufptr, des, 1, BIG_BUFFER_SIZE, server_list[i].ssl_fd);
++						junk = dgets(bufptr, des, 1, BIG_BUFFER_SIZE/2, server_list[i].ssl_fd);
+ 				}
+ 				else
+ #endif
+-					junk = dgets(bufptr, des, 1, BIG_BUFFER_SIZE, NULL);
++					junk = dgets(bufptr, des, 1, BIG_BUFFER_SIZE/2, NULL);
+ 			}
+ 			switch (junk)
+ 			{
+@@ -1741,7 +1741,7 @@
+ 			default:
+ 				if (FD_ISSET(des, &rd))
+ 				{
+-					if (!dgets(buffer, des, 0, BIG_BUFFER_SIZE, NULL))
++					if (!dgets(buffer, des, 0, BIG_BUFFER_SIZE/2, NULL))
+ 						flushing = 0;
+ 				}
+ 				break;
+@@ -1751,7 +1751,7 @@
+ 	FD_ZERO(&rd);
+ 	FD_SET(des, &rd);
+ 	if (new_select(&rd, NULL, &timeout) > 0)
+-		dgets(buffer, des, 1, BIG_BUFFER_SIZE, NULL);
++		dgets(buffer, des, 1, BIG_BUFFER_SIZE/2, NULL);
+ }
+ 
+ 
+
+
+

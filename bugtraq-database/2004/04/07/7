@@ -1,0 +1,118 @@
+
+Date: Wed, 07 Apr 2004 18:02:34 +0400
+From: Evgeny Legerov <e.legerov@...uadra.com>
+To: mattmurphy@...rr.com, full-disclosure@...ts.netsys.com,
+   bugtraq@...urityfocus.com
+Subject: Re: Advisory: Multiple Vulnerabilities in Monit
+
+
+Hello,
+
+ > mattmurphy@...rr.com wrote:
+
+>Multiple Vulnerabilities in Monit
+>
+>* UPDATE: Integer Overflow in POST Input Handler (Initially discovered by
+>S-Quadra)
+>
+>S-Quadra discovered that a large HTTP POST would cause an xmalloc() call
+>within the WBA to fail.  This issue was fixed in 4.2.1 as a denial of
+>service.  In fact, this code also contained an exploitable integer
+>overflow.  By specifying a Content-Length header of -1, a zero-byte heap
+>allocation is performed.  An attacker can then input an arbitrary amount of
+>data, overwriting significant portions of the heap.  My research suggests
+>that this issue could also be exploited.
+>  
+>
+It seems to me that the above statement is bit incorrect, lets follow 
+the code path to see why:
+
+$ cat monit-4.0/http/protocol.c
+...
+static int create_parameters(HttpRequest req) {
+
+  int alloc= FALSE;
+  char *query_string= NULL;
+
+  if(IS(req->method, METHOD_POST)) {
+
+    Socket_T S= req->S;
+
+    int len; char *l= get_header(req, "Content-Length");
+
+    if(l && (len= atoi(l))) {
+
+[1]      query_string= xmalloc(sizeof(char) * (len + 1));
+
+[2]     if(socket_read(S, query_string, len) <= 0) {
+
+        free(query_string);
+        return FALSE;
+
+      }
+
+      alloc= TRUE;
+
+    }
+
+  } else if(IS(req->method, METHOD_GET)) {
+...
+...
+}
+
+On line #1 we see that indeed, by specifying Content-Length header of 
+-1, we can perform 'zero-byte heap allocation',
+on #2 (it translates to socket_read(S, query_string, -1) ) we supposedly 
+should be able to 'input an arbitrary amount of data, overwriting 
+significant portions of the heap', but lets look at socket_read() function:
+
+$ cat monit-4.0/socket.c
+...
+int socket_read(Socket_T S, void *b, int size) {
+
+  int n= 0;
+  void *p= b;
+  int timeout= 0;
+
+  ASSERT(S);
+
+  timeout= S->timeout;
+
+  while(size > 0) {
+    if(S->ssl) {
+      n= recv_ssl_socket(S->ssl, p, size, timeout);
+    } else {
+      n= sock_read(S->socket, p, size, timeout);
+    }
+    if(n <= 0) break;
+    p+= n;
+    size-= n;
+    timeout= 0;
+  }
+
+  if(n < 0 && p==b) {
+    return -1;
+  }
+
+  return (int) p - (int) b;
+
+}
+...
+
+We can clearly see that while loop will not be executed (as long as size 
+< 0) ...
+
+Best regards,
+Evgeny Legerov
+Director of simple source code review department, S-Quadra
+
+
+
+
+
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.netsys.com/full-disclosure-charter.html
+
+

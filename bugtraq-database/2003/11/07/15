@@ -1,0 +1,271 @@
+
+Date: Fri, 7 Nov 2003 18:25:53 +0100
+From: "c0wboy@...33" <c0wboy@...cali.it>
+To: <bugtraq@...urityfocus.com>
+Subject: terminatorX 3.8.1 local vulnerabilities
+
+
+
+           -       0x333 OUTSIDERS SECURITY LABS       -
+            -              www.0x333.org              -
+
+
+~~~~~~~~~ contents ~~~~~~~~~
+
+0x0 Info
+0x1 Description
+0x2 Stack Overflow in Switch (1)
+0x3 Stack Overflow in Switch (2)
+0x4 Stack Overflow in $LADSPA_PATH
+0x5 Format String Bug in tx_note()
+0x6 Solutions
+0x7 Vendor Contact
+
+
+
+[0x0 Info]
+
+ author   : c0wboy
+ mail     : c0wboy@...cali.it
+ date     : 7 November 2003
+ advisory : outsiders-terminatorX-001.txt
+ vendor   : http://terminatorX.cx
+ category : stack overflow, format bug
+ platform : linux, unix
+
+
+[0x1 Description]
+
+>From terminatorX's offcial web page : "terminatorX is a realtime audio
+synthesizer that allows
+you to "scratch" on digitally sampled audio data (*.wav, *.au, *.ogg, *.mp3,
+etc.)" . In Last
+version (3.8.1) there are still lots of bugs, that could be used by user to
+execute arbitrary
+codes with root privileges.
+
+
+[0x2 Stack Overflow in Switch (1)]
+
+It is possible to overflow a static buffer, by passing a long string after
+switch "-f"
+(or "--file"). In function parse_args() (src/main.cc) we find the follow
+piece of code:
+
+  if ((strcmp(argv[i], "-f") == 0) || (strcmp(argv[i], "--file") == 0)) {
+   ++i;
+   globals.startup_set = argv[i];
+
+The variable "globals.startup_set" will contain our (long) string. After
+this the variable
+will be passed to function load_tt_part() (src/tX_mastergui.cc) which is
+called by main():
+
+int main(int argc, char **argv)
+{
+...
+ if (globals.startup_set) {
+  while (gtk_events_pending()) gtk_main_iteration(); gdk_flush();
+  tX_cursor::set_cursor(tX_cursor::WAIT_CURSOR);
+  load_tt_part(globals.startup_set);
+...
+
+/* src/tX_mastergui.cc */
+void load_tt_part(char * buffer)
+{
+ char idbuff[256];
+ char wbuf[PATH_MAX];
+...
+ strcpy(globals.tables_filename, buffer);
+...
+   strcpy(idbuff, "Failed to access file: \"");
+   strcat(idbuff, globals.tables_filename);
+...
+
+In load_tt_part() our string will be first copied in
+"globals.tables_filename", that will
+overflow the static buffer idbuff[256]. User could overwrite eip and
+executes arbitrary
+code.
+
+
+[0x3 Stack Overflow in Switch (2)]
+
+This case is similar to the first one. Here we can overflow a static buffer
+by passing a
+long string after option "-r" (or "--rc-file"). In function parse_args()
+(src/main.cc) we
+
+
+  if ((strcmp(argv[i], "-r") == 0) || (strcmp(argv[i], "--rc-file") == 0)) {
+   ...
+   globals.alternate_rc = argv[i];
+
+In function get_rc_name() (src/tX_global.c) there is a unchecked strcpy()
+that will overflow
+a static buffer (passed to this function as argument) with the content of
+"globals.alternate_rc"
+variable:
+
+void get_rc_name(char *buffer)
+{
+ strcpy(buffer,"");
+ if (globals.alternate_rc) {
+  strcpy(buffer, globals.alternate_rc);
+...
+
+This bug can be used to overwrite the eip, and execute arbitrary code.
+
+
+[0x4 Stack Overflow in $LADSPA_PATH]
+
+In file tX_ladspa.cc, is possible overflow a static buffer by setting a long
+"$LADSPA_PATH"
+environment variable. As we had before, there is an unchecked strcpy(), in
+this case a long string
+will overflow "ladspa_path[PATH_MAX]":
+
+void LADSPA_Plugin :: init ()
+{
+ char *ladspa_path_ptr;
+ char ladspa_path[PATH_MAX];
+...
+
+ /* Finding the LADSPA Path */
+ ladspa_path_ptr=getenv("LADSPA_PATH");
+...
+ else strcpy(ladspa_path, ladspa_path_ptr);
+...
+
+By overflowing "ladspa_path[PATH_MAX]", eip will be overwritten, permitting
+the execution of
+arbitrary code.
+
+
+[0x5 Format String Bug in tx_note()]
+
+There is a format string bug in function tx_note(), that can be found in
+src/tX_mastergui.cc. The
+problem exists in function "gtk_message_dialog_new()". User can control the
+contents of "message"
+variable, and set it to special format string parameters (for example lots
+of '%x'). Here's the
+vulnerable code :
+
+void tx_note(const char *message, bool isError)
+{
+ char buffer[4096]="terminatorX ";
+ if (isError) {
+  strcat(buffer, "note:\n\n");
+ } else {
+  strcat(buffer, "error:\n\n");
+ }
+
+ strcat(buffer, message);
+ GtkWidget *dialog=gtk_message_dialog_new(GTK_WINDOW(main_window),
+  GTK_DIALOG_DESTROY_WITH_PARENT,
+  isError ? GTK_MESSAGE_ERROR : GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
+message);
+ gtk_dialog_run(GTK_DIALOG(dialog));                                      /*
+|_____ fmt bug  */
+ gtk_widget_destroy(dialog);
+}
+
+Is possible to exploit this bug, by passing a crafted string after witch
+"-f" (or "--file"). TerminatorX
+will be run, but it will display a warning-windows showing memory addresses.
+There will be a segfault.
+
+[c0wboy@...33 src]$ ./terminatorX -f %x%x%x%x%x%x%n
+terminatorX Release 3.81 - Copyright (C) 1999-2003 by Alexander Knig
+terminatorX comes with ABSOLUTELY NO WARRANTY - for details read the
+license.
+* tX_error: set_capabilities(): failed to set caps: Operation not permitted.
++ tX_warning: engine_thread_entry(): can't set SCHED_FIFO -> lacking
+capabilities.
++ tX_warning: engine_thread_entry() - engine has no realtime priority
+scheduling.
++ tX_warning: LADSPA_PATH not set. Trying
+/usr/lib/ladspa:/usr/local/lib/ladspa
+* tX_error: tX: Error: couldn't access directory "/usr/lib/ladspa".
++ tX_warning: Plugin "Stereo Amplifier" disabled. Not a 1-in/1-out plugin.
++ tX_warning: Plugin "White Noise Source" disabled. Not a 1-in/1-out plugin.
++ tX_warning: Plugin "Sine Oscillator (Freq:audio, Amp:audio)" disabled. Not
+a 1-in/1-out plugin.
++ tX_warning: Plugin "Sine Oscillator (Freq:control, Amp:control)" disabled.
+Not a 1-in/1-out plugin.
+warning: failed to load external entity "%25x%25x%25x%25x%25x%25x%25n"
+Segmentation fault
+[c0wboy@...33 src]$
+
+**NOTE** : There are lots of syntax-wrong gtk_message_dialog_new(), in
+src/tX_mastergui.cc file.
+
+
+[0x6 Solutions]
+
+ 0x1 (switch "-f"):
+
+ /* src/tX_mastergui.cc */
+ void load_tt_part(char * buffer)
+ {
+  char idbuff[256];
+  char wbuf[PATH_MAX];
+  xmlDocPtr doc;
+ ...
+ if (strlen(idbuff) + strlen(buffer) > 256-strlen("Failed to access file:
+\"")-strlen("\""))
+  return;
+ else
+  strcpy(globals.tables_filename, buffer);
+  ...
+
+ This will correctly check the "idbuff" lenght.
+
+
+ 0x2 (switch "-r"):
+
+ void get_rc_name(char *buffer)
+ {
+  strcpy(buffer,"");
+  if (globals.alternate_rc && (strlen(globals.alternate_rc) <
+sizeof(buffer)-1) ) { /* bof fixed */
+   strcpy(buffer, globals.alternate_rc);
+ ...
+
+ 0x3 ($ env):
+
+ The program already use a funtion to check the environment variables leghnt
+(checkenv()).
+ Just us it in main() also with $LADSPA_PATH.
+
+
+ 0x4 (fmt bug):
+
+ void tx_note(const char *message, bool isError)
+ {
+  char buffer[4096]="terminatorX ";
+  if (isError) {
+   strcat(buffer, "note:\n\n");
+  } else {
+   strcat(buffer, "error:\n\n");
+  }
+
+  /* - */ strcat(buffer, message);
+  /* + */ strncat(buffer, sizeof(message), message); /* i don't like this
+strcat() ... */
+
+  GtkWidget *dialog=gtk_message_dialog_new(GTK_WINDOW(main_window),
+GTK_DIALOG_DESTROY_WITH_PARENT,
+  isError ? GTK_MESSAGE_ERROR : GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE, "%s",
+message); /* fmt bug fixed */
+  ...
+
+
+[0x7 Vendor Contact]
+
+Vendor was informed about the bugs.
+
+
+
+

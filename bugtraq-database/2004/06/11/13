@@ -1,0 +1,181 @@
+
+Date: Thu, 10 Jun 2004 09:45:52 +0200
+From: Joel Eriksson <je-secfocus@...nux.com>
+To: bugtraq@...urityfocus.com
+Subject: [0xbadc0ded #04] smtp.proxy <= 1.1.3
+
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+==========================================================================
+0xbadc0ded Advisory #04 - 2004/06/10 - smtp.proxy <= 1.1.3
+==========================================================================
+
+Reference      http://0xbadc0ded.org/advisories/0402.txt
+PGP-key        http://0xbadc0ded.org/advisories/pubkey.asc
+
+Application    smtp.proxy <= 1.1.3
+Discovered By  Joel Eriksson <je@...nux.com>
+Researched By  Joel Eriksson <je@...nux.com>
+
+Overview
+
+  smtp.proxy is an application level gateway for SMTP. It assures that
+  the data received from the client fulfills the protocol specification
+  before forwarding it to the server. It also offers email address
+  control so that only certain sender or recipient addresses is allowed
+  and can optionally remove the 'Received:' lines from the mail header.
+
+Problem
+
+  A remotely exploitable format string vulnerability exists in smtp.proxy
+  up to and including version 1.1.3. The bug is present and exploitable
+  regardless of any compile time and runtime configuration options.
+
+  The bug can be exploited by sending a message with an embedded
+  format string in either the client hostname or the message-id, the
+  userspecified message-id string is obviously the most convenient to
+  use though. The sender address (smtp command "mail from:") is also part
+  of the format string, but the string is filtered for '%'-chars so it
+  cannot be used.
+
+  The vulnerability is caused by this piece of code in smtp.c:
+
+    snprintf (line, sizeof(line) - 2, "client= %s, sender= %s, nrcpt= %d,
+                    size= %ld, jobid= <%s>, message-id= <%s>, status= %d",
+          x->client, x->sender, x->nrcpt, x->size,
+          x->jobid, x->msgid, rc);
+    // echoline(stdout, line, 0);
+    syslog(LOG_NOTICE, line);
+
+  The line to be logged is first formatted with snprintf() and then sent
+  to syslog() and parsed as a format string. Since the 'line' buffer is
+  a local variable and thus placed on the stack, arbitrary addresses can
+  be embedded into the buffer and the data on those addresses can be
+  written to by using the %*n format string specifiers.
+
+Exploit
+
+  An exploit has been developed, but will be kept private for now.
+  Those who share our interest for exploit development may find the
+  following description interesting though.
+
+  Since smtp.proxy is started from a superserver, like inetd, the stack
+  offsets will remain constant and an attacker can use bruteforcing to
+  determine the unknown parameters required to exploit the vulnerability.
+
+  This means that even though it is a blind format string attack (the
+  output is not written back to the client) it can still be exploited
+  reliably by determining exploit parameters step by step. The unknown
+  parameters are (in the order they can be determined):
+
+  1. Offset to the format string on the stack (for embedding addresses)
+  2. Address to a function pointer or saved return address
+  3. Address to the shellcode
+
+  Determining the offset to the format string can be done by embedding
+  a known non-writable address in the message-id and attempting to write
+  into it with %*n at different stack offsets. For each offset that
+  causes a crash, embed a known writable addr (e.g. some high stack addr,
+  like 0xbffffffc for vanilla Linux/x86), and try again with the same
+  offset. If the daemon doesn't crash this time we have found it.
+
+  To determine the address of a function pointer we could either try to
+  find a saved return-address on the stack or the address of a suitable
+  GOT-entry by bruteforcing it. To decrease the number of attempts needed
+  we could use multiple writes. To see if the address is readable, so we
+  don't just try to write to non-mapped memory, we can use %*s. If we
+  cause a crash when writing to a certain (readable, and thus mapped)
+  address, these are the three most likely possibilities:
+
+  - We have tried to write to a read-only page
+  - We have written to a pointer that is dereferenced
+  - We have written to a function pointer or saved return address
+
+  We can determine if we have written to a read-only page by attempting
+  to write to surrounding addresses, if those writes also causes crashes
+  this is almost certainly the case.
+
+  Determining if we have written to a pointer that is dereferenced, or
+  perhaps an integer representing an array index or the length of a
+  buffer, is harder. If we don't cause a crash when overwriting with a
+  small integer or with a known readable and writable address we can
+  assume that we have not overwritten a function pointer and continue our
+  search. By writing the address we're writing into with the address to
+  itself we can also survive double dereferences.
+
+  If we pass the tests above (e.g. we still cause a crash when overwriting
+  with small integer values and other valid addresses, including the
+  address we write into to see if we have overwritten a pointer to a
+  pointer) then we can be reasonably sure that we have found a function
+  pointer. Let's start searching for our shellcode.
+
+  If we have embedded our code into the message-id it will be located on
+  both the heap in a malloc()'ed buffer and on the stack. The message-id
+  buffer is only 200 bytes large though, so unless the host has a
+  non-executable stack we are better off embedding our code in the 2048
+  bytes large line buffer on the stack in receive_data()'s stack frame.
+
+  Since fgets() is used to read lines, we can use a line like:
+
+     .<NUL-byte><NOPs><Code>
+
+  to terminate the message. A single dot indicates the end of the message
+  after the DATA-command has been sent. fgets() ignores NUL-bytes and
+  reads bytes into the buffer until a newline has been read or until the
+  buffer is full. This means we can stuff 2046 bytes of NOPs + shellcode
+  into the buffer, and thus use a stepsize of 2046 minus the length of the
+  shellcode when bruteforcing the shellcode address on the stack to be
+  certain to hit it.
+
+Fix
+
+  Upgrade to smtp.proxy 1.3.3. When this vulnerability was discovered 1.1.3
+  was the latest announced version, and it is still the version available from:
+
+     http://www.quietsche-entchen.de/software/smtp.proxy.html
+
+  The author, Wolfgang Zekoll, has informed me of the previously unannounced
+  version 1.3.3, that is not vulnerable for this problem. After waiting over
+  one week for a response from the author that he has officially announced
+  version 1.3.3 we discovered that he announced it the same day as we reported
+  the problem. The page above is not yet updated, but version 1.3.3 is available
+  from:
+
+     http://www.quietsche-entchen.de/cgi-bin/wiki.cgi/software/smtp.proxy.yawk
+
+  Make sure you check that the URL is at quietsche-entchen.de before following
+  the download URL though, since it's a Wiki and anyone can edit the page...
+
+Disclosure Timeline
+
+  2004/06/01 Notified the smtp.proxy developer (Wolfgang Zekoll)
+  2004/06/10 Public release
+
+==========================================================================
+The 0xbadc0ded.org team is hosted and sponsored by Bitnux: www.bitnux.com
+==========================================================================
+
+Bitnux is a company located in Sweden focused on security
+research and system development. We offer services such as:
+
+  - Code Reviews
+  - Exploit Development
+  - Reverse Engineering of Code
+  - Security Revisions of Systems and Software
+  - Custom System Development for Unix/Linux/BSD and Windows
+
+E-mail : info@...nux.com
+Phone  : +46-70-228 64 16
+Chat   : http://bitnux.com/live
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.2.1 (GNU/Linux)
+
+iD8DBQFAyBJQqnq6VG/4jhQRAnHUAJ9tKNGuxwwD/FgZjCuXV3Sn+Ka+zACdEYCd
+N34z7nqSUzQUPIQ2eJIQ3aA=
+=/KiB
+-----END PGP SIGNATURE-----
+
+

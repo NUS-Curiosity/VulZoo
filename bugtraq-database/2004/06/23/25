@@ -1,0 +1,106 @@
+
+Date: Wed, 23 Jun 2004 15:20:59 -0400
+From: infamous41md@...pop.com
+To: bugtraq <bugtraq@...urityfocus.com>
+Subject: Linux Broadcom 5820 Cryptonet Driver Integer Overflow
+
+
+Linux Broadcom 5820 Cryptonet Driver Integer Overflow
+-----------------------------------------------------
+
+Overview:
+
+    There exists an integer overflow in the cryptonet driver.  A user supplied
+value is used to size a dynamic buffer, and this buffer is subsequently filled
+with user supplied data.  
+
+Impact:
+    
+    Local DOS, and possible code execution depending on the location of the
+    buffer in slab.  The Cryptonet driver is not distributed by default in all
+    distributions.  I found it in the RedHat 8 2.4.20 sources, but not in
+    Slackware 9.  If it is installed, you can find it in 
+    /usr/src/linux/drivers/crypto/bcm/
+	    
+
+Details:
+
+    The ubsec_ioctl() function is used to setup various operating parameters
+    for the device driver.  One of the commands is used to setup the key being
+    used for encryption.  This occurs in the following code:
+
+/drivers/crypto/bcm/dispatch.c, 196:
+
+case UBSEC_KEY_SETUP_FUNC:
+    status = ubsec_keysetup(DeviceInfoList[SelectedDevice].Context, (void *)arg);
+    break;
+
+which calls this function found in /drivers/crypto/bcm/pkey.c, 91:
+
+int ubsec_keysetup(ubsec_DeviceContext_t pContext, ubsec_key_io_t *pKeyIOInfo)
+{
+    ...snip....
+
+1]
+  copy_from_user( &KeyIOInfoForDSA,pKeyIOInfo, sizeof(KeyIOInfoForDSA));
+
+  if((KeyIOInfoForDSA.command == UBSEC_DSA_SIGN) || (KeyIOInfoForDSA.command == UBSEC_DSA_VERIFY)) {
+    message_alignment = DSA_MESSAGE_ALIGNMENT;
+2]
+    add_dsa_buf_bytes = KeyIOInfoForDSA.key.DSAParams.InputFragments->FragmentLength + DSA_MESSAGE_ALIGNMENT;
+  }
+   
+   .......
+
+3]
+  pkey_buf = (unsigned char *) kmalloc((4096+add_dsa_buf_bytes),GFP_KERNEL|GFP_ATOMIC);
+  pCommandContext = (CommandContext_pt)pkey_buf;
+  kcmd = (ubsec_KeyCommandInfo_pt) &pCommandContext[1];
+  KeyIOInfo = (ubsec_key_io_pt)&kcmd[1];
+  KeyLoc = ((unsigned char *)&KeyIOInfo[1]) + message_alignment;
+  
+4]
+  copy_from_user( KeyIOInfo, pKeyIOInfo, sizeof(*KeyIOInfo));
+
+   ...snip...
+}
+
+    The last argument passed to ubsec_keysetup() is the device specific user
+    supplied argument to ioctl().  It is copied into the KeyIOInfoForDSA
+    variable at 1], and then used to size the buffer at 2].  Now one of the
+    things that doesn't make sense to me, is that at 2] when accessing the
+    just copied in user structure, they are accessing a pointer embedded in
+    the structure.  This pointer would point somewhere into userland, and from
+    what I have learned so far about kernel programming, that would NOT be a
+    valid pointer to just dereference?  I don't have this hardware, so I
+    couldn't test this myself, but I was under the impression that code would
+    fault, or perhaps access some random area of memory?  However, proceeding
+    on regardless, that signed integer value is then added to 4096 at 3] when
+    used to allocate the buffer.  Part of this buffer is then used at 4] when
+    the same user structure from 1] is copied into an address further into the
+    allocated buffer.  If a properly calculated negative value is used for the
+    add_dsa_buf_bytes variable, an integer overflow will occur when allocating
+    the buffer at 3].  The smallest sized buffer that can be allocated via
+    kmalloc() is 32 on some platforms, and 64 on others.  Regardless of this,
+    it is still possible to overflow the buffer at 4] because of the size of
+    the structure being copied combined with the fact that we start copying
+    from buffer base + 24(or greater on certain platforms) bytes into the
+    allocated buffer.  Depending on the location of the allocated buffer in
+    the cache slab, it may be possible to overwrite slab control structures
+    and execute arbitrary code.  However, it is likely that we will be
+    overwriting a piece of memory that belongs to someone else, and this may
+    lead to system instability when that memory is accessed by whomever it
+    belongs to.
+
+Vendor Status:
+   The vendor was not contacted.
+
+Thanks:
+   This bug and several others were found with the advanced, open source 
+   auditing tool grep.
+
+-- 
+-sean
+
+
+

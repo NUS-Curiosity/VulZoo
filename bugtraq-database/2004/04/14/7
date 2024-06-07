@@ -1,0 +1,205 @@
+
+Date: Tue, 13 Apr 2004 13:04:04 -0700
+From: "Marc Maiffret" <mmaiffret@...e.com>
+To: <BUGTRAQ@...URITYFOCUS.COM>
+Subject: EEYE: Windows Local Security Authority Service Remote Buffer Overflow
+
+
+Windows Local Security Authority Service Remote Buffer Overflow
+
+Release Date:
+April 13, 2004
+
+Date Reported:
+October 8, 2003
+
+Severity:
+High (Remote Code Execution)
+
+Vendor:
+Microsoft
+
+Systems Affected:
+Windows 2000 
+Windows XP
+
+Description:
+eEye Digital Security has discovered a remote buffer overflow in the
+Windows LSA (Local Security Authority) Service (LSASRV.DLL). An
+unauthenticated attacker could exploit this vulnerability to execute
+arbitrary code with system-level privileges on Windows 2000 and Windows
+XP machines. The susceptible LSA functionality is accessible via the
+LSARPC named pipe over TCP ports 139 and 445.
+
+This buffer overflow bug is within the Microsoft Active Directory
+service functions exposed by the LSASS DCE/RPC endpoint. These functions
+provide the ability to use Active Directory services both locally and
+remotely, and on default installations of Windows 2000 and Windows XP,
+no special privileges are required.
+
+Some Active Directory service functions generate a debug log file in the
+"debug" subdirectory located in the Windows directory. A logging
+function implemented in LSASRV.DLL is called to write entries to the log
+file. In this function, the vsprintf() routine is used to create a log
+entry. The string arguments for this logging function are supplied as
+parameters to vsprintf() without any bounds checking, so if we can pass
+a long string argument to the logging function, then a buffer overflow
+will occur.
+
+We found some RPC functions which will accept a long string as a
+parameter, and will attempt to write it to the debug log file. If we
+specify a long string as a parameter to these RPC functions, a
+stack-based buffer overflow will happen in the Active Directory service
+functions on the remote system. Attackers who successfully leverage this
+vulnerability will be executing code under the SYSTEM context of the
+remote host.
+
+Technical Description:
+The buffer overflow bug is in a logging function which generates a
+string for the log file using vsprintf(). The name of the log file is
+"DCPROMO.LOG", and it is located in the Windows "debug" directory.
+
+The Active Directory service functions implemented in LSASRV.DLL are as
+follows:
+
+Function Function Name
+number
+-----------------------------------------------
+0 DsRolerGetPrimaryDomainInformation
+1 DsRolerDnsNameToFlatName
+2 DsRolerDcAsDc
+3 DsRolerDcAsReplica
+4 DsRolerDemoteDc
+5 DsRolerGetDcOperationProgress
+6 DsRolerGetDcOperationResults
+7 DsRolerCancel
+8 DsRolerServerSaveStateForUpgrade
+9 DsRolerUpgradeDownlevelServer
+10 DsRolerAbortDownlevelServerUpgrade
+
+In these functions, the DsRolepInitializeLog() API is called to create
+the log file "DCPROMO.LOG" in the Windows "debug" subdirectory. After
+calling this API, entries are written to the log file by invoking the
+DsRolepLogPrintRoutine() function. The following is an example of a log
+file that can be generated on the remote host using DsRolerDcAsDc() API:
+
+09/25 21:49:22 [INFO] DsRolerDcAsDc: DnsDomainName aaaaa
+09/25 21:49:22 [INFO] SiteName bbbbb
+09/25 21:49:22 [INFO] SystemVolumeRootPath ccccc
+09/25 21:49:22 [INFO] DsDatabasePath ddddd, DsLogPath eeeee
+09/25 21:49:22 [INFO] ParentDnsDomainName fffff
+09/25 21:49:22 [INFO] ParentServer ggggg
+09/25 21:49:22 [INFO] Account hhhhh
+09/25 21:49:22 [INFO] Options 1
+
+The remote host can be specified as the first argument of the
+DsRolerDcAsDc() API. The parameters shown in this debug log file such as
+DnsDomainName "aaaaa", SiteName "bbbbb", and SystemVolumeRootPath
+"ccccc" are string arguments for the DsRolerDcAsDc() API. These string
+parameters are logged using DsRolepLogPrintRoutine(), so, we can cause a
+buffer overflow condition by supplying a long DnsDomainName, SiteName,
+SystemVolumeRootPath, etc.
+
+However, most of Active Directory service functions call
+RpcImpersonateClient() API, which changes the server thread's security
+context to that of the client. Generally, the "debug" subdirectory
+located in the Windows directory is not writeable by everyone if the
+drive is formatted as NTFS, meaning that we cannot append to the log
+using a null session. The RpcImpersonateClient() API is called before
+opening the log file, and if the connected client does not have the
+privilege to write to the log file, then CreateFile() will fail, and the
+vulnerable call to vsprintf() is not performed.
+
+However, the DsRolerUpgradeDownlevelServer() function, which is
+supported by Windows 2000 and XP, does not use the
+RpcImpersonateClient() API -- it calls DsRolepInitializeLog() API
+immediately. So, if we specify a long string parameter to this function,
+we can pass these parameters into vsprinf() in the
+DsRolepLogPrintRoutine() API, and a buffer overflow will occur.
+
+The DsRoleUpgradeDownlevelServer() client API which issues the DCE/RPC
+request is implemented in NETAPI32.DLL. This is an undocumented API. If
+we specify a long szDomainName, LSASS.EXE -- which provides the Active
+Directory service functions running on the local computer -- will crash.
+This type of attack can be performed against the local machine for the
+purpose of privilege escalation.
+
+There is no parameter to specify the remote host for the
+DsRoleUpgradeDownlevelServer() client API. The API specifies the host as
+NULL internally, so the DCE/RPC request will be sent to LSASS.EXE
+running on the local computer. However, the function called from
+LSASS.EXE does not check whether the request is sent from the local
+machine or a remote one, so it will also handle requests sent from
+remote hosts. So, if we craft this DCE/RPC packet by hand, or if we
+modify the client API to be able to specify remote host, then we can
+cause a buffer overflow on an arbitrary remote host running Windows 2000
+or Windows XP.
+
+Because the Active Directory services interface is registered on the
+LSASS named pipe RPC endpoint (ncacn_np:host[\PIPE\LSARPC]), it is
+sufficient to use CreateFile() and ReadFile(), WriteFile(), and/or
+TransactNamedPipe() in order to communicate with LSASS.EXE on the
+vulnerable host. No SMB knowledge is necessary, just an RPC bind and a
+DsRoleUpgradeDownlevelServer() packet.
+
+We also can craft this DCE/RPC packet if we modify the instructions of
+DsRoleUpgradeDownlevelServer() client API. The first argument for
+DsRolepEncryptPasswordStart() API which is used in
+DsRoleUpgradeDownlevelServer() API internally is the remote host. In
+this case, NULL is specified for the first argument. So, if we can
+change this to the pointer which is stored the remote host, we can send
+DCE/RPC request for DsRoleUpgradeDownlevelServer() function.
+
+In order to modify the DsRoleUpgradeDownlevelServer() API, the
+protections on a region of this API implemented in NETAPI32.DLL must be
+changed to PAGE_EXECUTE_READWRITE using the VirtualProtect() API. The
+following code changes will allow the remote host to be specified as the
+9th parameter (szUnknown2) of the DsRoleUpgradeDownlevelServer() API.
+
+In case of Windows 2000, we should specify the DomainName as Unicode; on
+Windows XP, we should use ASCII. We can execute about 2KB of code on the
+remote host using this buffer overflow.
+
+Protection:
+Retina Network Security Scanner has been updated to identify this
+vulnerability.
+
+Vendor Status:
+Microsoft has released a patch for this vulnerability. The patch is
+available at: www.microsoft.com/technet/security/bulletin/MS04-011.mspx.
+
+Credit:
+Discovery: Yuji Ukai
+Additional Research: Derek Soeder
+
+Related Links:
+Retina Network Security Scanner - Free 15 Day Trial
+http://www.eeye.com/html/Products/Retina/download.html
+
+Greetings:
+All security guys in anti rootkit research team.
+
+Copyright (c) 1998-2004 eEye Digital Security
+Permission is hereby granted for the redistribution of this alert
+electronically. It is not to be edited in any way without express
+consent of eEye. If you wish to reprint the whole or any part of this
+alert in any other medium excluding electronic medium, please email
+alert@...e.com for permission.
+
+Disclaimer
+The information within this paper may change without notice. Use of this
+information constitutes acceptance for use in an AS IS condition. There
+are no warranties, implied or express, with regard to this information.
+In no event shall the author be liable for any direct or indirect
+damages whatsoever arising out of or in connection with the use or
+spread of this information. Any use of this information is at the user's
+own risk.
+
+Feedback
+Please send suggestions, updates, and comments to:
+
+eEye Digital Security
+http://www.eEye.com
+info@...e.com
+
+

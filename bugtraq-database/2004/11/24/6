@@ -1,0 +1,489 @@
+
+Date: Wed, 24 Nov 2004 11:24:17 +0800
+From: icbm <icbm@...57.org>
+To: full-disclosure@...ts.netsys.com, bugtraq@...urityfocus.com
+Subject: Jabberd2.x remote BuffJabberd2.x remote Buffer Overflowser Overflows
+
+
+                [Security Advisory]
+
+
+Advisory: [AD_LAB-04002]Jabberd2.x remote Buffer Overflows
+Authors: icbm@...ustech.com.cn
+Class: Boundary Condition Error
+CVE:CAN-2004-0953
+Remote: Yes, could allow remote compromise
+
+Vulnerable: Jabberd 2.*
+Unvulnerable: Jabberd 1.4
+Vendor: http://jabberd.jabberstudio.org/
+
+I.INFO:
+-------
+
+Jabber 2 server (Jabberd), the latest release of the popular open source
+messaging system based
+on the Jabber Protocol. It has been rewritten from the ground up to be
+scalable, architecturally
+sound, and to support the latest protocol extensions coming out of the
+JSF. The goal of Jabber
+is to provide an XML protocol for synchronous and asynchronous
+communication for client to
+client, client to server, and server to server messaging, although the
+primary use of Jabber
+is instant messaging (IM).
+
+The C2S (Client to Server) component handles communication with Jabber
+clients:
+1.Connects to Jabber clients
+2.Passes packets to the SM
+3.Authenticates clients
+4.Registers users
+5.Triggers activity with the SM
+The C2S component connects to the Authentication Data Package (authreg)
+in order to register
+and authenticate users.
+
+II.DESCRIPTION:
+------------------------
+
+There is a remote buffer overflow in the C2S module of Jabberd2.x which
+allows attackers to
+crash the Jabberd sever or even run an arbitrary code on it.
+
+The nature of this vulnerability lies in the fact that an attacker can
+bypass the length check
+of a username and the password and supply a very long username to the
+server which directly handles
+the long username with the database relate function like
+mysql_real_escape_string, PQescapeString
+etc. and then cause a remote buffer overflow.
+
+
+III.DETAILS:
+-----------------
+
+In the Authreg.c(c2s) file the jabberd server cuts the length of the
+username with this:
+
+    snprintf(username, 1024, "%.*s", NAD_CDATA_L(nad, elem),
+NAD_CDATA(nad, elem));
+
+So we believe the max length of the username is 1024, so the fist
+problem is in the
+authreg_mysql.c
+
+static MYSQL_RES *_ar_mysql_get_user_tuple(authreg_t ar, char *username,
+char *realm) {
+    mysqlcontext_t ctx = (mysqlcontext_t) ar->private;
+    MYSQL *conn = ctx->conn;
+    char euser[513], erealm[513], sql[2049]; //euser and erealm only 513
+long
+    MYSQL_RES *res;
+
+    if(mysql_ping(conn) != 0) {
+        log_write(ar->c2s->log, LOG_ERR, "mysql: connection to database
+lost");
+        return NULL;
+    }
+
+    mysql_real_escape_string(conn, euser, username,
+strlen(username));//Thers is the buffer overflow
+    mysql_real_escape_string(conn, erealm, realm, strlen(realm));//and
+there also has one.
+
+As the user should be (strlen(username)*2)+1 long so if the username or
+realm is longer than
+256 bytes there will be a buffer overflow. But when we patched the hole
+by increasing the user
+and realm to 2049 bytes(1024*2+1) there still was a buffer overflow.
+
+This data flow is:
+
+_sx_sasl_scod_callback(sasl.c:501)
+    |
+    |----->_c2s_sx_sasl_callback(main.c:264)
+        |
+        |----->_ar_mysql_get_password(authreg_mysql.c:92)
+            |
+            |----->_ar_mysql_get_user_tuple(authreg_mysql.c:42)
+
+So we find the essence of this problem: in the
+_c2s_sx_sasl_callback(c2s/main.c) the sever directly
+calls the database related function to handle the username here without
+any length check.
+
+BTW:In the file authreg_pgsql.c have the same problems, the code is below:
+
+    char euser[513], erealm[513], sql[2049];    /* query(1024) +
+euser(512) + erealm(512) + \0(1) */
+    PGresult *res;
+
+    PQescapeString(euser, username, strlen(username));
+    PQescapeString(erealm, realm, strlen(realm));
+
+IV.POC&Patch:
+---------------------
+
+Just a POC:)
+#!/usr/bin/python
+import xmpp
+name = 'a'*10240
+# Born a client
+cl=xmpp.Client('localhost')
+if not cl.connect(server=('192.168.10.138',5222)):
+    raise IOError('Can not connect to server.')
+if not cl.auth(name,'jabberuserpassword','optional resource name'):
+    raise IOError('Can not auth with server.')
+cl.disconnect()
+
+Stephen Marquard gave a rapidly patch on this issue:
+
+diff -ru c2sorig/authreg.c c2s/authreg.c
+--- c2sorig/authreg.c    Mon Nov 22 15:53:34 2004
++++ c2s/authreg.c    Mon Nov 22 20:06:25 2004
+@@ -623,7 +623,7 @@
+         log_write(c2s->log, LOG_NOTICE, "[%d] created user: user=%s;
+realm=%s", sess->s->tag, username, sess->realm);
+
+     /* extract the password */
+-    snprintf(password, 1024, "%.*s", NAD_CDATA_L(nad, elem),
+NAD_CDATA(nad, elem));
++    snprintf(password, 257, "%.*s", NAD_CDATA_L(nad, elem),
+NAD_CDATA(nad, elem));
+
+     /* change it */
+     if((c2s->ar->set_password)(c2s->ar, username, sess->realm,
+password) != 0)
+diff -ru c2sorig/authreg_mysql.c c2s/authreg_mysql.c
+--- c2sorig/authreg_mysql.c    Mon Nov 22 15:53:34 2004
++++ c2s/authreg_mysql.c    Mon Nov 22 16:55:37 2004
+@@ -24,6 +24,10 @@
+
+#ifdef STORAGE_MYSQL
+
++#define MYSQL_LU  1024   /* maximum length of username - should
+correspond to field length */
++#define MYSQL_LR   256   /* maximum length of realm - should correspond
+to field length */
++#define MYSQL_LP   256   /* maximum length of password - should
+correspond to field length */
++
+#include <mysql.h>
+
+typedef struct mysqlcontext_st {
+@@ -42,7 +46,8 @@
+static MYSQL_RES *_ar_mysql_get_user_tuple(authreg_t ar, char
+*username, char *realm) {
+     mysqlcontext_t ctx = (mysqlcontext_t) ar->private;
+     MYSQL *conn = ctx->conn;
+-    char euser[2049], erealm[2049], sql[5121];  /* query(1024) +
+euser(2048) + erealm(2048) + \0(1) */
++    char iuser[MYSQL_LU+1], irealm[MYSQL_LR+1];
++    char euser[MYSQL_LU*2+1], erealm[MYSQL_LR*2+1], sql[1024 +
+MYSQL_LU*2 + MYSQL_LR*2 + 1];  /* query(1024) + euser + erealm + \0(1) */
+     MYSQL_RES *res;
+
+     if(mysql_ping(conn) != 0) {
+@@ -50,8 +55,11 @@
+         return NULL;
+     }
+
+-    mysql_real_escape_string(conn, euser, username, strlen(username));
+-    mysql_real_escape_string(conn, erealm, realm, strlen(realm));
++    snprintf(iuser, MYSQL_LU+1, "%s", username);
++    snprintf(irealm, MYSQL_LR+1, "%s", realm);
++
++    mysql_real_escape_string(conn, euser, iuser, strlen(iuser));
++    mysql_real_escape_string(conn, erealm, irealm, strlen(irealm));
+
+     sprintf(sql, ctx->sql_select, euser, erealm);
+
+@@ -127,15 +135,21 @@
+static int _ar_mysql_set_password(authreg_t ar, char *username, char
+*realm, char password[257]) {
+     mysqlcontext_t ctx = (mysqlcontext_t) ar->private;
+     MYSQL *conn = ctx->conn;
+-    char euser[2049], erealm[2049], epass[513], sql[5633];  /*
+query(1024) + euser(2048) + erealm(2048) + epass(512) + \0(1) */
++    char iuser[MYSQL_LU+1], irealm[MYSQL_LR+1];
++    char euser[MYSQL_LU*2+1], erealm[MYSQL_LR*2+1], epass[513],
+sql[1024+MYSQL_LU*2+MYSQL_LR*2+512+1];  /* query(1024) + euser + erealm
++ epass(512) + \0(1) */
+
+     if(mysql_ping(conn) != 0) {
+         log_write(ar->c2s->log, LOG_ERR, "mysql: connection to database
+lost");
+         return 1;
+     }
+
+-    mysql_real_escape_string(conn, euser, username, strlen(username));
+-    mysql_real_escape_string(conn, erealm, realm, strlen(realm));
++    snprintf(iuser, MYSQL_LU+1, "%s", username);
++    snprintf(irealm, MYSQL_LR+1, "%s", realm);
++
++    password[256]= '\0';
++
++    mysql_real_escape_string(conn, euser, iuser, strlen(iuser));
++    mysql_real_escape_string(conn, erealm, irealm, strlen(irealm));
+     mysql_real_escape_string(conn, epass, password, strlen(password));
+
+     sprintf(sql, ctx->sql_setpassword, epass, euser, erealm);
+@@ -195,15 +209,19 @@
+static int _ar_mysql_set_zerok(authreg_t ar, char *username, char
+*realm, char hash[41], char token[11], int sequence) {
+     mysqlcontext_t ctx = (mysqlcontext_t) ar->private;
+     MYSQL *conn = ctx->conn;
+-    char euser[2049], erealm[2049], ehash[81], etoken[21], sql[5233];
+/* query(1024) + euser(2048) + erealm(2048) + ehash(80) + etoken(20) +
+sequence(12) + \0(1) */
++    char iuser[MYSQL_LU+1], irealm[MYSQL_LR+1];
++    char euser[MYSQL_LU*2+1], erealm[MYSQL_LR*2+1], ehash[81],
+etoken[21], sql[1024+MYSQL_LU*2+MYSQL_LR*2+80+20+12+1]; /* query(1024) +
+euser + erealm + ehash(80) + etoken(20) + sequence(12) + \0(1) */
+
+     if(mysql_ping(conn) != 0) {
+         log_write(ar->c2s->log, LOG_ERR, "mysql: connection to database
+lost");
+         return 1;
+     }
+
+-    mysql_real_escape_string(conn, euser, username, strlen(username));
+-    mysql_real_escape_string(conn, erealm, realm, strlen(realm));
++    snprintf(iuser, MYSQL_LU+1, "%s", username);
++    snprintf(irealm, MYSQL_LR+1, "%s", realm);
++
++    mysql_real_escape_string(conn, euser, iuser, strlen(iuser));
++    mysql_real_escape_string(conn, erealm, irealm, strlen(irealm));
+     mysql_real_escape_string(conn, ehash, hash, strlen(hash));
+     mysql_real_escape_string(conn, etoken, token, strlen(token));
+
+@@ -222,7 +240,8 @@
+static int _ar_mysql_create_user(authreg_t ar, char *username, char
+*realm) {
+     mysqlcontext_t ctx = (mysqlcontext_t) ar->private;
+     MYSQL *conn = ctx->conn;
+-    char euser[2049], erealm[2049], sql[5121];    /* query(1024) +
+euser(2048) + erealm(2048) + \0(1) */
++    char iuser[MYSQL_LU+1], irealm[MYSQL_LR+1];
++    char euser[MYSQL_LU*2+1], erealm[MYSQL_LR*2+1],
+sql[1024+MYSQL_LU*2+MYSQL_LR*2+1];    /* query(1024) + euser + erealm +
+\0(1) */
+     MYSQL_RES *res = _ar_mysql_get_user_tuple(ar, username, realm);
+
+     if(res != NULL) {
+@@ -237,8 +256,11 @@
+         return 1;
+     }
+
+-    mysql_real_escape_string(conn, euser, username, strlen(username));
+-    mysql_real_escape_string(conn, erealm, realm, strlen(realm));
++    snprintf(iuser, MYSQL_LU+1, "%s", username);
++    snprintf(irealm, MYSQL_LR+1, "%s", realm);
++
++    mysql_real_escape_string(conn, euser, iuser, strlen(iuser));
++    mysql_real_escape_string(conn, erealm, irealm, strlen(irealm));
+
+     sprintf(sql, ctx->sql_create, euser, erealm);
+
+@@ -255,15 +277,19 @@
+static int _ar_mysql_delete_user(authreg_t ar, char *username, char
+*realm) {
+     mysqlcontext_t ctx = (mysqlcontext_t) ar->private;
+     MYSQL *conn = ctx->conn;
+-    char euser[2049], erealm[2049], sql[5121];    /* query(1024) +
+euser(2048) + erealm(2048) + \0(1) */
++    char iuser[MYSQL_LU+1], irealm[MYSQL_LR+1];
++    char euser[MYSQL_LU*2+1], erealm[MYSQL_LR*2+1],
+sql[1024+MYSQL_LU*2+MYSQL_LR*2+1];    /* query(1024) + euser + erealm +
+\0(1) */
+
+     if(mysql_ping(conn) != 0) {
+         log_write(ar->c2s->log, LOG_ERR, "mysql: connection to database
+lost");
+         return 1;
+     }
+
+-    mysql_real_escape_string(conn, euser, username, strlen(username));
+-    mysql_real_escape_string(conn, erealm, realm, strlen(realm));
++    snprintf(iuser, MYSQL_LU+1, "%s", username);
++    snprintf(irealm, MYSQL_LR+1, "%s", realm);
++
++    mysql_real_escape_string(conn, euser, iuser, strlen(iuser));
++    mysql_real_escape_string(conn, erealm, irealm, strlen(irealm));
+
+     sprintf(sql, ctx->sql_delete, euser, erealm);
+
+diff -ru c2sorig/authreg_pgsql.c c2s/authreg_pgsql.c
+--- c2sorig/authreg_pgsql.c    Mon Nov 22 15:53:34 2004
++++ c2s/authreg_pgsql.c    Mon Nov 22 16:52:20 2004
+@@ -26,6 +26,10 @@
+
+#include <libpq-fe.h>
+
++#define PGSQL_LU  1024   /* maximum length of username - should
+correspond to field length */
++#define PGSQL_LR   256   /* maximum length of realm - should correspond
+to field length */
++#define PGSQL_LP   256   /* maximum length of password - should
+correspond to field length */
++
+typedef struct pgsqlcontext_st {
+   PGconn * conn;
+   char * sql_create;
+@@ -42,11 +46,16 @@
+static PGresult *_ar_pgsql_get_user_tuple(authreg_t ar, char *username,
+char *realm) {
+     pgsqlcontext_t ctx = (pgsqlcontext_t) ar->private;
+     PGconn *conn = ctx->conn;
+-    char euser[2049], erealm[2049], sql[5121];  /* query(1024) +
+euser(2048) + erealm(2048) + \0(1) */
++
++    char iuser[PGSQL_LU+1], irealm[PGSQL_LR+1];
++    char euser[PGSQL_LU*2+1], erealm[PGSQL_LR*2+1],
+sql[1024+PGSQL_LU*2+PGSQL_LR*2+1];  /* query(1024) + euser + erealm +
+\0(1) */
+     PGresult *res;
+
+-    PQescapeString(euser, username, strlen(username));
+-    PQescapeString(erealm, realm, strlen(realm));
++    snprintf(iuser, PGSQL_LU+1, "%s", username);
++    snprintf(irealm, PGSQL_LR+1, "%s", realm);
++
++    PQescapeString(euser, iuser, strlen(iuser));
++    PQescapeString(erealm, irealm, strlen(irealm));
+
+     sprintf(sql, ctx->sql_select, euser, erealm);
+
+@@ -114,11 +123,15 @@
+static int _ar_pgsql_set_password(authreg_t ar, char *username, char
+*realm, char password[257]) {
+     pgsqlcontext_t ctx = (pgsqlcontext_t) ar->private;
+     PGconn *conn = ctx->conn;
+-    char euser[2049], erealm[2049], epass[513], sql[5633];  /*
+query(1024) + euser(2048) + erealm(2048) + epass(512) + \0(1) */
++    char iuser[PGSQL_LU+1], irealm[PGSQL_LR+1];
++    char euser[PGSQL_LU*2+1], erealm[PGSQL_LR*2+1], epass[513],
+sql[1024+PGSQL_LU*2+PGSQL_LR*2+512+1];  /* query(1024) + euser + erealm
++ epass(512) + \0(1) */
+     PGresult *res;
+
+-    PQescapeString(euser, username, strlen(username));
+-    PQescapeString(erealm, realm, strlen(realm));
++    snprintf(iuser, PGSQL_LU+1, "%s", username);
++    snprintf(irealm, PGSQL_LR+1, "%s", realm);
++
++    PQescapeString(euser, iuser, strlen(iuser));
++    PQescapeString(erealm, irealm, strlen(irealm));
+     PQescapeString(epass, password, strlen(password));
+
+     sprintf(sql, ctx->sql_setpassword, epass, euser, erealm);
+@@ -177,11 +190,15 @@
+static int _ar_pgsql_set_zerok(authreg_t ar, char *username, char
+*realm, char hash[41], char token[11], int sequence) {
+     pgsqlcontext_t ctx = (pgsqlcontext_t) ar->private;
+     PGconn *conn = ctx->conn;
+-    char euser[2049], erealm[2049], ehash[81], etoken[21], sql[5233];
+/* query(1024) + euser(2048) + erealm(2048) + ehash(80) + etoken(20) +
+sequence(12) + \0(1) */
++    char iuser[PGSQL_LU+1], irealm[PGSQL_LR+1];
++    char euser[PGSQL_LU*2+1], erealm[PGSQL_LR*2+1], ehash[81],
+etoken[21], sql[1024 + PGSQL_LU*2 + PGSQL_LR*2 + 80 + 20 + 12 + 1]; /*
+query(1024) + euser + erealm + ehash(80) + etoken(20) + sequence(12) +
+\0(1) */
+     PGresult *res;
+
+-    PQescapeString(euser, username, strlen(username));
+-    PQescapeString(erealm, realm, strlen(realm));
++    snprintf(iuser, PGSQL_LU+1, "%s", username);
++    snprintf(irealm, PGSQL_LR+1, "%s", realm);
++
++    PQescapeString(euser, iuser, strlen(iuser));
++    PQescapeString(erealm, irealm, strlen(irealm));
+     PQescapeString(ehash, hash, strlen(hash));
+     PQescapeString(etoken, token, strlen(token));
+
+@@ -210,7 +227,8 @@
+static int _ar_pgsql_create_user(authreg_t ar, char *username, char
+*realm) {
+     pgsqlcontext_t ctx = (pgsqlcontext_t) ar->private;
+     PGconn *conn = ctx->conn;
+-    char euser[2049], erealm[2049], sql[5121];    /* query(1024) +
+euser(2048) + erealm(2048) + \0(1) */
++    char iuser[PGSQL_LU+1], irealm[PGSQL_LR+1];
++    char euser[PGSQL_LU*2+1], erealm[PGSQL_LR*2+1],
+sql[1024+PGSQL_LU*2+PGSQL_LR*2+1];  /* query(1024) + euser + erealm +
+\0(1) */
+     PGresult *res;
+
+     res = _ar_pgsql_get_user_tuple(ar, username, realm);
+@@ -221,8 +239,11 @@
+
+     PQclear(res);
+
+-    PQescapeString(euser, username, strlen(username));
+-    PQescapeString(erealm, realm, strlen(realm));
++    snprintf(iuser, PGSQL_LU+1, "%s", username);
++    snprintf(irealm, PGSQL_LR+1, "%s", realm);
++
++    PQescapeString(euser, iuser, strlen(iuser));
++    PQescapeString(erealm, irealm, strlen(irealm));
+
+     sprintf(sql, ctx->sql_create, euser, erealm);
+
+@@ -249,11 +270,15 @@
+static int _ar_pgsql_delete_user(authreg_t ar, char *username, char
+*realm) {
+     pgsqlcontext_t ctx = (pgsqlcontext_t) ar->private;
+     PGconn *conn = ctx->conn;
+-    char euser[2049], erealm[2049], sql[5121];    /* query(1024) +
+euser(2048) + erealm(2048) + \0(1) */
++    char iuser[PGSQL_LU+1], irealm[PGSQL_LR+1];
++    char euser[PGSQL_LU*2+1], erealm[PGSQL_LR*2+1],
+sql[1024+PGSQL_LU*2+PGSQL_LR*2+1];    /* query(1024) + euser + erealm +
+\0(1) */
+     PGresult *res;
+
+-    PQescapeString(euser, username, strlen(username));
+-    PQescapeString(erealm, realm, strlen(realm));
++    snprintf(iuser, PGSQL_LU+1, "%s", username);
++    snprintf(irealm, PGSQL_LR+1, "%s", realm);
++
++    PQescapeString(euser, iuser, strlen(iuser));
++    PQescapeString(erealm, irealm, strlen(irealm));
+
+     sprintf(sql, ctx->sql_delete, euser, erealm);
+
+
+V.CREDIT:
+----------------
+
+Thanks to Alex, Simon and rob@...aclysm.cx help me on this and Stephen
+Marquard's rapidly patch.
+Sam, Air, Kkqq, Swan, Flashsky, S0f, Cjj and all Venustech AD-Lab guys
+and "Niubi" Houzi!:)
+And my LeiLei...
+
+VI.DISCLAIMS:
+----------------------
+
+The information in this bulletin is provided "AS IS" without warranty of any
+kind. In no event shall we be liable for any damages whatsoever
+including direct,
+indirect, incidental, consequential, loss of business profits or special
+damages.
+
+Copyright 1996-2004 VENUSTECH. All Rights Reserved. Terms of use.
+
+VENUSTECH Security Lab
+VENUSTECH INFORMATION TECHNOLOGY CO.,LTD(http://www.venustech.com.cn)
+
+              Security
+Trusted  {Solution} Provider
+              Service
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.netsys.com/full-disclosure-charter.html
+
+

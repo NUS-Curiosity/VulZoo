@@ -1,0 +1,117 @@
+
+Date: Tue, 29 Jun 2004 18:03:31 -0400
+From: infamous41md@...pop.com
+To: bugtraq <bugtraq@...urityfocus.com>
+Subject: linux kernel Sbus PROM driver multiple integer overflows
+
+
+Sbus PROM driver multiple integer overflows
+-------------------------------------------
+
+Description:
+
+    This character device driver allows user programs to access the PROM
+    device tree. It is compatible with the SunOS /dev/openprom driver and the
+    NetBSD /dev/openprom driver. The SunOS eeprom utility works without any
+    modifications.
+
+Source:
+    
+    This driver is distributed by default in all of the distros that I have.
+    It's source can be found:
+        /usr/src/linux/drivers/sbus/char/openprom.c
+
+Impact:
+    
+    Local DOS, possible code execution depending on location of the overflowed
+    buffer in the slab.
+
+Bug:
+
+    There exist multiple integer overflows in routines that handle copying in
+    user supplied data.  In both routines, user supplied parameters are used
+    to allocate buffers after being added to another number.  Passing certain
+    values will result in integer overflows and small buffers being allocated.
+    Then large amounts of user data are copied into these buffers.  Both of
+    the functions in which the overflows occur are 'utility' functions called
+    from multiple other functions.  An ioctl() call is the simplest way to
+    access them.
+
+
+Detail:
+
+    The copyin() and the copyin_string() function are both vulnerable:
+
+
+/* Copy in a whole string from userspace into kernelspace. */
+static int copyin_string(char *user, size_t len, char **ptr)
+{
+        char *tmp;
+
+    /* ME: it's not signed; if( len + 1 < len ) .. */
+1]      if (len < 0 || len + 1 < 0)
+                return -EINVAL;
+
+2]      tmp = kmalloc(len + 1, GFP_KERNEL);
+        if (!tmp)
+                return -ENOMEM;
+
+3]      if(copy_from_user(tmp, user, len)) {
+                kfree(tmp);
+                return -EFAULT;
+        }
+..... snip  .....
+
+    In this function it appears they forgot that size_t is not signed.  The
+    checks made at 1] will never be true, and by passing in ~0 for the len
+    variable an integer overflow occurs at 2].  Then at 3] user supplied data
+    is copied int this buffer.  In various ioctl() calls for both the bsd and
+    sun versions the user has full control over the user and len variables.
+    
+
+static int copyin(struct openpromio *info, struct openpromio **opp_p)
+{
+        int bufsize;
+
+        if (!info || !opp_p)
+                return -EFAULT;
+
+1]      if (get_user(bufsize, &info->oprom_size))
+                return -EFAULT;
+
+        if (bufsize == 0)
+                return -EINVAL;
+
+        /* If the bufsize is too large, just limit it.
+         * Fix from Jason Rappleye.
+ 	 * ME: apparently not fixed enough
+         */
+2]      if (bufsize > OPROMMAXPARAM)
+                bufsize = OPROMMAXPARAM;
+
+3]      if (!(*opp_p = kmalloc(sizeof(int) + bufsize + 1, GFP_KERNEL)))
+                return -ENOMEM;
+        memset(*opp_p, 0, sizeof(int) + bufsize + 1);
+
+4]      if (copy_from_user(&(*opp_p)->oprom_array,
+                           &info->oprom_array, bufsize)) {
+                kfree(*opp_p);
+                return -EFAULT;
+        }
+        return bufsize;
+}
+
+    The bufsize integer variable obtained from the user at 1] is checked for
+    being to large at 2], but it is not checked for being negative.  we then 
+    have an overflow occuring at 3] when the buffer is allocated.  Then at 4] 
+    this buffer is used to hold user data, resulting in memory being overwritten.
+
+Vendor Status:
+	
+    The driver authors from the source listing were contacted and didn't reply.
+
+-- 
+-sean
+
+
+

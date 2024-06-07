@@ -1,0 +1,246 @@
+
+Date: Thu, 29 Apr 2004 23:17:51 -0300
+From: Juliano Rizzo <juliano.rizzo@...est.com>
+To: bugtraq@...urityfocus.com
+Subject: A technical description of the  SSL PCT vulnerability (CVE-2003-0719)
+
+
+
+There has been public discussions about the exploitation of
+the SSL PCT vulnerability. Exploit code was made publicly available
+(THCIISLame.c) and rumors of a potential worm that uses the
+vulnerability as an attack vector are spreading the security news.
+
+What follows is my analysis of the vulnerability and the method of
+exploitation, it is based on the CORE IMPACT exploit module I wrote
+that shipped to our customers on April 16th. The THCIISLame.c
+exploit seems to be a direct port of the module's first version.
+
+
+The vulnerable code is located in schannel.dll which is loaded by
+LSASS.exe, a dissembly of the vulnerable code translates roughly
+to the following C construct:
+
+  function(char *packet, unsigned int N)
+	char buf[32];
+	unsigned int register i;
+	if(N < 32)
+	{
+     	memcpy(buf,packet,N);
+	    for(i = 0; i < N; i++)
+	    buf[i+N] = ~buf[i];
+	}
+
+Compilation of the above code with optimizations and inline expansion
+translates to the following ASM that can be found in LSASS.exe:
+
+.text:781786C8                 mov     [ebp-60], eax
+.text:781786CB                 mov     eax, [esi+0Ch]
+.text:781786CE                 mov     ecx, eax
+.text:781786D0                 add     esi, 30h
+.text:781786D3                 mov     edx, ecx
+.text:781786D5                 lea     edi, [ebp-24]
+.text:781786D8                 shr     ecx, 2
+.text:781786DB                 rep movsd
+.text:781786DD                 mov     ecx, edx
+.text:781786DF                 and     ecx, 3
+.text:781786E2                 rep movsb
+.text:781786E4                 xor     esi, esi
+.text:781786E6                 test    eax, eax
+.text:781786E8                 jbe     short dontcopy
+.text:781786EA
+.text:781786EA loop:
+.text:781786EA                 mov     dl, [ebp+esi-24]
+.text:781786EE                 lea     ecx, [ebp+esi-24]
+.text:781786F2                 inc     esi
+.text:781786F3                 not     dl
+.text:781786F5                 cmp     esi, eax
+.text:781786F7                 mov     [ecx+eax], dl
+.text:781786FA                 jb      short loop
+.text:781786FA dontcopy:
+
+
+In the above C code N is a value obtained from the PCT packet.
+A value higher than 0x10 is enough to trigger the overflow. A value
+of 0x16 overwrites the return address. The boundary check (N<32) is done
+before the call to memcpy() but the concatenation code that follows it
+is logically wrong.
+
+The vulnerability could be exploited to execute arbitrary code, for that
+purpose the return address should be overwritten with an address
+pointing to data controlled by the attacker, but the address of such 
+data is
+not predictable.
+
+The usual way to reach the attacker code in Windows exploits is jumping 
+to a portion of  instructions at a known address that redirects the 
+program flow to the attackers code. Those instructions are part of the 
+vulnerable application code, or part of any module loaded by it, so the 
+address depends on the application and system version, sometimes the 
+address is the same in different version of the same modules and 
+applications. It is part of the exploit developer's work to find those 
+instructions to make the exploit reliable against different target 
+configurations.
+This is the approach I took for the first version of the PCT exploit, 
+the THCISLame.c exploit uses the same technique although I have a 
+different address.
+
+In this case, when the vulnerable function returns to the address chosen 
+by the attacker, there is no register pointing to the controllable data, 
+but there is a pointer to the PCT packet on the thread's stack at [esp+6c].
+If we can find a set of instructions in the vulnerable application 
+memory equivalent to CALL [esp+6C] part of the job is done.
+
+I used:
+     add esp,6c
+     ret
+
+There are many occurrences of those instructions in the lsass.exe memory.
+
+But there is still a problem to solve: The address at [esp+6c] points to 
+the PCT packet header, so the fields of that header are going to be used
+as executable code. If the PCT packet doesn't fulfil some protocol 
+checks execution flow will not reach the vulnerable function so we need 
+to craft a packet with valid field values and valid opcodes.
+
+In this context a "valid field value" is one that allows the execution 
+flow to reach the vulnerable function AND is also a valid opcode so as 
+to prevent the application from crashing when it is executed.
+Note that for successful exploitation, its not necessary to craft a
+packet that complies with the PCT RFC (See RFC referenced at the end of 
+this email)
+
+The packet used on the first version of the exploit module was:
+
+"\x80\x66\x01\x02\xbd\x00\x01\x00\x01\x00\x16\x8F\x86\x01\x00\x00\x00"
+
+
+Here is a brief explanation  of the values used:
+
+  Value             Condition to fulfill
+  XX YY            (RecordLength):
+                    if(XX & 0x80)
+                       RecordLength = ((XX & 0x7f) << 8) | YY
+                    else
+                       RecordLength = ((XX & 0x3f) << 8) | YY
+
+I selected XX=0x80 and YY=0x66 which satisfies the above condition.
+
+   01        0x01   (j):=  0x01
+   02 BD     0x02bd (k):0x0002 <= k < 0x301 < 0x8001
+
+Here two bytes that satisfy the above condition can be used, 0x02
+and 0xbd are just arbitrarily chosen values, because I like them!
+Note that 0xbd == mov ebp
+
+   00 01     0x0001 (l): > 0x0001, its better to keep it under 0x0003
+   00 01     0x0001 (m):<= 0x10
+   00 16     0x001A (N): (l+m+N+9 <= RecordLength) && (0 <  N <= 0x20)
+   8F        0x008F (o): =  0x008F
+   86 01     0x8601 (p): >= 0x8001
+
+
+Additionally, RecordLength must be less or equal to the packet size.
+
+The crafted packet translates to the following ASM code:
+
+     80660102         and     byte ptr [esi+0x1],0x2
+     bd00010001       mov     ebp,0x1000100
+     0016             add     [esi],dl
+     8f8601000000     pop     [esi+0x1]
+     eb20             jmp     0016f40b
+
+The ESI register points to writable data in both XP and 2000, the 
+register  used by the first and fourth instructions can be changed but 
+the third (00 16) is the right size to overwrite the return address.
+A jump opcode (eb xx) could be used in the first two bytes if the 
+packet's length is modified accordingly.
+
+Looking at the conditions that must be met for each field we can see 
+that there are more than 25 millions different packets that will trigger 
+the vulnerability (combinations of the possible values for XX,YY,k,l,m 
+and p)
+Modifying the value for N is also possible but would require additional
+payload to overwrite portions of the memory  of the running process
+with valid data.
+
+Detection of an exploitation attempt:
+
+In view of the above, detection of an attack that exploits this
+vulnerability should not rely entirely on packet bytes that can have
+value arbitrary chosen.
+
+A proper check should *at least* check for the required fixed values:
+  o == 0x8F
+  0x10 < N <= 0x20 (a value less than 0x10 does not overwrite the stack)
+
+Relying on other packet bytes for a proper detection signature should
+be subject to careful analysis as there might be other execution paths
+reaching the vulnerable function.
+
+The workaround proposed in Microsoft's bulletin MS04-011 does prevent
+exploitation of this vulnerability.
+
+After further research I've found that it may be possible to write
+an exploit that doesn't need to carry a hardcoded address and would work
+against Windows XP and 2000 systems independent of service pack and
+hot fixes applied, except of course for MS04-011 which does fix
+the problem.
+
+Exploitation has been successfully tested against the following systems:
+
+Windows 2000 Professional - sp4 (i386)
+Windows 2000 Professional - sp3 (i386)
+Windows 2000 Professional - sp2 (i386)
+Windows 2000 Server - sp4 (i386)
+Windows 2000 Server - sp3 (i386)
+Windows 2000 Server - sp2 (i386)
+Windows 2000 Advanced Server - sp4 (i386)
+Windows 2000 Advanced Server - sp3 (i386)
+Windows 2000 Advanced Server - sp2 (i386)
+Windows XP Professional - sp0 (i386)
+Windows XP Professional - sp1 (i386)
+
+(NT 4 exploitation seems possible with the same technique.)
+
+The following services can be used as attack vectors:
+
+IIS 4.0
+IIS 5.0
+IIS 5.1
+Exchange 5.0 with SSL enabled
+Active Directory with SSL
+
+The vulnerable IIS and Microsoft Exchange services are:
+  HTTPS 443/tcp
+  SMTP 25/tcp (STARTTLS)
+  IMAP 993/tcp,
+  POP3 995/tcp
+  NNTP 563/tcp.
+
+Active Directory:
+  ldaps 636/tcp
+  globalcatLDAPssl 3269/tcp.
+
+Exploitation through the Analysis Services 2000 (included with SQL 
+Server 2000) were not researched.
+
+PCT must be enabled and a valid certificate installed.
+
+References:
+  http://www.microsoft.com/technet/security/bulletin/MS04-011.mspx
+  http://www.develop.com/books/pws/draft-benaloh-pct-01.txt
+  http://www.graphcomp.com/info/specs/ms/pct.htm
+  http://www.coresecurity.com/products/coreimpact/index.php
+
+Thanks
+   Halvar Flake helped with the initial vulnerability analysis which
+   demonstrated not only his code reversing expertise but also the great
+   power of his bindiff tool.
+
+
+
+
+
+
+

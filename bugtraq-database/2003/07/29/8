@@ -1,0 +1,433 @@
+
+Date: Tue, 29 Jul 2003 18:32:32 +0000
+From: Auriemma Luigi <aluigi@...x.com>
+Cc: bugtraq@...urityfocus.com, vulnwatch@...nwatch.org,
+ full-disclosure@...ts.netsys.com, list@...ield.org, support@...telli.com,
+ 24@...telli.com, list@...uriteam.com
+Subject: Half-Life servers: buffer-overflow and freeze
+
+
+#######################################################################
+
+Applications: Half-Life (http://half-life.sierra.com)
+Versions:     1.1.1.0 and previous versions (including all MODs 
+              based on the game, such as Counter-Strike and DoD)
+              3.1.1.1c1 and 4.1.1.1a of the free dedicated server
+Platforms:    Windows and Linux
+Bugs:         Remote buffer overflow and Denial of Service
+Risk          High
+Author:       Auriemma Luigi
+              Senior Security Researcher, PivX Solutions, LLC
+              e-mail: aluigi@...x.com
+              web:    http://www.pivx.com/luigi/
+
+
+#######################################################################
+
+
+1) Introduction
+2) Bugs resume
+3) Bugs details (long, unuseful and boring)
+4) The Code
+5) Fix
+6) Researcher's Philosophy
+
+
+#######################################################################
+
+===============
+1) Introduction
+===============
+
+
+Valve's Half-Life was released in 1998 but still remains as the worlds
+most popular FPS game.
+
+The success of the game is largely due to the overwhelming community
+support, which has spawned a range of MODs for the game - including
+the popular Counter-Strike MOD and Day Of Defeat.
+
+
+
+#######################################################################
+
+==============
+2) Bugs resume
+==============
+
+
+There is a buffer overflow in the Half-Life servers.
+
+Both the dedicated server and the game server are vulnerable.
+
+The only limitation in this buffer-overflow is that some bytes can not
+be used in the shellcode because they are delimiters or otherwise
+reserved for use by the Half-Life protocol. This puts some minor
+constraints on the execution of the remote code, but is far from
+limiting.
+
+Further, there is a Denial of Service vulnerability that completely
+freezes the server, entering it into an infinite loop.
+
+
+
+#######################################################################
+
+==========================================
+3) Bugs details (long, useless and boring)
+==========================================
+
+
+---
+The following information is long, read only if you want some useless
+details on this vulnerability or simply if you want too appreciate all
+the time I have lost debugging this game, it has not been completely
+lost 8-)
+---
+
+
+The first thing that I want to specify is that some bytes cannot be
+used to fully exploit the following buffer-overflow, so the code
+execution could theoretically be limited.
+
+
+The explanation of the bug is divided into 4 sections used to show the
+effects of the long string as parameter and value on the graphical game
+and on the dedicated server:
+
+BUG 1: buffer-overflow
+BUG 2: freeze (infinite loop)
+
+
+With parameter and value I mean:
+
+\name\Test
+ |    |
+ |    value
+ parameter
+
+
+The problem happens because Half-Life uses other instructions if the
+total lenght of the string sent by the client is major than 256 bytes:
+
+cmp ecx, edi
+jl 00d3e687
+
+
+
+
+---------------------------
+BUG 1: HLDS.EXE (parameter)
+---------------------------
+
+
+First of all, I want to explain the buffer overflow that only occurs
+within the Half-Life dedicated server.
+
+During my explanation I will refer only to the exact addresses of the
+Half-Life 1.1.1.0 dedicated server on Windows (hlds.exe from the retail
+game).
+
+
+The problem happens when a too long parameter is passed in the packet
+to join multiplayer matches sent by the client to the server and the
+following is an example in C language of the UDP packet plus a big
+parameter (that I have called PAYLOAD):
+
+
+#define PAYLOAD    [268 chars]
+#define BOF        "\xff\xff\xff\xff" \
+/* 1 */            "connect %d" \
+/* 2 */            " %s \"" \
+                   "\\prot\\2" \
+                   "\\unique\\-1" \
+                   "\\raw\\00000000000000000000000000000000" \
+                   "\" \"" \
+                   "\\model\\" MODEL \
+                   "\\topcolor\\" TOPCOLOR \
+                   "\\bottomcolor\\" BOTTOMCOLOR \
+                   "\\rate\\9999.000000" \
+                   "\\cl_updaterate\\20" \
+                   "\\cl_lw\\1" \
+                   "\\cl_lc\\1" \
+                   "\\cl_dlmax\\128" \
+                   "\\hud_classautokill\\1" \
+                   "\\name\\" NAME \
+/* 3 */            "\\" PAYLOAD "\\value" \
+                   "\"\n"
+
+where:
+1) the first "%d" is the protocol version supported by the server
+2) "%s" is the challenge key sent by the server previously
+3) PAYLOAD is a long string of 268 chars (268 are needed to overwrite
+   the stored EBP and EIP registers in the stack, respectively at
+   offset 260 and 264 of the PAYLOAD string)
+
+The dangerous code is located in the function at address 0xD3E3F0 of
+SWDS.DLL (address that in memory will become 0x63ce3f0, so if you want
+to debug it in real-time remember to add 0x5690000...).
+
+This function seems to be something similar to a strcpy() function but
+it is used ONLY with parameters, and it looks not only for NULL bytes
+but also for backslashes '\' in the parameters sent by the client.
+
+
+The problem however is located "exactly" in the loop that starts from
+address 0xD3E425 to 0xD3E432:
+
+:00D3E425 3C5C                    cmp al, 5C
+:00D3E427 740B                    je 00D3E434
+:00D3E429 8801                    mov byte ptr [ecx], al
+:00D3E42B 8A4601                  mov al, byte ptr [esi+01]
+:00D3E42E 41                      inc ecx
+:00D3E42F 46                      inc esi
+:00D3E430 3AC3                    cmp al, bl
+:00D3E432 75F1                    jne 00D3E425
+
+
+As you can see, this loop makes the following things:
+
+1) if the current byte in our string is equal to '\' the loop will be
+   broken
+2) it stores the current byte in memory (buffer overflow)
+3) it gets the next byte from our string
+4) the pointer now points to the next memory position and next byte of
+   the string
+5) if the current byte in our string is a NULL byte the loop will be
+   broken (BL in our case is a NULL byte)
+
+
+Wonderful!
+In the meantime no instruction checks if the string/parameter passed by
+the client is too long for the local buffer, so our Half-Life server is
+in a very bad situation... In fact the previously stored EIP (that was
+equal to 0x63ce614) has been fully overwritten by our string.
+
+
+
+-------------------------
+BUG 1: HL.EXE (parameter)
+-------------------------
+
+
+:01D3E425 3C5C                    cmp al, 5C
+:01D3E427 740B                    je 01D3E434
+:01D3E429 8801                    mov byte ptr [ecx], al
+:01D3E42B 8A4601                  mov al, byte ptr [esi+01]
+:01D3E42E 41                      inc ecx
+:01D3E42F 46                      inc esi
+:01D3E430 3AC3                    cmp al, bl
+:01D3E432 75F1                    jne 01D3E425
+
+(The executable seems to decode itself in memory at runtime or something
+similar)
+
+
+
+
+-----------------------
+BUG 2: HLDS.EXE (value)
+-----------------------
+
+
+A similar problem happens in the value field, for example inserting the
+PAYLOAD as value of a normal parameter, like (C language):
+
+"\\parameter\\" PAYLOAD
+
+
+In the dedicated server (SWDS.DLL) after the vulnerable loop that
+checks the parameter (0xD3E425 as seen previously) there is another
+loop that instead checks the value of the parameters.
+This loop goes from 0xD3E45B to 0xD3E468:
+
+:00D3E45B 3C5C                    cmp al, 5C
+:00D3E45D 740B                    je 00D3E46A
+:00D3E45F 8801                    mov byte ptr [ecx], al
+:00D3E461 8A4601                  mov al, byte ptr [esi+01]
+:00D3E464 41                      inc ecx
+:00D3E465 46                      inc esi
+:00D3E466 3AC3                    cmp al, bl
+:00D3E468 75F1                    jne 00D3E45B
+
+
+This loop copies our string/value to another buffer in memory that is
+located before the buffer used to store the parameter.
+
+The stack of these functions is similar to the following:
+
+[value_buff]...[parameter_buff]...[EBP][EIP]
+0x415df94      0x415e094               0x415e19c
+
+
+Fortunately Half-Life can accept only values minor/equal than 380 chars
+(parameters limit is minor than 380), so the string to use to exploit
+the server is limited and cannot reach the position in memory where is
+stored the EIP value.
+
+Practical resuming:
+- The function that checks the value uses a buffer that starts from the
+  memory position: 0x415df94
+- The function that checks the parameter uses a buffer that starts from
+  the memory position: 0x415e094
+- EIP is stored at position: 0x415e19c
+
+So: 0x415df94 + 0x17c = 0x415E110 (that is 140 bytes minor than the
+position of the stored EIP in memory)
+
+
+However the problem is not finished here because a buffer-overflow 
+doesn't exist in the value, but a good Denial of Service does exist.
+
+
+In fact, the effect in the Half-Life dedicated server is an infinite
+loop in SWDS.DLL, from the memory address 0x63ce60d (0xD3E60D) to
+0x63ce645 (0xD3E645).
+
+
+This function simply makes an infinite check of the same string given
+by the user, this is the simple cause of the DoS.
+
+
+
+---------------------
+BUG 2: HL.EXE (value)
+---------------------
+
+
+The problem is the same in HLDS.EXE
+
+The only things that change are the offsets of the checking function
+because the vulnerable loop is in HL.EXE and in memory it starts from
+0x01d3e60d to 0x01d3e645:
+
+
+:01D3E60D 57                      push edi
+:01D3E60E 56                      push esi
+:01D3E60F E8DCFDFFFF              call 01D3E3F0 <-- vulnerable function
+...
+:01D3E643 84C0                    test al, al
+:01D3E645 75C6                    jnz 01D3E60D
+
+
+
+
+
+---
+
+
+NOTE: the same things happen on the Linux dedicated server too.
+      However I have noted a difference between the 3.1.1.1 and the
+      latest versions of the dedicated server where seems that the
+      buffer-overflow in the parameter cause an infinite loop...
+
+
+
+#######################################################################
+
+===========
+4) The Code
+===========
+
+
+The proof-of-concept exploit is very simple, and acts partly as a DoS
+and a code execution exploit.
+
+The return address is overwritten with the offset of a function in
+SWDLL.DLL that displays a message in the console of the dedicated
+server, after which it crashes.
+This approach was chosen to demonstrate actual code execution without
+endangering the administrator, enabling the admin to easily verify
+whether the server is vulnerable.
+The POC exploit can be used against both the dedicated and the game
+servers, overwriting the stored address with 0x063c27f5.
+
+It can be compiled on both Windows and Unix and can test both the
+buffer-overflow in the parameter (code-execution) and in the value
+(DoS):
+
+
+http://www.pivx.com/luigi/poc/hlbof-server.zip
+
+
+
+
+#######################################################################
+
+======
+5) Fix
+======
+
+
+Valve was notified of this vulnerability on April 14 2003, and replied
+that they were working to patch these bugs.
+
+Since that last point of contact, Valve and it's representatives have
+been contacted on multiple occasions for a status update on the patch,
+without any replies.
+
+
+---
+
+
+I have found a little work-around to the problem (just a jump).
+Practically I avoid that the data sent by the client will be managed by
+the vulnerable functions if it is longer than 256 bytes.
+I don't have the source code of the game and I'm not a Valve's
+programmer so this is just a personal and simple work-around that I
+have tested which seems not to have any problems.
+Feel free to try it until an official patch will be provided and please
+let me know if there are problems:
+
+
+Half-Life 1.1.1.0 dedicated server (retail game):
+
+http://www.pivx.com/luigi/patches/hlbof-server-1110-fix.zip
+
+
+Half-Life 4.1.1.1a dedicated server for Windows:
+
+http://www.pivx.com/luigi/patches/hlbof-server-4111a-fix.zip
+
+
+
+#######################################################################
+
+==========================
+5) Researcher's Philosophy
+==========================
+
+
+Be free.
+The researchers' community needs your reversing, your programs, and
+your research. Never let your passion die and don't stop your work!
+
+Disclosure:
+Full and responsible disclosure can lead to a quick fix, and prevent a
+problem before it gets into the wrong hands.
+
+
+
+#######################################################################
+
+====================
+About PivX Solutions
+====================
+
+
+PivX Solutions, is a premier network security consultancy offering a
+myriad of network security services to our clients.
+
+For more information go to http://www.PivX.com
+
+
+#######################################################################
+
+
+--- 
+Researcher
+http://www.pivx.com/luigi/
+
+
+
+

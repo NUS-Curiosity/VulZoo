@@ -1,0 +1,180 @@
+
+Date: Thu, 04 Dec 2003 15:41:37 -0800
+From: canon@...sc.gov
+To: bugtraq@...urityfocus.com
+Subject: Hot fix for do_brk bug
+
+
+
+Greetings,
+
+I've written a linux kernel module that can be used to hot fix a
+Linux system for the bug in do_brk.  It scans the
+kernel space and replaces jmp and calls to do_brk
+to point to a wrapper routine instead.  It also maps
+the symbol table to point to the wrapper.  This only
+works on x86 and it has only been tested with RH kernels
+2.4.18-27.7.xsmp and 2.4.20-20.7smp.  It is quite possible
+this could crash or screw-up a system, so use at your own
+risk.  I've tested the module against the proof of concept code
+written and posted by Christophe Devine.  The module catches
+the exploit and logs the attempt.
+
+--Shane Canon
+
+------brk_fix.c------------
+#define MODULE
+#define __KERNEL__
+
+/* some constants used in our module */
+#define MODULE_NAME "brk_fix"
+#define MODULE_VERSION "0.01"
+
+/* brk_fix
+ * Verions: 0.01
+ *
+ * WARNING WARNING WARNING
+ * This module intentionally modifies kernel memory.
+ * This module could potentially crash or damage your system.  
+ * Use at your own risks.
+ *
+ *  Hot fix for integer overflow in do_brk
+ *   
+ *  This module scans kernel code space looking for jumps and calls
+ *  to do_brk.  It then changes these calls to instead call my_brk,
+ *  which is a wrapper routine that does some checks before calling do_brk.
+ *  The module also scans for the address of do_brk and replaces it
+ *  with my_brk.  This would mainly occur in the exported symbols table.
+ *
+ *  This has been tested with RH 2.4.20-20.7smp and RH 2.4.18-27.7.xsmp on i686
+ *
+ *  Sample use...
+ *  gcc -O3 -I/lib/modules/`uname -r`/build/include   -c -o brk_fix.o brk_fix.c
+ *  insmod ./brk_fix.o
+ *
+ *  Written by Shane Canon <canon@...sc.gov>
+ *  (c) Copyright 2003 Regents of the University of California
+ *             All rights reserved.
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+
+#include <linux/kernel.h>
+#include <linux/errno.h>
+#include <linux/version.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+
+extern void * __start___kallsyms;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,4,9)
+#ifdef MODULE_LICENSE
+MODULE_LICENSE("GPL");
+#endif
+#endif
+
+unsigned long my_brk(unsigned long addr, unsigned long len);
+
+int init_module(void)
+{
+  unsigned char *ptr;
+  unsigned char *newptr;
+  long *lptr;
+  unsigned char *cptr;
+  long diff;
+  int count=0;
+  unsigned char *start=(unsigned char *) (TASK_SIZE);  /* Start at the 
+beginning of kernel space */
+  unsigned char *end=(unsigned char *)&__start___kallsyms;    
+                                             /* Want something that is well 
+past the kernel test */
+                                             /* This seems to fit the bill     
+                  */
+
+
+  ptr=(unsigned char *)(do_brk);              /* We are looking for 
+calls/jumps to this function */
+  newptr=(unsigned char *)(my_brk);           /* This is what we will change 
+it to               */
+  for (cptr=start;cptr<end;cptr++){           /* Lets scan all of kernel space 
+                  */
+    if (*cptr==0xe8||*cptr==0xe9){            /* Look for calls or jumps       
+                  */
+      cptr++;                                 /* If you find one look at the 
+next dword          */
+      lptr=(long *)cptr;
+      cptr+=4;
+      if ((cptr+*lptr)==(ptr)){               /* See if the offset would point 
+to do_brk         */
+        printk("fixing 0x%08lx\n",lptr);      /* If so, change it to our new 
+routine             */
+        *lptr=(newptr-cptr);
+        count++;
+      }
+    }
+    else{
+      lptr=(long *)cptr;                      /* Look for the address as well. 
+ This would show  */
+      if ((unsigned char*)(*lptr)==ptr){      /* up in the symbol table.       
+                  */
+        printk("Fixing address at 0x%08lx\n",lptr);
+        *lptr=(long)(newptr);
+      }
+    }
+  }
+  printk ("Fix brk installed..\n");           /* All done. */
+  MOD_INC_USE_COUNT;                          /* We can't unload this one.  So 
+lets inc the mod  */
+                                              /* count and leave it there. */
+  return 0;                                   /* success */
+
+}
+
+
+void cleanup_module(void)
+{
+  /* Can't remove it */
+}
+
+/* These are the first couple of lines from the patched mmap.c */
+/* Do the new checks and then call the original do_brk         */
+
+unsigned long my_brk(unsigned long addr, unsigned long len)
+{
+        len = PAGE_ALIGN(len);
+        if (!len)
+                return addr;
+
+        if ((addr + len) > TASK_SIZE || (addr + len) < addr){   /* Let's make 
+sure its in bounds */
+		printk("caught do_brk exploit!!!\n");
+                return -EINVAL;
+        }
+	return do_brk(addr,len);                                /* Call the real 
+do_brk          */
+}
+
+-------end---------
+
+------------------------------------------------------------------------
+Shane Canon
+National Energy Research Scientific
+  Computing Center                       
+------------------------------------------------------------------------
+
+
+
+

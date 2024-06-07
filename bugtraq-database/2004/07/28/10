@@ -1,0 +1,219 @@
+
+Date: Wed, 28 Jul 2004 17:19:57 +0200
+From: "Berend-Jan Wever" <skylined@...p.tudelft.nl>
+To: <vulnwatch@...nwatch.org>, <full-disclosure@...ts.netsys.com>,
+   <bugtraq@...urityfocus.com>
+Subject: Re: Internet Explorer Remote Null Pointer Crash(mshtml.dll)
+
+
+Here's a detailed description of what's going wrong with the <a href=::%7b> right click bug.
+(yeah, my reply is a bit late but I was busy and went on a holliday)
+
+Right click on a link with href="file://::XXXX" and IE will try to download
+it, fail and try to report an error. While creating this errormessage
+FormatMessageW calls RtlFormatMessage with parts of our url in the
+formatstring.
+
+- RtlFormatMessage's arguments include a pointer to the formatstring and a
+pointer to a pointer to a pointer to an Array of arguments (Array1). All
+pointers, the formatstring and Array1 are on the stack.
+- Array1 should contain the normal printf-type arguments (except the
+formatstring ofcourse) but since none are expected to be there, the pointers
+to Array1 exist but Array1 itself is totally empty (doesn't exist). The
+pointer points to the end of a stack frame.
+- The formatstring for RtlFormatMessage looks like this:
+"%index!conversion!", eg. "%1!x!" will display Array1[0] as heX, "%2!s!"
+will display Array1[1] as string.
+- The actual conversion is done with _snwprintf. RtlFormatMessage passes the
+destination string, the length, the formatstring, and Array1[index] as first
+argument to convert. We control the formatstring and Array1[index]: %10!x%x!
+will give _snwprintf %x%x as formatstring and Array1[9] as first argument.
+
+- The href gets converted to "[file] from [server]" (XXXX from ::), which is
+used as formatstring in RtlFormatMessage.
+- The total href can not be more then 97 bytes or _snwprintf won't be
+called.
+- [file] cannot be more then 28 bytes or _snwprintf won't be called.
+- "file://::XXXX/A" converts to "A from ::XXXX". Use this to bypass the
+restriction on the [file]-length.
+- Each conversion specifier passed to RtlFormatMessage (%index!conversion!)
+cannot be more then 34 bytes or snwprintf won't be called.
+- RtlFormatMessage limits to total length of the message to 10000 bytes,
+each call to _snwprintf gets a proper max length accordingly.
+
+Here's a little stack layout, I hope it doesn't get to mangled:
+
+Address    Stack      Procedure / arguments                 Called from
+Frame
+xxxxEB3C   77F8F40C   ntdll._snwprintf                      ntdll.77F8F407
+xxxxEED8
+xxxxEB40   yyyyyyyy     destination = yyyyyyyy
+xxxxEB44   00010000     count = 10000 (10000-allready printed chars)
+xxxxEB48   xxxxEE84     format = "%x" (conversion)
+xxxxEB4C   xxxxxxxx       = 1  Array1[index]
+xxxxEB50   00000000       = 0
+xxxxEB54   00000000       = 0
+xxxxEB58   00000500       = 0x500
+xxxxEB5C   00000000       = 0
+xxxxEB60   00000000       = 0
+xxxxEB64   xxxxFE6C       = &Array1[1]
+xxxxEEDC   7C57F221   ntdll.RtlFormatMessage
+KERNEL32.7C57F21B             xxxxEF74
+xxxxEEE0   04246F30     Source = UNICODE "A from ::%1!x!"
+xxxxEEE4   00000000
+xxxxEEE8   00000000
+xxxxEEEC   00000000
+xxxxEEF0   00000000
+xxxxEEF4   xxxxFE24     Arguments = xxxxFE24 [&&&Array of arguments]
+xxxxEEF8   yyyy0000     Destination = freshly allocated heap.
+xxxxEEFC   00010000     Length = 10000 (updated by RtlFormatMessage and
+passed to _snwprintf)
+xxxxEF64   xxxxFFDC   [Pointer to next SEH record]
+xxxxEF68   xxxxxxxx   [SE handler]
+xxxxEF78   7C57F2CB   KERNEL32.7C57F102
+KERNEL32.7C57F2C6             xxxxEF74
+xxxxEFA0   70A9D0CD   KERNEL32.FormatMessageW               SHLWAPI.70A9D0C7
+xxxxEF9C
+xxxxEFA4   00000500     Flags = ALLOCATE_BUFFER|FROM_STRIN
+xxxxEFA8   04246F30     pSource = 04246F30
+xxxxEFAC   00000000     MessageId = 0
+xxxxEFB0   00000000     LanguageId = 0 (LANG_NEUTRAL)
+xxxxEFB4   xxxxFE28     Buffer = xxxxFE28
+xxxxEFB8   00000000     BufSize = 0
+xxxxEFBC   xxxxFE24     Arguments = xxxxFE24 [&&&Array of arguments]
+xxxxF3F8   7174B9DD   SHLWAPI.#68                           SHDOCVW.7174B9D7
+        xxxxF3F4
+xxxxFC38   UNICODE "::%1!x!/A"
+xxxxFE24   xxxxFE44   [&&Array of arguments]
+xxxxFE30   7175E158   SHDOCVW.7174B97C                      SHDOCVW.7175E153
+xxxxFE2C
+xxxxFE44   xxxxFE6C   [&Array of arguments]
+xxxxFE48   717610C6   SHDOCVW.7175E122                      SHDOCVW.717610C1
+xxxxFE44
+xxxxFE6C   xxxxFEA4   [arg 1 -> arg 15]
+xxxxFE70   7176111D   SHDOCVW.7176103E              SHDOCVW.7176111D
+xxxxFE74   00199020
+xxxxFE78   001D4358
+xxxxFE94   001D5F74
+xxxxFEA4   xxxxFEEC   [arg 15 -> arg 33 ]
+xxxxFEA8   71761331   RETURN to SHDOCVW.71761331 from SHDOCVW.717610EC
+xxxxFEAC   00199020
+xxxxFEB0   001D4358
+xxxxFED0   001D5F74
+xxxxFEE4   001D5F50
+xxxxFEE8   00199020
+xxxxFEEC   xxxxFF50   [ arg 33 -> ... ]
+xxxxFEF0   717604AB   RETURN to SHDOCVW.717604AB from SHDOCVW.717612E2
+xxxxFEF4   00199C80   (arg 35) UNICODE "file://:|%1!x!/A"
+xxxxFE70   7176111D   SHDOCVW.7176103E                      SHDOCVW.71761118
+xxxxFE6C
+xxxxFEA8   71761331   SHDOCVW.717610EC                      SHDOCVW.7176132C
+xxxxFEA4
+xxxxFEF0   717604AB   SHDOCVW.717612E2                      SHDOCVW.717604A6
+xxxxFEEC
+xxxxFF50   040BFFB4   [ ... -> ... ]
+xxxxFF54   70AAC487   Includes SHDOCVW.717604AB             SHLWAPI.70AAC484
+xxxxFF50
+xxxxFFB8   7C57438B   Includes SHLWAPI.70AAC487
+KERNEL32.7C574388             xxxxFFB4
+xxxxFFDC   FFFFFFFF   [Pointer to next SEH record]
+xxxxFFE0   xxxxxxxx   [SE handler]
+
+Is this exploitable ? Probably not...
+1. I can't reach the SEH. RtlFormatMessage doesn't allow enough room in the
+formatstring to have _snwprintf do stackpopping and overwrite it.
+2. I can't overwrite anything with a proper value: I can print 0x10000 bytes
+max, so I can only overwrite with values 00000000-00010000. %hn is nice, but
+then I'd have to have two pointers that point to the high and low word of
+something usefull. And I can't use integer overflow with %hn to write a big value followed by a small value.
+
+Cheers,
+
+SkyLined
+
+
+
+
+
+----- Original Message ----- 
+From: "Rafel Ivgi, The-Insider" <theinsider@....net.il>
+To: "vulnwatch" <vulnwatch@...nwatch.org>
+Sent: Monday, June 14, 2004 23:20
+Subject: [Full-Disclosure] Internet Explorer Remote Null Pointer Crash(mshtml.dll)
+
+
+> ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+> 
+> Application:      Internet Explorer
+> Vendors:           http://www.microsoft.com
+> Versions:          6.0.2800.1106.xpclnt_qfe.021108-2107
+> Patched With:  SP1;Q832894;Q330994;Q837009;Q831167;
+> ModName:       mshtml.dll
+> ModVer:           6.0.2734.1600
+> Platforms:        Windows
+> Bug:                  Remote/Local Null Pointer Crash
+> Exploitation:    Remote with browser
+> Date:                14 Jun 2004
+> Author:             Rafel Ivgi, The-Insider
+> e-mail:              the_insider@...l.com
+> web:                 http://theinsider.deep-ice.com
+> 
+> ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+> 
+> 1) Introduction
+> 2) Bugs
+> 3) The Code
+> 
+> ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+> 
+> ===============
+> 1) Introduction
+> ===============
+> 
+> Internet Explorer is currently the most common internet browser in the
+> world.
+> It comes by default with every windows operating system. Therefore any
+> vulnerability
+> concerning it is an highly important issue.
+> 
+> ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+> 
+> ======
+> 2) Bug
+> ======
+> 
+> Upon clicking "Save As" on a link with double colon --> "::"
+> and
+> a left curly bracket --> "{"
+> then
+> Internet Explorer Will Crash.
+> 
+> AppName: iexplore.exe  AppVer: 6.0.2600.0  ModName: ntdll.dll
+> ModVer: 5.1.2600.114  Offset: 00056074
+> 
+> ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+> 
+> ===========
+> 3) The Code
+> ===========
+> 
+> Paste into an htm/html file:
+> <center><a href=::%7b>Right  Click aOn Me And Click "Save Target As"</a>
+> 
+> ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+> 
+> --- 
+> Rafel Ivgi, The-Insider
+> http://theinsider.deep-ice.com
+> 
+> "Scripts and Codes will make me D.O.S , but they will never HACK me."
+> 
+> _______________________________________________
+> Full-Disclosure - We believe in it.
+> Charter: http://lists.netsys.com/full-disclosure-charter.html
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.netsys.com/full-disclosure-charter.html
+
+

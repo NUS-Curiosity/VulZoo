@@ -1,0 +1,347 @@
+
+Date: 3 Apr 2003 17:21:21 -0000
+From: Francesco Vigo <f.vigo@...i-idle.com>
+To: bugtraq@...urityfocus.com
+Subject: NetBIOS could be used as network flood amplier
+
+
+
+
+Overview: 
+
+Commonly used services, such as NetBIOS Name Server can be used to flood 
+hosts with UDP data, sending spoofed name requests.
+
+Details:
+
+Sending a Netbios Name Request to a broadcast address on an insecure 
+network (for 'insecure' I mean a network that does not filter packets 
+directed to its broadcast address from outside) makes all Windows machines 
+with NetBIOS enabled and Unix machines running Samba reply to it. 
+A malicious user could exploit this problem to send spoofed requests to a 
+list of broadcast addresses in order to flood a victim host with UDP data. 
+Papasmurf, Fraggle and a lot of other programs do this, but the difference 
+is that the number of machines replying to this query is way bigger, 
+because Windows 9x machines do not reply to ICMP echo packets directed the 
+broadcast address (the way smurf works) and to UDP echo requests. Also, 
+the size of the outgoing packet, including IP and UDP headers, is 78 
+bytes, but the answer size, according to my tests, can range from 80 to 
+280 bytes, so if 5-6 machines reply to it, about 1000 bytes of data are 
+generated, which means that the original request is amplified 13x. This is 
+nothing new, but the problem applies to a lot of networks that weren't 
+supposed to be vulnerable to 'flood amplification': I ran a test on the 
+whole vulnerable network list taken from http://www.netscan.org, about 
+32800 IPs, and I noticed that many of the IPs in the bottom part of the 
+list reply with more than 2000 bytes to the NetBIOS Name Request query, 
+which is about a 25x amplifcation, and a total of 2500 networks reply with 
+at least 300 bytes (~ 4x). 
+
+The packet to send is a simple UDP on port 137, contaning this payload 
+(which is the Netbios Name Request):
+
+(hex dump)
+
+6836 0000 0001 0000 0000 0000 2043 4B41 4141 4141 4141 4141 
+4141 4141 4141 4141 4141 4141 4141 4141 4141 4141 4100 0021
+0001
+
+Below there is a very simple (and badly coded) scanner to test your 
+network, which works over Ethernet or PPP connections, using libpcap. It 
+just monitors UDP data on port 137, so make sure you don't have other 
+NetBIOS traffic on your network while running the scanner (or it will 
+display wrong response sizes)
+
+
+Regards,
+Francesco Vigo - Anti-Idle Security Research - f.vigo {AT} anti-idle.com
+
+
+--------------- nns-scanner.c 
+
+/**************************************************************************
+********************************
+* NNS 
+SCANNER                                                                    
+                         *
+* By Francesco Vigo - Anti-Idle Security Team - f.vigo {AT} anti-idle.com -
+ Greets to G.Girardi,S.Sartini *
+* Compile with gcc -lpcap nns-scanner.c -o nns-
+scanner                                                    *
+***************************************************************************
+*******************************/
+
+#include <stdio.h>
+#include <unistd.h>
+#include <time.h>
+#include <netdb.h>
+#include <linux/socket.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <linux/if_ether.h>
+#include <linux/if_arp.h>
+#include <linux/if.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <ctype.h>
+#include <errno.h>
+#include <pcap.h>
+
+#define MAX_PACKET_LEN  100
+#define MAX_LIST_SIZE   32768
+#define MAX_IP_LEN      16
+#define IPLEN   sizeof(struct iphdr)
+#define ETHLEN  sizeof(struct ethhdr)
+#define UDPLEN  sizeof(struct udphdr)
+#define NETLEN  (sizeof(netbios)-1) /* -1 ?!?!?!? */
+#define VERSION "\n[6149] NNS broadcast NetBIOS scanner version 0.1 [6149]
+\nby Francesco Vigo <f.vigo at anti-idle.com>\n\n"
+
+/* checksum, ripped */
+unsigned short in_cksum(addr, len)
+    u_short *addr;
+    int len;
+{
+    register int nleft = len;
+    register u_short *w = addr;
+    register int sum = 0;
+    u_short answer = 0;
+
+    /*
+     * Our algorithm is simple, using a 32 bit accumulator (sum), we add
+     * sequential 16 bit words to it, and at the end, fold back all the
+     * carry bits from the top 16 bits into the lower 16 bits.
+     */
+    while (nleft > 1)  {
+        sum += *w++;
+        nleft -= 2;
+    }
+
+    /* mop up an odd byte, if necessary */
+    if (nleft == 1) {
+        *(u_char *)(&answer) = *(u_char *)w ;
+        sum += answer;
+    }
+
+    /* add back carry outs from top 16 bits to low 16 bits */
+    sum = (sum >> 16) + (sum & 0xffff); /* add hi 16 to low 16 */
+    sum += (sum >> 16);         /* add carry */
+    answer = ~sum;              /* truncate to 16 bits */
+    return(answer);
+}
+
+void p_die(int die) {
+    printf("died with error %d : ",die);
+    switch(die) {
+        case 0:
+            printf("command line error\n\n");
+            break;
+        case 1:  
+            printf("cannot open socket\n\n");
+            break;
+        case 2:
+            printf("cannot resolve localhost host\n\n");
+            break;
+        case 3:
+            printf("euid=0 (root) is needed\n\n");
+            break;
+        case 4:
+            printf("cannot send to raw socket\n\n");
+            break;
+        case 5:
+            printf("cannot resolve remote host\n\n");
+            break;
+        case 6:
+            printf("cannot start pcap capture session\n\n");
+            break;
+        case 7:
+            printf("error capturing packet\n\n");
+            break;
+        default:
+            printf("unspecified error\n\n");
+            break;
+    }
+    exit(die);
+}
+
+/* dummy function for signal */
+void dum(int trash) {
+printf("\n\nAll done!!\n\n");
+exit(0);
+}
+
+void usage(char *arg,int verr) {
+printf("usage: %s <local ip> <remote ip> <delay> <if>\n",arg);
+printf("\tlocal ip  = local ip\n");
+printf("\tremote ip = broadcast ip network address (to test)\n");
+printf("\tdelay     = response wait time (in seconds) [should be 1 or 2 to 
+get trustable information]\n");
+printf("\tif        = interface (e.g. eth0)\n");
+printf("\n");
+p_die(verr);
+}
+
+/* checks if the udp packet is a response from the broadcast */
+void parse_packet(u_char *useless, struct pcap_pkthdr *head, u_char *data) 
+{
+
+        struct iphdr ip;
+ struct udphdr udp;
+ struct ethhdr ethh;
+ int dim = 0; /* packet size */
+ int t_dim = 0;
+ int len=0;
+ char c;
+
+ /* check if we got ethernet header or not */
+
+ memcpy((u_char *)&c,(u_char *)&data[0],1); 
+ if(c == 69) len = 0; /* no */
+        else {
+            len = ETHLEN;
+     /* ethernet structure */
+     memcpy((u_char *) &ethh, (u_char *) &data[0], ETHLEN);
+     if(ethh.h_proto != ntohs(ETH_P_IP)) return; /* we want an IP packet */
+        }
+       
+ /* copy ip structure  */
+ memcpy((u_char *)&ip, &data[len], IPLEN);
+
+ /* check if is udp */
+ if(ip.protocol != 17) return;
+ /* copy udp structure */
+ memcpy((u_char *)&udp, &data[(len+IPLEN)], UDPLEN);
+ /* check if dest port is 137  */
+ if(udp.dest != htons(137)) return;
+
+ dim = head->len - len; /* packet size without ETH header */
+ memcpy((u_char *)&t_dim,useless,2);
+ t_dim += dim;
+ memcpy(useless,(u_char *) &t_dim,2); 
+ return;
+}
+
+int main(int argc, char *argv[]) {
+    int fd;
+    struct iphdr *ip;
+    struct udphdr *udp;
+    unsigned char *packet;
+    struct hostent *serverhost;
+    struct hostent *clienthost;
+    struct sockaddr_in kill;
+
+    pcap_t *hat = NULL;
+    char errbuf[PCAP_ERRBUF_SIZE]; /* libpcap buffer */
+    time_t now; /* timeout check */
+    
+    long delay = 0;
+    int i = 0;
+    int t_size = 0, f_size = 0; /* data size (total, partial)*/
+    
+
+    char netbios[] = 
+    "\x68\x36\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x20\x43"
+    "\x4b\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41"
+    "\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41\x41"
+    "\x41\x41\x41\x00\x00\x21\x00\x01";
+
+    signal(SIGINT, dum); /* catch ^C */
+
+    printf(VERSION);
+
+    if(argc != 5) usage(argv[0],0);
+    if(!(delay = atoi(argv[3]))) usage(argv[0],0);
+
+    packet=malloc(MAX_PACKET_LEN);
+    memset(packet,0,MAX_PACKET_LEN);
+    memset(&kill,0,sizeof(kill));
+
+    
+    ip = (struct iphdr *) packet;
+    udp = (struct udphdr *) (packet+IPLEN);
+
+    /* root check */
+    if(geteuid() != 0) p_die(3);
+
+
+    /* set socket and resolve hostname */
+    if((fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) p_die(1); /* 
+socket error */
+
+    /* build ip hdr */
+    ip->version=4;
+    ip->ihl=5;
+    ip->tos=0;
+    ip->tot_len=htons((IPLEN+UDPLEN+NETLEN));
+    ip->id=htons(0);
+    ip->frag_off=htons(0);
+    ip->ttl=64;
+    ip->protocol=17; /* udp */
+    ip->saddr=0;
+    ip->daddr=0;
+
+    /* build udp hdr */
+    udp->source=htons(137);
+    udp->dest=htons(137);
+    udp->len=htons((NETLEN+UDPLEN));
+    /* push netbios data into packet */
+    memcpy((packet+IPLEN+UDPLEN), &netbios, NETLEN);
+
+    /* build sockaddr */
+    kill.sin_family=AF_INET;
+
+    if((serverhost = gethostbyname(argv[1])) < 0) p_die(2); /* source 
+resolve error */
+    memcpy(&ip->saddr,serverhost->h_addr,serverhost->h_length);
+
+    if((clienthost = gethostbyname(argv[2])) < 0) p_die(5); /* test host 
+resolve error */
+    memcpy(&ip->daddr,clienthost->h_addr,serverhost->h_length);
+
+
+    /* open pcap */
+    hat = pcap_open_live(argv[4], 128, 0, 0, &errbuf[0]);
+    if(hat == NULL)
+    {
+        p_die(6);
+    }
+
+    /* send packets */    
+    printf("Testing %s with local IP %s with %ld seconds of 
+listening\n\n",argv[2],argv[1],delay);
+    
+        t_size = -(IPLEN+UDPLEN+NETLEN);
+        f_size = 0;
+        printf("Testing: %s... ",argv[2]);
+        fflush(stdout);
+        memcpy(&kill.sin_addr,&ip->daddr,4);
+        /* set checksums */
+        ip->check=in_cksum((u_short *)packet,IPLEN);
+        /* send packet */
+        if((sendto(fd,packet,(IPLEN+UDPLEN+NETLEN),0,(struct sockaddr *)
+&kill,sizeof(kill))) < 0) p_die(4);
+        now = time(NULL);
+        while((time(NULL) - now) < delay) {
+   i = pcap_dispatch(hat, 50, (void *) &parse_packet, (u_char *) &f_size);
+   t_size += f_size;
+   f_size = 0;
+   if(i < 0) p_die(7);
+        }
+        if(t_size > 0) { 
+            printf("works! (%d bytes received)\n",t_size);
+        }
+        else printf("doesn't work!\n");
+    pcap_close(hat);  /* close pcap monitoring */
+    printf("Finished!\n");
+    exit(0);
+}
+
+
+
+
+

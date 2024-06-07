@@ -1,0 +1,169 @@
+
+Date: Tue, 23 Nov 2004 22:45:15 +0100
+From: "Martin Buchholz" <Martin.Buchholz@....COM>
+To: <kbo@....tiscali.de>
+Cc: bug-findutils@....org, parimiv@...haw.com, srevilak@...akeasy.net,
+	bugtraq@...urityfocus.com, levon@...ementarian.org
+Subject: Re: Changes to the filesystem while find is running - comments?
+
+
+James Youngman wrote:
+> On Mon, Nov 22, 2004 at 06:05:43PM -0800, Martin Buchholz wrote:
+> 
+> 
+>>I mean,
+>>- first go back to the parent directory
+>>- then lstat("foo"); check if it's a symlink or a real directory
+>>- if a symlink, then this is fishy, but it could happen non-maliciously.
+>>  I would issue a warning, then continue, without chdir'ing into foo.
+>>- if a directory, then probably we've hit the automounter problem.
+>>  Don't issue a warning; chdir("foo") again; this time it should work.
+> 
+> 
+> It sounds like this strategy, which is the same as we currently do,
+> but with a retry, is fairly sensible.
+> 
+> The only problem that occurs to me is that we did not recheck "foo" to
+> see if it still matches the predictes specified on the find command
+> line (think about commands like 
+> 	find /z -user fred -o -name baz -print
+> 
+> ... here, if the original "foo" was owned by root but the "new" foo is
+> owned by fred, our retrying technique has ensured that we have
+> wandered into a place which we are not supposed to.  It's possible
+> that we could simply reissue process_path() to retry instead of
+> directly trying the chdir("foo") again.  I can't remember offhand if
+> that is likely to be a viable strategy.
+
+I don't know the details of find's implementation.
+Conceptually, I would want to forget everything I knew about "foo",
+except that we've already tried it, So re-process this path again
+in its entirety.  This way, when find reports a file, it was
+at least reporting the true state of the file AT SOME POINT.
+
+E.g. if a file is changing from a regular file owned by Bob,
+to a directory owned by Alice, then
+find -user Bob -type d
+should never report that file.
+
+> 
+>>Unlike replacing directories with symlinks, where the malicious
+>>possibilities are evident, I don't see any malicious possibilities
+>>arising out of mounted filesystems replaced by other filesystems.
+> 
+> 
+> Is there a consensus agreeing with this point of view?  If so, that
+> would make the implementsation much simpler...
+> 
+> 
+> 
+>>Hmmm... You're right. I guess you'd have to:
+>>FD=open("foo");
+>>ST1=lstat("foo");
+> 
+> 
+> I think find would have to use xstat() there because "-L" ("-follow")
+> might be in effect, problematic though it is security-wise.  xstat in
+> GNU find is a function pointer that points to lstat() if the -P flag
+> is in effect (this is the default; the explicit -P is a BSD
+> invention), points to stat() if the -L flag is in effect, and points
+> to a more complex function optionh_stat() if -H is in effect
+> (optionh_stat() eventually calls either stat() or lstat()).
+
+My suggestion is very high-level pseudocode.  There are a lot of details
+to get right, as you point out.
+
+> 
+>>ST2=fstat(FD);
+>>compare(ST1,ST2); 
+>>fchdir(FD);
+> 
+> 
+> I wonder what happens there if we're at an automount mount point.
+> Does the fchdir() provoke automount() into mounting the filesystem?
+> Would you be able to check this, Martin?
+
+It does.  Here's a test program, and a sample run against an
+automounter mount point:
+
+-----------------------------------------------------------------
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+void printID(char *file)
+{
+  struct stat s;
+  if (lstat(file,&s) < 0) exit(1);
+  printf("file=\"%s\" dev=%ld ino=%ld\n",
+	 file, (long) s.st_dev, (long) s.st_ino);
+}
+
+int main (int argc, char *argv[])
+{
+  char *d = argv[1];
+  printID(d);
+  int fdParent = open(".", O_RDONLY);
+  int fdChild = open(d, O_RDONLY);
+  if (fchdir(fdChild) < 0) exit(1);
+  printID(".");
+  printID("..");
+  if (fchdir(fdParent) < 0) exit(1);
+  printID(d);
+}
+-----------------------------------------------------------------
+
+$ ~/src/a.out make
+file="make" dev=81033283 ino=186105
+file="." dev=80744820 ino=1353076
+file=".." dev=81033281 ino=186097
+file="make" dev=80744820 ino=1353076
+$ ~/src/a.out make
+file="make" dev=80744820 ino=1353076
+file="." dev=80744820 ino=1353076
+file=".." dev=81033281 ino=186097
+file="make" dev=80744820 ino=1353076
+
+
+
+> 
+>>On a related note,
+>>Solaris has some interesting non-standard functions:
+>>
+>>     int openat(int fildes,  const  char  *path,  int  oflag,  /*
+>>     mode_t mode */...);
+>>
+>>     The openat() function is identical to  the  open()  function
+>>     except that the path argument is interpreted relative to the
+>>     starting point implied by the fd argument. If the  fd  argu-
+>>     ment  has  the special value AT_FDCWD, a relative path argu-
+>>     ment will be resolved relative to the current working direc-
+>>     tory.  If  the path argument is absolute, the fd argument is
+>>     ignored.
+> 
+> 
+> So, with an absolute path or with AT_FDCWD, it's equivalent to
+> open(2)?  If'a a shame that openat() doesn't have a flag to prevent it
+> following symbolic links.  Or does it?
+> 
+
+fstatat has such a flag, bug openat does not.
+
+Another interesting function is
+
+
+     DIR *fdopendir(int fildes);
+
+     The fdopendir() function opens a directory  stream  for  the
+     directory   file   descriptor  fildes.  The  directory  file
+     discriptor should not be used or closed following a success-
+     ful  function  call,  as  this might cause undefined results
+     from future operations on the directory stream obtained from
+     the call. Use closedir(3C) to close a directory stream.
+
+BTW, all the Sun man pages are easily googlable with a query like
+
+openat site:docs.sun.com
+
+Martin
+

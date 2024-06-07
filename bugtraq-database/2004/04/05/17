@@ -1,0 +1,242 @@
+
+Date: Sun, 4 Apr 2004 17:56:42 +0100 (BST)
+From: Shaun Colley <shaunige@...oo.co.uk>
+To: bugtraq@...urityfocus.com
+Subject: Texutil symlink vulnerability.
+
+
+~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*
+
+Product:      texutil
+Versions:     All     
+Bug:          Symlink bug
+Impact:       Attackers can overwrite arbitrary files
+              with the privileges of the invoking user
+Risk:         Medium
+Date:         April 4, 2004
+Author:       Shaun Colley
+              Email: shaunige yahoo co uk
+              WWW: http://www.nettwerked.co.uk
+
+~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*~*
+
+
+
+Introduction
+#############
+
+Vendor description:
+---
+
+"When processing a text, ConTEXt saves table and index
+entries, cross references, and
+some more information in a so called utility file.
+After a successful run, this file is
+converted into a format suitable for the next run.
+This conversion is done by TEXutil,
+a Perl script that comes with the ConTEXt
+distribution." - Taken from the texutil man page.
+---
+
+Texutil is prone to a symlink vulnerability when
+writing output to a hardcoded logfile, when the
+'--silent' option is supplied when the texutil script
+is invoked.
+
+
+
+Details
+########
+
+Texutil is prone to a symlink vulnerability when
+writing to a pre-defined logfile, which may allow
+local users to overwrite arbitrary files with the
+privileges of the invoking user of texutil.  This
+issue manifests when a user supplies the '--silent'
+switch at the shell.  When the texutil script is
+invoked with the '--silent' flag, all standard output
+is redirected to a hardcoded log file, 'texutil.log',
+in the current directory.  
+
+Below is the offending code:
+
+--- /usr/bin/texutil snippet ---
+$ProgramLog = "texutil.log" ;
+
+sub RedirectTerminal
+  { open SAVEDSTDOUT, ">&STDOUT" ;
+    open STDOUT, ">$ProgramLog" ;
+    select STDOUT; $| = 1 }
+
+#D And, indeed:
+
+if ($ProcessSilent)
+  { RedirectTerminal }
+else
+  { $ProcessVerbose = 0 }
+--- EOC ---
+
+When the command line flags are parsed, $ProcessSilent
+is set if '--silent' is supplied.
+
+As one can see, the above code checks for the
+existance of the $ProcessSilent variable, indicating
+'--silent' was given, and calls the RedirectTerminal
+sub-routine, which redirects standard output to
+'texutil.log' - otherwise, texutil output is printed
+to STDOUT.
+
+However, when the 'texutil.log' file is opened, checks
+aren't performed to ensure that a symlink doesn't
+exist, or otherwise:
+
+---
+open STDOUT, ">$ProgramLog" ;
+---
+
+This line simply opens the logfile (texutil.log) with
+the 'write, truncate' open() code, thus clobbering
+*all* data already in 'texutil.log'.  Due to the lack
+of file checks on 'texutil.log', a possibility of
+exploitation exists.
+
+If an attacker can somehow place a symlink in the
+working directory of the invoking user of texutil to a
+sensitive system file or otherwise, the attacker can
+cause data to be overwritten/destroyed with the
+privileges of the invoker of texutil.  If the user
+running texutil was the root user, and their current
+working directory was /tmp, almost any sensitive
+system file could be destroyed.
+
+
+
+Exploitation
+#############
+
+All that a would-be attacker needs to exploit this
+flaw is the correct privileges to place a suitable
+symlink in the working directory of the invoker on
+texutil.
+
+Below is an example scenario in which the
+vulnerability is exploited to create a system file,
+/etc/nologin.
+
+--- attack ---
+[root@...alhost shaun]# cd /tmp
+
+[...]
+
+[shaun@...alhost shaun]$ ls -al /etc/nologin
+ls: /etc/nologin: No such file or directory
+[shaun@...alhost shaun]$ cd /tmp
+[shaun@...alhost tmp]$ ln -s /etc/nologin texutil.log
+
+[...]
+
+[root@...alhost tmp]# texutil --silent
+
+[...]
+
+[shaun@...alhost tmp]$ ls -al /etc/nologin
+-rw-r--r--    1 root     root         1511 Apr  4
+15:21 /etc/nologin
+--- EO attack ---
+
+After this attack, no users except root can log in,
+due to the existance of /etc/nologin.
+
+In the example attack above, the root user changed
+directories to /tmp, whilst an attacker created a
+symlink by the name of /tmp/texutil.log linked to
+/etc/nologin.  Because of the non-existance of file
+checks performed by texutil on 'texutil.log', the
+symlink is followed, and /etc/nologin is written to by
+root.  Obviously, more sensitive system files could be
+overwritten/corrupted, but this scenario demonstrates
+partial impact.
+
+It should be noted that the attacker would need to
+have sufficient privileges to write to the working
+directory of the invoker of texutil, so as to create a
+symlink.  However, this isn't really infeasible.
+
+
+
+Solution
+#########
+
+I contacted the author of texutil on 25 March 2004,
+but I haven't received any response, so I wrote my own
+fix for the issue.
+
+--- texutil.patch ---
+--- /usr/bin/texutil    2002-08-30 22:11:22.000000000
++0100
++++ /usr/bin/texutil.1  2004-04-04 16:41:34.000000000
++0100
+@@ -126,6 +126,16 @@
+
+ sub RedirectTerminal
+   { open SAVEDSTDOUT, ">&STDOUT" ;
++
++    # Check for existance of texutil.log
++    # if the file already exists, or a symlink
+exists,
++    # the script will die, thus fixing the
+vulnerability.
++    #
++    # -shaun2k2
++    if(lstat $ProgramLog) {
++    die "texutil: texutil.log exists - possibly a
+symlink.\n";
++    }
++
+     open STDOUT, ">$ProgramLog" ;
+     select STDOUT; $| = 1 }
+
+--- EOF ---
+
+To apply the patch, simply create a file containing
+the patch, and issue the following command as root:
+
+---
+root# patch /usr/bin/texutil texutil.patch
+---
+
+When texutil is invoked with the '--silent' flag, a
+check is performed for 'texutil.log' - if it exists as
+a file or a symlink, the script dies with a
+semi-informative error message.
+
+
+The above patch is also available from:
+
+<http://www.nettwerked.co.uk/code/texutil.patch>
+
+
+
+Credit
+#######
+
+This issue was discovered by Shaun Colley / shaun2k2 -
+<shaunige yahoo co uk>.
+
+
+
+
+Thank you for your time.
+Shaun.
+
+
+
+
+
+	
+	
+		
+___________________________________________________________
+WIN FREE WORLDWIDE FLIGHTS - nominate a cafe in the Yahoo! Mail Internet Cafe Awards  www.yahoo.co.uk/internetcafes 
+
+

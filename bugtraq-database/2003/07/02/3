@@ -1,0 +1,161 @@
+
+Date: Wed, 2 Jul 2003 11:36:26 +0200 (CEST)
+From: Michal Zalewski <lcamtuf@...ttot.org>
+To: vulndiscuss@...nwatch.org, <full-disclosure@...sys.com>,
+   <vuln-dev@...urityfocus.com>
+Cc: bugtraq@...urityfocus.com, <vulnwatch@...nwatch.org>
+Subject: Red Hat 9: free tickets
+
+
+
+[ This is not strictly a new vulnerability - but a description of
+  a flaw that can be combined with any of the minor vulnerabilities
+  that pop up once a week to turn them into a major vulnerability.
+  I will leave it up to the moderators of BUGTRAQ and VulnWatch to
+  approve or reject it... ]
+
+The reason for this post is that largely under-appreciated file creation
+vulnerabilities can now get a higher profile, I think. Below are some
+hopefully interesting thoughts on turning almost any O_CREAT w/o O_EXCL in
+a world-writable directory - or similar issues, you name it - into an
+instant, generic root compromise scenario on modern Linux boxes (primarily
+Red Hat and derivates)...
+
+Until recently, you could basically exercise three possible active attack
+vectors against such a /tmp vulnerability - none of which is particularly
+tempting in terms of privilege escalation:
+
+  1) Denial of Service:
+
+     Just create an appropriate symlink to create /etc/nologin,
+     truncate /lib/libc.so.6 or do something of a similar nature once
+     followed by a broken application. This is possible in almost all
+     cases when a vulnerable application is run by a privileged user.
+     Fortunately or unfortunately, there's very little benefit for the
+     attacker in this scenario.
+
+  2) Contents manipulation:
+
+     Attack the application itself by securing a write access to the
+     soon-to-be-accessed temporary file (it's usually enough to create
+     it in advance). Then stuff its temporary file with some unexpected
+     data. This could be successful only if the application uses file
+     contents in some interesting way later on. While there are some
+     nice examples (for example, older versions of GCC), this is seldom
+     a feasible scenario, and is very application-specific.
+
+  3) Contents redirection:
+
+     If you can control the data written by the application to a temporary
+     file, you could use a symlink to force writing to a file like
+     /etc/ld.so.preload, /etc/passwd, ~/.ssh/authorized_keys or such. In
+     most cases, however, races occur in boot scripts, cron scripts,
+     non-suid applications run by privileged users, etc - and the attacker
+     can exercise very little control over the contents of such a file.
+
+As far as I know, there was no neat and generic way to exploit an insecure
+/tmp file creation alone - well, until now.
+
+Starting release 9, Red Hat ships and uses pam_timestamp_check.so module
+(accompanied by /sbin/pam_timestamp_check setuid helper), a part of the
+new pam-0.75 (Pluggable Authentication Modules) package. PAM is a generic
+centralized authentication and session management component that is also
+shipped by an increasing number of other distributions, so it is
+reasonable that the code is about to propagate to other distros.
+
+The module mentioned implements a credential caching functionality, very
+closely inspired on a tty ticketing system used in sudo. Most sudo users
+are familiar with the fact they are not prompted for password if a
+subsequent sudo session is opened shortly after a previous one on the same
+terminal - and this is exactly what pam_timestamp_check tries to implement
+for other services.
+
+The system used in sudo is somewhat naive and does have its problems, but
+the impact caused by an eventual ticket stealing attack is fairly minimal
+- the user has to be trusted and listed in /etc/sudoers in the first
+place, and the credentials that are cached are for his own account (sudo
+users enter their own password, as opposed to root's).
+
+The way Red Hat deployed this mechanism is badly broken, since they use it
+to cache root credentials for access to critical components of the system,
+and there are no restrictions as to who can use those components. While in
+sudo, stealing or spoofing a ticket is worth exactly as much as knowing
+the password for the account you already have access to, and the account
+has to be trusted, in Red Hat, it is worth root's password almost all the
+time, and any user can use it. As such, there should me much more caution
+exercised with such a mechanism. But there is not, causing an obvious
+exposure.
+
+The way the module (and sudo) works, in essence, is that it gets current
+pseudo-terminal name A (which can be trivially spoofed, but this is of no
+relevance at the moment), current user name B, and the user for which
+credentials are cached, C (usually root for Red Hat applications, user
+himself for sudo). Then the code checks for /var/run/sudo/B/A:C (or
+/var/run/sudo/B/A if B == C), and if the file is recent, the module
+returns success, and enables the user to skip the usual password
+authentication.
+
+The mechanism is used in Red Hat to make it easier for users to perform
+administrative tasks without having to switch to root via su or sudo,
+granted they know the admin password. There is a number of management
+applications that can be invoked via a single setuid PAM-enabled wrapper,
+/usr/sbin/userhelper, that all have pam_timestamp_check.so included in their
+PAM configs. From quite harmless ones, such as redhat-config-mouse,
+to pretty much instant root scenarios once the mechanism is compromised
+- say, redhat-config-rootpassword, redhat-install-packages, up2date-config,
+redhat-config-services, etc.
+
+A noble concept indeed, but there is a nasty issue - since there's no
+check for file origin, it should be more than obvious that suddenly, any
+insecure file creation problem in an application used by a superuser (or
+from privileged scripts, such as boot rc files, crontabs, etc), it is
+possible to spoof a ticket in /var/run and bypass root password prompt and
+other checks, and perform administrative tasks, easily modifying system
+config, installing custom components (say, a rootshell), etc. All this by
+crafting a single symlink that is later opened with O_CREAT with no O_EXCL
+or O_NOFOLLOW.
+
+The simplest workaround for all concerned users is to first remove all
+occurrences of pam_timestamp_check.so from /etc/pam.d, and replace
+/sbin/pam_timestamp_check standalone helper, if possible. Perhaps
+reconsider the necessity of having /usr/sbin/userhelper mechanism
+implemented at all.
+
+For Red Hat, my suggestion is to verify ticket contents. Say, have a
+host-wide random key K, and put user_name, expire_time, MD5(K + user_name
++ expire_time) in every ticket. The check code would verify the MD5
+signature to make sure the origin of the ticket is sane, and the
+originating application performed a specific operation on a not publicly
+readable key.
+
+On a side note, the per-terminal ticketing in pam_timestamp_check the way
+it is has absolutely no significance and adds no protection, since the A
+element of the path can be easily manipulated. Just an example (there are
+other possible ways of accomplishing this):
+
+    ln `tty` /tmp/tty1
+    /usr/sbin/userhelper -w -t redhat-install-packages </tmp/tty1
+
+As such, those tickets effectively become per-user, and an attacker who
+compromised the account can snatch a ticket granted to the legitimate user
+who already authenticated. Consider dropping the honor tty system and
+granting per-user tickets to avoid giving users a false sense of security.
+
+I mailed pam_timestamp_check maintainer at Red Hat (Nalin Dahyabhai) about
+a week ago, but never heard back from him. Since this is not an issue
+alone, I decided to post the information here.
+
+-- 
+------------------------- bash$ :(){ :|:&};: --
+ Michal Zalewski * [http://lcamtuf.coredump.cx]
+    Did you know that clones never use mirrors?
+--------------------------- 2003-07-02 11:07 --
+
+
+
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.netsys.com/full-disclosure-charter.html
+
+
