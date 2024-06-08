@@ -8,13 +8,19 @@ git pull --recurse-submodules
 RAW_DATA_DIR=raw-data
 
 # cisa-kev
-wget https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json -O $RAW_DATA_DIR/cisa-kev-database/known_exploited_vulnerabilities.json
+wget https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json -O $RAW_DATA_DIR/cisa-kev-database/kev.json
 
 # cwe
 wget https://cwe.mitre.org/data/xml/cwec_latest.xml.zip -O $RAW_DATA_DIR/cwe-database/cwec_latest.xml.zip
 cd $RAW_DATA_DIR/cwe-database/
 unzip -o cwec_latest.xml.zip
 rm cwec_latest.xml.zip
+for file in cwec*.xml; do
+  if [ -e "$file" ]; then
+    mv "$file" "cwec.xml"
+    break
+  fi
+done
 cd -
 
 # capec
@@ -22,6 +28,20 @@ wget https://capec.mitre.org/data/archive/capec_latest.zip -O $RAW_DATA_DIR/cape
 cd $RAW_DATA_DIR/capec-database/
 unzip -o capec_latest.zip
 rm capec_latest.zip
+# mv ap_schema*.xsd ap_schema.xsd # rename the file
+for file in ap_schema*.xsd; do
+  if [ -e "$file" ]; then
+    mv "$file" "ap_schema.xsd"
+    break
+  fi
+done
+# mv capec*.xml capec.xml # rename the file
+for file in capec*.xml; do
+  if [ -e "$file" ]; then
+    mv "$file" "capec.xml"
+    break
+  fi
+done
 cd -
 
 # d3fend
