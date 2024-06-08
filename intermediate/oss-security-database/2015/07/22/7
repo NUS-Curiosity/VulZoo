@@ -1,0 +1,111 @@
+
+Date: Wed, 22 Jul 2015 11:12:00 -0700
+From: Andy Lutomirski <luto@...capital.net>
+To: oss security list <oss-security@...ts.openwall.com>, 
+	"linux-kernel@...r.kernel.org" <linux-kernel@...r.kernel.org>
+Subject: Linux x86_64 NMI security issues
+
+x86 has a woefully poorly designed NMI mechanism.  Linux uses it for
+profiling.  The tricks that keep NMIs from nesting improperly are
+complicated, as are the tricks that try to handle things like NMI
+watchdogs and physical buttons without proper status registers.  On
+x86_64 it's particularly bad due to a nasty interaction with SYSCALL.
+
+Perhaps unsurprisingly, the implementation was incorrect in a few corner cases.
+
++++++ CVE-2015-3291 +++++
+
+Malicious user code can cause some fraction of NMIs to be ignored.
+(Off the top of my head, it might work 25% of the time.)  This happens
+when user code points RSP to the kernel's NMI stack and executes
+SYSCALL.  An NMI that occurs before the kernel updates RSP or that
+occurs between when the kernel restores RSP and executes SYSRET will
+take the wrong code path through the NMI handler and be ignored.
+
+This has probably existed since Linux 3.3.  The impact is extremely
+low.  Fixed by:
+
+https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=810bc075f78ff2c221536eb3008eac6a492dba2d
+
++++++ CVE-2015-5157 +++++
+
+Petr Matousek and I discovered that an NMI that interrupts userspace
+and encounters an IRET fault is incorrectly handled.  Symptoms range
+from an OOPS to possible corruption or privilege escalation.  I
+haven't verified how much corruption is possible or on what kernel
+versions it occurs.  Some form of crash is likely in principle since
+3.3, and it can be triggered by the attached exploit on 3.13 or newer,
+I believe.
+
+On kernels that are patched for BadIRET and have a fixup_bad_iret
+function (which should be most kernels that are keeping up with
+low-level security issues), there are two cases.
+
+Case 1a (more up-to-date kernels where INTERRUPT_RETURN is "jmp
+irq_return"): fixup_bad_iret will be invoked and will attempt to
+recover.  There's a narrow window in which a new NMI will cause
+corruption, in which case all bets are off.  That could hang, crash,
+or possibly be exploited for privilege escalation.
+
+Case 1b (less up-to-date kernels where INTERRUPT_RETURN is "iretq"):
+The kernel will try to OOPS due to a bad kernel fault, except that the
+OOPS will be processed with the wrong gsbase.  This is basically the
+BadIRET condition, and is probably exploitable using similar
+techniques to BadIRET.
+
+Case 2 (kernels that are not patched for BadIRET): I didn't analyze
+it.  BadIRET is a much worse vulnerability and you should fix it.  If
+you have just the minimal BadIRET fix but not fixup_bad_iret, the
+impact is probably similar to Case 1a except that the window for
+corruption is much larger.
+
+On some of these kernels, it can take quite a while for the exploit to
+do anything.
+
+Mitigations: Use seccomp to disable perf_event_open or modify_ldt or
+run with only a single CPU.  To my knowledge, this cannot be exploited
+on single-processor systems or in single-threaded applications.
+
+Fixed by:
+
+https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=9b6e6a8334d56354853f9c255d1395c2ba570e0a
+
+Alternatively worked around by:
+
+https://git.kernel.org/cgit/linux/kernel/git/luto/linux.git/commit/?h=x86/nmi&id=59ab8e572e5f65289822f3cedfcdf857f43f7c74
+
+although the latter patch is incompatible with Xen.
+
++++++ NMI bug, no CVE assigned +++++
+
+On a kernel with the first of the two patches above but not the
+second, the attached CVE-2015-5157 exploit can cause severe log spam.
+
+I don't think this fundamentally depends on the first of the patches,
+but I haven't been able to reproduce it without that patch.  On the
+other hand, I haven't tried that hard.
+
++++++ CVE-2015-3290 +++++
+
+High impact NMI bug on x86_64 systems 3.13 and newer, embargoed.  Also fixed by:
+
+https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=9b6e6a8334d56354853f9c255d1395c2ba570e0a
+
+The other fix (synchronous modify_ldt) does *not* fix CVE-2015-3290.
+
+You can mitigate CVE-2015-3290 by blocking modify_ldt or
+perf_event_open using seccomp.  A fully-functional, portable, reliable
+exploit is privately available and will be published in a week or two.
+*Patch your systems*
+
+
+Note: Several of these fixes each depend on a few patches immediately
+before them.  The NMI stack switching fix also depends on changes made
+in 4.2 and will appear to apply but crash on older kernels.  I have a
+different variant that's more portable.
+
+-- 
+Andy Lutomirski
+AMA Capital Management, LLC
+
+View attachment "CVE-2015-5157.c" of type "text/x-csrc" (3381 bytes)

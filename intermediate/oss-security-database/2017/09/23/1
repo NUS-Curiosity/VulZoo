@@ -1,0 +1,143 @@
+
+Date: Sat, 23 Sep 2017 07:47:15 +0200
+From: Salvatore Bonaccorso <carnil@...ian.org>
+To: Hosein Askari <hosein.askari@....com>
+Cc: luciano@...ian.org, team@...urity.debian.org,
+	oss-security@...ts.openwall.com
+Subject: Re: [CVE-2017-14266] tcprewrite Heap-Based Buffer Overflow
+
+Hi
+
+On Thu, Sep 21, 2017 at 03:05:30PM -0400, Hosein Askari wrote:
+> I uploaded the file,please check out these links:
+> https://files.fm/u/dkrrjjj2
+> 
+> http://www.filedropper.com/tcp_1
+> 
+> https://expirebox.com/download/bcef1a6e3cb2877cd26ef60add1ddaee.html
+
+Thanks for providing the tcp.zip (it looks the mail did not make it to
+the list, the attachment was 6.4M so maybe it was rejected).
+
+I'm attaching for list archiving purposed the base64 encoded tcp.pcap
+gzip compressed file.
+
+Now looking at an ASAN build, on i386:
+
+sid-i386:/tmp/source-tcpreplay/tcpreplay-3.4.4# ./src/tcprewrite --portmap=21:2121 --infile=/tmp/tcp.pcap --outfile=/tmp/output.pcap
+=================================================================
+==31017==ERROR: AddressSanitizer: heap-buffer-overflow on address 0xb46107ff at pc 0xb726e32a bp 0xbf82fee8 sp 0xbf82fac0
+WRITE of size 65549 at 0xb46107ff thread T0
+    #0 0xb726e329  (/usr/lib/i386-linux-gnu/libasan.so.4+0x74329)
+    #1 0x804e3b4 in rewrite_packets src/tcprewrite.c:267
+    #2 0x804da06 in main src/tcprewrite.c:140
+    #3 0xb6ff2285 in __libc_start_main (/lib/i386-linux-gnu/libc.so.6+0x18285)
+    #4 0x804a060  (/tmp/source-tcpreplay/tcpreplay-3.4.4/src/tcprewrite+0x804a060)
+
+0xb46107ff is located 0 bytes to the right of 65535-byte region [0xb4600800,0xb46107ff)
+allocated by thread T0 here:
+    #0 0xb72d8cd4 in malloc (/usr/lib/i386-linux-gnu/libasan.so.4+0xdecd4)
+    #1 0x80734ea in _our_safe_malloc src/common/utils.c:57
+    #2 0x804e22c in rewrite_packets src/tcprewrite.c:248
+    #3 0x804da06 in main src/tcprewrite.c:140
+    #4 0xb6ff2285 in __libc_start_main (/lib/i386-linux-gnu/libc.so.6+0x18285)
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow (/usr/lib/i386-linux-gnu/libasan.so.4+0x74329)
+Shadow bytes around the buggy address:
+  0x368c20a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x368c20b0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x368c20c0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x368c20d0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x368c20e0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x368c20f0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00[07]
+  0x368c2100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x368c2110: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x368c2120: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x368c2130: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x368c2140: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==31017==ABORTING
+
+In src/tcprewrite.c:
+
+230 /** 
+231  * Main loop to rewrite packets
+232  */
+233 int
+234 rewrite_packets(tcpedit_t *tcpedit, pcap_t *pin, pcap_dumper_t *pout)
+235 {
+236     tcpr_dir_t cache_result = TCPR_DIR_C2S;     /* default to primary */
+237     struct pcap_pkthdr pkthdr, *pkthdr_ptr;     /* packet header */
+238     const u_char *pktconst = NULL;              /* packet from libpcap */
+239     u_char **pktdata = NULL;
+240     static u_char *pktdata_buff;
+241     static char *frag = NULL;
+242     COUNTER packetnum = 0;
+243     int rcode, frag_len, i;
+244 
+245     pkthdr_ptr = &pkthdr;
+246 
+247     if (pktdata_buff == NULL)
+248         pktdata_buff = (u_char *)safe_malloc(MAXPACKET);
+249
+250     pktdata = &pktdata_buff;
+251
+252     if (frag == NULL)
+253         frag = (char *)safe_malloc(MAXPACKET);
+254 
+255     /* MAIN LOOP 
+256      * Keep sending while we have packets or until
+257      * we've sent enough packets
+258      */
+259     while ((pktconst = pcap_next(pin, pkthdr_ptr)) != NULL) {
+260         packetnum++;
+261         dbgx(2, "packet " COUNTER_SPEC " caplen %d", packetnum, pkthdr.caplen);
+262 
+263         /* 
+264          * copy over the packet so we can pad it out if necessary and
+265          * because pcap_next() returns a const ptr
+266          */
+267         memcpy(*pktdata, pktconst, pkthdr.caplen);
+[...]
+
+So in line 248 MAXPACKET with originally 
+
+#define MAXPACKET 65535         /* was 16436 linux loopback, but maybe something is bigger then   
+                                   linux loopback */
+
+and on line 267 there is a memcpy to a destination which is too small.
+
+Earlier there was CVE-2016-6160 which was assigned for:
+
+https://bugs.debian.org/829350
+
+with patch enforce-maxpacket.patch, wich addresses this issue as well.
+
+I asked MITRE if CVE-2017-14266 should be rejected, since
+CVE-2016-6160 exists, or if the two should be kept, for different
+types of issues. 
+
+Regards,
+Salvatore
+
+View attachment "tcp.pcap.gz.base64" of type "text/plain" (63250 bytes)
+
+View attachment "enforce-maxpacket.patch" of type "text/x-diff" (1419 bytes)

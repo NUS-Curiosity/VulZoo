@@ -1,0 +1,243 @@
+
+Date: Thu, 3 Aug 2023 12:08:05 +0200
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: Mozilla VPN: CVE-2023-4104: Privileged vpndaemon on Linux wrongly
+ and incompletely implements Polkit authentication
+
+Hello list,
+
+an openSUSE community packager wanted to add the Mozilla VPN client [1] to
+openSUSE Tumbleweed, which required a review [2] by the SUSE security team,
+as it contains a privileged D-Bus service running as root and a Polkit policy.
+In the course of this review we noticed a broken and otherwise lacking Polkit
+authorization logic in the privileged `mozillavpn linuxdaemon` process.
+
+We publish this report today, because the maximum embargo period of 90 days we
+offer has been exceeded. Most of the issues mentioned in this report are
+currently not addressed by upstream, as is outlined in more detail below.
+
+Introduction
+============
+
+The Mozilla VPN client is a multi-platform VPN solution offered by Mozilla
+based on technologies like Wireguard. For this review we did not look in
+detail into the VPN protocol specifics and cryptography, but focused on the
+privileged operations performed by the Mozilla VPN client daemon on Linux.
+
+The findings in this report relate to the Mozilla VPN client version 2.14.1.
+
+Broken Polkit Authentication Check
+==================================
+
+The code for the privileged component in Mozilla VPN on Linux is mostly
+found in mozillavpn-2.14.1/src/apps/vpn/platforms/linux. The D-Bus
+method callbacks are found in src/apps/vpn/platforms/linux/daemon/dbusservice.cpp.
+
+Mozilla VPN ships a Polkit policy with the following content:
+
+```
+ <action id="org.mozilla.vpn.activate">
+    <description>Activate the Mozilla VPN</description>
+    <message>Activate the Mozilla VPN</message>
+    <defaults>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.mozilla.vpn.deactivate">
+    <description>Deactivate the Mozilla VPN</description>
+    <message>Deactivate the Mozilla VPN</message>
+    <defaults>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+```
+
+Of these two privileged actions, the Polkit authorization check is only
+performed in the `activate` D-Bus method, while no such check is present
+at all in the `deactivate` method.
+
+For the activate D-Bus method the Polkit check is implemented in
+`PolkitHelper::checkAuthorization()` in
+src/apps/vpn/platforms/linux/daemon/polkithelper.cpp line 58:
+
+```
+h.m_subject = polkit_unix_process_new_for_owner(getpid(), 0, -1);
+```
+
+The UNIX process Polkit subject is deprecated and shouldn't be used
+anymore for most cases, because it affected by race conditions by design.
+Instead the D-Bus sender subject should be used, which is based on the UNIX
+domain socket used by D-Bus, to obtain the credentials of the client via the
+Linux kernel.
+
+Even worse, the UNIX process Polkit subject is initialized here using
+`getpid()` as the process ID and `-1` for the user ID. The latter asks
+Polkit to determine the given PID's user ID by looking into /proc.
+In summary this asks Polkit to check whether the privileged Mozilla VPN
+D-Bus service _itself_ is authorized to perform the action. Since The
+Mozilla VPN D-Bus service runs as root, this will always be true.
+
+This can be verified from the command line using a minimal pseudo
+configuration like this:
+
+    nobody$ gdbus call -y -d org.mozilla.vpn.dbus -o / -m org.mozilla.vpn.dbus.activate \
+        '{"privateKey": "nothing", "serverPublicKey": "nothing", "serverPort": 1234, "deviceIpv4Address": "127.0.0.2", "serverIpv4AddrIn": "127.0.0.3", "allowedIPAddressRanges": []}'
+
+This D-Bus call will work without any authentication, even if a low privilege
+user account like `nobody` runs it.
+
+The impact is that arbitrary local users can configure arbitrary VPN
+setups using Mozilla VPN and thus possibly redirect network traffic to
+malicious parties, pretend that a secure VPN is present while it
+actually isn't, perform a denial-of-service against an existing VPN connection
+or other integrity violations.
+
+Since the daemon does not perform any file system or otherwise dangerous
+operations besides of the network setup, we don't see a possibility to
+escalate privileges beyond the network aspect using this attack vector.
+
+Missing Polkit Authentication Checks
+====================================
+
+Apart from the fact that the existing Polkit authentication check is
+flawed, there isn't even an attempt to secure any of the other D-Bus
+methods offered by the Mozilla VPN D-Bus service.
+
+For the following methods Polkit authorization checks should be
+considered, or their scope should be limited by other means:
+
+- getLogs(): returns potentially problematic world-readable log data, even
+  debug logs, e.g. about other users' activities in the system. The
+  same data is publicly available in /var/log/mozillavpn.txt. These
+  logs allow to track what applications other users start, for example.
+
+  Log data of system services should generally not be world readable, so
+  this item refers to both the D-Bus API and the logfile in /var/log.
+  This is an information leak (especially since there is also debug data
+  found here) that might facilitate other security issues or might allow
+  other users in the system to deduce what a Mozilla VPN user is doing.
+
+- cleanupLogs(): allows everybody to clear the current logs. This should
+  be restricted to authorized users, otherwise it might be used to clear
+  traces of attacks etc.
+
+- runningApps(): this leaks information from other users'
+  sessions and their apps to everybody in the system. Most of this data
+  is probably also available via `ps` or /proc, respectively. Some
+  hardened systems may not allow this, though. A solution might be to
+  only return data here that belongs to the user making the request on
+  D-Bus.
+
+- firewallApp(): allows to put arbitrary appIDs into split tunneling /
+  exclude, even for other users. This should be restricted to
+  applications of the requesting D-Bus user.
+
+- firewallClear(): clears the exclude list. should also be restricted to
+  entries affecting the calling user.
+
+- deactivate(): everybody may shutdown the whole VPN. There is a
+  deactivate() Polkit action declared but is is never used, as was explained
+  before already.
+
+Suggested Fixes
+===============
+
+From looking at the D-Bus implementation it is apparent that Mozilla VPN on
+Linux doesn't have a proper multi user concept. We recommended to upstream, as
+a simple way out of this, to store the UID of the user that successfully
+authenticates during `activate()` and then only allow the other D-Bus methods
+for the same user until `deactivate()` is called. Mixing different user
+contexts would be avoided this way.
+
+For this to work, of course, all D-Bus methods would need to be properly
+Polkit authenticated, based on the D-Bus sender subject.
+
+Furthermore we observed that the Mozilla VPN linux daemon only uses its high
+privileges for two things:
+
+- setting up the network
+- monitoring user sessions and attaching to their D-Bus session busses
+  to keep track of running applications ("AppTracker" class).
+
+It could be considered running this service not as root but only with
+the `CAP_NET_ADMIN` capability. This would limit the potential attack
+surface considerably.
+
+Upstream Fixes
+==============
+
+As a first measure Upstream removed the use Polkit authentication completely [3].
+This change will be included in an upcoming v2.16.0 release. This
+doesn't really change anything in the security posture of the privileged
+daemon on Linux though, since all D-Bus APIs are still unauthenticated and
+usable by any local user.
+
+In another effort upstream is attempting to introduce better authorization
+controls on the D-Bus API by requiring the caller to possess `CAP_NET_ADMIN`
+permission, or matching the UID of the user that activated the connection. This
+is anticipated to be included in a 2.17.0 release, for which no release date
+is known yet (supposedly in one to two months).
+
+Whether the minor information leaks outlined above like world readable logs
+and keeping track of other users' activities will be addressed by this is
+unclear.
+
+Timeline and Disclosure Process
+===============================
+
+2023-05-04: We privately shared the findings with security@...illa.org,
+offering coordinated disclosure according to the openSUSE disclosure policy.
+Upstream created a private bugzilla bug [4] to keep track of the issue.
+
+Until 2023-06-12: There has been a lack of communication by upstream. Relevant
+questions about the disclosure process remained unanswered, there was no
+formal reply to our report and no wishes have been expressed about how to
+continue the coordinated disclosure, or what the next steps would be.
+
+2023-06-12: We learned that the embargo over this issue was violated by
+upstream via a GitHub PR [3] and, inspired by that, our community packager
+followed suit via another GitHub PR [5].
+
+We asked upstream once more what their intentions are regarding coordinated
+disclosure but did not get a proper response.
+
+2023-08-02: Even though the embargo was already violated and there was no
+clear statement from upstream about the coordinated disclosure process, we
+held back the full report until the 90 days maximum embargo time we offer
+elapsed.
+
+We tried to get additional information from upstream once more and only now
+learned more details about their plans on how to address this, which we
+outlined in the previous section.
+
+2023-08-03: Our continued requests to assign a CVE for this issue (Mozilla is a
+CVE CNA) resulted in a last minute assignment of CVE-2023-4104.
+
+References
+==========
+
+[1]: https://github.com/mozilla-mobile/mozilla-vpn-client
+[2]: https://bugzilla.suse.com/show_bug.cgi?id=1209921
+[3]: https://github.com/mozilla-mobile/mozilla-vpn-client/pull/7055
+[4]: https://bugzilla.mozilla.org/show_bug.cgi?id=1831318
+[5]: https://github.com/mozilla-mobile/mozilla-vpn-client/pull/7151
+
+Best Regards
+
+Matthias
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Security Engineer
+https://www.suse.com/security
+GPG Key ID: 0x14C405C971923553
+ 
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev, Andrew McDonald, Werner Knoblich
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

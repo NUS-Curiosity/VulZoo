@@ -1,0 +1,187 @@
+
+Date: Wed, 22 Feb 2023 05:54:36 +0000
+From: Qualys Security Advisory <qsa@...lys.com>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: Re: double-free vulnerability in OpenSSH server 9.1 (CVE-2023-25136)
+
+Hi all,
+
+Another quick update on the exploitation of this double-free bug on
+OpenBSD:
+
+a/ our previous attack (the arbitrary control of sshd's instruction
+pointer via the EVP_AES_KEY structure) works only on OpenBSD amd64, not
+on OpenBSD i386;
+
+b/ we were able to recycle the chunk of memory where
+options.kex_algorithms was allocated, into a chunk of a different size
+(which gives us greater freedom), but this happens with such a low
+probability (even on i386) that we do not consider this particular
+attack to be practical;
+
+c/ as a direct consequence of CVE-2023-25136, we found an information
+leak (of bits and pieces from the memory of the unprivileged sshd
+process), but it is unlikely to be useful in practice.
+
+========================================================================
+a/ Our previous attack, on OpenBSD i386.
+
+options.kex_algorithms is a 266-byte string, which occupies a 512-byte
+chunk of memory. On OpenBSD amd64, we can re-allocate this chunk (after
+it is freed for the first time) with a struct EVP_AES_KEY, whose size is
+264 bytes and therefore also requires a 512-byte chunk of memory.
+
+But on OpenBSD i386, the size of a struct EVP_AES_KEY is only 252 bytes,
+and it therefore requires a 256-byte chunk instead; i.e., we cannot
+easily re-allocate options.kex_algorithms's chunk with a struct
+EVP_AES_KEY.
+
+========================================================================
+b/ The recycling of options.kex_algorithms's chunk.
+
+One solution to the previous problem (on OpenBSD i386) is to recycle
+options.kex_algorithms's 512-byte chunk, into a 256-byte chunk; i.e.,
+recycle the page of memory where options.kex_algorithms was allocated,
+into a page of 256-byte chunks instead. To achieve this:
+
+- options.kex_algorithms must be allocated in an otherwise empty page
+  of memory (so that, after options.kex_algorithms is freed, this empty
+  page can be re-used for chunks of a different size). Luckily, because
+  options.kex_algorithms is allocated randomly from several pages of
+  memory, this does happen from time to time, with a probability of
+  ~1/512 in our tests.
+
+- This empty page must then be re-used for chunks of a different size,
+  but sshd enables malloc's "secure" mode (malloc_options = "S"): empty
+  pages are not cached by malloc but are immediately munmap()ed, and the
+  re-mmap()ing of a page at the exact same address is therefore subject
+  to AS(L)R. This happens with a probability of ~1/2^18 at best (unlike
+  Linux, OpenBSD randomizes every single mmap() address, in a 1GB range
+  on i386).
+
+- Inside this recycled page, our target chunk must be allocated exactly
+  where options.kex_algorithms was allocated. For a 256-byte target
+  chunk, this happens with a probability of 1/16.
+
+As a result, the probability of recycling options.kex_algorithms's chunk
+into a 256-byte chunk is ~1/2^31 at best, so we do not consider this
+particular attack to be practical.
+
+========================================================================
+c/ A useless (?) information leak.
+
+After options.kex_algorithms's chunk is freed for the first time (in
+compat_kex_proposal()), sshd enters input_userauth_request():
+
+------------------------------------------------------------------------
+250 static int
+251 input_userauth_request(int type, u_int32_t seq, struct ssh *ssh)
+252 {
+...
+262         if ((r = sshpkt_get_cstring(ssh, &user, NULL)) != 0 ||
+263             (r = sshpkt_get_cstring(ssh, &service, NULL)) != 0 ||
+264             (r = sshpkt_get_cstring(ssh, &method, NULL)) != 0)
+265                 goto out;
+...
+274         if (authctxt->attempt++ == 0) {
+275                 /* setup auth context */
+276                 authctxt->pw = PRIVSEP(getpwnamallow(ssh, user));
+...
+289                 authctxt->user = xstrdup(user);
+290                 authctxt->service = xstrdup(service);
+...
+298         } else if (strcmp(user, authctxt->user) != 0 ||
+299             strcmp(service, authctxt->service) != 0) {
+300                 ssh_packet_disconnect(ssh, "Change of username or service "
+301                     "not allowed: (%s,%s) -> (%s,%s)",
+302                     authctxt->user, authctxt->service, user, service);
+303         }
+...
+328  out:
+329         free(service);
+330         free(user);
+331         free(method);
+332         return r;
+333 }
+------------------------------------------------------------------------
+
+- at lines 262-264, we re-allocate options.kex_algorithms's chunk with
+  our user, service, or method string (a 300-byte string, which requires
+  a 512-byte chunk, just like options.kex_algorithms);
+
+- at line 276, options.kex_algorithms's chunk (now our user, service, or
+  method string) is freed again;
+
+- at lines 289-290, we re-allocate options.kex_algorithms's chunk again,
+  with either authctxt->user or authctxt->service (a copy of our user or
+  service string);
+
+- at lines 329-331, options.kex_algorithms's chunk (now authctxt->user
+  or authctxt->service) is freed again (via user, service, or method);
+
+- when sshd enters input_userauth_request() for the second time, either
+  user or service does not match (at lines 298-299), and the contents of
+  the free authctxt->user or authctxt->service chunk is sent to us (at
+  lines 300-302).
+
+Initially, we thought that this information leak would not leak any
+information at all, because OpenBSD's malloc (when in "secure" mode)
+overwrites the contents of free chunks with 0xdf bytes. Nevertheless,
+because the authctxt->user or authctxt->service chunk is sent to us as a
+null-terminated string (%s), and because this chunk does not contain any
+null bytes (only 0xdf bytes), the chunk that follows authctxt->user or
+authctxt->service is also sent to us, and might contain interesting
+pieces of information (because it can be an allocated chunk).
+
+Our proof of concept (a simple patch for openssh-9.1p1) is attached to
+this email. We have not fully analyzed its output yet (disconnect.log),
+but we do not expect it to be particularly useful, because of sshd's
+defense-in-depth mechanisms:
+
+- the memory of the unprivileged sshd process (where the information
+  leak occurs) is not supposed to contain any secret information (for
+  example, the private host keys are scrubbed from the memory of the
+  unprivileged sshd process as soon as it is fork()ed, in
+  demote_sensitive_data());
+
+- any leaked memory address is mostly useless (except maybe for its
+  least significant bits), because sshd calls _exit() at the end of
+  ssh_packet_disconnect() (at lines 300-302), and because sshd fork()s
+  and re-execv()s itself (and therefore re-randomizes its address space)
+  every time it accept()s a new client connection.
+
+As an example, below is an excerpt from a disconnect.log that was
+produced when running our proof of concept against an unpatched OpenBSD
+7.2 (on amd64):
+
+------------------------------------------------------------------------
+$ while true ;do ./ssh invalid@....168.56.123 ;done
+...
+
+$ hexdump -C disconnect.log
+...
+000280d0  00 43 68 61 6e 67 65 20  6f 66 20 75 73 65 72 6e  |.Change of usern|
+000280e0  61 6d 65 20 6f 72 20 73  65 72 76 69 63 65 20 6e  |ame or service n|
+000280f0  6f 74 20 61 6c 6c 6f 77  65 64 3a 20 28 df df df  |ot allowed: (...|
+00028100  df df df df df df df df  df df df df df df df df  |................|
+*
+000282f0  df df df df df df df df  df df df df df 29 4e 90  |.............)N.|
+00028300  92 98 14 ff b0 35 d4 f8  f8 59 db 0a ba 43 99 95  |.....5...Y...C..|
+00028310  70 6d 2d 2a 5e 85 fe 22  ff 1c 92 19 3b 4e 6d 58  |pm-*^.."....;NmX|
+00028320  4b 82 2f bd 97 1e 8c 0d  ab 61 4f 76 9b 4b c2 6b  |K./......aOv.K.k|
+00028330  91 f1 25 c5 5e c2 12 79  d5 a9 56 7f 10 18 e2 71  |..%.^..y..V....q|
+00028340  f5 0c c7 9c d0 08 61 82  18 36 66 eb cf af d0 60  |......a..6f....`|
+00028350  e9 e0 af 86 5d 07 2c df  df df df df df df df df  |....].,.........|
+00028360  df df df df df df df df  df df df df df df df df  |................|
+...
+------------------------------------------------------------------------
+
+We are at your disposal for questions, comments, and further
+discussions. Thank you very much!
+
+With best regards,
+
+-- 
+the Qualys Security Advisory team
+
+View attachment "infoleak.patch" of type "text/plain" (3639 bytes)

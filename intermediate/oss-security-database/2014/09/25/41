@@ -1,0 +1,153 @@
+
+Date: Thu, 25 Sep 2014 15:06:43 -0400
+From: Jason Cooper <osssecurity@...edaemon.net>
+To: Solar Designer <solar@...nwall.com>
+Cc: oss-security@...ts.openwall.com, chet.ramey@...e.edu
+Subject: Re: CVE-2014-6271: remote code execution through
+ bash
+
+On Thu, Sep 25, 2014 at 09:31:41PM +0400, Solar Designer wrote:
+> On Thu, Sep 25, 2014 at 12:59:22PM -0400, Jason Cooper wrote:
+> > On Thu, Sep 25, 2014 at 02:24:14AM +0400, Solar Designer wrote:
+> > > On Wed, Sep 24, 2014 at 06:08:21PM -0400, Jason Cooper wrote:
+> > > > [jason@...alhost] $ ssh -i .ssh/test_key -o 'rsaauthentication yes' 0 '() { ignored; }; /usr/bin/id'
+> > > > uid=1000(jason) gid=1000(jason) groups=1000(jason)
+> > > > [jason@...alhost] $ # add 'command=/path/to/secsh -f /path/to/test.rc' in .ssh/authorized_keys on server
+> > > > [jason@...alhost] $ ssh -i .ssh/test_key -o 'rsaauthentication yes' 0 '() { ignored; }; /usr/bin/id'
+> > > > secsh v0.8-rc1-2-ga86f09832fa2: access denied.
+> > > 
+> > > This is puzzling.  I tried:
+> > > 
+> > > command="/bin/env - date"
+> > > 
+> > > and:
+> > > 
+> > > command="exec /bin/env - date"
+> > > 
+> > > and neither prevents exploitation of the issue as above (I get the
+> > > output of "id", not of "date"), which is not surprising given that the
+> > > command is run via the shell before it reaches "env".
+> > > 
+> > > Maybe your target user account's login shell is not bash?  That would
+> > > explain it, but it's also the easier case where the issue had been
+> > > exposed via a subshell only (does your test.rc explicitly use bash?)
+> > 
+> > Nope, login shell is /bin/bash.  Please look at the code in
+> > 
+> >   http://git.infradead.org/users/jcooper/secsh.git/blob/HEAD:/match.c
+> 
+> I expected your code to be irrelevant, because the shell gets invoked
+> first (to invoke your code).  I tested this with "env -".
+
+Dammit.  You're right.  In do_child(), session.c, line 1876:
+
+        /*
+         * Execute the command using the user's shell.  This uses the -c
+         * option to execute the command.
+         */
+        argv[0] = (char *) shell0;
+        argv[1] = "-c";
+        argv[2] = (char *) command;
+        argv[3] = NULL;
+        execve(shell, argv, env);
+        perror(shell);
+        exit(1);
+}
+
+> > While tinkering with this, I discovered that if you force ssh to provide
+> > a pty (ssh -t ...), even with secsh locked down, the hack works.  You
+> > *must* set 'no-pty' after 'command=' in your authorized_keys file to
+> > prevent ssh from launching a shell. :-/
+> 
+> Oh, so you're saying that your sshd does not use the shell when you
+> specify no-pty?  This isn't the case here.  What version/package of
+> OpenSSH are you using?
+
+>From debian wheezy:
+
+Package: openssh-server
+Source: openssh
+Version: 1:6.0p1-4
+
+> I do have a habit to specify no-pty whenever I use "command=", but I
+> also have a habit to start the actual command with "exec ..."
+> specifically because the shell is invoked anyway (the "exec" then saves
+> some memory on not keeping that shell around while the actual program
+> runs).  I've tried specifying /full/path/to/program, like you do, but
+> this does not prevent invocation going via the shell here.  My OpenSSH
+> is rather old, though (with lots of patches).
+
+
+Hmmm, I wonder if they would consider a 'no-user-shell' option?  Could
+you try the attached patch and see if that fixes it for you?
+
+thx,
+
+Jason.
+
+
+------------------>8-------------------------------
+diff --git a/auth-options.c b/auth-options.c
+index f3d9c9df820f..77185d937588 100644
+--- a/auth-options.c
++++ b/auth-options.c
+@@ -40,6 +40,7 @@ int no_agent_forwarding_flag = 0;
+ int no_x11_forwarding_flag = 0;
+ int no_pty_flag = 0;
+ int no_user_rc = 0;
++int no_user_shell = 0;
+ int key_is_cert_authority = 0;
+ 
+ /* "command=" option. */
+@@ -64,6 +65,7 @@ auth_clear_options(void)
+ 	no_pty_flag = 0;
+ 	no_x11_forwarding_flag = 0;
+ 	no_user_rc = 0;
++	no_user_shell = 0;
+ 	key_is_cert_authority = 0;
+ 	while (custom_environment) {
+ 		struct envstring *ce = custom_environment;
+@@ -141,6 +143,13 @@ auth_parse_options(struct passwd *pw, char *opts, char *file, u_long linenum)
+ 			opts += strlen(cp);
+ 			goto next_option;
+ 		}
++		cp = "no-user-shell";
++		if (strncasecmp(opts, cp, strlen(cp)) == 0) {
++			auth_debug_add("User shell execution disabled.");
++			no_user_shell = 1;
++			opts += strlen(cp);
++			goto next_option;
++		}
+ 		cp = "command=\"";
+ 		if (strncasecmp(opts, cp, strlen(cp)) == 0) {
+ 			opts += strlen(cp);
+diff --git a/auth-options.h b/auth-options.h
+index 7455c945465a..658728e4f165 100644
+--- a/auth-options.h
++++ b/auth-options.h
+@@ -27,6 +27,7 @@ extern int no_agent_forwarding_flag;
+ extern int no_x11_forwarding_flag;
+ extern int no_pty_flag;
+ extern int no_user_rc;
++extern int no_user_shell;
+ extern char *forced_command;
+ extern struct envstring *custom_environment;
+ extern int forced_tun_device;
+diff --git a/session.c b/session.c
+index 3e96557b8977..8a55bccbf5b9 100644
+--- a/session.c
++++ b/session.c
+@@ -1869,6 +1869,13 @@ do_child(Session *s, const char *command)
+ 		perror(shell);
+ 		exit(1);
+ 	}
++	if (no_user_shell) {
++		argv[0] = (char *) command;
++		argv[1] = NULL;
++		execve(command, argv, env);
++		perror(command);
++		exit(1);
++	}
+ 	/*
+ 	 * Execute the command using the user's shell.  This uses the -c
+ 	 * option to execute the command.

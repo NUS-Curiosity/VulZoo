@@ -1,0 +1,250 @@
+
+Date: Sat, 6 Jun 2015 17:22:13 +0530
+From: Payatu Research <research@...atu.com>
+To: bugtraq@...urityfocus.com
+Subject: Hardcoded AES 256 bit key used in Kankun IoT/Smart socket and its
+ mobile App
+
+Hi List,
+
+Vulnerability
+=============
+Hardcoded AES 256 bit key used in Kankun IoT/Smart socket and its mobile App
+
+Vulnerability Description
+==========================
+The kankun smart socket device and the mobile app use a hardcoded AES
+256 bit key to encrypt the commands and responses between the device
+and the app. The communication happens over UDP. An attacker on the
+local network can use the same key to encrypt and send unsolicited
+commands to the device and hijack it.
+
+CVE ID
+========
+CVE-2015-4080
+
+Vendor
+========
+www.ikonke.com
+
+Product
+=========
+Kankun Smart Socket
+
+Disclosure Timeline
+====================
+1. 25 May 2015 – Reported to Vendor, no response.
+2. 29 May 2015 – Reminder sent to vendor, no response.
+3. 5 June 2015 – Public disclosure.
+
+Credits
+=========
+1. Aseem Jakhar, Director - Research, Payatu Technologies Pvt. Ltd.
+2. Since at the time of publishing the finding, we searched online for
+the same and found that someone else had also published the key. In
+good faith we would like to mention the same person who goes by the
+handle: kankun hacker -
+https://plus.google.com/109112844319840106704/posts although both the
+research were independent of each other and we do not know who kankun
+hacker is.
+
+About Payatu
+============
+Payatu Technologies is a boutique security testing company. We
+specialize in Mobile/IoT/Product/Application security testing.
+
+PoC exploit source code
+========================
+https://bitbucket.org/aseemjakhar/kcmd
+
+Technical details
+==================
+
+We performed our analysis on the Android App and the device. The user
+manual specifies the app to be used for the device -
+http://kk.huafeng.com:8081/none/android/smartwifi.apk The smart socket
+has a newer version on the app on google play store which is also
+vulnerable - https://play.google.com/store/apps/details?id=hangzhou.zx
+
+
+Communication
+--------------
+The communication between the app and the device happens over UDP.
+The commands are Broadcasted on the network to UDP destination port 27431
+
+
+App Reversing
+----------------
+- We decompiled the app using using apktool
+- The app has a native shared library libNDK_03.so which contains the
+encryption logic and the hard-coded key
+- We analysed the app and got an idea of the command/response protocol
+being used between the app and the device.
+- The Java code uses JNI functions to encrypt and decrypt the commands
+and responses. The functions are encode() and decode(). Interestingly
+there is also a function called add() which adds the two parameters
+and returns the result. This must definitely be a testing function
+used while starting to develop the library :).
+
+- The command and response for switching ON and OFF is a 4 step process
+  - Step 1 - App sends an Open/Close request (Open means Switch ON,
+close means Switch OFF)
+  - Step 2 - Device sends a response containing a confirmation ID (a number)
+  - Step 3 - App sends the confirmation request along with the
+confirmation ID received from the Device
+  - Step 4 - Device sends an Acknowledgement and Switches the device ON/OFF
+  - An example of the communication protocol to Switch ON the device,
+assuming the MAC address of the device is “de:ad:de:ad:de:ad”, the
+password set by the user is “secretpass” and the confirmation ID is
+70018. If the user does not set any encryption password the string
+“nopassword” is used.
+
+  APP --> lan_phone%de:ad:de:ad:de:ad%secretpass%open%request --> Device
+  DEVICE -->  lan_device%de:ad:de:ad:de:ad%secretpass%confirm#70018%rack --> APP
+
+  APP -->  lan_phone%de:ad:de:ad:de:ad%secretpass%confirm#70018%request
+--> DEVICE
+  DEVICE --> lan_device%de:ad:de:ad:de:ad%secretpass%open%rack --> APP
+
+  - As you can see above, the communication is a simple string where
+fields are separated by the % character. The fields are self
+explanatory. There is also an option of wan_phone and wan_device which
+we did not test.
+
+- A quick strings output showed up the key along with other strings.
+This particular string looked a little intersting and we started
+reversing the native library.
+- Output of $ strings libNDK_03.so
+
+....
+UUPx((
+Zw--
+fdsl;mewrjope456fds4fbvfnjwaugfo
+java/lang/String
+....
+
+
+- The installed library is not stripped
+- In the library the JNI encode/decode functions call
+EncryptData/DecryptData respectively
+
+00003990 <Java_hangzhou_kankun_WifiJniC_encode>:
+    3990:       b5f0            push    {r4, r5, r6, r7, lr}
+    3992:       b085            sub     sp, #20
+    3994:       1c11            adds    r1, r2, #0
+    ....
+    39b6:       2380            movs    r3, #128        ; 0x80
+    39b8:       f7ff ff0e       bl      37d8 <EncryptData>
+     ....
+
+- The EncryptData() internally calls aes functions which means it is
+using AES encryption
+
+000037d8 <EncryptData>:
+    37d8:       b5f0            push    {r4, r5, r6, r7, lr}
+    37da:       465f            mov     r7, fp
+    37dc:       4656            mov     r6, sl
+    ....
+    3868:       9001            str     r0, [sp, #4]
+    386a:       f7fd fb8b       bl      f84 <aes_set_key>
+    ....
+    38be:       1c29            adds    r1, r5, #0
+    38c0:       f7fd fd84       bl      13cc <aes_encrypt>
+
+- Now to find the key we look at the code of EncryptData(). The below
+code generates the memory address of the key string within the
+library.
+
+    3842:       4b4e            ldr     r3, [pc, #312]  ; (397c
+<EncryptData+0x1a4>)
+    ....
+    384a:       447b            add     r3, pc
+    ....
+    384e:       3328            adds    r3, #40 ; 0x28
+    ....
+    397c:       00003e96        muleq   r0, r6, lr
+
+- Lets look at the code:
+  - The ldr instruction loads the value 0x3e96 in r3, which is the
+value at address 0x397c.
+  - The “add r3, pc” instruction adds 384e to r3. Because of
+pipelining and THUMB mode while executing the “add r3, pc” instruction
+pc will point 4 bytes ahead of the address 0x384a i.e. 0x384e.
+  - Finally the instruction “adds r3, #40” adds 0x28 (decimal 40) to r3.
+  - In effect r3 = 0x3e96 + 0x384e + 0x28 = 0x770c which is where our
+key resides.
+  - The key is fdsl;mewrjope456fds4fbvfnjwaugfo
+
+    770c:       6c736466    # fdsl
+    7710:       77656d3b   # ;mew
+    7714:       706f6a72    # rjop
+    7718:       36353465   # e456
+    771c:       34736466    # fds4
+    7720:       66766266    # fbvf
+    7724:       61776a6e     # njwa
+    7728:       6f666775     # ugfo
+
+- The algorithm uses 256 bits which is set in register r2 before the
+call to aes_set_key(). The below instructions translate to r2 = 128
+Left shift by 1 = 256
+    3860:       2280            movs    r2, #128        ; 0x80
+    ....
+    3866:       0052            lsls    r2, r2, #1
+
+- The same function i.e. aes_set_key() is called from DecryptData() as well.
+- We also confirmed that the key is being used by the UDP service
+listening on the device by simply running strings on it and we could
+see the same string in the program. There are two binaries in the
+device that use the key - kkeps_off and kkeps_on
+- Output of $ strings kkeps_off
+
+....
+B$Bh0
+pointer is null
+pucOutputData too small
+fdsl;mewrjope456fds4fbvfnjwaugfo
+pucInputData dataLen is incorrect
+pucOutPutData is too small
+....
+
+Hijacking the Smart Socket
+---------------------------
+Now that we have the encryption key lets go hijack the socket. Instead
+of writing your own openssl wrapper for encryption/decryption, we can
+simply use the native shared library to do the magic for us. A quick
+look at the IDA output shows that EncryptData() and DecryptData() are
+exported functions which means any native program can load libNDK_03
+using dlopen() and family and can use these functions which is exactly
+what we did.
+
+IDA output
+.text:000037D8 ; int EncryptData(unsigned __int8 *pucInputData, int
+nInPutLen, unsigned __int8 *pucOutputData, int nOutputsize, int
+*pnOutPutLen)
+.text:000037D8                 EXPORT EncryptData
+
+But wait a minute! What if the user sets a password :O. Since, there
+is an option called Encryption in the app (which actually means set a
+password to be used between the app and the device communication and
+not actually an encryption passphrase), if the user sets a password,
+only that user will be able to control the device. Worry not! We
+previously saw that the app sends the commands as UDP broadcasts to
+port 27431. Which means anyone on the local network can sniff the
+command packets. So all you need to do is:
+1. nmap scan for UDP port 27431 on the network. When you find the
+device note down its MAC address to be used in the request.
+2. Encrypt and Send open/close request with default password string
+i.e “nopassword”
+3. Check the response
+1. If response received with confirmation ID goto step 7
+2. If no response received or response unknown goto step 4
+4. Listen on (broadcast address) UDP port 27431 and sniff all requests.
+5. Decrypt the request received and extract the password.
+6. Encrypt and send open/close request with the extracted password.
+7. Extract the confirmation ID from the response
+8. Send the confirmation request to the device
+9. Receive the acknowledgement response
+10. The device has been successfully hijacked
+
+Regards,
+Payatu Research Team

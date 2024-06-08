@@ -1,0 +1,268 @@
+
+Date: Tue, 26 Oct 2021 14:37:20 +0800
+From: Lin Horse <kylin.formalin@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2021-3760: Linux kernel: Use-After-Free vulnerability of ndev->rf_conn_info object
+
+Hello there,
+
+Our team found a UAF vulnerability of ndev->rf_conn_info object in the
+kernel NFC stack. The root cause is that ndev->rf_conn_info is forgotten to
+set to NULL when the object is released.
+
+
+=*=*=*=*=*=*=*=*=  BUG DETAILS  =*=*=*=*=*=*=*=*=
+
+We will talk about the ALLOC routine, the FREE routine, and the UAF routine.
+
+
+>>>>>>>> ALLOC routine <<<<<<<<
+
+With dynamic debugging, I found the object allocation routine is like below
+
+.. -> nci_recv_frame()
+      -> nci_rx_work()
+         -> nci_rsp_packet()
+            -> nci_rf_disc_rsp_packet()
+               -> devm_kzalloc()
+
+The function nci_rf_disc_rsp_packet() is like below
+
+static void nci_rf_disc_rsp_packet(struct nci_dev *ndev, struct sk_buff
+*skb)
+{
+    struct nci_conn_info    *conn_info;
+    __u8 status = skb->data[0];
+
+    pr_debug("status 0x%x\n", status);
+
+    if (status == NCI_STATUS_OK) {
+        atomic_set(&ndev->state, NCI_DISCOVERY);
+
+        conn_info = ndev->rf_conn_info;
+        if (!conn_info) {
+            conn_info = devm_kzalloc(&ndev->nfc_dev->dev, /* ALLOCATING */
+                         sizeof(struct nci_conn_info),
+                         GFP_KERNEL);
+            if (!conn_info) {
+                status = NCI_STATUS_REJECTED;
+                goto exit;
+            }
+            conn_info->conn_id = NCI_STATIC_RF_CONN_ID;
+            INIT_LIST_HEAD(&conn_info->list);
+            list_add(&conn_info->list, &ndev->conn_info_list);
+            ndev->rf_conn_info = conn_info;
+        }
+    }
+
+exit:
+    nci_req_complete(ndev, status);
+}
+
+This function will allocate nci_conn_info object if the ndev->rf_conn_info
+is NULL. It will also update conn_info->conn_id and add this info data to
+ndev->conn_info_list. The ndev->rf_conn_info will be set to this newly
+allocated object at last.
+
+
+>>>>>>>> FREE routine <<<<<<<<
+
+We now know that the conn_info is created when the sent discovery packet is
+replied to. How about the deallocation? By reading through the source code,
+we will find out the deallocation site is in nci_core_conn_close_rsp_packet()
+function.
+
+.. -> nci_recv_frame()
+      -> nci_rx_work()
+         -> nci_rsp_packet()
+            -> nci_core_conn_close_rsp_packet()
+               -> devm_kfree()
+
+
+static void nci_core_conn_close_rsp_packet(struct nci_dev *ndev,
+                       struct sk_buff *skb)
+{
+    struct nci_conn_info *conn_info;
+    __u8 status = skb->data[0];
+
+    pr_debug("status 0x%x\n", status);
+    if (status == NCI_STATUS_OK) {
+        conn_info = nci_get_conn_info_by_conn_id(ndev,
+                             ndev->cur_conn_id);
+        if (conn_info) {
+            list_del(&conn_info->list);
+            devm_kfree(&ndev->nfc_dev->dev, conn_info);
+        }
+    }
+    nci_req_complete(ndev, status);
+}
+
+This function will call devm_kfree() to release conn_info, which is
+obtained in function nci_get_conn_info_by_conn_id() with given conn_id.
+(The cur_conn_id can be set in nci_send_data() function,
+nci_nfcc_loopback() function and nci_core_conn_close() function).
+
+In another word, the ndev->cur_conn_id is possible be NCI_STATIC_RF_CONN_ID
+(0x00). That is, the devm_kfree() is possibly make the ndev->rf_conn_info a
+dangling pointer.
+
+
+>>>>>>>> UAF routine <<<<<<<<
+
+We can find code side that dereference the dangling pointer
+ndev->rf_conn_info. For example, the nci_rf_intf_activated_ntf_packet()
+function.
+
+
+static void nci_rf_intf_activated_ntf_packet(struct nci_dev *ndev,
+                                             struct sk_buff *skb)
+{
+/* ... */
+exit:
+        if (err == NCI_STATUS_OK) {
+                conn_info = ndev->rf_conn_info;
+                if (!conn_info) // This check is failed
+                        return;
+
+                conn_info->max_pkt_payload_len =
+ntf.max_data_pkt_payload_size;
+                conn_info->initial_num_credits = ntf.initial_num_credits;
+/* ... */
+}
+
+As we can see, this function will check if the pointer ndev->rf_conn_info
+is NULL. However, this check is failed because the ndev->rf_conn_info is
+not set to NULL even if the object is released.
+(In fact, I didn't find any code like ndev->rf_conn_info = NULL in the
+kernel source code).
+
+Hence, the following dereference of max_pkt_payload_len and
+initial_num_credits will cause UAF write.
+
+
+=*=*=*=*=*=*=*=*=  BUG EFFECTS  =*=*=*=*=*=*=*=*=
+
+Below we provide the report from KASan.
+
+[   42.075031] ============================================================
+======
+[   42.075705] BUG: KASAN: use-after-free in nci_ntf_packet+0x279a/0x2fd0
+[   42.076322] Write of size 1 at addr ffff888009cad9c2 by task
+kworker/u2:1/43
+[   42.076976]
+[   42.077126] CPU: 0 PID: 43 Comm: kworker/u2:1 Not tainted 5.13.1+ #26
+[   42.077732] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS
+rel-1.14.0-0-g155821a1990b-prebuilt.qemu.org 04/01/2014
+[   42.078800] Workqueue: nfc2_nci_rx_wq nci_rx_work
+[   42.079244] Call Trace:
+[   42.079482]  dump_stack+0x157/0x1ae
+[   42.079820]  print_address_description+0x7b/0x3a0
+[   42.080265]  __kasan_report+0x14d/0x240
+[   42.080628]  ? nci_ntf_packet+0x279a/0x2fd0
+[   42.081022]  kasan_report+0x45/0x60
+[   42.081353]  nci_ntf_packet+0x279a/0x2fd0
+[   42.081738]  ? nfc_send_to_raw_sock+0x237/0x260
+[   42.082165]  ? skb_dequeue+0x10f/0x140
+[   42.082524]  nci_rx_work+0x140/0x280
+[   42.082871]  process_one_work+0x7b1/0x1060
+[   42.083264]  worker_thread+0xa56/0x1270
+[   42.083627]  ? __schedule+0xc39/0x11d0
+[   42.083984]  ? process_one_work+0x1060/0x1060
+[   42.084394]  kthread+0x2ee/0x310
+[   42.084701]  ? process_one_work+0x1060/0x1060
+[   42.085111]  ? kthread_unuse_mm+0x1a0/0x1a0
+[   42.085505]  ret_from_fork+0x22/0x30
+[   42.085851]
+[   42.085999] Allocated by task 0:
+[   42.086307] (stack is not available)
+[   42.086643]
+[   42.086791] Freed by task 7:
+[   42.087064]  kasan_set_track+0x3d/0x70
+[   42.087419]  kasan_set_free_info+0x1f/0x40
+[   42.087804]  ____kasan_slab_free+0x111/0x150
+[   42.088204]  kfree+0xf6/0x2d0
+[   42.088488]  nci_rsp_packet+0x119f/0x2060
+[   42.088865]  nci_rx_work+0x102/0x280
+[   42.089203]  process_one_work+0x7b1/0x1060
+[   42.089588]  worker_thread+0xa56/0x1270
+[   42.089954]  kthread+0x2ee/0x310
+[   42.090261]  ret_from_fork+0x22/0x30
+[   42.090600]
+[   42.090747] The buggy address belongs to the object at ffff888009cad980
+[   42.090747]  which belongs to the cache kmalloc-128 of size 128
+[   42.091894] The buggy address is located 66 bytes inside of
+[   42.091894]  128-byte region [ffff888009cad980, ffff888009cada00)
+[   42.092964] The buggy address belongs to the page:
+[   42.093411] page:000000005b218ee6 refcount:1 mapcount:0
+mapping:0000000000000000 index:0x0 pfn:0x9cac
+[   42.094269] head:000000005b218ee6 order:1 compound_mapcount:0
+[   42.094803] flags: 0x100000000010200(slab|head|node=0|zone=1)
+[   42.095340] raw: 0100000000010200 ffffea00004bf308 ffff888005c40e70
+ffff888005c431c0
+[   42.096055] raw: 0000000000000000 00000000000c000c 00000001ffffffff
+0000000000000000
+[   42.096769] page dumped because: kasan: bad access detected
+[   42.097285]
+[   42.097432] Memory state around the buggy address:
+[   42.097885]  ffff888009cad880: fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+fc fc
+[   42.098553]  ffff888009cad900: fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+fc fc
+[   42.099218] >ffff888009cad980: fa fb fb fb fb fb fb fb fb fb fb fb fb fb
+fb fb
+[   42.099885]                                            ^
+[   42.100379]  ffff888009cada00: fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+fc fc
+[   42.101047]  ffff888009cada80: fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+fc fc
+[   42.101720] ============================================================
+======
+[   42.102385] Disabling lock debugging due to kernel taint
+
+In function nci_rf_intf_activated_ntf_packet(), the attacker is able to
+corrupt 6 bytes of one released slub object.
+Though it sounds very limited. But the write position (66 - 71 th bytes)
+happens to be the metadata of a kmalloc-128 object. That is to say, one
+skillful attack can use this UAF write primitive to corrupt the slub free
+list to gain more powerful primitive like arbitrary address allocating.
+
+
+=*=*=*=*=*=*=*=*=  BUG REPRODUCE  =*=*=*=*=*=*=*=*=
+
+This UAF bug, in some perspective, is not easy to trigger. These three
+routines are the interaction between the kernel NFC stack and the
+underlying NFC controller. That is to say, the attacker may need to
+compromise one real hardware controller before he can send these malicious
+NFC packets.
+
+(P.S. This bug is found by fuzzing whose threat model is assuming the
+controller is already be compromised. I didn't test if this bug can be
+triggered remotely using a normal controller).
+
+However, similar to some bugs I found in the Bluetooth stack, I found that
+the NFC controller can also be simulated in userspace when the attacker
+gains NET_ADMIN privilege. And this is proven to be possible!!
+
+Hence, this bug reproducing can be achieved using the virtual_nfc driver or
+the UART device simulation. The POC code for the second choice is provided
+as an attachment to allow everyone to trigger this crash.
+
+In a nutshell, the malicious controller only needs to send three packets:
+
+1. nci_rf_disc_rsp_packet: this will awake ALLOC routine.
+2. nci_core_conn_close_rsp_packet: this will awake FREE routine.
+3. nci_rf_intf_activated_ntf_packet: this will cause UAF.
+
+=*=*=*=*=*=*=*=*=  Timeline  =*=*=*=*=*=*=*=*=
+
+2021-09-01 Report to security and linux-distro
+2021-09-01 CVE-2021-3760 assigned
+2021-10-26 patch upstream
+
+Sorry for the delay of this report T.T
+
+Best wishes
+
+Content of type "text/html" skipped
+
+Download attachment "reproduce.tar" of type "application/x-tar" (24576 bytes)

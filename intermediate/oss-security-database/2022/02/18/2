@@ -1,0 +1,123 @@
+
+Date: Fri, 18 Feb 2022 12:22:57 +1030
+From: Alex Murray <alex.murray@...onical.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2021-4120: Insufficient validation of snap content interface
+ and layout paths
+
+Hi,
+
+Earlier today, two security vulnerabilities (CVE-2021-44730,
+CVE-2021-44731) in the snap-confine component of snapd were disclosed by
+Qualys. These have been fixed in the snapd project by the 2.54.3 release
+earlier today.
+
+In addition to these two vulnerabilities in snap-confine, a third
+vulnerability in snapd was independently discovered by Ian Johnson from
+the snapd team, which was also resolved in the 2.54.3 release.
+
+
+CVE-2021-4120
+-------------------------------------------------------------------
+
+snapd fails to perform sufficient validation of snap content interface and
+layout paths, resulting in the ability for snaps to inject arbitrary
+AppArmor policy rules via malformed content interface and layout
+declarations and hence escape strict snap confinement.
+
+CVSS:3.1/AV:L/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:H (8.2)
+
+This vulnerability was reported via Launchpad against the snapd project
+(https://bugs.launchpad.net/snapd/+bug/1949368) - quoting from this:
+
+ Snapd does not properly or sufficiently validate the input strings used in
+ content interface plugs/slots, meaning that snaps can be installed with
+ strict confinement with malformed content interface slots which
+ effectively grant any AppArmor rule to the plug side.
+
+ To exploit this, create two snaps, one which provides the slot and one
+ which has a plug connected to the slot. For the purposes of the exploit,
+ these can just be local snaps, but note that a snap publisher could upload
+ both of these snaps to the store and the two snaps will have their
+ plug/slot auto-connected due to rules about auto-connection of matching
+ content interface plugs/slots for snaps of the same publisher.
+
+ The first snap has a content slot definition like this:
+
+ slots:
+   content-plug:
+     interface: content
+     content: mycont
+     read:
+       - "$SNAP/ rw, /** rw, } profile foobar (attach_disconnected) { /foo"
+
+ The embedded profile name does not really matter, but what is important is
+ that this rule has arbitrary apparmor rules embedded inside it, abusing
+ the "," character. For the plug side use a definition like this:
+
+ plugs:
+  content-plug:
+   interface: content
+   content: mycont
+   target: $SNAP_DATA/mycont
+
+ The plug side target does not matter at all, but the `content` attribute
+ must match the slot definition in order for the plug and slot to be
+ auto-connected.
+
+ What we are effectively doing is taking advantage of the fact that snapd
+ just validates that the read setting is a "clean" filepath, and does no
+ further validation and effectively ends up just copy-pasting the string
+ into various places inside an AppArmor profile without any quoting or
+ further validation.
+
+ There are really two profiles which get generated with this malicious
+ string without validation, the one for snap-update-ns of the plugging snap
+ in question, and the one for the snap itself. This actually presented
+ something of a problem, as for snap-update-ns, the string appears as part
+ of a mount rule source, which means that including other stuff here like
+ we do makes apparmor_parser fail to compile the file for snap-update-ns,
+ as it does not expect a mount rule to be formed like this. I still suspect
+ it is possible to craft a string such that it somehow is valid both as a
+ file source in a mount rule and as a file rule itself, but it turned out
+ that actually it doesn't need to be a valid rule for both profiles in
+ order to be exploited. This is because snapd just loads the profiles and
+ if they fail to be loaded, snapd does nothing about it. This means we can
+ craft a rule which is valid for just the profile for the app itself, (but
+ not for the profile of snap-update-ns), and still be able to use our
+ crafted rule. The one hiccup to this is that the mount namespace must
+ already exist, so that snap run does not need to invoke snap-update-ns,
+ otherwise presumably the exploit will not be exploitable since the app
+ cannot be run. It might be possible to also avoid this by using a daemon
+ and something like refresh-mode: endure, but I didn't take the time to
+ figure out all those details.
+
+ To be clear, with the above plug, for the plugging app snap we get this as
+ the tail end of the apparmor profile:
+
+ ```
+ # In addition to the bind mount, add any AppArmor rules so that
+ # snaps may directly access the slot implementation's files
+ # read-only.
+ /snap/test-content-interface-escape-slot/x15/ rw, /** rw, } profile
+snap-update-ns.test-content-interface-escape-plug2 (attach_disconnected) { /foo/** mrkix,
+
+ }
+ ```
+
+ Which for the purposes of this bug just demonstrates that we can inject
+ arbitrary apparmor rules into the profile through the snap.yaml plug/slot
+ definition.
+
+As stated above, to remediate this and the two vulnerabilities reported
+by Qualys, the snapd team released snapd 2.54.3
+(https://github.com/snapcore/snapd/releases/tag/2.54.3) earlier
+today. In addition, Ubuntu published updates for snapd as detailed in
+USN-5292-1 (https://ubuntu.com/security/notices/USN-5292-1).
+
+The details of the fixes can be found in the following merge commit
+https://github.com/snapcore/snapd/commit/f3f669d720ed8b0bcb73da7789843bf43b5c16cf
+in the snapd project.
+
+The Ubuntu Security team would like to thank Qualys for their help in
+the disclosure and coordination of the snap-confine issues.

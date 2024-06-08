@@ -1,0 +1,272 @@
+
+Date: Tue, 11 May 2021 13:28:17 +0800
+From: Lin Horse <kylin.formalin@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2021-32399 Linux device detach race condition
+
+Hello there,
+
+Our team (BlockSec) found a race-condition vulnerability resides in
+the kernel BlueTooth subsystem, which can lead to UAF of slab objects.
+At worst, this bug can be exploited to get code execution for
+escalating local privilege.
+
+=*=*=*=*=*=*=*=*=  BUG DETAILS  =*=*=*=*=*=*=*=*=
+
+The race occurs between issuing a command to the BlueTooth controller
+and unregistering the BlueTooth controller. For example, thread-A is
+issuing a command while thread-B is going to close the device.
+
+The thread-A will enter into hci_req_sync() function like below
+
+int hci_req_sync(struct hci_dev *hdev, int (*req)(struct hci_request *req,
+						  unsigned long opt),
+		 unsigned long opt, u32 timeout, u8 *hci_status)
+{
+...
+	if (!test_bit(HCI_UP, &hdev->flags))
+		return -ENETDOWN;
+
+	/* Serialize all requests */
+	hci_req_sync_lock(hdev);
+	ret = __hci_req_sync(hdev, req, opt, timeout, hci_status);
+	hci_req_sync_unlock(hdev);
+...
+
+The thread-B will enter into hci_dev_do_close() function like below snippet
+
+int hci_dev_do_close(struct hci_dev *hdev)
+{
+...
+	hci_req_sync_lock(hdev);
+
+	if (!test_and_clear_bit(HCI_UP, &hdev->flags)) {
+		cancel_delayed_work_sync(&hdev->cmd_timer);
+		hci_req_sync_unlock(hdev);
+		return 0;
+	}
+...
+
+The problem here is that these two commands can run as below sequences.
+
+thread-A                         |   thread-B
+test_bit(HCI_UP, &hdev->flags);  |
+                                 |   hci_req_sync_lock(hdev);
+                                 |
+...                              |   test_and_clear_bit(HCI_UP, &hdev->flags)
+                                 |
+hci_req_sync_lock(hdev);         |
+
+Or like below
+
+thread-A                         |   thread-B
+                                 |   hci_req_sync_lock(hdev);
+test_bit(HCI_UP, &hdev->flags);  |
+...                              |   test_and_clear_bit(HCI_UP, &hdev->flags)
+hci_req_sync_lock(hdev);         |
+
+Anyway, once the thread-B obtains the sync lock (hdev->req_lock)
+before the thread-A, the bug is triggered.
+
+That is, although the thread-B will flush the work queue and check if
+any commands are stayed pending, the thread-A can obtain the sync lock
+even after the thread-B has already closed the HCI device and then
+awake the command work, which results in Use After Free.
+
+
+=*=*=*=*=*=*=*=*=  BUG EFFECTS  =*=*=*=*=*=*=*=*=
+
+For now, I can successfully trigger the vulnerability to crash the
+kernel. The log is presented below and the POC code is given as an
+attachment
+
+[   73.753790] BUG: kernel NULL pointer dereference, address: 0000000000000000
+[   73.754061] #PF: supervisor read access in kernel mode
+[   73.754061] #PF: error_code(0x0000) - not-present page
+[   73.754061] PGD 0 P4D 0
+[   73.754061] Oops: 0000 [#1] SMP NOPTI
+[   73.754061] CPU: 3 PID: 155 Comm: ptmx_crash Not tainted 5.11.11+ #7
+[   73.754061] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996),
+BIOS 1.10.2-1ubuntu1 04/01/2014
+[   73.754061] RIP: 0010:__queue_work+0xd5/0x3e0
+[   73.754061] Code: 75 00 40 f6 c6 04 75 d1 48 c1 ee 05 81 fe ff ff
+ff 7f 0f 84 92 00 00 00 48 c7 c7 90 c6 64 82 48 63 f6 e8 1e d1 3a 00
+48 89 c7 <49> 8b 07 48 85 ff 0f 84 7e 02 00 00 48 39 f8 74 72 48 89 7c
+24 08
+[   73.754061] RSP: 0018:ffffc900003f3c98 EFLAGS: 00000046
+[   73.754061] RAX: ffff888003d4f800 RBX: 000000000000002f RCX: 0000000000000000
+[   73.754061] RDX: ffff888003800000 RSI: ffff888003800070 RDI: ffff888003d4f800
+[   73.754061] RBP: ffff888004d5e860 R08: ffff888003d4f800 R09: ffffffff8264c698
+[   73.754061] R10: 0000000000000000 R11: 0000000000000000 R12: 0000000000000003
+[   73.754061] R13: 0000000000027508 R14: ffff888004cc1a00 R15: 0000000000000000
+[   73.754061] FS:  00007f8d77212700(0000) GS:ffff88807dd80000(0000)
+knlGS:0000000000000000
+[   73.754061] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[   73.754061] CR2: 0000000000000000 CR3: 0000000004c16000 CR4: 00000000000006e0
+[   73.754061] Call Trace:
+[   73.754061]  queue_work_on+0x17/0x20
+[   73.754061]  req_run+0xa9/0xf0
+[   73.754061]  __hci_req_sync+0xaa/0x250
+[   73.754061]  ? hci_unregister_cb+0x50/0x50
+[   73.754061]  hci_req_sync+0x4e/0x70
+[   73.754061]  hci_inquiry+0x1a3/0x350
+[   73.754061]  ? release_sock+0x14/0x90
+[   73.754061]  sock_do_ioctl+0x37/0x130
+[   73.754061]  ? selinux_file_ioctl+0x130/0x220
+[   73.754061]  sock_ioctl+0x219/0x310
+[   73.754061]  ? __hrtimer_init+0xc0/0xc0
+[   73.754061]  __x64_sys_ioctl+0x7e/0xb0
+[   73.754061]  do_syscall_64+0x33/0x40
+[   73.754061]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+[   73.754061] RIP: 0033:0x7f8d77b19247
+[   73.754061] Code: 00 00 90 48 8b 05 49 8c 0c 00 64 c7 00 26 00 00
+00 48 c7 c0 ff ff ff ff c3 66 2e 0f 1f 84 00 00 00 00 00 b8 10 00 00
+00 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 8b 0d 19 8c 0c 00 f7 d8 64 89
+01 48
+[   73.754061] RSP: 002b:00007f8d77211ec8 EFLAGS: 00000202 ORIG_RAX:
+0000000000000010
+[   73.754061] RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 00007f8d77b19247
+[   73.754061] RDX: 00007f8d77211eee RSI: 00000000800448f0 RDI: 0000000000000009
+[   73.754061] RBP: 00007f8d77211f00 R08: 0000000000000000 R09: 00007f8d77212700
+[   73.754061] R10: 0000000000000000 R11: 0000000000000202 R12: 00007ffc80c9d9ee
+[   73.754061] R13: 00007ffc80c9d9ef R14: 00007f8d77211fc0 R15: 00007f8d77212700
+
+This NULL-pointer-dereference is occurred in the req_run function,
+called from hci_req_sync() of thread-A.
+
+static int req_run(struct hci_request *req, hci_req_complete_t complete,
+		   hci_req_complete_skb_t complete_skb)
+{
+	...
+
+	queue_work(hdev->workqueue, &hdev->cmd_work);
+
+	return 0;
+}
+
+As the hdev object has already be freed after device unregistering.
+The hdev->workqueue and hdev->cmd_work are all NULL pointer. That's
+why the NULL pointer will be dereferenced.
+
+In another word, the attacker can adopt the heap spraying technique to
+keep corrupting the objects to gain more. As the hdev object contains
+a lot of pointers, the attacker can easily get arbitrary memory write
+primitive or RIP hijacking.
+
+
+=*=*=*=*=*=*=*=*=  BUG REPRODUCING  =*=*=*=*=*=*=*=*=
+
+This race-condition vulnerability occurs between device closing and
+command issuing. Hence, the attacker needs chances to close the device
+multiple times. To attain this, there are three possible ways that may
+be used.
+
+1. Using the virtual HCI driver (vhci)
+2. Using the ptmx to act as an HCI TTY device.
+3. Using real devices.
+
+The vhci module will be used when testing BlueTooth programs. However,
+loading this driver requires root privilege.
+
+The second choice is more versatile: using the ptmx to fake an HCI TTY
+device and attaching it to the kernel as a controller, which won't
+require extra privilege. However, it's worth mentioning that the
+attached fake controller will be put into the HCI_AUTO_OFF state by
+default. In this case, the attacker needs CAP_NET_ADMIN privilege to
+set the device up.
+
+For the third choice, it is also possible (but not convenient) to
+trigger this race condition. This choice won't require any privilege.
+
+As this bug is found through fuzzing, the KASan can help to reproduce
+the bug. In addition, to increase the possibility of bug triggering,
+you can adopt the following patch to your kernel.
+
+diff --git a/net/bluetooth/hci_request.c b/net/bluetooth/hci_request.c
+index 5aa7bd503..0ec8d8278 100644
+--- a/net/bluetooth/hci_request.c
++++ b/net/bluetooth/hci_request.c
+@@ -274,6 +274,8 @@ int hci_req_sync(struct hci_dev *hdev, int
+(*req)(struct hci_request *req,
+        if (!test_bit(HCI_UP, &hdev->flags))
+                return -ENETDOWN;
+
++       udelay(200);
++
+        /* Serialize all requests */
+        hci_req_sync_lock(hdev);
+        ret = __hci_req_sync(hdev, req, opt, timeout, hci_status);
+(END)
+
+
+It maliciously injects delay to expand the race window.
+( In addition, I found and exploited the bug in QEMU environment. )
+
+
+=*=*=*=*=*=*=*=*=  Bug FIX  =*=*=*=*=*=*=*=*=
+
+The adopted patch is presentd at
+https://github.com/torvalds/linux/commit/e2cb6b891ad2b8caa9131e3be70f45243df82a80
+
+diff --git a/net/bluetooth/hci_request.c b/net/bluetooth/hci_request.c
+index e55976db4403..790ebe5d818e 100644
+--- a/net/bluetooth/hci_request.c
++++ b/net/bluetooth/hci_request.c
+@@ -272,12 +272,16 @@ int hci_req_sync(struct hci_dev *hdev, int
+(*req)(struct hci_request *req,
+ {
+ 	int ret;
+
+-	if (!test_bit(HCI_UP, &hdev->flags))
+-		return -ENETDOWN;
+-
+ 	/* Serialize all requests */
+ 	hci_req_sync_lock(hdev);
+-	ret = __hci_req_sync(hdev, req, opt, timeout, hci_status);
++	/* check the state after obtaing the lock to protect the HCI_UP
++	 * against any races from hci_dev_do_close when the controller
++	 * gets removed.
++	 */
++	if (test_bit(HCI_UP, &hdev->flags))
++		ret = __hci_req_sync(hdev, req, opt, timeout, hci_status);
++	else
++		ret = -ENETDOWN;
+ 	hci_req_sync_unlock(hdev);
+
+ 	return ret;
+-- 
+That is, let thread-A does the flag checking after it obtains the sync
+lock. This can indeed solve the race-condition problem as the thread-A
+will not be able to send any commands once the device is closed.
+However, this patch is not beautiful and may harm the performance.
+
+
+=*=*=*=*=*=*=*=*=  Timeline  =*=*=*=*=*=*=*=*=
+
+This is the first time I report kernel bugs and my timeline is quite,
+emm, werid xD
+
+2021-04-11: Bug reported to security () kernel org
+2021-04-24: Patch accepted to mainline kernel
+
+2021-05-01: CVE request from MRITE
+
+2021-05-07: CVE-2021-32399 assigned
+
+
+=*=*=*=*=*=*=*=*=  Credit  =*=*=*=*=*=*=*=*=
+
+LinMa@...ckSec Team
+syzkaller (amazing kernel fuzzer)
+
+Best regards.
+
+Content of type "text/html" skipped
+
+Download attachment "ptmx_crash.c" of type "application/octet-stream" (1486 bytes)
+
+Download attachment "ptmx_sim.h" of type "application/octet-stream" (3037 bytes)
+
+Download attachment "README" of type "application/octet-stream" (625 bytes)
+
+Download attachment "ptmx_sim.c" of type "application/octet-stream" (5201 bytes)

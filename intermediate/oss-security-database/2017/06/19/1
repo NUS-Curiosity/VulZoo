@@ -1,0 +1,2926 @@
+
+Date: Mon, 19 Jun 2017 08:28:43 -0700
+From: Qualys Security Advisory <qsa@...lys.com>
+To: oss-security@...ts.openwall.com
+Subject: Qualys Security Advisory - The Stack Clash
+
+
+Qualys Security Advisory
+
+The Stack Clash
+
+
+========================================================================
+Contents
+========================================================================
+
+I. Introduction
+II. Problem
+    II.1. Automatic stack expansion
+    II.2. Stack guard-page
+    II.3. Stack-clash exploitation
+III. Solutions
+IV. Results
+    IV.1. Linux
+    IV.2. OpenBSD
+    IV.3. NetBSD
+    IV.4. FreeBSD
+    IV.5. Solaris
+V. Acknowledgments
+
+
+========================================================================
+I. Introduction
+========================================================================
+
+Our research started with a 96-megabyte surprise:
+
+b97bb000-b97dc000 rw-p 00000000 00:00 0          [heap]
+bf7c6000-bf806000 rw-p 00000000 00:00 0          [stack]
+
+and a 12-year-old question: "If the heap grows up, and the stack grows
+down, what happens when they clash? Is it exploitable? How?"
+
+- In 2005, Gael Delalleau presented "Large memory management
+  vulnerabilities" and the first stack-clash exploit in user-space
+  (against mod_php 4.3.0 on Apache 2.0.53):
+
+  http://cansecwest.com/core05/memory_vulns_delalleau.pdf
+
+- In 2010, Rafal Wojtczuk published "Exploiting large memory management
+  vulnerabilities in Xorg server running on Linux", the second
+  stack-clash exploit in user-space (CVE-2010-2240):
+
+  http://www.invisiblethingslab.com/resources/misc-2010/xorg-large-memory-attacks.pdf
+
+- Since 2010, security researchers have exploited several stack-clashes
+  in the kernel-space; for example:
+
+  https://jon.oberheide.org/blog/2010/11/29/exploiting-stack-overflows-in-the-linux-kernel/
+  https://jon.oberheide.org/files/infiltrate12-thestackisback.pdf
+  https://googleprojectzero.blogspot.com/2016/06/exploiting-recursion-in-linux-kernel_20.html
+
+In user-space, however, this problem has been greatly underestimated;
+the only public exploits are Gael Delalleau's and Rafal Wojtczuk's, and
+they were written before Linux introduced a protection against
+stack-clashes (a "guard-page" mapped below the stack):
+
+https://bugzilla.redhat.com/show_bug.cgi?id=CVE-2010-2240
+
+In this advisory, we show that stack-clashes are widespread in
+user-space, and exploitable despite the stack guard-page; we discovered
+multiple vulnerabilities in guard-page implementations, and devised
+general methods for:
+
+- "Clashing" the stack with another memory region: we allocate memory
+  until the stack reaches another memory region, or until another memory
+  region reaches the stack;
+
+- "Jumping" over the stack guard-page: we move the stack-pointer from
+  the stack and into the other memory region, without accessing the
+  stack guard-page;
+
+- "Smashing" the stack, or the other memory region: we overwrite the
+  stack with the other memory region, or the other memory region with
+  the stack.
+
+To illustrate our findings, we developed the following exploits and
+proofs-of-concepts:
+
+- a local-root exploit against Exim (CVE-2017-1000369, CVE-2017-1000376)
+  on i386 Debian;
+
+- a local-root exploit against Sudo (CVE-2017-1000367, CVE-2017-1000366)
+  on i386 Debian, Ubuntu, CentOS;
+
+- an independent Sudoer-to-root exploit against CVE-2017-1000367 on any
+  SELinux-enabled distribution;
+
+- a local-root exploit against ld.so and most SUID-root binaries
+  (CVE-2017-1000366, CVE-2017-1000370) on i386 Debian, Fedora, CentOS;
+
+- a local-root exploit against ld.so and most SUID-root PIEs
+  (CVE-2017-1000366, CVE-2017-1000371) on i386 Debian, Ubuntu, Fedora;
+
+- a local-root exploit against /bin/su (CVE-2017-1000366,
+  CVE-2017-1000365) on i386 Debian;
+
+- a proof-of-concept that gains eip control against Sudo on i386
+  grsecurity/PaX (CVE-2017-1000367, CVE-2017-1000366, CVE-2017-1000377);
+
+- a local proof-of-concept that gains rip control against Exim
+  (CVE-2017-1000369) on amd64 Debian;
+
+- a local-root exploit against ld.so and most SUID-root binaries
+  (CVE-2017-1000366, CVE-2017-1000379) on amd64 Debian, Ubuntu, Fedora,
+  CentOS;
+
+- a proof-of-concept against /usr/bin/at on i386 OpenBSD, for
+  CVE-2017-1000372 in OpenBSD's stack guard-page implementation and
+  CVE-2017-1000373 in OpenBSD's qsort() function;
+
+- a proof-of-concept for CVE-2017-1000374 and CVE-2017-1000375 in
+  NetBSD's stack guard-page implementation;
+
+- a proof-of-concept for CVE-2017-1085 in FreeBSD's setrlimit()
+  RLIMIT_STACK implementation;
+
+- two proofs-of-concept for CVE-2017-1083 and CVE-2017-1084 in FreeBSD's
+  stack guard-page implementation;
+
+- a local-root exploit against /usr/bin/rsh (CVE-2017-3630,
+  CVE-2017-3629, CVE-2017-3631) on Solaris 11.
+
+
+========================================================================
+II. Problem
+========================================================================
+
+Note: in this advisory, the "start of the stack" is the lowest address
+of its memory region, and the "end of the stack" is the highest address
+of its memory region; we do not use the ambiguous terms "top of the
+stack" and "bottom of the stack".
+
+========================================================================
+II.1. Automatic stack expansion
+========================================================================
+
+The user-space stack of a process is automatically expanded by the
+kernel:
+
+- if the stack-pointer (the esp register, on i386) reaches the start of
+  the stack and the unmapped memory pages below (the stack grows down,
+  on i386),
+
+- then a "page-fault" exception is raised and caught by the kernel,
+
+- and the page-fault handler transparently expands the user-space stack
+  of the process (it decreases the start address of the stack),
+
+- or it terminates the process with a SIGSEGV if the stack expansion
+  fails (for example, if the RLIMIT_STACK is reached).
+
+Unfortunately, this stack expansion mechanism is implicit and fragile:
+it relies on page-fault exceptions, but if another memory region is
+mapped directly below the stack, then the stack-pointer can move from
+the stack into the other memory region without raising a page-fault,
+and:
+
+- the kernel cannot tell that the process needed more stack memory;
+
+- the process cannot tell that its stack-pointer moved from the stack
+  into another memory region.
+
+In contrast, the heap expansion mechanism is explicit and robust: the
+process uses the brk() system-call to tell the kernel that it needs more
+heap memory, and the kernel expands the heap accordingly (it increases
+the end address of the heap memory region -- the heap always grows up).
+
+========================================================================
+II.2. Stack guard-page
+========================================================================
+
+The fragile stack expansion mechanism poses a security threat: if the
+stack-pointer of a process can move from the stack into another memory
+region (which ends exactly where the stack starts) without raising a
+page-fault, then:
+
+- the process uses this other memory region as if it were an extension
+  of the stack;
+
+- a write to this stack extension smashes the other memory region;
+
+- a write to the other memory region smashes the stack extension.
+
+To protect against this security threat, the kernel maps a "guard-page"
+below the start of the stack: one or more PROT_NONE pages (or unmappable
+pages) that:
+
+- raise a page-fault exception if accessed (before the stack-pointer can
+  move from the stack into another memory region);
+
+- terminate the process with a SIGSEGV (because the page-fault handler
+  cannot expand the stack if another memory region is mapped directly
+  below).
+
+Unfortunately, a stack guard-page of a few kilobytes is insufficient
+(CVE-2017-1000364): if the stack-pointer "jumps" over the guard-page --
+if it moves from the stack into another memory region without accessing
+the guard-page -- then no page-fault exception is raised and the stack
+extends into the other memory region.
+
+This theoretical vulnerability was first described in Gael Delalleau's
+2005 presentation (slides 24-29). In the present advisory, we discuss
+its practicalities, and multiple vulnerabilities in stack guard-page
+implementations (in OpenBSD, NetBSD, and FreeBSD), but we exclude
+related vulnerabilities such as unbounded alloca()s and VLAs
+(Variable-Length Arrays) that have been exploited in the past:
+
+http://phrack.org/issues/63/14.html
+http://blog.exodusintel.com/2013/01/07/who-was-phone/
+
+========================================================================
+II.3. Stack-clash exploitation
+========================================================================
+
+    Must be a clash, there's no alternative.
+                              --The Clash, "Kingston Advice"
+
+Our exploits follow a series of four sequential steps -- each step
+allocates memory that must not be freed before all steps are complete:
+
+Step 1: Clash (the stack with another memory region)
+Step 2: Run (move the stack-pointer to the start of the stack)
+Step 3: Jump (over the stack guard-page, into the other memory region)
+Step 4: Smash (the stack, or the other memory region)
+
+========================================================================
+II.3.1. Step 1: Clash the stack with another memory region
+========================================================================
+
+    Have the boys found the leak yet?
+                              --The Clash, "The Leader"
+
+Allocate memory until the start of the stack reaches the end of another
+memory region, or until the end of another memory region reaches the
+start of the stack.
+
+- The other memory region can be, for example:
+  . the heap;
+  . an anonymous mmap();
+  . the read-write segment of ld.so;
+  . the read-write segment of a PIE, a Position-Independent Executable.
+
+- The memory allocated in this Step 1 can be, for example:
+  . stack and heap memory;
+  . stack and anonymous mmap() memory;
+  . stack memory only.
+
+- The heap and anonymous mmap() memory can be:
+
+  . temporarily allocated, but not freed before the stack guard-page is
+    jumped over in Step 3 and memory is smashed in Step 4;
+
+  . permanently leaked. On Linux, a general method for allocating
+    anonymous mmap()s is the LD_AUDIT memory leak that we discovered in
+    the ld.so part of the glibc, the GNU C Library (CVE-2017-1000366).
+
+- The stack memory can be allocated, for example:
+
+  . through megabytes of command-line arguments and environment
+    variables.
+
+    On Linux, this general method for allocating stack memory is limited
+    by the kernel to 1/4 of the current RLIMIT_STACK (1GB on i386 if
+    RLIMIT_STACK is RLIM_INFINITY -- man execve, "Limits on size of
+    arguments and environment").
+
+    However, as we were drafting this advisory, we realized that the
+    kernel imposes this limit on the argument and environment strings,
+    but not on the argv[] and envp[] pointers to these strings, and we
+    developed alternative versions of our Linux exploits that do not
+    depend on application-specific memory leaks (CVE-2017-1000365).
+
+  . through recursive function calls.
+
+    On BSD, we discovered a general method for allocating megabytes of
+    stack memory: a vulnerability in qsort() that causes this function
+    to recurse N/4 times, given a pathological input array of N elements
+    (CVE-2017-1000373 in OpenBSD, CVE-2017-1000378 in NetBSD, and
+    CVE-2017-1082 in FreeBSD).
+
+- In a few rare cases, Step 1 is not needed, because another memory
+  region is naturally mapped directly below the stack (for example,
+  ld.so in our Solaris exploit).
+
+========================================================================
+II.3.2. Step 2: Move the stack-pointer to the start of the stack
+========================================================================
+
+    Run, run, run, run, run, don't you know?
+                              --The Clash, "Three Card Trick"
+
+Consume the unused stack memory that separates the stack-pointer from
+the start of the stack. This Step 2 is similar to Step 3 ("Jump over the
+stack guard-page") but is needed because:
+
+- the stack-pointer is usually several kilobytes higher than the start
+  of the stack (functions that allocate a large stack-frame decrease the
+  start address of the stack, but this address is never increased
+  again); moreover:
+
+  . the FreeBSD kernel automatically expands the user-space stack of a
+    process by multiples of 128KB (SGROWSIZ, in vm_map_growstack());
+
+  . the Linux kernel initially expands the user-space stack of a process
+    by 128KB (stack_expand, in setup_arg_pages()).
+
+- in Step 3, the stack-based buffer used to jump over the guard-page:
+
+  . is usually not large enough to simultaneously move the stack-pointer
+    to the start of the stack, and then into another memory region;
+
+  . must not be fully written to (a full write would access the stack
+    guard-page and terminate the process) but the stack memory consumed
+    in this Step 2 can be fully written to (for example, strdupa() can
+    be used in Step 2, but not in Step 3).
+
+The stack memory consumed in this Step 2 can be, for example:
+
+- large stack-frames, alloca()s, or VLAs (which can be detected by
+  grsecurity/PaX's STACKLEAK plugin for GCC,
+  https://grsecurity.net/features.php);
+
+- recursive function calls (which can be detected by GNU cflow,
+  http://www.gnu.org/software/cflow/);
+
+- on Linux, we discovered that the argv[] and envp[] arrays of pointers
+  can be used to consume the 128KB of initial stack expansion, because
+  the kernel allocates these arrays on the stack long after the call to
+  setup_arg_pages(); this general method for completing Step 2 is
+  exploitable locally, but the initial stack expansion poses a major
+  obstacle to the remote exploitation of stack-clashes, as mentioned in
+  IV.1.1.
+
+In a few rare cases, Step 2 is not needed, because the stack-pointer is
+naturally close to the start of the stack (for example, in Exim's main()
+function, the 256KB group_list[] moves the stack-pointer to the start of
+the stack and beyond).
+
+========================================================================
+II.3.3. Step 3: Jump over the stack guard-page, into another memory
+region
+========================================================================
+
+    You need a little jump of electrical shockers.
+                              --The Clash, "Clash City Rockers"
+
+Move the stack-pointer from the stack and into the memory region that
+clashed with the stack in Step 1, but without accessing the guard-page.
+To complete this Step 3, a large stack-based buffer, alloca(), or VLA is
+needed, and:
+
+- it must be larger than the guard-page;
+
+- it must end in the stack, above the guard-page;
+
+- it must start in the memory region below the stack guard-page;
+
+- it must not be fully written to (a full write would access the
+  guard-page, raise a page-fault exception, and terminate the process,
+  because the memory region mapped directly below the stack prevents the
+  page-fault handler from expanding the stack).
+
+In a few cases, Step 3 is not needed:
+
+- on FreeBSD, a stack guard-page is implemented but disabled by default
+  (CVE-2017-1083);
+
+- on OpenBSD, NetBSD, and FreeBSD, we discovered implementation
+  vulnerabilities that eliminate the stack guard-page (CVE-2017-1000372,
+  CVE-2017-1000374, CVE-2017-1084).
+
+On Linux, we devised general methods for jumping over the stack
+guard-page (CVE-2017-1000366):
+
+- The glibc's __dcigettext() function alloca()tes single_locale, a
+  stack-based buffer of up to 128KB (MAX_ARG_STRLEN, man execve), the
+  length of the LANGUAGE environment variable (if the current locale is
+  neither "C" nor "POSIX", but distributions install default locales
+  such as "C.UTF-8" and "en_US.utf8").
+
+  If LANGUAGE is mostly composed of ':' characters, then single_locale
+  is barely written to, and can be used to jump over the stack
+  guard-page.
+
+  Moreover, if __dcigettext() finds the message to be translated, then
+  _nl_find_msg() strdup()licates the OUTPUT_CHARSET environment variable
+  and allows a local attacker to immediately smash the stack and gain
+  control of the instruction pointer (the eip register, on i386), as
+  detailed in Step 4a.
+
+  We exploited this stack-clash against Sudo and su, but most of the
+  SUID (set-user-ID) and SGID (set-group-ID) binaries that call
+  setlocale(LC_ALL, "") and __dcigettext() or its derivatives (the
+  *gettext() functions, the _() convenience macro, the strerror()
+  function) are exploitable.
+
+- The glibc's vfprintf() function (called by the *printf() family of
+  functions) alloca()tes a stack-based work buffer of up to 64KB
+  (__MAX_ALLOCA_CUTOFF) if a width or precision is greater than 1KB
+  (WORK_BUFFER_SIZE).
+
+  If the corresponding format specifier is %s then this work buffer is
+  never written to and can be used to jump over the stack guard-page.
+
+  None of our exploits is based on this method, but it was one of our
+  ideas to exploit Exim remotely, as mentioned in IV.1.1.
+
+- The glibc's getaddrinfo() function calls gaih_inet(), which
+  alloca()tes tmpbuf, a stack-based buffer of up to 64KB
+  (__MAX_ALLOCA_CUTOFF) that may be used to jump over the stack
+  guard-page.
+
+  Moreover, gaih_inet() calls the gethostbyname*() functions, which
+  malloc()ate a heap-based DNS response of up to 64KB (MAXPACKET) that
+  may allow a remote attacker to immediately smash the stack, as
+  detailed in Step 4a.
+
+  None of our exploits is based on this method, but it may be the key to
+  the remote exploitation of stack-clashes.
+
+- The glibc's run-time dynamic linker ld.so alloca()tes llp_tmp, a
+  stack-based copy of the LD_LIBRARY_PATH environment variable. If
+  LD_LIBRARY_PATH contains Dynamic String Tokens (DSTs), they are first
+  expanded: llp_tmp can be larger than 128KB (MAX_ARG_STRLEN) and not
+  fully written to, and can therefore be used to jump over the stack
+  guard-page and smash the memory region mapped directly below, as
+  detailed in Step 4b.
+
+  We exploited this ld.so stack-clash in two data-only attacks that
+  bypass NX (No-eXecute) and ASLR (Address Space Layout Randomization)
+  and obtain a privileged shell through most SUID and SGID binaries on
+  most i386 Linux distributions.
+
+- Several local and remote applications allocate a 256KB stack-based
+  "gid_t buffer[NGROUPS_MAX];" that is not fully written to and can be
+  used to move the stack-pointer to the start of the stack (Step 2) and
+  jump over the guard-page (Step 3). For example, Exim's main() function
+  and older versions of util-linux's su.
+
+  None of our exploits is based on this method, but an experimental
+  version of our Exim exploit unexpectedly gained control of eip after
+  the group_list[] buffer had jumped over the stack guard-page.
+
+========================================================================
+II.3.4. Step 4: Either smash the stack with another memory region (Step
+4a) or smash another memory region with the stack (Step 4b)
+========================================================================
+
+    Smash and grab, it's that kind of world.
+                              --The Clash, "One Emotion"
+
+In Step 3, a function allocates a large stack-based buffer and jumps
+over the stack guard-page into the memory region mapped directly below;
+in Step 4, before this function returns and jumps back into the stack:
+
+- Step 4a: a write to the memory region mapped below the stack (where
+  esp still points to) effectively smashes the stack. We exploit this
+  general method for completing Step 4 in Exim, Sudo, and su:
+
+  . we overwrite a return-address on the stack and gain control of eip;
+
+  . we return-into-libc (into system() or __libc_dlopen()) to defeat NX;
+
+  . we brute-force ASLR (8 bits of entropy) if CVE-2016-3672 is patched;
+
+  . we bypass SSP (Stack-Smashing Protector) because we overwrite the
+    return-address of a function that is not protected by a stack canary
+    (the memcpy() that smashes the stack usually overwrites its own
+    stack-frame and return-address).
+
+- Step 4b: a write to the stack effectively smashes the memory region
+  mapped below (where esp still points to). This second method for
+  completing Step 4 is application-specific (it depends on the contents
+  of the memory region that we smash) unless we exploit the run-time
+  dynamic linker ld.so:
+
+  . on Solaris, we devised a general method for smashing ld.so's
+    read-write segment, overwriting one of its function pointers, and
+    executing our own shell-code;
+
+  . on Linux, we exploited most SUID and SGID binaries through ld.so:
+    our "hwcap" exploit smashes an mmap()ed string, and our ".dynamic"
+    exploit smashes a PIE's read-write segment before it is mprotect()ed
+    read-only by Full RELRO (Full RELocate Read-Only -- GNU_RELRO and
+    BIND_NOW).
+
+
+========================================================================
+III. Solutions
+========================================================================
+
+Based on our research, we recommend that the affected operating systems:
+
+- Increase the size of the stack guard-page to at least 1MB, and allow
+  system administrators to easily modify this value (for example,
+  grsecurity/PaX introduced /proc/sys/vm/heap_stack_gap in 2010).
+
+  This first, short-term solution is cheap, but it can be defeated by a
+  very large stack-based buffer.
+
+- Recompile all userland code (ld.so, libraries, binaries) with GCC's
+  "-fstack-check" option, which prevents the stack-pointer from moving
+  into another memory region without accessing the stack guard-page (it
+  writes one word to every 4KB page allocated on the stack).
+
+  This second, long-term solution is expensive, but it cannot be
+  defeated (even if the stack guard-page is only 4KB, one page) --
+  unless a vulnerability is discovered in the implementation of the
+  stack guard-page or the "-fstack-check" option.
+
+
+========================================================================
+IV. Results
+========================================================================
+
+========================================================================
+IV.1. Linux
+========================================================================
+
+========================================================================
+IV.1.1. Exim
+========================================================================
+
+Debian 8.5
+
+Crude exploitation
+
+Our first exploit, a Local Privilege Escalation against Exim's SUID-root
+PIE (Position-Independent Executable) on i386 Debian 8.5, simply follows
+the four sequential steps outlined in II.3.
+
+Step 1: Clash the stack with the heap
+
+To reach the start of the stack with the end of the heap (man brk), we
+permanently leak memory through multiple -p command-line arguments that
+are malloc()ated by Exim but never free()d (CVE-2017-1000369) -- we call
+such a malloc()ated chunk of heap memory a "memleak-chunk".
+
+Because the -p argument strings are originally allocated on the stack by
+execve(), we must cover half of the initial heap-stack distance (between
+the start of the heap and the end of the stack) with stack memory, and
+half of this distance with heap memory.
+
+If we set the RLIMIT_STACK to 136MB (MIN_GAP, arch/x86/mm/mmap.c) then
+the initial heap-stack distance is minimal (randomized in a [96MB,137MB]
+range), but we cannot reach the stack with the heap because of the 1/4
+limit imposed by the kernel on the argument and environment strings (man
+execve): 136MB/4=34MB of -p argument strings cannot cover 96MB/2=48MB,
+half of the minimum heap-stack distance.
+
+Moreover, if we increase the RLIMIT_STACK, the initial heap-stack
+distance also increases and we still cannot reach the stack with the
+heap. However, if we set the RLIMIT_STACK to RLIM_INFINITY (4GB on i386)
+then the kernel switches from the default top-down mmap() layout to a
+legacy bottom-up mmap() layout, and:
+
+- the initial heap-stack distance is approximately 2GB, because the
+  start of the heap (the initial brk()) is randomized above the address
+  0x40000000, and the end of the stack is randomized below the address
+  0xC0000000;
+
+- we can reach the stack with the heap, despite the 1/4 limit imposed by
+  the kernel on the argument and environment strings, because 4GB/4=1GB
+  of -p argument strings can cover 2GB/2=1GB, half of the initial
+  heap-stack distance;
+
+- we clash the stack with the heap around the address 0x80000000.
+
+Step 2: Move the stack-pointer (esp) to the start of the stack
+
+The 256KB stack-based group_list[] in Exim's main() naturally consumes
+the 128KB of initial stack expansion, as mentioned in II.3.2.
+
+Step 3: Jump over the stack guard-page and into the heap
+
+To move esp from the start of the stack into the heap, without accessing
+the stack guard-page, we use a malformed -d command-line argument that
+is written to the 32KB (STRING_SPRINTF_BUFFER_SIZE) stack-based buffer
+in Exim's string_sprintf() function. This buffer is not fully written to
+and hence does not access the stack guard-page, because our -d argument
+string is much shorter than 32KB.
+
+Step 4a: Smash the stack with the heap
+
+Before string_sprintf() returns (and moves esp from the heap back into
+the stack) it calls string_copy(), which malloc()ates and memcpy()es our
+-d argument string to the end of the heap, where esp still points to --
+we call this malloc()ated chunk of heap memory the "smashing-chunk".
+
+This call to memcpy() therefore smashes its own stack-frame (which is
+not protected by SSP) with the contents of our smashing-chunk, and we
+overwrite memcpy()'s return-address with the address of libc's system()
+function (which is not randomized by ASLR because Debian 8.5 is
+vulnerable to CVE-2016-3672):
+
+- instead of smashing memcpy()'s stack-frame with an 8-byte pattern (the
+  return-address to system() and its argument) we smash it with a simple
+  4-byte pattern (the return-address to system()), append "." to the
+  PATH environment variable, and symlink() our exploit to the string
+  that begins at the address of libc's system() function;
+
+- system() does not drop our escalated root privileges, because Debian's
+  /bin/sh is dash, not bash and its -p option (man bash).
+
+This first version of our Exim exploit obtained a root-shell after
+nearly a week of failed attempts; to improve this result, we analyzed
+every step of a successful run.
+
+Refined exploitation
+
+Step 1: Clash the stack with the heap
+
++ The heap must be able to reach the stack [Condition 1]
+
+The start of the heap is randomized in the 32MB range above the end of
+Exim's PIE (the end of its .bss section), but the growth of the heap is
+sometimes blocked by libraries that are mmap()ed within the same range
+(because of the legacy bottom-up mmap() layout). On Debian 8.5, Exim's
+libraries occupy about 8MB and thus block the growth of the heap with a
+probability of 8MB/32MB = 1/4.
+
+When the heap is blocked by the libraries, malloc() switches from brk()
+to mmap()s of 1MB (MMAP_AS_MORECORE_SIZE), and our memory leak reaches
+the stack with mmap()s instead of the heap. Such a stack-clash is also
+exploitable, but its probability of success is low, as detailed in
+IV.1.6., and we therefore discarded this approach.
+
++ The heap must always reach the stack, when not blocked by libraries
+
+Because the initial heap-stack distance (between the start of the heap
+and the end of the stack) is a random variable:
+
+- either we allocate the exact amount of heap memory to cover the mean
+  heap-stack distance, but the probability of success of this approach
+  is low and we therefore discarded it;
+
+- or we allocate enough heap memory to always reach the stack, even when
+  the initial heap-stack distance is maximal; after the heap reaches the
+  stack, our memory leak allocates mmap()s of 1MB above the stack (below
+  0xC0000000) and below the heap (above the libraries), but it must not
+  exhaust the address-space (the 1GB below 0x40000000 is unmappable);
+
+- the final heap-stack distance (between the end of the heap and the
+  start of the stack) is also a random variable:
+
+  . its minimum value is 8KB (the stack guard-page, plus a safety page
+    imposed by the brk() system-call in mm/mmap.c);
+
+  . its maximum value is roughly the size of a memleak-chunk, plus 128KB
+    (DEFAULT_TOP_PAD, malloc/malloc.c).
+
+Step 3: Jump over the stack guard-page and into the heap
+
+- The stack-pointer must jump over the guard-page and land into the free
+  chunk at the end of the heap (the remainder of the heap after malloc()
+  switches from brk() to mmap()), where both the smashing-chunk and
+  memcpy()'s stack-frame are allocated and overwritten in Step 4a
+  [Condition 2];
+
+- The write (of approximately smashing-chunk bytes) to
+  string_sprintf()'s stack-based buffer (which starts where the
+  guard-page jump lands) must not crash into the end of the heap
+  [Condition 3].
+
+Step 4a: Smash the stack with the heap
+
+The smashing-chunk must be allocated into the free chunk at the end of
+the heap:
+
+- the smashing-chunk must not be allocated into the free chunks left
+  over at the end of the 1MB mmap()s [Condition 4];
+
+- the memleak-chunks must not be allocated into the free chunk at the
+  end of the heap [Condition 5].
+
+Intuitively, the probability of gaining control of eip depends on the
+size of the smashing-chunk (the guard-page jump's landing-zone) and the
+size of the memleak-chunks (which determines the final heap-stack
+distance).
+
+To maximize this probability, we wrote a helper program that imposes the
+following conditions on the smashing-chunk and memleak-chunks:
+
+- the smashing-chunk must be smaller than 32KB
+  (STRING_SPRINTF_BUFFER_SIZE) [Condition 3];
+
+- the memleak-chunks must be smaller than 128KB (DEFAULT_MMAP_THRESHOLD,
+  malloc/malloc.c);
+
+- the free chunk at the end of the heap must be larger than twice the
+  smashing-chunk size [Conditions 2 and 3];
+
+- the free chunk at the end of the heap must be smaller than the
+  memleak-chunk size [Condition 5];
+
+- when the final heap-stack distance is minimal, the 32KB
+  (STRING_SPRINTF_BUFFER_SIZE) guard-page jump must land below the free
+  chunk at the end of the heap [Condition 2];
+
+- the free chunks at the end of the 1MB mmap()s must be:
+
+  . either smaller than the smashing-chunk [Condition 4];
+
+  . or larger than the free chunk at the end of the heap (glibc's
+    malloc() is a best-fit allocator) [Condition 4].
+
+The resulting smashing-chunk and memleak-chunk sizes are:
+
+smash: 10224    memleak: 27656  brk_min: 20464  brk_max: 24552  mmap_top: 25304
+probability: 1/16 (0.06190487817)
+
+In theory, the probability of gaining control of eip is 1/21: the
+product of the 1/16 probability calculated by this helper program
+(approximately (smashing-chunk / (memleak-chunk + DEFAULT_TOP_PAD))) and
+the 3/4 probability of reaching the stack with the heap [Condition 1].
+
+In practice, on Debian 8.5, our final Exim exploit:
+
+- gains eip control in 1 run out of 28, on average;
+
+- takes 2.5 seconds per run (on a 4GB Virtual Machine);
+
+- has a good chance of obtaining a root-shell after 28*2.5 = 70 seconds;
+
+- uses 4GB of memory (2GB in the Exim process, and 2GB in the process
+  fork()ed by system()).
+
+Debian 8.6
+
+Unlike Debian 8.5, Debian 8.6 is not vulnerable to CVE-2016-3672: after
+gaining eip control in Step 4a (Smash), the probability of successfully
+returning-into-libc's system() function is 1/256 (8 bits of entropy --
+libraries are randomized in a 1MB range but aligned on 4KB).
+
+Consequently, our final Exim exploit has a good chance of obtaining a
+root-shell on Debian 8.6 after 256*28*2.5 seconds = 5 hours (256*28=7168
+runs).
+
+As we were drafting this advisory, we tried an alternative approach
+against Exim on Debian 8.6: we discovered that its stack is executable,
+because it depends on libgnutls-deb0, which depends on libp11-kit, which
+depends on libffi, which incorrectly requires an executable GNU_STACK
+(CVE-2017-1000376).
+
+Initially, we discarded this approach because our 1GB of -p argument
+strings on the stack is not executable (_dl_make_stack_executable() only
+mprotect()s the stack below argv[] and envp[]):
+
+41e00000-723d7000 rw-p 00000000 00:00 0          [heap]
+802f1000-80334000 rwxp 00000000 00:00 0          [stack]
+80334000-bfce6000 rw-p 00000000 00:00 0
+
+and because the stack is randomized in an 8MB range but we do not
+control the contents of any large buffer on the executable stack.
+
+Later, we discovered that two 128KB (MAX_ARG_STRLEN) copies of the
+LD_PRELOAD environment variable can be allocated onto the executable
+stack by ld.so's dl_main() and open_path() functions, automatically
+freed upon return from these functions, and re-allocated (but not
+overwritten) by Exim's 256KB stack-based group_list[].
+
+In theory, the probability of returning into our shell-code (into these
+executable copies of LD_PRELOAD) is 1/32 (2*128KB/8MB), higher than the
+1/256 probability of returning-into-libc. In practice, this alternative
+Exim exploit has a good chance of obtaining a root-shell after 1174 runs
+-- instead of 32*28=896 runs in theory, because the two 128KB copies of
+LD_PRELOAD are never perfectly aligned with Exim's 256KB group_list[] --
+or 1174*2.5 seconds = 50 minutes.
+
+Debian 9 and 10
+
+Unlike Debian 8, Debian 9 and 10 are not vulnerable to offset2lib, a
+minor weakness in Linux's ASLR that coincidentally affects Step 1
+(Clash) of our stack-clash exploits:
+
+https://cybersecurity.upv.es/attacks/offset2lib/offset2lib.html
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=d1fd836dcf00d2028c700c7e44d2c23404062c90
+
+If we set RLIMIT_STACK to RLIM_INFINITY, the kernel still switches to
+the legacy bottom-up mmap() layout, and the libraries are randomized in
+the 1MB range above the address 0x40000000, but Exim's PIE is randomized
+in the 1MB range above the address 0x80000000 and the heap is randomized
+in the 32MB range above the PIE's .bss section. As a result:
+
+- the heap is always able to reach the stack, because its growth is
+  never blocked by the libraries -- the theoretical probability of
+  gaining eip control is 1/16, the probability calculated by our helper
+  program;
+
+- the heap clashes with the stack around the address 0xA0000000, because
+  the initial heap-stack distance is 1GB (0xC0000000-0x80000000) and can
+  be covered with 512MB of heap memory and 512MB of stack memory.
+
+Remote exploitation
+
+Exim's string_sprintf() or glibc's vfprintf() can be used to remotely
+complete Steps 3 and 4 of the stack-clash; and the 256KB group_list[] in
+Exim's main() naturally consumes the 128KB of initial stack expansion in
+Step 2; but another 256KB group_list[] in Exim's exim_setugid() further
+decreases the start address of the stack and prevents us from remotely
+completing Step 2 and exploiting Exim.
+
+========================================================================
+IV.1.2. Sudo
+========================================================================
+
+Introduction
+
+We discovered a vulnerability in Sudo's get_process_ttyname() for Linux:
+this function opens "/proc/[pid]/stat" (man proc) and reads the device
+number of the tty from field 7 (tty_nr). Unfortunately, these fields are
+space-separated and field 2 (comm, the filename of the command) can
+contain spaces (CVE-2017-1000367).
+
+For example, if we execute Sudo through the symlink "./     1 ",
+get_process_ttyname() calls sudo_ttyname_dev() to search for the
+non-existent tty device number "1" in the built-in search_devs[].
+
+Next, sudo_ttyname_dev() calls the recursive function
+sudo_ttyname_scan() to search for this non-existent tty device number
+"1" in a breadth-first traversal of "/dev".
+
+Last, we exploit this recursive function during its traversal of the
+world-writable "/dev/shm", and allocate hundreds of megabytes of heap
+memory from the filesystem (directory pathnames) instead of the stack
+(the command-line arguments and environment variables allocated by our
+other stack-clash exploits).
+
+Step 1: Clash the stack with the heap
+
+sudo_ttyname_scan() strdup()licates the pathnames of the directories and
+sub-directories that it traverses, but does not free() them until it
+returns. Each one of these "memleak-chunks" allocates at most 4KB
+(PATH_MAX) of heap memory.
+
+Step 2: Move the stack-pointer to the start of the stack
+
+The recursive calls to sudo_ttyname_scan() allocate 4KB (PATH_MAX)
+stack-frames that naturally consume the 128KB of initial stack
+expansion.
+
+Step 3: Jump over the stack guard-page and into the heap
+
+If the length of a directory pathname reaches 4KB (PATH_MAX),
+sudo_ttyname_scan() calls warning(), which calls strerror() and _(),
+which call gettext() and allow us to jump over the stack guard-page with
+an alloca() of up to 128KB (the LANGUAGE environment variable), as
+explained in II.3.3.
+
+Step 4a: Smash the stack with the heap
+
+The self-contained gettext() exploitation method malloc()ates and
+memcpy()es a "smashing-chunk" of up to 128KB (the OUTPUT_CHARSET
+environment variable) that smashes memcpy()'s stack-frame and
+return-address, as explained in II.3.4.
+
+Debian 8.5
+
+Step 1: Clash the stack with the heap
+
+Debian 8.5 is vulnerable to CVE-2016-3672: if we set RLIMIT_STACK to
+RLIM_INFINITY, the kernel switches to the legacy bottom-up mmap() layout
+and disables the ASLR of Sudo's PIE and libraries, but still the initial
+heap-stack distance is randomized and roughly 2GB (0xC0000000-0x40000000
+-- the start of the heap is randomized in a 32MB range above 0x40000000,
+and the end of the stack is randomized in the 8MB range below
+0xC0000000).
+
+To reach the start of the stack with the end of the heap, we allocate
+hundreds of megabytes of heap memory from the filesystem (directory
+pathnames), and:
+
+- the heap must be able to reach the stack -- on Debian 8.5, Sudo's
+  libraries occupy about 3MB and hence block the growth of the heap with
+  a probability of 3MB/32MB ~= 1/11;
+
+- when not blocked by the libraries, the heap must always reach the
+  stack, even when the initial heap-stack distance is maximal (as
+  detailed in IV.1.1.);
+
+- we cover half of the initial heap-stack distance with 1GB of heap
+  memory (the memleak-chunks, strdup()licated directory pathnames);
+
+- we cover the other half of this distance with 1GB of stack memory (the
+  maximum permitted by the kernel's 1/4 limit on the argument and
+  environment strings) and thus reduce our on-disk inode usage;
+
+- we redirect sudo_ttyname_scan()'s traversal of /dev to /var/tmp
+  (through a symlink planted in /dev/shm) to work around the small
+  number of inodes available in /dev/shm.
+
+After the heap reaches the stack and malloc() switches from brk() to
+mmap()s of 1MB:
+
+- the size of the free chunk left over at the end of the heap is a
+  random variable in the [0B,4KB] range -- 4KB (PATH_MAX) is the
+  approximate size of a memleak-chunk;
+
+- the final heap-stack distance (between the end of the heap and the
+  start of the stack) is a random variable in the [8KB,4KB+128KB=132KB]
+  range -- the size of a memleak-chunk plus 128KB (DEFAULT_TOP_PAD);
+
+- sudo_ttyname_scan() recurses a few more times and therefore allocates
+  more stack memory, but this stack expansion is blocked by the heap and
+  crashes into the stack guard-page after 16 recursions on average
+  (132KB/4KB/2, where 132KB is the maximum final heap-stack distance,
+  and 4KB is the size of sudo_ttyname_scan()'s stack-frame).
+
+To solve this unexpected problem, we:
+
+- first, redirect sudo_ttyname_scan() to a directory tree "A" in
+  /var/tmp that recurses and allocates stack memory, but does not
+  allocate heap memory (each directory level contains only one entry,
+  the sub-directory that is connected to the next directory level);
+
+- second, redirect sudo_ttyname_scan() to a directory tree "B" in
+  /var/tmp that recurses and allocates heap memory (each directory level
+  contains many entries), but does not allocate more stack memory (it
+  simply consumes the stack memory that was already allocated by the
+  directory tree "A"): it does not further expand the stack, and does
+  not crash into the guard-page.
+
+Finally, we increase the speed of our exploit and avoid thousands of
+useless recursions:
+
+- in each directory level traversed by sudo_ttyname_scan(), we randomly
+  modify the names of its sub-directories until the first call to
+  readdir() returns the only sub-directory that is connected to the next
+  level of the directory tree (all other sub-directories allocate heap
+  memory but are otherwise empty);
+
+- we dup2() Sudo's stdout and stderr to a pipe with no readers that
+  terminates Sudo with a SIGPIPE if sudo_ttyname_scan() calls warning()
+  and sudo_printf() (a failed exploit attempt, usually because the final
+  heap-stack distance is much longer or shorter than the guard-page
+  jump).
+
+Step 2: Move the stack-pointer to the start of the stack
+
+sudo_ttyname_scan() allocates a 4KB (PATH_MAX) stack-based pathbuf[]
+that naturally consumes the 128KB of initial stack expansion in fewer
+than 128KB/4KB=32 recursive calls.
+
+The recursive calls to sudo_ttyname_scan() allocate less than 8MB of
+stack memory: the maximum number of recursions (PATH_MAX / strlen("/a")
+= 2K) multiplied by the size of sudo_ttyname_scan()'s stack-frame (4KB).
+
+Step 3: Jump over the stack guard-page and into the heap
+
+The length of the guard-page jump in gettext() is the length of the
+LANGUAGE environment variable (at most 128KB, MAX_ARG_STRLEN): we take a
+64KB jump, well within the range of the final heap-stack distance; this
+jump then lands into the free chunk at the end of the heap, where the
+smashing-chunk will be allocated in Step 4a, with a probability of
+(smashing-chunk / (memleak-chunk + DEFAULT_TOP_PAD)).
+
+If available, we assign "C.UTF-8" to the LC_ALL environment variable,
+and prepend "be" to our 64KB LANGUAGE environment variable, because
+these minimal locales do not interfere with our heap feng-shui.
+
+Step 4a: Smash the stack with the heap
+
+In gettext(), the smashing-chunk (a malloc() and memcpy() of the
+OUTPUT_CHARSET environment variable) must be allocated into the free
+chunk at the end of the heap, where the stack-frame of memcpy() is also
+allocated.
+
+First, if the size of our memleak-chunks is exactly 4KB+8B
+(PATH_MAX+MALLOC_ALIGNMENT), then:
+
+- the size of the free chunk at the end of the heap is a random variable
+  in the [0B,4KB] range;
+
+- the size of the free chunks left over at the end of the 1MB mmap()s is
+  roughly 1MB%(4KB+8B)=2KB.
+
+Second, if the size of our smashing-chunk is about 2KB+256B
+(PATH_MAX/2+NAME_MAX), then:
+
+- it is always larger than (and never allocated into) the free chunks at
+  the end of the 1MB mmap()s;
+
+- it is smaller than (and allocated into) the free chunk at the end of
+  the heap with a probability of roughly 1-(2KB+256B)/4KB.
+
+Last, in each level of our directory tree "B", sudo_ttyname_scan()
+malloc()ates and realloc()ates an array of pointers to sub-directories,
+but these realloc()s prevent the smashing-chunk from being allocated
+into the free chunk at the end of the heap:
+
+- they create holes in the heap, where the smashing-chunk may be
+  allocated to;
+
+- they may allocate the free chunk at the end of the heap, where the
+  smashing-chunk should be allocated to.
+
+To solve these problems, we carefully calculate the number of
+sub-directories in each level of our directory tree "B":
+
+- we limit the size of the realloc()s -- and hence the size of the holes
+  that they create -- to 4KB+2KB:
+
+  . either a memleak-chunk is allocated into such a hole, and the
+    remainder is smaller than the smashing-chunk ("not a fit");
+
+  . or such a hole is not allocated, but it is larger than the largest
+    free chunk at the end of the heap ("a worse fit");
+
+- we gradually reduce the final size of the realloc()s in the last
+  levels of our directory tree "B", and hence re-allocate the holes
+  created in the previous levels.
+
+In theory, on Debian 8.5, the probability of gaining control of eip is
+approximately 1/148, the product of:
+
+- (Step 1) the probability of reaching the stack with the heap:
+  1-3MB/32MB;
+
+- (Step 3) the probability of jumping over the stack guard-page and into
+  the free chunk at the end of the heap: (2KB+256B) / (4KB+8B + 128KB);
+
+- (Step 4a) the probability of allocating the smashing-chunk into the
+  free chunk at the end of the heap: 1-(2KB+256B)/4KB.
+
+In practice, on Debian 8.5, this Sudo exploit:
+
+- gains eip control in 1 run out of 200, on average;
+
+- takes 2.8 seconds per run (on a 4GB Virtual Machine);
+
+- has a good chance of obtaining a root-shell after 200 * 2.8 seconds =
+  9 minutes;
+
+- uses 2GB of memory.
+
+Note: we do not return-into-libc's system() in Step 4a because /bin/sh
+may be bash, which drops our escalated root privileges upon execution.
+Instead, we:
+
+- either return-into-libc's __gconv_find_shlib() function through
+  find_module(), which loads this function's argument from -0x20(%ebp);
+
+- or return-into-libc's __libc_dlopen_mode() function through
+  nss_load_library(), which loads this function's argument from
+  -0x1c(%ebp);
+
+- search the libc for a relative pathname that contains a slash
+  character (for example, "./fork.c") and pass its address to
+  __gconv_find_shlib() or __libc_dlopen_mode();
+
+- symlink() our PIE exploit to this pathname, and let Sudo execute our
+  _init() constructor as root, upon successful exploitation.
+
+Debian 8.6
+
+Unlike Debian 8.5, Debian 8.6 is not vulnerable to CVE-2016-3672: Sudo's
+PIE and libraries are always randomized, even if we set RLIMIT_STACK to
+RLIM_INFINITY; the probability of successfully returning-into-libc,
+after gaining eip control in Step 4a (Smash), is 1/256.
+
+However, Debian 8.6 is still vulnerable to offset2lib, the minor
+weakness in Linux's ASLR that coincidentally affects Step 1 (Clash) of
+our stack-clash exploits:
+
+- if we set RLIMIT_STACK to 136MB (MIN_GAP) or less (the default is
+  8MB), then the initial heap-stack distance (between the start of the
+  heap and the end of the stack) is minimal, a random variable in the
+  [96MB,137MB] range;
+
+- instead of allocating 1GB of heap memory and 1GB of stack memory to
+  clash the stack with the heap, we merely allocate 137MB of heap memory
+  (directory pathnames from our directory tree "B") and no stack memory.
+
+In theory, on Debian 8.6, the probability of gaining eip control is
+1/134 (instead of 1/148 on Debian 8.5) because the growth of the heap is
+never blocked by Sudo's libraries; and in practice, this Sudo exploit
+takes only 0.15 second per run (instead of 2.8 on Debian 8.5).
+
+Independent exploitation
+
+The vulnerability that we discovered in Sudo's get_process_ttyname()
+function for Linux (CVE-2017-1000367) is exploitable independently of
+its stack-clash repercussions: through this vulnerability, a local user
+can pretend that his tty is any character device on the filesystem, and
+after two race conditions, he can pretend that his tty is any file on
+the filesystem.
+
+On an SELinux-enabled system, if a user is Sudoer for a command that
+does not grant him full root privileges, he can overwrite any file on
+the filesystem (including root-owned files) with this command's output,
+because relabel_tty() (in src/selinux.c) calls open(O_RDWR|O_NONBLOCK)
+on his tty and dup2()s it to the command's stdin, stdout, and stderr.
+
+To exploit this vulnerability, we:
+
+- create a directory "/dev/shm/_tmp" (to work around
+  /proc/sys/fs/protected_symlinks), and a symlink "/dev/shm/_tmp/_tty"
+  to a non-existent pty "/dev/pts/57", whose device number is 34873;
+
+- run Sudo through a symlink "/dev/shm/_tmp/     34873 " that spoofs the
+  device number of this non-existent pty;
+
+- set the flag CD_RBAC_ENABLED through the command-line option "-r role"
+  (where "role" can be our current role, for example "unconfined_r");
+
+- monitor our directory "/dev/shm/_tmp" (for an IN_OPEN inotify event)
+  and wait until Sudo opendir()s it (because sudo_ttyname_dev() cannot
+  find our non-existent pty in "/dev/pts/");
+
+- SIGSTOP Sudo, call openpty() until it creates our non-existent pty,
+  and SIGCONT Sudo;
+
+- monitor our directory "/dev/shm/_tmp" (for an IN_CLOSE_NOWRITE inotify
+  event) and wait until Sudo closedir()s it;
+
+- SIGSTOP Sudo, replace the symlink "/dev/shm/_tmp/_tty" to our
+  now-existent pty with a symlink to the file that we want to overwrite
+  (for example "/etc/passwd"), and SIGCONT Sudo;
+
+- control the output of the command executed by Sudo (the output that
+  overwrites "/etc/passwd"):
+
+  . either through a command-specific method;
+
+  . or through a general method such as "--\nHELLO\nWORLD\n" (by
+    default, getopt() prints an error message to stderr if it does not
+    recognize an option character).
+
+To reliably win the two SIGSTOP races, we preempt the Sudo process: we
+setpriority() it to the lowest priority, sched_setscheduler() it to
+SCHED_IDLE, and sched_setaffinity() it to the same CPU as our exploit.
+
+[john@...alhost ~]$ head -n 8 /etc/passwd
+root:x:0:0:root:/root:/bin/bash
+bin:x:1:1:bin:/bin:/sbin/nologin
+daemon:x:2:2:daemon:/sbin:/sbin/nologin
+adm:x:3:4:adm:/var/adm:/sbin/nologin
+lp:x:4:7:lp:/var/spool/lpd:/sbin/nologin
+sync:x:5:0:sync:/sbin:/bin/sync
+shutdown:x:6:0:shutdown:/sbin:/sbin/shutdown
+halt:x:7:0:halt:/sbin:/sbin/halt
+
+[john@...alhost ~]$ sudo -l
+[sudo] password for john:
+...
+User john may run the following commands on localhost:
+    (ALL) /usr/bin/sum
+
+[john@...alhost ~]$ ./Linux_sudo_CVE-2017-1000367 /usr/bin/sum $'--\nHELLO\nWORLD\n'
+[sudo] password for john:
+
+[john@...alhost ~]$ head -n 8 /etc/passwd
+/usr/bin/sum: unrecognized option '--
+HELLO
+WORLD
+'
+Try '/usr/bin/sum --help' for more information.
+ogin
+adm:x:3:4:adm:/var/adm:/sbin/nologin
+lp:x:4:7:lp:/var/spool/lpd:/sbin/nologin
+
+========================================================================
+IV.1.3. ld.so "hwcap" exploit
+========================================================================
+
+"ld.so and ld-linux.so* find and load the shared libraries needed by a
+program, prepare the program to run, and then run it." (man ld.so)
+
+Through ld.so, most SUID and SGID binaries on most i386 Linux
+distributions are exploitable. For example: Debian 7, 8, 9, 10; Fedora
+23, 24, 25; CentOS 5, 6, 7.
+
+Debian 8.5
+
+Step 1: Clash the stack with anonymous mmap()s
+
+The minimal malloc() implementation in ld.so calls mmap(), not brk(), to
+obtain memory from the system, and it never calls munmap(). To reach the
+start of the stack with anonymous mmap()s, we:
+
+- set RLIMIT_STACK to RLIM_INFINITY and switch from the default top-down
+  mmap() layout to the legacy bottom-up mmap() layout;
+
+- cover half of the initial mmap-stack distance
+  (0xC0000000-0x40000000=2GB) with 1GB of stack memory (the maximum
+  permitted by the kernel's 1/4 limit on the argument and environment
+  strings);
+
+- cover the other half of this distance with 1GB of anonymous mmap()s,
+  through multiple LD_AUDIT environment variables that permanently leak
+  millions of audit_list structures (CVE-2017-1000366) in
+  process_envvars() and process_dl_audit() (elf/rtld.c).
+
+Step 2: Move the stack-pointer to the start of the stack
+
+To consume the 128KB of initial stack expansion, we simply pass 128KB of
+argv[] and envp[] pointers to execve(), as explained in II.3.2.
+
+Step 3: Jump over the stack guard-page and into the anonymous mmap()s
+
+_dl_init_paths() (elf/dl-load.c), which is called by dl_main() after
+process_envvars(), alloca()tes llp_tmp, a stack-based buffer large
+enough to hold the LD_LIBRARY_PATH environment variable and any
+combination of Dynamic String Token (DST) replacement strings. To
+calculate the size of llp_tmp, _dl_init_paths() must:
+
+- first, scan LD_LIBRARY_PATH and count all DSTs ($LIB, $PLATFORM, and
+  $ORIGIN);
+
+- second, multiply the number of DSTs by the length of the longest DST
+  replacement string (on Debian, $LIB is replaced by the 18-char-long
+  "lib/i386-linux-gnu", $PLATFORM by "i386" or "i686", and $ORIGIN by
+  the pathname of the program's directory, for example "/bin" or
+  "/usr/sbin" -- the longest DST replacement string is usually
+  "lib/i386-linux-gnu");
+
+- last, add the length of the original LD_LIBRARY_PATH.
+
+Consequently, if LD_LIBRARY_PATH contains many DSTs that are replaced by
+the shortest DST replacement string, then llp_tmp is large but not fully
+written to, and can be used to jump over the stack guard-page and into
+the anonymous mmap()s.
+
+Our ld.so exploits do not use $ORIGIN because it is ignored by several
+distributions and glibc versions; for example:
+
+2010-12-09  Andreas Schwab  <schwab@...hat.com>
+
+        * elf/dl-object.c (_dl_new_object): Ignore origin of privileged
+        program.
+
+Index: glibc-2.12-2-gc4ccff1/elf/dl-object.c
+===================================================================
+--- glibc-2.12-2-gc4ccff1.orig/elf/dl-object.c
++++ glibc-2.12-2-gc4ccff1/elf/dl-object.c
+@@ -214,6 +214,9 @@ _dl_new_object (char *realname, const ch
+     out:
+       new->l_origin = origin;
+     }
++  else if (INTUSE(__libc_enable_secure) && type == lt_executable)
++    /* The origin of a privileged program cannot be trusted.  */
++    new->l_origin = (char *) -1;
+
+   return new;
+ }
+
+Step 4b: Smash an anonymous mmap() with the stack
+
+Before _dl_init_paths() returns to dl_main() and jumps back from the
+anonymous mmap()s into the stack, we overwrite the block of mmap()ed
+memory malloc()ated by _dl_important_hwcaps() with the contents of the
+stack-based buffer llp_tmp.
+
+- The block of memory malloc()ated by _dl_important_hwcaps() is divided
+  in two:
+
+  . The first part (the "hwcap-pointers") is an array of r_strlenpair
+    structures that point to the hardware-capability strings stored in
+    the second part of this memory block.
+
+  . The second part (the "hwcap-strings") contains strings of
+    hardware-capabilities that are appended to the pathnames of trusted
+    directories, such as "/lib/" and "/lib/i386-linux-gnu/", when
+    open_path() searches for audit libraries (LD_AUDIT), preload
+    libraries (LD_PRELOAD), or dependent libraries (DT_NEEDED).
+
+    For example, on Debian, when open_path() finds "libc.so.6" in
+    "/lib/i386-linux-gnu/i686/cmov/", "i686/cmov/" is such a
+    hardware-capability string.
+
+- To overwrite the block of memory malloc()ated by
+  _dl_important_hwcaps() with the contents of the stack-based buffer
+  llp_tmp, we divide our LD_LIBRARY_PATH environment variable in two:
+
+  . The first, static part (our "good-write") overwrites the first
+    hardware-capability string with characters that we do control.
+
+  . The second, dynamic part (our "bad-write") overwrites the last
+    hardware-capability strings with characters that we do not control
+    (the short DST replacement strings that enlarge llp_tmp and allow us
+    to jump over the stack guard-page).
+
+If our 16-byte-aligned good-write overwrites the 8-byte-aligned first
+hardware-capability string with the 8-byte pattern "/../tmp/", and if we
+append the trusted directory "/lib" to our LD_LIBRARY_PATH, then (after
+_dl_init_paths() returns to dl_main()):
+
+- dlmopen_doit() tries to load an LD_AUDIT library "a" (our memory leak
+  from Step 1);
+
+- _dl_map_object() searches for "a" in the trusted directory "/lib" from
+  our LD_LIBRARY_PATH;
+
+- open_path() finds our library "a" in "/lib//../tmp//../tmp//../tmp/"
+  because we overwrote the first hardware-capability string with the
+  pattern "/../tmp/";
+
+- dl_open_worker() executes our library's _init() constructor, as root.
+
+In theory, this exploit's probability of success depends on:
+
+- (event A) the size of rtld_search_dirs.dirs[0], an array of
+  r_search_path_elem structures that are malloc()ated by
+  _dl_init_paths() after the _dl_important_hwcaps(), and must be
+  allocated above the stack (below 0xC0000000), not below the stack
+  where it would interfere with Steps 3 (Jump) and 4b (Smash):
+
+P(A) = 1 - size of rtld_search_dirs.dirs[0] / max stack randomization
+
+- (event B) the size of the hwcap-pointers and the size of our
+  good-write, which must overwrite the first hardware-capability string,
+  but not the first hardware-capability pointer (to this string):
+
+P(B|A) = MIN(size of hwcap-pointers, size of good-write) /
+          (max stack randomization - size of rtld_search_dirs.dirs[0])
+
+- (event C) the size of the hwcap-strings and the size of our bad-write,
+  which must not write past the end of hwcap-strings; but we guarantee
+  that size of hwcap-strings >= size of good-write + size of bad-write:
+
+P(C|B) = 1
+
+In practice, we use the LD_HWCAP_MASK environment variable to maximize
+this exploit's probability of success, because:
+
+- the size of the hwcap-pointers -- which act as a cushion that absorbs
+  the excess of good-write without crashing,
+
+- the size of the hwcap-strings -- which act as a cushion that absorbs
+  the excess of good-write and bad-write without crashing,
+
+- and the size of rtld_search_dirs.dirs[0],
+
+are all proportional to 2^N, where N is the number of supported
+hardware-capabilities that we enable in LD_HWCAP_MASK.
+
+For example, on Debian 8.5, this exploit:
+
+- has a 1/151 probability of success;
+
+- takes 5.5 seconds per run (on a 4GB Virtual Machine);
+
+- has a good chance of obtaining a root-shell after 151 * 5.5 seconds =
+  14 minutes.
+
+Debian 8.6
+
+Unlike Debian 8.5, Debian 8.6 is not vulnerable to CVE-2016-3672, but
+our ld.so "hwcap" exploit is a data-only attack and is not affected by
+the ASLR of the libraries and PIEs.
+
+Debian 9 and 10
+
+Unlike Debian 8, Debian 9 and 10 are not vulnerable to offset2lib: if we
+set RLIMIT_STACK to RLIM_INFINITY, the libraries are randomized above
+the address 0x40000000, but the PIE is randomized above 0x80000000
+(instead of 0x40000000 before the offset2lib patch).
+
+Unfortunately, we discovered a vulnerability in the offset2lib patch
+(CVE-2017-1000370): if the PIE is execve()d with 1GB of argument or
+environment strings (the maximum permitted by the kernel's 1/4 limit)
+then the stack occupies the address 0x80000000, and the PIE is mapped
+above the address 0x40000000 instead, directly below the libraries.
+This vulnerability effectively nullifies the offset2lib patch, and
+allows us to reuse our Debian 8 exploit against Debian 9 and 10.
+
+$ ./Linux_offset2lib
+Run #1...
+CVE-2017-1000370 triggered
+40076000-40078000 r-xp 00000000 00:26 25041      /tmp/Linux_offset2lib
+40078000-40079000 r--p 00001000 00:26 25041      /tmp/Linux_offset2lib
+40079000-4009b000 rw-p 00002000 00:26 25041      /tmp/Linux_offset2lib
+4009b000-400c0000 r-xp 00000000 fd:00 8463588    /usr/lib/ld-2.24.so
+400c0000-400c1000 r--p 00024000 fd:00 8463588    /usr/lib/ld-2.24.so
+400c1000-400c2000 rw-p 00025000 fd:00 8463588    /usr/lib/ld-2.24.so
+400c2000-400c4000 r--p 00000000 00:00 0          [vvar]
+400c4000-400c6000 r-xp 00000000 00:00 0          [vdso]
+400c6000-400c8000 rw-p 00000000 00:00 0
+400cf000-402a3000 r-xp 00000000 fd:00 8463595    /usr/lib/libc-2.24.so
+402a3000-402a4000 ---p 001d4000 fd:00 8463595    /usr/lib/libc-2.24.so
+402a4000-402a6000 r--p 001d4000 fd:00 8463595    /usr/lib/libc-2.24.so
+402a6000-402a7000 rw-p 001d6000 fd:00 8463595    /usr/lib/libc-2.24.so
+402a7000-402aa000 rw-p 00000000 00:00 0
+7fcf1000-bfcf2000 rw-p 00000000 00:00 0          [stack]
+
+Caveats
+
+- On Fedora and CentOS, this ld.so "hwcap" exploit fails against
+  /usr/bin/passwd and /usr/bin/chage (but it works against all other
+  SUID-root binaries) because of SELinux:
+
+type=AVC msg=audit(1492091008.983:414): avc:  denied  { execute } for  pid=2169 comm="passwd" path="/var/tmp/a" dev="dm-0" ino=12828063 scontext=unconfined_u:unconfined_r:passwd_t:s0-s0:c0.c1023 tcontext=unconfined_u:object_r:user_tmp_t:s0 tclass=file permissive=0
+
+type=AVC msg=audit(1492092997.581:487): avc:  denied  { execute } for  pid=2648 comm="chage" path="/var/tmp/a" dev="dm-0" ino=12828063 scontext=unconfined_u:unconfined_r:passwd_t:s0-s0:c0.c1023 tcontext=unconfined_u:object_r:user_tmp_t:s0 tclass=file permissive=0
+
+- It fails against recent versions of Sudo that specify an RPATH such as
+  "/usr/lib/sudo": _dl_map_object() first searches for our LD_AUDIT
+  library in RPATH, but open_path() fails to find our library in
+  "/usr/lib/sudo//../tmp/" and crashes as soon as it reaches an
+  overwritten hwcap-pointer.
+
+  This problem can be solved by a 16-byte pattern "///../../../tmp/"
+  (instead of the 8-byte pattern "/../tmp/") but the exploit's
+  probability of success would be divided by two.
+
+- On Ubuntu, this ld.so "hwcap" exploit always fails, because of the
+  following patch:
+
+Description: pro-actively disable LD_AUDIT for setuid binaries, regardless
+ of where the libraries are loaded from. This is to try to make sure that
+ CVE-2010-3856 cannot sneak back in. Upstream is unlikely to take this,
+ since it limits the functionality of LD_AUDIT.
+Author: Kees Cook <kees@...ntu.com>
+
+Index: eglibc-2.15/elf/rtld.c
+===================================================================
+--- eglibc-2.15.orig/elf/rtld.c 2012-05-09 10:05:29.456899131 -0700
++++ eglibc-2.15/elf/rtld.c      2012-05-09 10:38:53.952009069 -0700
+@@ -2529,7 +2529,7 @@
+   while ((p = (strsep) (&str, ":")) != NULL)
+     if (p[0] != '\0'
+        && (__builtin_expect (! __libc_enable_secure, 1)
+-           || strchr (p, '/') == NULL))
++       ))
+       {
+        /* This is using the local malloc, not the system malloc.  The
+           memory can never be freed.  */
+
+========================================================================
+IV.1.4. ld.so ".dynamic" exploit
+========================================================================
+
+To exploit ld.so without the LD_AUDIT memory leak, we rely on a second
+vulnerability that we discovered in the offset2lib patch
+(CVE-2017-1000371):
+
+if we set RLIMIT_STACK to RLIM_INFINITY, and allocate nearly 1GB of
+stack memory (the maximum permitted by the kernel's 1/4 limit on the
+argument and environment strings) then the stack grows down to almost
+0x80000000, and because the PIE is mapped above 0x80000000, the minimum
+distance between the end of the PIE's read-write segment and the start
+of the stack is 4KB (the stack guard-page).
+
+$ ./Linux_offset2lib 0x3f800000
+Run #1...
+Run #2...
+Run #3...
+...
+Run #796...
+Run #797...
+Run #798...
+CVE-2017-1000371 triggered
+4007b000-400a0000 r-xp 00000000 fd:00 8463588    /usr/lib/ld-2.24.so
+400a0000-400a1000 r--p 00024000 fd:00 8463588    /usr/lib/ld-2.24.so
+400a1000-400a2000 rw-p 00025000 fd:00 8463588    /usr/lib/ld-2.24.so
+400a2000-400a4000 r--p 00000000 00:00 0          [vvar]
+400a4000-400a6000 r-xp 00000000 00:00 0          [vdso]
+400a6000-400a8000 rw-p 00000000 00:00 0
+400af000-40283000 r-xp 00000000 fd:00 8463595    /usr/lib/libc-2.24.so
+40283000-40284000 ---p 001d4000 fd:00 8463595    /usr/lib/libc-2.24.so
+40284000-40286000 r--p 001d4000 fd:00 8463595    /usr/lib/libc-2.24.so
+40286000-40287000 rw-p 001d6000 fd:00 8463595    /usr/lib/libc-2.24.so
+40287000-4028a000 rw-p 00000000 00:00 0
+8000a000-8000c000 r-xp 00000000 00:26 25041      /tmp/Linux_offset2lib
+8000c000-8000d000 r--p 00001000 00:26 25041      /tmp/Linux_offset2lib
+8000d000-8002f000 rw-p 00002000 00:26 25041      /tmp/Linux_offset2lib
+80030000-bf831000 rw-p 00000000 00:00 0          [heap]
+
+Note: in this example, the "[stack]" is incorrectly displayed as the
+"[heap]" by show_map_vma() (in fs/proc/task_mmu.c).
+
+This completes Step 1: we clash the stack with the PIE's read-write
+segment; we complete the remaining steps as in the "hwcap" exploit:
+
+- Step 2: we consume the initial stack expansion with 128KB of argv[]
+  and envp[] pointers;
+
+- Step 3: we jump over the stack guard-page and into the PIE's
+  read-write segment with llp_tmp's alloca() (in _dl_init_paths());
+
+- Step 4b: we smash the PIE's read-write segment with llp_tmp's
+  good-write and bad-write (in _dl_init_paths()); we can smash the
+  following sections:
+
+  + .data and .bss: but we discarded this application-specific approach;
+
+  + .got: although protected by Full RELRO (Full RELocate Read-Only,
+    GNU_RELRO and BIND_NOW) the .got is still writable when we smash it
+    in _dl_init_paths(); however, within ld.so, the .got is written to
+    but never read from, and we therefore discarded this approach;
+
+  + .dynamic: our favored approach.
+
+On i386, the .dynamic section is an array of Elf32_Dyn structures (an
+int32 d_tag, and the union of uint32 d_val and uint32 d_ptr) that
+contains entries such as:
+
+- DT_STRTAB, a pointer to the PIE's .dynstr section (a read-only string
+  table): its d_tag (DT_STRTAB) is read (by elf_get_dynamic_info())
+  before we smash it in _dl_init_paths(), but its d_ptr is read (by
+  _dl_map_object_deps()) after we smash it in _dl_init_paths();
+
+- DT_NEEDED, an offset into the .dynstr section: the pathname of a
+  dependent library that must be loaded by _dl_map_object_deps().
+
+If we overwrite the entire .dynamic section with the following 8-byte
+pattern (an Elf32_Dyn structure):
+
+- a DT_NEEDED d_tag,
+
+- a d_val equal to half the address of our own string table on the stack
+  (16MB of argument strings, enough to defeat the 8MB stack
+  randomization),
+
+then _dl_map_object_deps() reads the pathname of this dependent library
+from DT_STRTAB.d_ptr + DT_NEEDED.d_val = our_strtab/2 + our_strtab/2 =
+our_strtab, and loads our own library, as root. This 8-byte pattern is
+simple, but poses two problems:
+
+- DT_NEEDED is an int32 equal to 1, but we smash the .dynamic section
+  with a string copy that cannot contain null-bytes: to solve this first
+  problem we use DT_AUXILIARY instead, which is equivalent but equal to
+  0x7ffffffd;
+
+- ld.so crashes before it returns from dl_main() (before it calls
+  _dl_init() and executes our library's _init() constructor):
+
+  . in _dl_map_object_deps() because of our DT_AUXILIARY entry;
+
+  . in version_check_doit() because we overwrote the DT_VERNEED entry;
+
+  . in _dl_relocate_object() because we overwrote the DT_REL, DT_RELSZ,
+    and DT_RELCOUNT entries.
+
+To solve this second problem, we could overwrite the .dynamic section
+with a more complicated pattern that repairs these entries, but our
+exploit's probability of success would decrease significantly.
+
+Instead, we take control of ld.so's execution flow as soon as
+_dl_map_object_deps() loads our library:
+
+- our library contains three executable LOAD segments,
+
+- but only the first and last segments are sanity-checked by
+  _dl_map_object_from_fd() and _dl_map_segments(),
+
+- and all segments except the first are mmap()ed with MAP_FIXED by
+  _dl_map_segments(),
+
+- so we can mmap() our second segment anywhere -- we mmap() it on top of
+  ld.so's executable segment,
+
+- and return into our own code (instead of ld.so's) as soon as this
+  second mmap() system-call returns.
+
+Probabilities
+
+The "hwcap" exploit taught us that this ".dynamic" exploit's probability
+of success depends on:
+
+- the size of the cushion below the .dynamic section, which can absorb
+  the excess of "good-write" without crashing: the padding bytes between
+  the start of the PIE's read-write segment and the start of its first
+  read-write section;
+
+- the size of the cushion above the .dynamic section, which can absorb
+  the excess of "good-write" and "bad-write" without crashing: the .got,
+  .data, and .bss sections.
+
+If we guarantee that (cushion above .dynamic > good-write + bad-write),
+then the theoretical probability of success is approximately:
+
+MIN(cushion below .dynamic, good-write) / max stack randomization
+
+The maximum size of the cushion below the .dynamic section is 4KB (one
+page) and hence the maximum probability of success is 4KB/8MB=1/2048.
+In practice, on Ubuntu 16.04.2:
+
+- the highest probability is 1/2589 (/bin/su) and the lowest probability
+  is 1/9225 (/usr/lib/eject/dmcrypt-get-device);
+
+- each run uses 1GB of memory and takes 1.5 seconds (on a 4GB Virtual
+  Machine);
+
+- this ld.so ".dynamic" exploit has a good chance of obtaining a
+  root-shell after 2589 * 1.5 seconds ~= 1 hour.
+
+========================================================================
+IV.1.5. /bin/su
+========================================================================
+
+As we were drafting this advisory, we discovered a general method for
+completing Step 1 (Clash) of the stack-clash exploitation: the Linux
+kernel limits the size of the command-line arguments and environment
+variables to 1/4 of the RLIMIT_STACK, but it imposes this limit on the
+argument and environment strings, not on the argv[] and envp[] pointers
+to these strings (CVE-2017-1000365).
+
+On i386, if we set RLIMIT_STACK to RLIM_INFINITY, the maximum number of
+argv[] and envp[] pointers is 1G (1/4 of the RLIMIT_STACK, divided by
+1B, the minimum size of an argument or environment string). In theory,
+the maximum size of the initial stack is therefore 1G*(1B+4B)=5GB. In
+practice, this would exhaust the address-space and allows us to clash
+the stack with the memory region that is mapped below, without an
+application-specific memory leak.
+
+This discovery allowed us to write alternative versions of our
+stack-clash exploits; for example:
+
+- an ld.so "hwcap" exploit against Ubuntu: we replace the LD_AUDIT
+  memory leak with 2GB of stack memory (1GB of argument and environment
+  strings, and 1GB of argv[] and envp[] pointers) and replace the
+  LD_AUDIT library with an LD_PRELOAD library;
+
+- an ld.so ".dynamic" exploit against systems vulnerable to offset2lib:
+  we reach the end of the PIE's read-write segment with only 128MB of
+  stack memory (argument and environment strings and pointers).
+
+These proofs-of-concept demonstrate a general method for completing Step
+1 (Clash), but they are much slower than their original versions (10-20
+seconds per run) because they pass millions of argv[] and envp[]
+pointers to execve().
+
+Moreover, this discovery allowed us to exploit SUID binaries through
+general methods that do not depend on application-specific or ld.so
+vulnerabilities; if a SUID binary calls setlocale(LC_ALL, ""); and
+gettext() (or a derivative such as strerror() or _()), then it is
+exploitable:
+
+- Step 1: we clash the stack with the heap through millions of argument
+  and environment strings and pointers;
+
+- Step 2: we consume the initial stack expansion with 128KB of argument
+  and environment pointers;
+
+- Step 3: we jump over the stack guard-page and into the heap with the
+  alloca()tion of the LANGUAGE environment variable in gettext();
+
+- Step 4a: we smash the stack with the malloc()ation of the
+  OUTPUT_CHARSET environment variable in gettext() and thus gain control
+  of eip.
+
+For example, we exploited Debian's /bin/su (from the shadow-utils): its
+main() function calls setlocale() and save_caller_context(), which calls
+gettext() (through _()) if its stdin is not a tty.
+
+Debian 8.5
+
+Debian 8.5 is vulnerable to CVE-2016-3672: we set RLIMIT_STACK to
+RLIM_INFINITY and disable ASLR, clash the stack with the heap through
+2GB of argument and environment strings and pointers (1GB of strings,
+1GB of pointers), and return-into-libc's system() or __libc_dlopen():
+
+- the system() version uses 4GB of memory (2GB in the /bin/su process,
+  and 2GB in the process fork()ed by system());
+
+- the __libc_dlopen() version uses only 2GB of memory, but ebp must
+  point to our smashed data on the stack.
+
+Debian 8.6
+
+Debian 8.6 is vulnerable to offset2lib but not to CVE-2016-3672: we must
+brute-force the libc's ASLR (8 bits of entropy), but we clash the stack
+with the heap through only 128MB of argument and environment strings and
+pointers -- this /bin/su exploit can be parallelized.
+
+========================================================================
+IV.1.6. Grsecurity/PaX
+========================================================================
+
+https://grsecurity.net/
+
+In 2010, grsecurity/PaX introduced a configurable stack guard-page: its
+size can be modified through /proc/sys/vm/heap_stack_gap and is 64KB by
+default (unlike the hard-coded 4KB stack guard-page in the vanilla
+kernel).
+
+Unfortunately, a 64KB stack guard-page is not large enough, and can be
+jumped over with ld.so or gettext() (CVE-2017-1000377); for example, we
+were able to gain eip control against Sudo, but we were unable to obtain
+a root-shell or gain eip control against another application, because
+grsecurity/PaX imposes the following security measures:
+
+- it restricts the RLIMIT_STACK of SUID binaries to 8MB, which prevents
+  us from switching to the legacy bottom-up mmap() layout (Step 1);
+
+- it restricts the argument and environment strings to 512KB, which
+  prevents us from clashing the stack through megabytes of command-line
+  arguments and environment variables (Step 1);
+
+- it randomizes the PIE and libraries with 16 bits of entropy (instead
+  of 8 bits in vanilla), which prevents us from brute-forcing the ASLR
+  and returning-into-libc (Step 4a);
+
+- it implements /proc/sys/kernel/grsecurity/deter_bruteforce (enabled by
+  default), which limits the number of SUID crashes to 1 every 15
+  minutes (all Steps) and makes exploitation impossible.
+
+Sudo
+
+The vulnerability that we discovered in Sudo's get_process_ttyname()
+(CVE-2017-1000367) allows us to:
+
+- Step 1: clash the stack with 3GB of heap memory from the filesystem
+  (directory pathnames) and bypass grsecurity/PaX's 512KB limit on the
+  argument and environment strings;
+
+- Step 2: consume the 128KB of initial stack expansion with 3MB of
+  recursive function calls and avoid grsecurity/PaX's 8MB restriction on
+  the RLIMIT_STACK;
+
+- Step 3: jump over grsecurity/PaX's 64KB stack guard-page with a 128KB
+  (MAX_ARG_STRLEN) alloca()tion of the LANGUAGE environment variable in
+  gettext();
+
+- Step 4a: smash the stack with a 128KB (MAX_ARG_STRLEN) malloc()ation
+  of the OUTPUT_CHARSET environment variable in gettext() -- the
+  "smashing-chunk" -- and thus gain control of eip.
+
+In Step 1, we nearly exhaust the address-space until finally malloc()
+switches from brk() to 1MB mmap()s and reaches the start of the stack
+with the very last 1MB mmap() that we allocate. The exact amount of
+memory that we must allocate to reach the stack with our last 1MB mmap()
+depends on the sum of three random variables: the 256MB randomization of
+the stack, the 64MB randomization of the heap, and the 1MB randomization
+of the NULL region.
+
+To maximize the probability of jumping over the stack guard-page, into
+our last 1MB mmap() below the stack, and overwriting a return-address on
+the stack with our smashing-chunk:
+
+- (Step 1) we must allocate the mean amount of memory to reach the stack
+  with our last 1MB mmap(): the sum of three uniform random variables is
+  not uniform (https://en.wikipedia.org/wiki/Irwin-Hall_distribution),
+  but the values within the 256MB-64MB-1MB=191MB plateau at the center
+  of this bell-shaped probability distribution occur with a uniform and
+  maximum probability of (1MB*64MB)/(1MB*64MB*256MB)=1/256MB;
+
+- (Step 1) the end of our last 1MB mmap() must be allocated at a
+  distance within [stack guard-page (64KB), guard-page jump (128KB)]
+  below the start of the stack: the guard-page jump (Step 3) then lands
+  at a distance d within [0, guard-page jump - stack guard-page (64KB)]
+  below the end of our last 1MB mmap();
+
+- (Step 4a) the end of our smashing-chunk must be allocated at the end
+  of our last 1MB mmap(), above the landing-point of the guard-page
+  jump: our smashing-chunk then overwrites a return-address on the
+  stack, below the landing-point of the guard-page jump.
+
+In theory, this probability is roughly:
+
+SUM(d = 1; d < guard-page jump - stack guard-page; d++) d / (256MB*1MB)
+
+          ~= ((guard-page jump - stack guard-page)^2 / 2) / (256MB*1MB)
+
+          ~= 1 / 2^17
+
+In practice, we tested this Sudo proof-of-concept on an i386 Debian 8.6
+protected by the linux-grsec package from the jessie-backports, but we
+manually disabled /proc/sys/kernel/grsecurity/deter_bruteforce:
+
+- it uses 3GB of memory, and 800K on-disk inodes;
+
+- it takes 5.5 seconds per run (on a 4GB Virtual Machine);
+
+- it has a good chance of gaining eip control after 2^17 * 5.5 seconds =
+  200 hours; in our test:
+
+PAX: From 192.168.56.1: execution attempt in: <heap>, 1b068000-a100d000 1b068000
+PAX: terminating task: /usr/bin/sudo(     1 ):25465, uid/euid: 1000/0, PC: 41414141, SP: b8844f30
+PAX: bytes at PC: 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41 41
+PAX: bytes at SP-4: 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141 41414141
+
+However, brute-forcing the ASLR to obtain a root-shell would take ~1500
+years and makes exploitation impossible.
+
+Moreover, if we enable /proc/sys/kernel/grsecurity/deter_bruteforce,
+gaining eip control would take ~1365 days, and obtaining a root-shell
+would take thousands of years.
+
+========================================================================
+IV.1.7. 64-bit exploitation
+========================================================================
+
+Introduction
+
+The address-space of a 64-bit process is so vast that we initially
+thought it was impossible to clash the stack with another memory region;
+we were wrong.
+
+Linux's execve() first randomizes the end of the mmap region (which
+grows top-down by default) and then randomizes the end of the stack
+region (which grows down, on x86). On amd64, the initial mmap-stack
+distance (between the end of the mmap region and the end of the stack
+region) is minimal when RLIMIT_STACK is lower than or equal to MIN_GAP
+(mmap_base() in arch/x86/mm/mmap.c), and then:
+
+- the end of the mmap region is equal to (as calculated by
+  arch_pick_mmap_layout() in arch/x86/mm/mmap.c):
+
+  mmap_end = TASK_SIZE - MIN_GAP - arch_mmap_rnd()
+
+  where:
+
+  . TASK_SIZE is the highest address of the user-space (0x7ffffffff000)
+
+  . MIN_GAP = 128MB + stack_maxrandom_size()
+
+  . stack_maxrandom_size() is ~16GB (or ~4GB if the kernel is vulnerable
+    to CVE-2015-1593, but we do not consider this case here)
+
+  . arch_mmap_rnd() is a random variable in the [0B,1TB] range
+
+- the end of the stack region is equal to (as calculated by
+  randomize_stack_top() in fs/binfmt_elf.c):
+
+  stack_end = TASK_SIZE - "stack_rand"
+
+  where:
+
+  . "stack_rand" is a random variable in the [0, stack_maxrandom_size()]
+    range
+
+- the initial mmap-stack distance is therefore equal to:
+
+  stack_end - mmap_end = MIN_GAP + arch_mmap_rnd() - "stack_rand"
+
+    = 128MB + stack_maxrandom_size() - "stack_rand" + arch_mmap_rnd()
+
+    = 128MB + StackRand + MmapRand
+
+  where:
+
+  . StackRand = stack_maxrandom_size() - "stack_rand", a random variable
+    in the [0B,16GB] range
+
+  . MmapRand = arch_mmap_rnd(), a random variable in the [0B,1TB] range
+
+Consequently, the minimum initial mmap-stack distance is only 128MB
+(CVE-2017-1000379), and:
+
+- On kernels vulnerable to offset2lib, the heap of a PIE (which is
+  mapped at the end of the mmap region) is mapped below and close to the
+  stack with a good probability (~1/700). We can therefore clash the
+  stack with the heap in Step 1, jump over the stack guard-page and into
+  the heap in Step 3, and smash the stack with the heap and gain control
+  of rip in Step 4a (after 6 hours on average). However, because the
+  addresses of all executable regions contain null-bytes, and because
+  most of our stack-smashes in Step 4a are string operations (except the
+  getaddrinfo() method), we were unable to transform such a rip control
+  into arbitrary code execution.
+
+- On all kernels, either a PIE or ld.so is mapped directly below the
+  stack with a good probability (~1/17000) -- the end of the PIE's or
+  ld.so's read-write segment is then equal to the start of the stack
+  guard-page. We can therefore adapt our ld.so "hwcap" exploit to amd64
+  and obtain root privileges through most SUID binaries on most Linux
+  distributions (after 5 hours on average).
+
+Kernels vulnerable to offset2lib, local Exim proof-of-concept
+
+Exim's binary is usually a PIE, mapped at the end of the mmap region;
+and the heap, which always grows up and is randomized above the end of
+the binary, is therefore randomized above the end of the mmap region
+(arch_randomize_brk() in arch/x86/kernel/process.c):
+
+  heap_start = mmap_end + "heap_rand"
+
+where "heap_rand" is a random variable in the [0B,32MB] range
+(negligible and ignored here). For example, on Debian 8.5:
+
+# cat /proc/"`pidof -s /usr/sbin/exim4`"/maps
+...
+7fa6410d6000-7fa6411c8000 r-xp 00000000 08:01 14574                      /usr/sbin/exim4
+7fa6413b4000-7fa6413bd000 rw-p 00000000 00:00 0
+7fa6413c5000-7fa6413c7000 rw-p 00000000 00:00 0
+7fa6413c7000-7fa6413c9000 r--p 000f1000 08:01 14574                      /usr/sbin/exim4
+7fa6413c9000-7fa6413d2000 rw-p 000f3000 08:01 14574                      /usr/sbin/exim4
+7fa6413d2000-7fa6413d7000 rw-p 00000000 00:00 0
+7fa641b34000-7fa641b76000 rw-p 00000000 00:00 0                          [heap]
+7ffdf3e53000-7ffdf3ed6000 rw-p 00000000 00:00 0                          [stack]
+7ffdf3f3c000-7ffdf3f3e000 r-xp 00000000 00:00 0                          [vdso]
+7ffdf3f3e000-7ffdf3f40000 r--p 00000000 00:00 0                          [vvar]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
+
+To reach the start of the stack with the end of the heap (through the -p
+memory leak in Exim) in Step 1 of our stack-clash, we must minimize the
+initial heap-stack distance, and hence the initial mmap-stack distance,
+and set RLIMIT_STACK to MIN_GAP (~16GB). This limits the size of our -p
+argument strings on the stack to 16GB/4=4GB, and because we then leak
+the same amount of heap memory through -p, the initial heap-stack
+distance must be:
+
+- longer than 4GB (the stack must be able to contain the -p argument
+  strings);
+
+- shorter than 8GB (the end of the heap must be able to reach the start
+  of the stack during the -p memory leak).
+
+The initial heap-stack distance (approximately the initial mmap-stack
+distance, 128MB + StackRand + MmapRand, but we ignore the 128MB term
+here) follows a trapezoidal Irwin-Hall distribution, and the [4GB,8GB]
+range is within the first non-uniform area of this trapezoid, so the
+probability that the initial heap-stack distance is in this range is:
+
+  SUM(d = 4GB; d < 8GB; d++) d / (16GB * 1TB)
+
+  = SUM(d = 0; d < 4GB; d++) (4GB + d) / (16GB * 1TB)
+
+  = SUM(d = 0; d < 2^32; d++) (2^32 + d) / (2^34 * 2^40)
+
+  ~= ((2^32)*(2^32) + (2^32)*(2^32) / 2) / (2^74)
+
+  ~= 3 / 2^11
+
+  ~= 1 / 682
+
+The probability of gaining rip control after the heap reaches the stack
+is ~1/16 (as calculated by a 64-bit version of the small helper program
+presented in IV.1.1.), and the final probability of gaining rip control
+with our local Exim proof-of-concept is:
+
+  (3 / 2^11) * (1/16) ~= 1 / 10922
+
+On our 8GB Debian 8.7 test machine, this proof-of-concept takes roughly
+2 seconds per run, and has a good chance of gaining rip control after
+10922 * 2 seconds ~= 6 hours:
+
+# gdb /usr/sbin/exim4 core.6049
+GNU gdb (Debian 7.7.1+dfsg-5) 7.7.1
+...
+This GDB was configured as "x86_64-linux-gnu".
+...
+Core was generated by `/usr/sbin/exim4 -p0000000000000000000000000000000000000000000000000000000000000'.
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0  __memcpy_sse2_unaligned () at ../sysdeps/x86_64/multiarch/memcpy-sse2-unaligned.S:41
+41      ../sysdeps/x86_64/multiarch/memcpy-sse2-unaligned.S: No such file or directory.
+(gdb) x/i $rip
+=> 0x7ffab1be7061 <__memcpy_sse2_unaligned+65>: retq
+(gdb) x/xg $rsp
+0x7ffb9b294a48: 0x4141414141414141
+
+Kernels vulnerable to offset2lib, ld.so ".dynamic" exploit
+
+Since kernels vulnerable to offset2lib map PIEs below and close to the
+stack, we tried to adapt our ld.so ".dynamic" exploit to amd64. MIN_GAP
+guarantees a minimum distance of 128MB between the theoretical end of
+the mmap region and the end of the stack, but the stack then grows down
+to store the argument and environment strings, and may therefore occupy
+the theoretical end of the mmap region (where nothing has been mapped
+yet). Consequently, the end of the mmap region (where the PIE will be
+mapped) slides down to the first available address, directly below the
+stack guard-page and the initial stack expansion (described in II.3.2.):
+
+7ffbb7e51000-7ffbb7e53000 r-xp 00000000 fd:03 4465810                    /tmp/test64
+...
+7ffbb8053000-7ffbb808c000 rw-p 00002000 fd:03 4465810                    /tmp/test64
+7ffbb808d000-7ffc180ae000 rw-p 00000000 00:00 0                          [heap]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
+
+Note: in this example, the "[stack]" is, again, incorrectly displayed as
+the "[heap]" by show_map_vma() (in fs/proc/task_mmu.c).
+
+This layout is ideal for our stack-clash exploits, but poses an
+unexpected problem: because the PIE is mapped directly below the stack,
+the stack cannot grow anymore, and the only free stack space is the
+initial stack expansion (128KB) minus the argv[] and envp[] pointers
+(which are stored there, as mentioned in II.3.2.):
+
+- on the one hand, many argv[] and envp[] pointers, and hence many
+  argument and environment strings, result in a higher probability of
+  mapping the PIE directly below the stack;
+
+- on the other hand, many argv[] and envp[] pointers consume most of the
+  initial stack expansion and do not leave enough free stack space for
+  ld.so to operate.
+
+In practice, we pass 96KB of argv[] pointers to execve(), thus leaving
+32KB of free stack space for ld.so, and since the size of a pointer is
+8B, and the maximum size of an argument string is 128KB, we also pass
+96KB/8B*128KB=1.5GB of argument strings to execve(). The resulting
+probability of mapping the PIE directly below the stack is:
+
+  SUM(s = 0; s < 1.5GB - 128MB; s++) s / (16GB * 1TB)
+
+            ~= ((1.5GB - 128MB)^2 / 2) / (16GB * 1TB)
+
+            ~= 1 / 17331
+
+On a 4GB Virtual Machine, each run takes 1 second, and 17331 runs take
+roughly 5 hours. But we cannot add more uncertainty to this exploit, and
+because of the problems discussed in IV.1.4. (null-bytes in DT_NEEDED,
+but also in DT_AUXILIARY on 64-bit, etc), we were unable to overwrite
+the .dynamic section with a pattern that does not significantly decrease
+this exploit's probability of success.
+
+All kernels, ld.so "hwcap" exploit
+
+Despite this failure, we had an intuition: when the PIE is mapped
+directly below the stack, the stack layout should be deterministic --
+rsp should point into the 128KB of initial stack expansion, at a 32KB
+offset above the start of the stack, and the only entropy should be the
+8KB of sub-page randomization within the stack (arch_align_stack() in
+arch/x86/kernel/process.c). The following output of our small test
+program confirmed this intuition (the fourth field is the distance
+between the start of the stack and our main()'s rsp when the PIE is
+mapped directly below the stack):
+
+$ grep -w sp test64.out | sort -nk4
+sp 0x7ffbc271ff38 -> 28472
+sp 0x7ffbb95ccff8 -> 28664
+sp 0x7ffbaf062678 -> 30328
+sp 0x7ffbb08736e8 -> 30440
+sp 0x7ffbbc616d18 -> 32024
+sp 0x7ffbc1a0fdb8 -> 32184
+sp 0x7ffbb9c28ff8 -> 32760
+sp 0x7ffbdbf4c178 -> 33144
+sp 0x7ffbb39bc1c8 -> 33224
+sp 0x7ffbebb86838 -> 34872
+
+Surprisingly, the output of this test program contained additional
+valuable information:
+
+7ffbb7e51000-7ffbb7e53000 r-xp 00000000 fd:03 4465810                    /tmp/test64
+7ffbb8034000-7ffbb8037000 rw-p 00000000 00:00 0
+7ffbb804d000-7ffbb804e000 rw-p 00000000 00:00 0
+7ffbb804e000-7ffbb8050000 r--p 00000000 00:00 0                          [vvar]
+7ffbb8050000-7ffbb8052000 r-xp 00000000 00:00 0                          [vdso]
+7ffbb8052000-7ffbb8053000 r--p 00001000 fd:03 4465810                    /tmp/test64
+7ffbb8053000-7ffbb808c000 rw-p 00002000 fd:03 4465810                    /tmp/test64
+7ffbb808d000-7ffc180ae000 rw-p 00000000 00:00 0                          [heap]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
+
+- the distance between the end of the read-execute segment of our test
+  program and the start of its read-only and read-write segments is
+  approximately 2MB; indeed, for every ELF on amd64:
+
+$ readelf -a /usr/bin/su | grep -wA1 LOAD
+  LOAD           0x0000000000000000 0x0000000000000000 0x0000000000000000
+                 0x00000000000061b4 0x00000000000061b4  R E    200000
+  LOAD           0x0000000000006888 0x0000000000206888 0x0000000000206888
+                 0x0000000000000798 0x00000000000007d0  RW     200000
+
+$ readelf -a /lib64/ld-linux-x86-64.so.2 | grep -wA1 LOAD
+  LOAD           0x0000000000000000 0x0000000000000000 0x0000000000000000
+                 0x000000000001fad0 0x000000000001fad0  R E    200000
+  LOAD           0x000000000001fb60 0x000000000021fb60 0x000000000021fb60
+                 0x000000000000141c 0x00000000000015e8  RW     200000
+
+- several objects are actually mapped inside this ~2MB hole: [vdso],
+  [vvar], and two anonymous mappings (7ffbb804d000-7ffbb804e000 and
+  7ffbb8034000-7ffbb8037000).
+
+This discovery allowed us to adapt our ld.so "hwcap" exploit to amd64:
+
+- we choose hardware-capabilities that are small enough to be mapped
+  inside this ~2MB hole, but large enough to defeat the 8KB sub-page
+  randomization of the stack;
+
+- we jump over the stack guard-page, and over the read-only and
+  read-write segments of the PIE, and exploit ld.so as we did on i386.
+
+This exploit's probability of success is therefore 1 when the PIE is
+mapped directly below the stack, and its final probability of success is
+~1/17331: it takes 1 second per run, and has a good chance of obtaining
+a root-shell after 5 hours. Moreover, it works on all kernels: if a SUID
+binary is not a PIE, or if the kernel is not vulnerable to offset2lib,
+we simply jump over ld.so's read-write segment, instead of the PIE's.
+For example, on Fedora 25, when the exploit succeeds and loads our own
+library /var/tmp/a (the 7ffbabbef000-7ffbabca7000 mapping contains the
+hardware-capabilities that we smash):
+
+55a0c9e8d000-55a0c9e91000 r-xp 00000000 fd:00 112767                     /usr/libexec/cockpit-polkit
+55a0ca091000-55a0ca093000 rw-p 00004000 fd:00 112767                     /usr/libexec/cockpit-polkit
+7ffbab603000-7ffbab604000 r-xp 00000000 fd:00 4866583                    /var/tmp/a
+7ffbab604000-7ffbab803000 ---p 00001000 fd:00 4866583                    /var/tmp/a
+7ffbab803000-7ffbab804000 r--p 00000000 fd:00 4866583                    /var/tmp/a
+7ffbab804000-7ffbaba86000 rw-p 00000000 00:00 0
+7ffbaba86000-7ffbabaab000 r-xp 00000000 fd:00 4229637                    /usr/lib64/ld-2.24.so
+7ffbabbef000-7ffbabca7000 rw-p 00000000 00:00 0
+7ffbabca7000-7ffbabca9000 r--p 00000000 00:00 0                          [vvar]
+7ffbabca9000-7ffbabcab000 r-xp 00000000 00:00 0                          [vdso]
+7ffbabcab000-7ffbabcad000 rw-p 00025000 fd:00 4229637                    /usr/lib64/ld-2.24.so
+7ffbabcad000-7ffbabcae000 rw-p 00000000 00:00 0
+7ffbabcaf000-7ffc0bcf0000 rw-p 00000000 00:00 0                          [stack]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0                  [vsyscall]
+
+========================================================================
+IV.2. OpenBSD
+========================================================================
+
+========================================================================
+IV.2.1. Maximum RLIMIT_STACK vulnerability (CVE-2017-1000372)
+========================================================================
+
+The OpenBSD kernel limits the maximum size of the user-space stack
+(RLIMIT_STACK) to MAXSSIZ (32MB); the execve() system-call allocates a
+MAXSSIZ memory region for the stack and divides it in two:
+
+- the second part, effectively the user-space stack, is mapped
+  PROT_READ|PROT_WRITE at the end of this stack memory region, and
+  occupies RLIMIT_STACK bytes (by default 8MB for root processes, and
+  4MB for user processes);
+
+- the first part, effectively a large stack guard-page, is mapped
+  PROT_NONE at the start of this stack memory region, and occupies
+  MAXSSIZ - RLIMIT_STACK bytes.
+
+Unfortunately, we discovered that if an attacker sets RLIMIT_STACK to
+MAXSSIZ, he eliminates the PROT_NONE part of the stack region, and hence
+the stack guard-page itself (CVE-2017-1000372). For example:
+
+# sh -c 'ulimit -S -s; procmap -a -P'
+8192
+Start    End         Size  Offset   rwxpc  RWX  I/W/A Dev     Inode - File
+...
+14cf6000-14cfafff      20k 00000000 r-xp+ (rwx) 1/0/0 00:03   52375 - /usr/sbin/procmap [0xdb29ce10]
+...
+84a7b000-84a7bfff       4k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ anon ]
+cd7db000-cefdafff   24576k 00000000 ---p+ (rwx) 1/0/0 00:00       0 -   [ stack ]
+cefdb000-cf7cffff    8148k 00000000 rw-p+ (rwx) 1/0/0 00:00       0 -   [ stack ]
+cf7d0000-cf7dafff      44k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ stack ]
+ total              10348k
+
+# sh -c 'ulimit -S -s `ulimit -H -s`; procmap -a -P'
+Start    End         Size  Offset   rwxpc  RWX  I/W/A Dev     Inode - File
+...
+1a47f000-1a483fff      20k 00000000 r-xp+ (rwx) 1/0/0 00:03   52375 - /usr/sbin/procmap [0xdb29ce10]
+...
+8a3c8000-8a3c9fff       8k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ anon ]
+cd7c9000-cf7bffff   32732k 00000000 rw-p+ (rwx) 1/0/0 00:00       0 -   [ stack ]
+cf7c0000-cf7c8fff      36k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ stack ]
+ total              33992k
+
+A remote attacker cannot exploit this vulnerability, because he cannot
+modify RLIMIT_STACK; but a local attacker can set RLIMIT_STACK to
+MAXSSIZ, and:
+
+- Step 1: malloc()ate almost 2GB of heap memory, until the heap reaches
+  the start of the stack region;
+
+- Steps 2 and 3: consume MAXSSIZ (32MB) of stack memory, until the
+  stack-pointer reaches the start of the stack region (Step 2) and moves
+  into the heap (Step 3);
+
+- Step 4: smash the stack with the heap (Step 4a) or smash the heap with
+  the stack (Step 4b).
+
+========================================================================
+IV.2.2. Recursive qsort() vulnerability (CVE-2017-1000373)
+========================================================================
+
+To complete Step 2, a recursive function is needed, and the first
+possibly recursive function that we investigated is qsort(). On the one
+hand, glibc's _quicksort() function (in stdlib/qsort.c) is non-recursive
+(iterative): it uses a small, specialized stack of partition structures
+(two pointers, low and high), and guarantees that no more than 32
+partitions (on i386) or 64 partitions (on amd64) are pushed onto this
+stack, because it always pushes the larger of two sub-partitions and
+iterates on the smaller partition.
+
+On the other hand, BSD's qsort() function is recursive: it always
+recurses on the first sub-partition, and iterates on the second
+sub-partition; but instead, it should always recurse on the smaller
+sub-partition, and iterate on the larger sub-partition (CVE-2017-1000373
+in OpenBSD, CVE-2017-1000378 in NetBSD, and CVE-2017-1082 in FreeBSD).
+
+In theory, because BSD's qsort() is not randomized, an attacker can
+construct a pathological input array of N elements that causes qsort()
+to deterministically recurse N times. In practice, because this qsort()
+uses the median-of-three medians-of-three selection of a pivot element
+(the "ninther"), our attack constructs an input array of N elements that
+causes qsort() to recurse N/4 times.
+
+========================================================================
+IV.2.3. /usr/bin/at proof-of-concept
+========================================================================
+
+/usr/bin/at is SGID-crontab (which can be escalated to full root
+privileges) because it must be able to create ("at -t"), list ("at -l"),
+and remove ("at -r") job-files in the /var/cron/atjobs directory:
+
+-r-xr-sr-x  4 root  crontab  31376 Jul 26  2016 /usr/bin/at
+drwxrwx--T  2 root  crontab    512 Jul 26  2016 /var/cron/atjobs
+
+To demonstrate that OpenBSD's RLIMIT_STACK and qsort() vulnerabilities
+can be transformed into powerful primitives such as heap corruption, we
+developed a proof-of-concept against "at -l" (the list_jobs() function):
+
+- Step 1 (Clash): first, list_jobs() malloc()ates an atjob structure for
+  each file in /var/cron/atjobs -- if we create 40M job-files, then the
+  heap reaches the stack, but we do not exhaust the address-space;
+
+- Steps 2 and 3 (Run and Jump): second, list_jobs() qsort()s the
+  malloc()ated jobs -- if we construct their time-stamps with our
+  qsort() attack, then we can cause qsort() to recurse 40M/4=10M times
+  and consume at least 10M*4B=40MB of stack memory (each recursive call
+  to qsort() consumes at least 4B, the return-address) and move the
+  stack-pointer into the heap;
+
+- Step 4b (Smash the heap with the stack): last, list_jobs() free()s the
+  malloc()ated jobs, and abort()s with an error message -- OpenBSD's
+  hardened malloc() implementation detects that the heap has been
+  corrupted by the last recursive calls to qsort().
+
+This naive version of our /usr/bin/at proof-of-concept poses two major
+problems:
+
+- Our pathological input array of N=40M elements cannot be sorted (Step
+  2 never finishes because it exhibits qsort()'s worst-case behavior,
+  N^2). To solve this problem, we divide the input array in two:
+
+  . the first, pathological part contains only n=(33MB/176B)*4=768K
+    elements that are needed to complete Steps 2 and 3, and cause
+    qsort() to recurse n/4 times and consume (n/4)*176B=33MB of stack
+    memory (MAXSSIZ+1MB) as each recursive call to qsort() consumes 176B
+    of stack memory;
+
+  . the second, innocuous part contains the remaining N-n=39M elements
+    that are needed to complete Step 1, but not Steps 2 and 3, and are
+    therefore swapped into the second, iterative partition of the first
+    recursive call to qsort().
+
+- We were unable to create 40M files in /var/cron/atjobs: after one
+  week, OpenBSD's default filesystem (ffs) had created only 4M files,
+  and the rate of file creation had dropped from 25 files/second to 4
+  files/second. We did not solve this problem, but nevertheless wanted
+  to validate our proof-of-concept:
+
+  . we transformed it into an LD_PRELOAD library that intercepts calls
+    to readdir() and fstatat(), and pretends that our 40M files in
+    /var/cron/atjobs exist;
+
+  . we made /var/cron/atjobs world-readable and LD_PRELOADed our library
+    into a non-SGID copy of /usr/bin/at;
+
+  . after about an hour, "at" reports random heap corruptions:
+
+# chmod o+r /var/cron/atjobs
+# chmod o+r /var/cron/at.deny
+
+$ ulimit -c 0
+$ ulimit -S -d `ulimit -H -d`
+$ ulimit -S -s `ulimit -H -s`
+$ ulimit -S -a
+...
+coredump(blocks)     0
+data(kbytes)         3145728
+stack(kbytes)        32768
+...
+$ cp /usr/bin/at .
+
+$ LD_PRELOAD=./OpenBSD_at.so ./at -l -v -q x > /dev/null
+initializing jobkeys
+finalizing jobkeys
+reading jobs
+10%
+20%
+30%
+40%
+50%
+60%
+70%
+80%
+90%
+100%
+sorting jobs
+at(78717) in free(): error: chunk info corrupted
+Abort trap
+
+$ LD_PRELOAD=./OpenBSD_at.so ./at -l -v -q x > /dev/null
+initializing jobkeys
+finalizing jobkeys
+reading jobs
+10%
+20%
+30%
+40%
+50%
+60%
+70%
+80%
+90%
+100%
+sorting jobs
+at(14184) in free(): error: modified chunk-pointer 0xcd6d0120
+Abort trap
+
+========================================================================
+IV.3. NetBSD
+========================================================================
+
+Like OpenBSD, NetBSD is vulnerable to the maximum RLIMIT_STACK
+vulnerability (CVE-2017-1000374): if a local attacker sets RLIMIT_STACK
+to MAXSSIZ, he eliminates the PROT_NONE part of the stack region -- the
+stack guard-page itself. Unlike OpenBSD, however, NetBSD:
+
+- defines MAXSSIZ to 64MB on i386 (128MB on amd64);
+
+- maps the run-time link-editor ld.so directly below the stack region,
+  even if ASLR is enabled (CVE-2017-1000375):
+
+$ sh -c 'ulimit -S -s; pmap -a -P'
+2048
+Start    End         Size  Offset   rwxpc  RWX  I/W/A Dev     Inode - File
+08048000-0804dfff      24k 00000000 r-xp+ (rwx) 1/0/0 00:00   21706 - /usr/bin/pmap [0xc5c8f0b8]
+...
+bbbee000-bbbfefff      68k 00000000 r-xp+ (rwx) 1/0/0 00:00  107525 - /libexec/ld.elf_so [0xc535f580]
+bbbff000-bbbfffff       4k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ anon ]
+bbc00000-bf9fffff   63488k 00000000 ---p+ (rwx) 1/0/0 00:00       0 -   [ stack ]
+bfa00000-bfbeffff    1984k 00000000 rw-p+ (rwx) 1/0/0 00:00       0 -   [ stack ]
+bfbf0000-bfbfffff      64k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ stack ]
+ total               9528k
+
+$ sh -c 'ulimit -S -s `ulimit -H -s`; pmap -a -P'
+Start    End         Size  Offset   rwxpc  RWX  I/W/A Dev     Inode - File
+08048000-0804dfff      24k 00000000 r-xp+ (rwx) 1/0/0 00:00   21706 - /usr/bin/pmap [0xc5c8f0b8]
+...
+bbbee000-bbbfefff      68k 00000000 r-xp+ (rwx) 1/0/0 00:00  107525 - /libexec/ld.elf_so [0xc535f580]
+bbbff000-bbbfffff       4k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ anon ]
+bbc00000-bfbeffff   65472k 00000000 rw-p+ (rwx) 1/0/0 00:00       0 -   [ stack ]
+bfbf0000-bfbfffff      64k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ stack ]
+ total              73016k
+
+# cp /usr/bin/pmap .
+# paxctl +A ./pmap
+# sh -c 'ulimit -S -s `ulimit -H -s`; ./pmap -a -P'
+Start    End         Size  Offset   rwxpc  RWX  I/W/A Dev     Inode - File
+08048000-0804dfff      24k 00000000 r-xp+ (rwx) 1/0/0 00:00  172149 - /tmp/pmap [0xc5cb3c64]
+...
+bbbee000-bbbfefff      68k 00000000 r-xp+ (rwx) 1/0/0 00:00  107525 - /libexec/ld.elf_so [0xc535f580]
+bbbff000-bbbfffff       4k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ anon ]
+bbc00000-bf1bffff   55040k 00000000 rw-p+ (rwx) 1/0/0 00:00       0 -   [ stack ]
+bf1c0000-bf1cefff      60k 00000000 rw-p- (rwx) 1/0/0 00:00       0 -   [ stack ]
+ total              62580k
+
+Consequently, a local attacker can set RLIMIT_STACK to MAXSSIZ,
+eliminate the stack guard-page, and:
+
+- skip Step 1, because ld.so's read-write segment is naturally mapped
+  directly below the stack region;
+
+- Steps 2 and 3: consume 64MB (MAXSSIZ) of stack memory (for example,
+  through the recursive qsort() vulnerability, CVE-2017-1000378) until
+  the stack-pointer reaches the start of the stack region (Step 2) and
+  moves into ld.so's read-write segment (Step 3);
+
+- Step 4b: smash ld.so's read-write segment with the stack.
+
+We did not try to exploit this vulnerability, nor did we search for a
+vulnerable SUID or SGID binary, but we wrote a simple proof-of-concept,
+and some of the following crashes may be exploitable:
+
+$ sh -c 'ulimit -S -s `ulimit -H -s`; ./NetBSD_CVE-2017-1000375 0x04000000'
+[1]   Segmentation fault      ./NetBSD_CVE-201...
+
+$ sh -c 'ulimit -S -s `ulimit -H -s`; ./NetBSD_CVE-2017-1000375 0x03000000'
+
+...
+
+$ sh -c 'ulimit -S -s `ulimit -H -s`; ./NetBSD_CVE-2017-1000375 0x03ec5000'
+
+$ sh -c 'ulimit -S -s `ulimit -H -s`; ./NetBSD_CVE-2017-1000375 0x03ec5400'
+[1]   Segmentation fault      ./NetBSD_CVE-201...
+
+$ sh -c 'ulimit -S -s `ulimit -H -s`; gdb ./NetBSD_CVE-2017-1000375'
+GNU gdb (GDB) 7.7.1
+...
+(gdb) run 0x03ec5400
+Program received signal SIGSEGV, Segmentation fault.
+0xbbbf448d in _rtld_symlook_default () from /usr/libexec/ld.elf_so
+(gdb) x/i $eip
+=> 0xbbbf448d <_rtld_symlook_default+185>:      mov    %edx,(%esi,%edi,4)
+(gdb) info registers
+esi            0xbabae890       -1162155888
+edi            0x0      0
+...
+(gdb) run 0x03ec5800
+Program received signal SIGSEGV, Segmentation fault.
+0xbbbf4465 in _rtld_symlook_default () from /usr/libexec/ld.elf_so
+(gdb) x/i $eip
+=> 0xbbbf4465 <_rtld_symlook_default+145>:      mov    0x4(%ecx),%edx
+(gdb) info registers
+ecx            0x41414141       1094795585
+...
+(gdb) run 0x03ec5c00
+Program received signal SIGSEGV, Segmentation fault.
+0xbbbf4408 in _rtld_symlook_default () from /usr/libexec/ld.elf_so
+(gdb) x/i $eip
+=> 0xbbbf4408 <_rtld_symlook_default+52>:       mov    (%eax),%esi
+(gdb) info registers
+eax            0x41414141       1094795585
+...
+
+========================================================================
+IV.4. FreeBSD
+========================================================================
+
+========================================================================
+IV.4.1. setrlimit() RLIMIT_STACK vulnerability (CVE-2017-1085)
+========================================================================
+
+FreeBSD's kern_proc_setrlimit() function contains the following comment
+and code:
+
+                /*
+                 * Stack is allocated to the max at exec time with only
+                 * "rlim_cur" bytes accessible.  If stack limit is going
+                 * up make more accessible, if going down make inaccessible.
+                 */
+                if (limp->rlim_cur != oldssiz.rlim_cur) {
+                        ...
+                        if (limp->rlim_cur > oldssiz.rlim_cur) {
+                                prot = p->p_sysent->sv_stackprot;
+                                size = limp->rlim_cur - oldssiz.rlim_cur;
+                                addr = p->p_sysent->sv_usrstack -
+                                    limp->rlim_cur;
+                        } else {
+                                prot = VM_PROT_NONE;
+                                size = oldssiz.rlim_cur - limp->rlim_cur;
+                                addr = p->p_sysent->sv_usrstack -
+                                    oldssiz.rlim_cur;
+                        }
+                        ...
+                        (void)vm_map_protect(&p->p_vmspace->vm_map,
+                            addr, addr + size, prot, FALSE);
+                }
+
+OpenBSD's and NetBSD's dosetrlimit() function contains the same comment,
+which accurately describes the layout of their user-space stack region.
+Unfortunately, FreeBSD's kern_proc_setrlimit() comment and code are
+incorrect, as hinted at in exec_new_vmspace():
+
+/*
+ * Destroy old address space, and allocate a new stack
+ *      The new stack is only SGROWSIZ large because it is grown
+ *      automatically in trap.c.
+ */
+
+and vm_map_stack_locked():
+
+        /*
+         * We initially map a stack of only init_ssize.  We will grow as
+         * needed later.
+
+where init_ssize is SGROWSIZ (128KB), not MAXSSIZ (64MB on i386),
+because "init_ssize = (max_ssize < growsize) ? max_ssize : growsize;"
+(and max_ssize is MAXSSIZ, and growsize is SGROWSIZ).
+
+As a result, if a program calls setrlimit() to increase RLIMIT_STACK,
+vm_map_protect() may turn a read-only memory region below the stack into
+a read-write region (CVE-2017-1085), as demonstrated by the following
+proof-of-concept:
+
+% ./FreeBSD_CVE-2017-1085
+Segmentation fault
+
+% ./FreeBSD_CVE-2017-1085 setrlimit to the max
+char at 0xbd155000: 41
+
+========================================================================
+IV.4.2. Stack guard-page disabled by default (CVE-2017-1083)
+========================================================================
+
+The FreeBSD kernel implements a 4KB stack guard-page, and recent
+versions of the FreeBSD Installer offer it as a system hardening option.
+Unfortunately, it is disabled by default (CVE-2017-1083):
+
+% sysctl security.bsd.stack_guard_page
+security.bsd.stack_guard_page: 0
+
+========================================================================
+IV.4.3. Stack guard-page vulnerabilities (CVE-2017-1084)
+========================================================================
+
+- If FreeBSD's stack guard-page is enabled, its entire logic is
+  implemented in vm_map_growstack(): this function guarantees a minimum
+  distance of 4KB (the stack guard-page) between the start of the stack
+  and the end of the memory region that is mapped below (but the stack
+  guard-page is not physically mapped into the address-space).
+
+  Unfortunately, this guarantee is given only when the stack grows down
+  and clashes with the memory region mapped below, but not if the memory
+  region mapped below grows up and clashes with the stack: this
+  vulnerability effectively eliminates the stack guard-page
+  (CVE-2017-1084). In our proof-of-concept:
+
+  . we allocate anonymous mmap()s of 4KB, until the end of an anonymous
+    mmap() reaches the start of the stack [Step 1];
+
+  . we call a recursive function until the stack-pointer reaches the
+    start of the stack and moves into the anonymous mmap() directly
+    below [Step 2];
+
+  . but we do not jump over the stack guard-page, because each call to
+    the recursive function allocates (and fully writes to) a 1KB
+    stack-based buffer [Step 3];
+
+  . and we do not crash into the stack guard-page, because CVE-2017-1084
+    has effectively eliminated the stack guard-page in Step 1.
+
+# sysctl security.bsd.stack_guard_page=1
+security.bsd.stack_guard_page: 0 -> 1
+
+% ./FreeBSD_CVE-2017-FGPU
+char at 0xbfbde000: 41
+
+- vm_map_growstack() implements most of the stack guard-page logic in
+  the following code:
+
+                /*
+                 * Growing downward.
+                 */
+                /* Get the preliminary new entry start value */
+                addr = stack_entry->start - grow_amount;
+
+                /*
+                 * If this puts us into the previous entry, cut back our
+                 * growth to the available space. Also, see the note above.
+                 */
+                if (addr < end) {
+                        stack_entry->avail_ssize = max_grow;
+                        addr = end;
+                        if (stack_guard_page)
+                                addr += PAGE_SIZE;
+                }
+
+  where:
+
+  . addr is the new start of the stack;
+
+  . stack_entry->start is the old start of the stack;
+
+  . grow_amount is the size of the stack expansion;
+
+  . end is the end of the memory region below the stack.
+
+  Unfortunately, the "addr < end" test should be "addr <= end": if addr,
+  the new start of the stack, is equal to end, the end of the memory
+  region mapped below, then the stack guard-page is eliminated
+  (CVE-2017-1084). In our proof-of-concept:
+
+  . we allocate anonymous mmap()s of 4KB, until the end of an anonymous
+    mmap() reaches a randomly chosen distance below the start of the
+    stack [Step 1];
+
+  . we call a recursive function until the stack-pointer reaches the
+    start of the stack, and the stack expansion reaches the end of the
+    anonymous mmap() below [Step 2];
+
+  . we do not jump over the stack guard-page, because each call to the
+    recursive function allocates (and fully writes to) a 1KB stack-based
+    buffer [Step 3];
+
+  . and we crash into the stack guard-page most of the time;
+
+  . but we survive with a probability of 4KB/128KB=1/32 (grow_amount is
+    always a multiple of SGROWSIZ, 128KB) because CVE-2017-1084 has
+    effectively eliminated the stack guard-page in Step 2.
+
+% sysctl security.bsd.stack_guard_page
+security.bsd.stack_guard_page: 1
+
+% sh -c 'while true; do ./FreeBSD_CVE-2017-FGPE; done'
+Segmentation fault
+char at 0xbe45e000: 41; final dist 6097 (24778705)
+Segmentation fault
+Segmentation fault
+Segmentation fault
+...
+Segmentation fault
+Segmentation fault
+Segmentation fault
+char at 0xbd25e000: 41; final dist 7036 (43654012)
+Segmentation fault
+Segmentation fault
+Segmentation fault
+...
+Segmentation fault
+Segmentation fault
+Segmentation fault
+char at 0xbd29e000: 41; final dist 5331 (43390163)
+Segmentation fault
+Segmentation fault
+Segmentation fault
+...
+
+  In contrast, if FreeBSD's stack guard-page is disabled, our
+  proof-of-concept always survives:
+
+# sysctl security.bsd.stack_guard_page=0
+security.bsd.stack_guard_page: 1 -> 0
+
+% sh -c 'while true; do ./FreeBSD_CVE-2017-FGPE; done'
+char at 0xbe969000: 41; final dist 89894 (19488550)
+char at 0xbfa6d000: 41; final dist 74525 (1647389)
+char at 0xbf4df000: 41; final dist 78 (7471182)
+char at 0xbe9e4000: 41; final dist 112397 (18986765)
+char at 0xbf693000: 41; final dist 49811 (5685907)
+char at 0xbf533000: 41; final dist 51037 (7128925)
+char at 0xbd799000: 41; final dist 26043 (38167995)
+char at 0xbd54b000: 11; final dist 83754 (40585002)
+char at 0xbe176000: 41; final dist 36992 (27824256)
+char at 0xbfa91000: 41; final dist 57449 (1499241)
+char at 0xbd1b9000: 41; final dist 26115 (44328451)
+char at 0xbd1c8000: 41; final dist 94852 (44266116)
+char at 0xbf73a000: 41; final dist 22276 (5003012)
+char at 0xbe6b1000: 41; final dist 58854 (22341094)
+char at 0xbeb81000: 41; final dist 124727 (17295159)
+char at 0xbfb35000: 41; final dist 43174 (829606)
+...
+
+- FreeBSD's thread library (libthr) mmap()s a secondary PROT_NONE stack
+  guard-page at a distance RLIMIT_STACK below the end of the stack:
+
+# sysctl security.bsd.stack_guard_page=1
+security.bsd.stack_guard_page: 0 -> 1
+
+% sh -c 'exec procstat -v $$'
+  PID      START        END PRT  RES PRES REF SHD FLAG TP PATH
+ 2779  0x8048000  0x8050000 r-x    8    8   1   0 CN-- vn /usr/bin/procstat
+...
+ 2779 0x28400000 0x28800000 rw-   22   35   2   0 ---- df
+ 2779 0xbfbdf000 0xbfbff000 rwx    3    3   1   0 ---D df
+ 2779 0xbfbff000 0xbfc00000 r-x    1    1  23   0 ---- ph
+
+% sh -c 'LD_PRELOAD=libthr.so exec procstat -v $$'
+  PID      START        END PRT  RES PRES REF SHD FLAG TP PATH
+ 2798  0x8048000  0x8050000 r-x    8    8   1   0 CN-- vn /usr/bin/procstat
+...
+ 2798 0x28400000 0x28800000 rw-   23   35   2   0 ---- df
+ 2798 0xbbbfe000 0xbbbff000 ---    0    0   0   0 ---- --
+ 2798 0xbfbdf000 0xbfbff000 rwx    3    3   1   0 ---D df
+ 2798 0xbfbff000 0xbfc00000 r-x    1    1  23   0 ---- ph
+
+  Unfortunately, this secondary stack guard-page does not mitigate the
+  vulnerabilities that we discovered in FreeBSD's stack guard-page
+  implementation:
+
+% sysctl security.bsd.stack_guard_page
+security.bsd.stack_guard_page: 1
+
+% sh -c 'LD_PRELOAD=libthr.so ./FreeBSD_CVE-2017-FGPU'
+char at 0xbfbde000: 41
+
+% sh -c 'while true; do LD_PRELOAD=libthr.so ./FreeBSD_CVE-2017-FGPE; done'
+Segmentation fault
+Segmentation fault
+Segmentation fault
+...
+Segmentation fault
+Segmentation fault
+Segmentation fault
+char at 0xbda5e000: 41; final dist 3839 (35262207)
+Segmentation fault
+Segmentation fault
+Segmentation fault
+...
+Segmentation fault
+Segmentation fault
+Segmentation fault
+char at 0xbdb1e000: 41; final dist 3549 (34475485)
+Segmentation fault
+Segmentation fault
+Segmentation fault
+...
+
+========================================================================
+IV.4.4. Remote exploitation
+========================================================================
+
+Because FreeBSD's stack guard-page is disabled by default, we tried (and
+failed) to remotely exploit a test service vulnerable to:
+
+- an unlimited memory leak that allows us to malloc()ate gigabytes of
+  memory;
+
+- a limited recursion that allows us to allocate up to 1MB of stack
+  memory.
+
+FreeBSD's malloc() implementation (jemalloc) mmap()s 4MB chunks of
+anonymous memory that are aligned on multiples of 4MB. The first 4MB
+mmap() chunk starts at 0x28400000, and the last 4MB mmap() chunk ends at
+0xbf800000, because the stack itself already ends at 0xbfc00000; but it
+is impossible to cover this final mmap-stack distance (almost 4MB) with
+the limited recursion (1MB) of our test service.
+
+...
+break(0x80499b0)                 = 0 (0x0)
+break(0x8400000)                 = 0 (0x0)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = 672845824 (0x281ad000)
+mmap(0x285ad000,2437120,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = 677040128 (0x285ad000)
+munmap(0x281ad000,2437120)           = 0 (0x0)
+mmap(0x0,8388608,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = 679477248 (0x28800000)
+munmap(0x28c00000,4194304)           = 0 (0x0)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = 683671552 (0x28c00000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = 687865856 (0x29000000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = 692060160 (0x29400000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = 696254464 (0x29800000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = 700448768 (0x29c00000)
+...
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = -1103101952 (0xbe400000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = -1098907648 (0xbe800000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = -1094713344 (0xbec00000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = -1090519040 (0xbf000000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) = -1086324736 (0xbf400000)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) ERR#12 'Cannot allocate memory'
+break(0x8800000)                 = 0 (0x0)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) ERR#12 'Cannot allocate memory'
+break(0x8c00000)                 = 0 (0x0)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) ERR#12 'Cannot allocate memory'
+break(0x9000000)                 = 0 (0x0)
+...
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) ERR#12 'Cannot allocate memory'
+break(0x27c00000)                = 0 (0x0)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) ERR#12 'Cannot allocate memory'
+break(0x28000000)                = 0 (0x0)
+mmap(0x0,4194304,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0x0) ERR#12 'Cannot allocate memory'
+break(0x28400000)                ERR#12 'Cannot allocate memory'
+
+========================================================================
+IV.5. Solaris >= 11.1
+========================================================================
+
+========================================================================
+IV.5.1. Minimal RLIMIT_STACK vulnerability (CVE-2017-3630)
+========================================================================
+
+On Solaris, ASLR can be enabled or disabled for each ELF binary with the
+SUNW_ASLR dynamic section entry (man elfedit):
+
+$ elfdump /usr/bin/rsh | egrep 'ASLR|NX'
+     [39]  SUNW_ASLR       0x2        ENABLE
+     [40]  SUNW_NXHEAP     0x2        ENABLE
+     [41]  SUNW_NXSTACK    0x2        ENABLE
+
+Without ASLR
+
+If ASLR is disabled:
+
+- a stack region of size RLIMIT_STACK is reserved in the address-space;
+
+- a 4KB stack guard-page is mapped directly below this stack region;
+
+- the runtime linker ld.so is mapped directly below this stack
+  guard-page.
+
+$ cp /usr/bin/sleep .
+$ chmod u+w ./sleep
+$ elfedit -e 'dyn:sunw_aslr disable' ./sleep
+
+$ sh -c 'ulimit -S -s; ./sleep 3 & pmap -r ${!}'
+8192
+7176:   ./sleep 3
+...
+FE7B1000     228K r-x----  /lib/ld.so.1
+FE7FA000       8K rwx----  /lib/ld.so.1
+FE7FC000       8K rwx----  /lib/ld.so.1
+FE7FF000    8192K rw-----    [ stack ]
+ total     17148K
+
+$ sh -c 'ulimit -S -s 64; ./sleep 3 & pmap -r ${!}'
+7244:   ./sleep 3
+...
+FEFA1000     228K r-x----  /lib/ld.so.1
+FEFEA000       8K rwx----  /lib/ld.so.1
+FEFEC000       8K rwx----  /lib/ld.so.1
+FEFEF000      64K rw-----    [ stack ]
+ total      9020K
+
+On the one hand, a local attacker can exploit this simplified
+stack-clash:
+
+- Step 1 (Clash) is not needed, because ld.so is naturally mapped
+  directly below the stack (the distance between the end of ld.so's
+  read-write segment and the start of the stack is 4KB, the stack
+  guard-page);
+
+- Step 2 (Run) is not needed, because a local attacker can set
+  RLIMIT_STACK to just a few kilobytes, reserve a very small stack
+  region, and hence shorten the distance between the stack-pointer and
+  the start of the stack (and the end of ld.so's read-write segment);
+
+- Step 3 (Jump) can be completed with a large stack-based buffer that is
+  not fully written to;
+
+- Step 4b (Smash) can be completed by overwriting the function pointers
+  in ld.so's read-write segment with the contents of a stack-based
+  buffer.
+
+Such a simplified stack-clash exploit was first mentioned in Gael
+Delalleau's 2005 presentation (slide 30).
+
+On the other hand, a remote attacker cannot modify RLIMIT_STACK and must
+complete Step 2 (Run) with a recursive function that consumes the 8MB
+(the default RLIMIT_STACK) between the stack-pointer and the start of
+the stack.
+
+With ASLR
+
+If ASLR is enabled:
+
+- a stack region of size RLIMIT_STACK is reserved in the address-space;
+
+- a 4KB stack guard-page is mapped directly below this stack region;
+
+- the runtime linker ld.so is mapped below this stack guard-page, but at
+  a random distance (within a [4KB,128MB] range) -- effectively a large,
+  secondary stack guard-page.
+
+On the one hand, a local attacker can run the simplified "Without ASLR"
+stack-clash exploit until the ld.so-stack distance is minimal -- with a
+probability of 4KB/128MB=1/32K, the distance between the end of ld.so's
+read-write segment and the start of the stack is exactly 8KB: the stack
+guard-page plus the minimum distance between the stack guard-page and
+ld.so (CVE-2017-3629).
+
+On the other hand, a remote attacker must complete Step 2 (Run) with a
+recursive function, and:
+
+- has a good chance of exploiting this stack-clash after 32K connections
+  (when the ld.so-stack distance is minimal) if the remote service
+  re-execve()s (re-randomizes the ld.so-stack distance for each new
+  connection);
+
+- cannot exploit this stack-clash if the remote service does not
+  re-execve() (does not re-randomize the ld.so-stack distance for each
+  new connection) unless the attacker is able to restart the service,
+  reboot the server, or target a 32K-server farm.
+
+========================================================================
+IV.5.2. /usr/bin/rsh exploit
+========================================================================
+
+/usr/bin/rsh is SUID-root and its main() function allocates a 50KB
+stack-based buffer that is not written to and can be used to jump over
+the stack guard-page, into ld.so's read-write segment, in Step 3 of our
+simplified stack-clash exploit.
+
+Next, we discovered a general method for gaining eip control in Step 4b:
+setlocale(LC_ALL, ""), called by the main() function of /usr/bin/rsh and
+other SUID binaries, copies the LC_ALL environment variable to several
+stack-based buffers and thus smashes ld.so's read-write segment and
+overwrites some of ld.so's function pointers.
+
+Last, we execute our own shell-code: we return-into-binary (/usr/bin/rsh
+is not a PIE), to an instruction that reliably jumps into a copy of our
+LC_ALL environment variable in ld.so's read-write segment, which is in
+fact read-write-executable. For example, after we gain control of eip:
+
+- on Solaris 11.1, we return to a "pop; pop; ret" instruction, because a
+  pointer to our shell-code is stored at an 8-byte offset from esp;
+
+- on Solaris 11.3, we return to a "call *0xc(%ebp)" instruction, because
+  a pointer to our shell-code is stored at a 12-byte offset from ebp.
+
+Our Solaris exploit brute-forces the random ld.so-stack distance and two
+parameters:
+
+- the RLIMIT_STACK;
+
+- the length of the LC_ALL environment variable.
+
+========================================================================
+IV.5.3. Forced-Privilege vulnerability (CVE-2017-3631)
+========================================================================
+
+/usr/bin/rsh is SUID-root, but the shell that we obtained in Step 4b of
+our stack-clash exploit did not grant us full root privileges, only
+net_privaddr, the privilege to bind to a privileged port number.
+Disappointed by this result, we investigated and found:
+
+$ ggrep -r /usr/bin/rsh /etc 2>/dev/null
+/etc/security/exec_attr.d/core-os:Forced Privilege:solaris:cmd:RO::/usr/bin/rsh:privs=net_privaddr
+
+$ /usr/bin/rsh -h
+/usr/bin/rsh: illegal option -- h
+usage: rsh [ -PN / -PO ] [ -l login ] [ -n ] [ -k realm ] [ -a ] [ -x ] [ -f / -F ] host command
+       rsh [ -PN / -PO ] [ -l login ] [ -k realm ] [ -a ] [ -x ] [ -f / -F ] host
+
+# cat truss.out
+...
+7319:   execve("/usr/bin/rsh", 0xA9479C548, 0xA94792808)  argc = 2
+7319:       *** FPRIV: P/E: net_privaddr ***
+...
+
+Unfortunately, this Forced-Privilege protection is based on the pathname
+of SUID-root binaries, which can be execve()d through hard-links, under
+different pathnames (CVE-2017-3631). For example, we discovered that
+readable SUID-root binaries can be execve()d through hard-links in
+/proc:
+
+$ sleep 3 < /usr/bin/rsh & /proc/${!}/fd/0 -h
+[1] 7333
+/proc/7333/fd/0: illegal option -- h
+usage: rsh [ -PN / -PO ] [ -l login ] [ -n ] [ -k realm ] [ -a ] [ -x ] [ -f / -F ] host command
+       rsh [ -PN / -PO ] [ -l login ] [ -k realm ] [ -a ] [ -x ] [ -f / -F ] host
+
+# cat truss.out
+...
+7335:   execve("/proc/7333/fd/0", 0xA947CA508, 0xA94792808)  argc = 2
+7335:       *** SUID: ruid/euid/suid = 100 / 0 / 0  ***
+...
+
+This vulnerability allows us to bypass the Forced-Privilege protection
+and obtain full root privileges with our /usr/bin/rsh exploit.
+
+
+========================================================================
+V. Acknowledgments
+========================================================================
+
+We thank the members of the distros list, Oracle/Solaris, Exim, Sudo,
+security@...nel.org, grsecurity/PaX, and OpenBSD.
+

@@ -1,0 +1,208 @@
+
+Date: Sun, 5 Jun 2022 09:20:35 +0800 (GMT+08:00)
+From: duoming@....edu.cn
+To: oss-security@...ts.openwall.com
+Subject: CVE-2022-1974: Linux kernel: use-after-free caused by improper check
+ device_is_registered() in nfc netlink related functions
+
+Hello there,
+
+There are use-after-free vulnerabilities in /net/nfc/core.c of linux that allow 
+attacker to crash linux kernel by simulating nfc device from user-space.
+
+=*=*=*=*=*=*=*=*=  Bug Details  =*=*=*=*=*=*=*=*=
+
+The device_is_registered() in nfc core is used to check whether
+nfc device is registered in netlink related functions such as
+nfc_fw_download(), nfc_dev_up() and so on. Although device_is_registered()
+is protected by device_lock, there is still a race condition between
+device_del() and device_is_registered(). The root cause is that
+kobject_del() in device_del() is not protected by device_lock.
+
+   (cleanup task)         |     (netlink task)
+                          |
+nfc_unregister_device     | nfc_fw_download
+ device_del               |  device_lock
+  ...                     |   if (!device_is_registered)//(1)
+  kobject_del//(2)        |   ...
+ ...                      |  device_unlock
+
+The device_is_registered() returns the value of state_in_sysfs and
+the state_in_sysfs is set to zero in kobject_del(). If we pass check in
+position (1), then set zero in position (2). As a result, the check
+in position (1) is useless.
+
+One of the use-after-free vulnerabilities caused by this problem is shown below:
+
+   (Free)                 |     (Use)                      
+nfc_unregister_device     | nfc_dev_up
+ rfkill_destroy //(1)     |  ...
+ ...                      |  
+ device_del               |  device_lock
+  ...                     |   if (!device_is_registered)
+  kobject_del             |   ...
+                          |   rfkill_blocked
+                          |    spin_lock_irqsave(&rfkill->lock,..);//(2)
+ ...                      |  device_unlock
+
+The rfkill is deallocated is position(1) and use in position(2), which leads to 
+use-after-free bug.
+
+=*=*=*=*=*=*=*=*=  Bug Effects  =*=*=*=*=*=*=*=*=
+
+We can successfully trigger the vulnerabilities to crash the linux kernel.
+
+The backtrace caused by use-after-free bug is shown below.
+
+[   97.540761] ==================================================================
+[   97.541238] BUG: KASAN: use-after-free in do_raw_spin_lock+0x66/0x1a0
+[   97.541525] Read of size 4 at addr ffff888006e68004 by task example/635
+[   97.541525] CPU: 0 PID: 635 Comm: example Not tainted 5.18.0-rc3-00849-gfc06b2867f4c-dirty #167
+[   97.541525] Call Trace:
+[   97.541525]  <TASK>
+[   97.541525]  dump_stack_lvl+0x57/0x7d
+[   97.541525]  print_report.cold+0x5e/0x5db
+[   97.541525]  ? do_raw_spin_lock+0x66/0x1a0
+[   97.541525]  kasan_report+0xbe/0x1c0
+[   97.541525]  ? do_raw_spin_lock+0x66/0x1a0
+[   97.541525]  do_raw_spin_lock+0x66/0x1a0
+[   97.541525]  ? rwlock_bug.part.0+0x50/0x50
+[   97.541525]  ? lock_release+0x450/0x450
+[   97.541525]  _raw_spin_lock_irqsave+0x41/0x50
+[   97.541525]  ? rfkill_blocked+0xc/0x40
+[   97.541525]  rfkill_blocked+0xc/0x40
+[   97.541525]  nfc_dev_up+0x4c/0x140
+[   97.541525]  nfc_genl_dev_up+0x46/0x70
+[   97.541525]  genl_family_rcv_msg_doit+0x17a/0x200
+[   97.541525]  ? genl_family_rcv_msg_attrs_parse.constprop.0+0x130/0x130
+[   97.541525]  ? mutex_lock_io_nested+0xb63/0xbd0
+[   97.541525]  ? security_capable+0x48/0x60
+[   97.541525]  genl_rcv_msg+0x18d/0x2c0
+[   97.541525]  ? genl_get_cmd+0x1b0/0x1b0
+[   97.541525]  ? rcu_read_lock_sched_held+0xd/0x70
+[   97.541525]  ? nfc_genl_dev_down+0x70/0x70
+[   97.541525]  ? rcu_read_lock_sched_held+0xd/0x70
+[   97.541525]  ? lock_acquire+0xce/0x410
+[   97.541525]  netlink_rcv_skb+0xc4/0x1f0
+[   97.541525]  ? genl_get_cmd+0x1b0/0x1b0
+[   97.541525]  ? netlink_ack+0x4d0/0x4d0
+[   97.541525]  ? netlink_deliver_tap+0xf7/0x5a0
+[   97.541525]  genl_rcv+0x1f/0x30
+[   97.541525]  netlink_unicast+0x2d8/0x420
+[   97.541525]  ? netlink_attachskb+0x430/0x430
+[   97.541525]  netlink_sendmsg+0x3a9/0x6e0
+[   97.541525]  ? netlink_unicast+0x420/0x420
+[   97.541525]  ? netlink_unicast+0x420/0x420
+[   97.541525]  sock_sendmsg+0x91/0xa0
+[   97.541525]  __sys_sendto+0x168/0x200
+[   97.541525]  ? __ia32_sys_getpeername+0x40/0x40
+[   97.541525]  ? preempt_count_sub+0xf/0xb0
+[   97.541525]  ? fd_install+0xfb/0x340
+[   97.541525]  ? __sys_socket+0xf0/0x160
+[   97.541525]  ? kernel_fpu_begin_mask+0x160/0x160
+[   97.541525]  ? compat_sock_ioctl+0x410/0x410
+[   97.541525]  ? rwlock_bug.part.0+0x50/0x50
+[   97.541525]  __x64_sys_sendto+0x6f/0x80
+[   97.541525]  do_syscall_64+0x3b/0x90
+[   97.541525]  entry_SYSCALL_64_after_hwframe+0x44/0xae
+[   97.541525] RIP: 0033:0x7f4d46a9102c
+[   97.541525] Code: 0a f8 ff ff 44 8b 4c 24 2c 4c 8b 44 24 20 89 c5 44 8b 54 24 28 48 8b 54 24 18 b8 2c 00 00 00 48 8b 74 24 10 8b 7c 24 08 0f 05 <48> 3b
+[   97.541525] RSP: 002b:00007f4d460a8e10 EFLAGS: 00000293 ORIG_RAX: 000000000000002c
+[   97.541525] RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 00007f4d46a9102c
+[   97.541525] RDX: 000000000000001c RSI: 0000558ad8003090 RDI: 000000000000009d
+[   97.541525] RBP: 0000000000000000 R08: 00007f4d460a8e8c R09: 000000000000000c
+[   97.541525] R10: 0000000000000000 R11: 0000000000000293 R12: 00007ffded880efe
+[   97.541525] R13: 00007ffded880eff R14: 00007f4d460a8fc0 R15: 00007f4d460a9700
+[   97.541525]  </TASK>
+[   97.541525] 
+[   97.541525] Allocated by task 159:
+[   97.541525]  kasan_save_stack+0x1e/0x40
+[   97.541525]  __kasan_kmalloc+0x81/0xa0
+[   97.541525]  rfkill_alloc+0x6a/0x170
+[   97.541525]  nfc_register_device+0x8d/0x110
+[   97.541525]  nci_register_device+0x515/0x5e0
+[   97.541525]  nfcmrvl_nci_register_dev+0x143/0x170
+[   97.541525]  nfcmrvl_nci_uart_open+0x147/0x240
+[   97.541525]  nci_uart_tty_ioctl+0x1c3/0x270
+[   97.541525]  tty_ioctl+0x5f0/0xc70
+[   97.541525]  __x64_sys_ioctl+0xb4/0xf0
+[   97.541525]  do_syscall_64+0x3b/0x90
+[   97.541525]  entry_SYSCALL_64_after_hwframe+0x44/0xae
+[   97.541525] 
+[   97.541525] Freed by task 636:
+[   97.541525]  kasan_save_stack+0x1e/0x40
+[   97.541525]  kasan_set_track+0x21/0x30
+[   97.541525]  kasan_set_free_info+0x20/0x30
+[   97.541525]  __kasan_slab_free+0x108/0x170
+[   97.541525]  kfree+0xb0/0x330
+[   97.541525]  device_release+0x54/0xe0
+[   97.541525]  kobject_put+0xa5/0x120
+[   97.541525]  nfc_unregister_device+0x51/0x100
+[   97.541525]  nfcmrvl_nci_unregister_dev+0x45/0x70
+[   97.541525]  nci_uart_tty_close+0x87/0xd0
+[   97.541525]  tty_ldisc_kill+0x3e/0x80
+[   97.541525]  tty_ldisc_hangup+0x1b2/0x2c0
+[   97.541525]  __tty_hangup.part.0+0x316/0x520
+[   97.541525]  tty_release+0x200/0x670
+[   97.541525]  __fput+0x110/0x410
+[   97.541525]  task_work_run+0x86/0xd0
+[   97.541525]  exit_to_user_mode_prepare+0x1aa/0x1b0
+[   97.541525]  syscall_exit_to_user_mode+0x19/0x50
+[   97.541525]  do_syscall_64+0x48/0x90
+[   97.541525]  entry_SYSCALL_64_after_hwframe+0x44/0xae
+[   97.541525] 
+[   97.541525] Last potentially related work creation:
+[   97.541525]  kasan_save_stack+0x1e/0x40
+[   97.541525]  __kasan_record_aux_stack+0x97/0xa0
+[   97.541525]  insert_work+0x28/0x110
+[   97.541525]  __queue_work+0x357/0x830
+[   97.541525]  queue_work_on+0x76/0x80
+[   97.541525]  rfkill_register+0x37a/0x4a0
+[   97.541525]  nfc_register_device+0xb3/0x110
+[   97.541525]  nci_register_device+0x515/0x5e0
+[   97.541525]  nfcmrvl_nci_register_dev+0x143/0x170
+[   97.541525]  nfcmrvl_nci_uart_open+0x147/0x240
+[   97.541525]  nci_uart_tty_ioctl+0x1c3/0x270
+[   97.541525]  tty_ioctl+0x5f0/0xc70
+[   97.541525]  __x64_sys_ioctl+0xb4/0xf0
+[   97.541525]  do_syscall_64+0x3b/0x90
+[   97.541525]  entry_SYSCALL_64_after_hwframe+0x44/0xae
+[   97.541525] 
+[   97.541525] The buggy address belongs to the object at ffff888006e68000
+[   97.541525]  which belongs to the cache kmalloc-2k of size 2048
+[   97.541525] The buggy address is located 4 bytes inside of
+[   97.541525]  2048-byte region [ffff888006e68000, ffff888006e68800)
+[   97.541525] 
+[   97.541525] The buggy address belongs to the physical page:
+[   97.541525] page:00000000949930bb refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x6e68
+[   97.541525] head:00000000949930bb order:3 compound_mapcount:0 compound_pincount:0
+[   97.541525] flags: 0x100000000010200(slab|head|node=0|zone=1)
+[   97.541525] raw: 0100000000010200 0000000000000000 dead000000000122 ffff888006042f00
+[   97.541525] raw: 0000000000000000 0000000080080008 00000001ffffffff 0000000000000000
+[   97.541525] page dumped because: kasan: bad access detected
+[   97.541525] 
+[   97.541525] Memory state around the buggy address:
+[   97.541525]  ffff888006e67f00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[   97.541525]  ffff888006e67f80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[   97.541525] >ffff888006e68000: fa fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[   97.541525]                    ^
+[   97.541525]  ffff888006e68080: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[   97.541525]  ffff888006e68100: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[   97.541525] ==================================================================
+
+=*=*=*=*=*=*=*=*=  Bug Fix  =*=*=*=*=*=*=*=*=
+
+The patch that have been applied to mainline Linux kernel is shown below.
+https://github.com/torvalds/linux/commit/da5c0f119203ad9728920456a0f52a6d850c01cd
+
+=*=*=*=*=*=*=*=*=  Timeline  =*=*=*=*=*=*=*=*=
+
+2022-05-01: commit da5c0f119203 accepted to mainline kernel
+2022-06-03: CVE-2022-1974 is assigned
+
+=*=*=*=*=*=*=*=*=  Credit  =*=*=*=*=*=*=*=*=
+
+Duoming Zhou <duoming@....edu.cn>
+
+Best Regards,
+Duoming Zhou

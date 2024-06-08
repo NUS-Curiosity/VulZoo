@@ -1,0 +1,57 @@
+
+Date: Sat, 6 Jun 2015 21:32:07 +0300
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: CVE-2015-1805 Linux kernel: pipe: iovec overrun leading to memory corruption
+
+On Sat, Jun 06, 2015 at 02:30:57PM +0300, Solar Designer wrote:
+> However, it's trickier than that, since iov traverses over the multiple
+> struct iovec's and may eventually be what wasn't actually a struct iovec
+> in the caller.  This requires that iov->iov_len become exactly zero at
+> least one extra time.  If iov->iov_len becomes zero on
+> "iov->iov_len -= copy;" then pipe_iov_copy_to_user() either returns
+> success or proceeds to the next iteration of the loop.  In the former
+> case, there's no fault at this time.  In the latter case, there might be
+> a fault on the next iteration, in which case the caller will retry
+> pipe_iov_copy_to_user() with the original iov pointer.  The function
+> will then hit an extra !iov->iov_len (that's been zeroed by its previous
+> invocation) and perform iov++ an extra time.
+
+Actually, there may be multiple zero iov->iov_len's left by the previous
+invocation, as part of its normal processing.  (Moreover, the fix that
+went into RHEL5 appears to rely on this.)  So achieving this condition
+is not tricky at all.
+
+The trickier part is getting the second invocation to proceed beyond
+where the first one failed, perhaps via mapping the page from another
+thread to avoid the fault.  And there's no overrun until the second
+invocation proceeds beyond that point, because all of the iov->iov_len's
+up to that point are zero.  So there doesn't appear to be a way to
+trigger any overrun without winning a race first.
+
+> The possibility of "struct iovec *iov" going out of range and the
+> subsequent out of bounds metadata accesses feel much more severe than
+> the out of bounds accesses to actual data in the userspace.
+> "iov->iov_base += copy;" and "iov->iov_len -= copy;" might then be
+> corrupting kernel memory.  It feels relatively unimportant what the
+> resulting values of iov_base and iov_len will be for their intended
+> purpose, since we use copy_from_user() / copy_to_user() on them anyway.
+> It feels more important that these "+=" and "-=" operators directly
+> modify individual words in kernel memory, albeit only slightly(?) out of
+> bounds of the original iov array.  So maybe it's this risk that needs
+> to be evaluated further.
+
+"struct iovec iovstack[UIO_FASTIOV];" on the stack of do_readv_writev()
+looks like an attractive target.  To attack it, writev() may be invoked
+with iovcnt = UIO_FASTIOV (or less, but that's suboptimal), which is 8.
+
+However, whether or not the attack will proceed more than one element
+beyond iovstack[] appears to depend on previous content of the stack
+beyond that array.  That old stack data needs to be successfully
+interpreted as iov_base and iov_len pairs, with copy_from_user() not
+failing, for the loop to proceed further.  None of this feels
+impossible, and maybe off-by-one is enough to achieve arbitrary code
+execution.  These are just some extra hurdles, and at this time it is
+not reliably known (to me) to which extent the issue is exploitable.
+
+Alexander

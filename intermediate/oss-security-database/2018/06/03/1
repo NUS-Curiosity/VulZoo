@@ -1,0 +1,617 @@
+
+Date: Sun, 3 Jun 2018 20:44:50 +0200
+From: "oststrom \(public\)" <pub@...strom.com>
+To: <oss-security@...ts.openwall.com>
+Subject: CVE-2018-10058 and CVE-2018-10057 - cgminer <=4.10.0 and bfgminer <=5.5.0 remote management api post-auth buffer overflow and path traversal
+
+VuNote
+===================
+
+Author:       <github.com/tintinweb>
+Ref:
+https://github.com/tintinweb/pub/tree/master/pocs/cve-2018-10057
+ 
+https://github.com/tintinweb/pub/tree/master/pocs/cve-2018-10058
+Version:      0.1
+Date:         Feb 25th, 2018
+
+Tag:          cgminer bfgminer bitcoin miner authenticated buffer overflow
+and path traversal
+
+Overview
+--------
+
+Name:         cgminer
+Vendor:       ck kolivas
+References:   * https://github.com/ckolivas/cgminer
+              * https://bitcointalk.org/index.php?topic=28402.0
+
+Version:        4.10.0 [1]
+Latest Version: 4.10.0 [1]
+Other Versions: <= 4.10.0
+Platform(s):    windows, linux
+Technology:     C/C++
+
+Vuln Classes:   CWE-121: Stack-based Buffer Overflow
+                CWE-22: Improper Limitation of a Pathname to a Restricted
+Directory ('Path Traversal')
+Origin:         remote
+Min. Privs.:    authenticated
+
+Source:         open-source
+
+CVE:	        CVE-2018-10057 - arbitrary file write
+                CVE-2018-10058 - buffer overflow
+
+Description
+---------
+
+quote website [1][2]
+
+    This is a multi-threaded multi-pool FPGA and ASIC miner for bitcoin.
+
+
+Overview
+--------
+
+Name:         bfgminer
+Vendor:       luke-jr
+References:   * https://github.com/luke-jr/bfgminer/releases
+              * http://bfgminer.org/
+              * https://bitcointalk.org/?topic=877081
+
+Version:        5.5.0 [3]
+Latest Version: 5.5.0 [3]
+Other Versions: <= 5.5.0
+Platform(s):    windows, linux
+Technology:     C/C++
+
+Vuln Classes:   CWE-121: Stack-based Buffer Overflow
+                CWE-22: Improper Limitation of a Pathname to a Restricted
+Directory ('Path Traversal')
+Origin:         remote
+Min. Privs.:    authenticated
+
+Source:         open-source
+
+CVE:	        CVE-2018-10057 - arbitrary file write
+                CVE-2018-10058 - buffer overflow
+
+
+Description
+---------
+
+quote website [3][4][5]
+
+    What is BFGMiner?
+
+    BFGMiner is a modular ASIC/FPGA miner written in C, featuring dynamic
+clocking, monitoring, and remote interface capabilities.
+
+
+
+Summary
+-------
+
+cgminer and bfgminer both share a good portion of their code basis therefore
+they are both affected by the
+vulnerabilities described in this note. both applications provide remote
+management functionality via an api interface.
+This interface takes either custom plaintext or json encoded commands.
+Available API commands are defined in `api.c`.
+The set of available commands varies depending on the enabled features
+(opencl, fpga, cpumining). An api request can
+carry multiple commands if the commands are tagged as `joinable` (see
+`api.c`). While the API does not feature an
+authentication system, there is a `readonly` and `write` mode. Commands can
+either be accessible in `readonly` or also
+in `write` mode. Read/Write access can be granted via the commandline
+setting an IP-/Subnet-based ACL
+(`Interpret [W:]IP[/Prefix][,[R|W:]IP2[/Prefix2][,...]] --api-allow
+option`). In the context of this vulnerability note
+an `authenticated` vector refers to a vulnerability existing in the handling
+of write-mode commands. On the other hand
+unauthenticated vulnerabilities can be performed without having to match the
+IP-/Subnet-ACL first.
+
+* VU #1 - (CVE-2018-10058) Authenticated Stack buffer overflow (sprintf):
+addpool, save, failover-only, poolquota
+* VU #2 - (CVE-2018-10057) Authenticated path traversal (fopen): save
+* VU #3 - Unauthenticated Information Disclosure: banner / various commands
+leaking details
+* VU #4 - Missing Transport Security: no tls / trivial to mitm / eavesdrop
+
+
+see PoC ref github.
+
+Details
+-------
+
+// Note: annotations are prefixed with //#!
+
+Service Discovery:
+* shodan: `description=cgminer` or [6]
+* banner: `STATUS=E,When=1518898313,Code=14,Msg=Invalid
+command,Description=cgminer 4.9.0|\x00`
+
+#### VU #1 - (CVE-2018-10058) Authenticated Stack buffer overflow: addpool,
+save, failover-only, poolquota
+
+The root cause for the buffer overflow are missing bounds checks and
+unlimited format descriptors used with `sprintf`
+that lead to straight forward `sprintf` buffer overwrite vulnerabilities.
+Misuse pattern `sprintf(dst[size], "%s", param[can be > size])`.
+To exploit this an attacker must be able to provide string params to
+`sprintf` that are close or larger the destination
+buffer size. The way `escape_string` works makes it easier for attackers to
+generate large strings that are being passed
+to `sprintf` as the method does not limit the output size and may extend up
+to double the size of the input string
+(characters escaped one-by-one).
+
+
+Request Handler: `api(int api_thr_id){}`
+
+* The request recv buffer size is `buf[TMPBUFSIZ=8192]`.
+* `recv()` reads at most `TMPBUFSIZ-1` bytes from the socket. This means we
+can push at max 8191 bytes to the api handler (this includes json
+encoding/plaintext cmd overhead)
+* For plaintext commands we can push up to `TMPBUFSIZ-1-len(cmd+SEPARATOR)`
+bytes as param (recv_buffer_size - command and separator overhead)
+
+
+```c
+void api(int api_thr_id)
+{
+    ...
+    char buf[TMPBUFSIZ];            //#! fixed buffer 8192b
+    ...
+    while (!bye) {
+        ...
+        addrok = check_connect((struct sockaddr_storage *)&cli,
+&connectaddr, &group);      //#! check API access ok
+        applog(LOG_DEBUG, "API: connection from %s - %s",
+                    connectaddr, addrok ? "Accepted" : "Ignored");
+
+        if (addrok) {   //#! ACL - access allowed
+            n = recv(c, &buf[0], TMPBUFSIZ-1, 0);           //#! read up to
+8192-1 bytes
+
+            ...
+                if (*buf != ISJSON) {                       //#! plaintext
+cmd decoder
+                    isjson = false;
+
+                    param = strchr(buf, SEPARATOR);         //#! param can
+hold up to TMPBUFSIZ-1-sizeof(SEPARATOR) bytes
+                    if (param != NULL)
+                        *(param++) = '\0';
+
+                    cmd = buf;
+                }
+                else {                                      //#! json cmd
+decoder
+                    ...
+                    cmd = (char *)json_string_value(json_val);
+                    ...
+                    if (json_is_string(json_val))
+                            param = (char *)json_string_value(json_val);
+//#! param can hold up to TMPBUFSIZE-1-sizeof(json overhead including
+cmdstruct)
+            ...
+
+                        for (i = 0; cmds[i].name != NULL; i++) {
+                            ...
+                                if (ISPRIVGROUP(group) ||
+strstr(COMMANDS(group), cmdbuf))
+                                    (cmds[i].func)(io_data, c, param,
+isjson, group);           //#! call api command handler
+                                else {
+                                    message(io_data, MSG_ACCDENY, 0,
+cmds[i].name, isjson);
+                                    applog(LOG_DEBUG, "API: access denied to
+'%s' for '%s' command", connectaddr, cmds[i].name);
+                                }
+...
+```
+
+String escaping: (backslash escaping) `=` (non-json), `"` (json), `\` (both)
+will be prefixed with `\`
+
+* stage 1 - scans string for to-be escaped characters and counts them.
+* stage 2 - allocates a new buffer for the extended size due to added `\`
+for escaping.
+* stage 3 - scans string copying byte-by-byte to new buffer adding `\` when
+encountering `=,",\`.
+* Note: If the input string contains a to-be-escaped character the output
+string will be larger than the input.
+* Note: This means if the input string only consists of e.g. `=` the output
+string will be twice the size `\=`.
+
+Furthermore this means that in worst case an input string of 8k may generate
+an output string of 16k.
+
+```c
+static char *escape_string(char *str, bool isjson)
+{
+    char *buf, *ptr;
+    int count;
+
+    count = 0;
+    for (ptr = str; *ptr; ptr++) {
+        switch (*ptr) {
+            case ',':
+            case '|':
+            case '=':                //#! count to-be-escaped char
+                if (!isjson)
+                    count++;
+                break;
+            case '"':
+                if (isjson)
+                    count++;
+                break;
+            case '\\':
+                count++;
+                break;
+        }
+    }
+
+    if (count == 0)
+        return str;
+
+    buf = cgmalloc(strlen(str) + count + 1);         //#! malloc new buffer
+to fit escaped string
+
+    ptr = buf;
+    while (*str)
+        switch (*str) {
+            case ',':
+            case '|':
+            case '=':                               //#! copy string; insert
+escape chars when needed.
+                if (!isjson)
+                    *(ptr++) = '\\';
+                *(ptr++) = *(str++);
+                break;
+            case '"':
+                if (isjson)
+                    *(ptr++) = '\\';
+                *(ptr++) = *(str++);
+                break;
+            case '\\':
+                *(ptr++) = '\\';
+                *(ptr++) = *(str++);
+                break;
+            default:
+                *(ptr++) = *(str++);
+                break;
+        }
+
+    *ptr = '\0';
+
+    return buf;
+}
+```
+
+
+* Buffer overwrite for param to command: `addpool`
+
+```c
+...
+{ SEVERITY_ERR,   MSG_INVPDP,	PARAM_STR,	"Invalid addpool details
+'%s'" },
+...
+
+static void addpool(struct io_data *io_data, __maybe_unused SOCKETTYPE c,
+char *param, bool isjson, __maybe_unused char group)
+{
+    ...
+
+    if (!pooldetails(param, &url, &user, &pass)) {
+        ptr = escape_string(param, isjson);              //#! VU #1 -
+escape_string may return > 8192 bytes if it contains to be escaped chars
+        message(io_data, MSG_INVPDP, 0, ptr, isjson);    //#! VU #1 - may
+overwrite internal buf[TMPBUFSIZ=8192] if ptr>(8192 - len(hardcoded err
+msg))
+        if (ptr != param)                                //#! MSG_INVPDP -
+see def above - is a FMT using unbound %s that may cause a buffer overwrite
+if the param is > sprintf destination buffer size
+            free(ptr);
+        ptr = NULL;
+        return;
+    }
+
+    ...
+
+    ptr = escape_string(url, isjson);                            //#! VU #1
+- escape_string may return > 8192 bytes if it contains to be escaped chars
+    message(io_data, MSG_ADDPOOL, pool->pool_no, ptr, isjson);   //#! VU #1
+- may overwrite internal buf[TMPBUFSIZ=8192] if ptr>(8192 - len(hardcoded
+err msg))
+    if (ptr != url)
+        free(ptr);
+    ptr = NULL;
+}
+```
+
+
+Where `message()` is defined as follows:
+
+
+```c
+static void message(struct io_data *io_data, int messageid, int paramid,
+char *param2, bool isjson)
+{
+    struct api_data *root = NULL;
+    char buf[TMPBUFSIZ];                //#! fixed size stack buffer 8192
+bytes!
+    char severity[2];
+
+    ...
+
+    for (i = 0; codes[i].severity != SEVERITY_FAIL; i++) {      //#! get
+message FMT from codes (vulnerable if contains unbound %s in fmt)
+        if (codes[i].code == messageid) {
+            ...
+
+            switch(codes[i].params) {
+                ...
+                case PARAM_STR:
+                    sprintf(buf, codes[i].description, param2);
+//#! sprintf buffer overwrite; param2 can be > sizeof(buf)
+                    break;
+                ...
+```
+
+* Buffer overwrite for param to command: `dosave`
+
+```c
+void dosave(struct io_data *io_data, __maybe_unused SOCKETTYPE c, char
+*param, bool isjson, __maybe_unused char group)
+{
+    char filename[PATH_MAX];
+    FILE *fcfg;
+    char *ptr;
+
+    if (param == NULL || *param == '\0') {
+        default_save_file(filename);
+        param = filename;
+    }
+
+    fcfg = fopen(param, "w");
+    if (!fcfg) {
+        ptr = escape_string(param, isjson);  //#! VU #1 - escape_string may
+return > 8192 bytes if it contains to be escaped chars
+        message(io_data, MSG_BADFN, 0, ptr, isjson);  //#! VU#1 - may
+overwrite internal buf[TMPBUFSIZ=8192] if ptr>(8192 - len(hardcoded err
+msg))
+        if (ptr != param)
+            free(ptr);
+        ptr = NULL;
+        return;
+    }
+
+    write_config(fcfg);
+    fclose(fcfg);
+
+    ptr = escape_string(param, isjson);		//#! VU #1 - same here; see
+description above (case with valid filename)
+    message(io_data, MSG_SAVED, 0, ptr, isjson);
+    if (ptr != param)
+        free(ptr);
+    ptr = NULL;
+}
+```
+
+
+* Buffer overwrite for param to command: `failover-only`:
+
+The param to `failover-only` is directly passed to `message()` with message
+fmt `"Deprecated config option '%s'"` which
+is then passed to `sprintf(buf[TMPFBUFSIZ=8192], "Deprecated config option
+'%s'", param[can_be_>TMPBUFSIZ])`. `param` can
+be close to 8191 bytes (minus command encoding overhead ~15bytes). The
+message template `MSG_DEPRECATED` is already 27 bytes
+without `%s` being filled in. An attacker providing at least > 8191-27 bytes
+as param to this command will therefore make
+`sprintf` write past the stack buffer `buf[TMPBUFSIZ=8192]` in `message()`.
+
+```c
+...
+ { SEVERITY_ERR,   MSG_DEPRECATED, PARAM_STR,	"Deprecated config option
+'%s'" },    //#! VU #1 - sprintf fmt with unbound param %s. can be any
+length
+...
+
+static void failoveronly(struct io_data *io_data, __maybe_unused SOCKETTYPE
+c, char *param, bool isjson, __maybe_unused char group)
+{
+    message(io_data, MSG_DEPRECATED, 0, param, isjson);     //#! VU #1 -
+param can be > TMPBUFSIZE (hardcoded stack buffer for sprint destination in
+message())
+}
+```
+
+
+* Buffer overwrite for param to command: `poolquota`
+
+```c
+...
+ { SEVERITY_ERR,   MSG_CONVAL,	PARAM_STR,	"Missing config value N for
+'%s,N'" },     //#! VU #1 - sprintf fmt with unbound param %s. can be any
+length
+...
+
+static void poolquota(struct io_data *io_data, __maybe_unused SOCKETTYPE c,
+char *param, bool isjson, __maybe_unused char group)
+{
+    ...
+
+    comma = strchr(param, ',');
+    if (!comma) {
+        message(io_data, MSG_CONVAL, 0, param, isjson);     //#! VU #1 -
+sprintf buffer overwrite similar to other commands
+        return;
+    }
+
+    ...
+}
+```
+
+#### VU #2 - (CVE-2018-10057) Authenticated path traversal: save
+
+When calling api command `save` the `parameter` is passed to `dosave(.., ..,
+param, ...)` which calls `fopen(param)` on
+the unsanitized/unvalidated user provided parameter. This allows for
+absolute and relative path traversal allowing to
+save the current configuration (json) to any location provided with the
+request parameter (user provided).
+
+```c
+void dosave(struct io_data *io_data, __maybe_unused SOCKETTYPE c, char
+*param, bool isjson, __maybe_unused char group)
+{
+    char filename[PATH_MAX];
+    FILE *fcfg;
+    char *ptr;
+
+    if (param == NULL || *param == '\0') {
+        default_save_file(filename);
+        param = filename;
+    }
+
+    fcfg = fopen(param, "w");				 //#! VU #2 - param
+not filtered; abs path traversal
+    if (!fcfg) {
+        ptr = escape_string(param, isjson);
+        message(io_data, MSG_BADFN, 0, ptr, isjson);
+        if (ptr != param)
+            free(ptr);
+        ptr = NULL;
+        return;
+    }
+
+    write_config(fcfg);
+    fclose(fcfg);
+
+    ptr = escape_string(param, isjson);		//#! VU #2 - same here; see
+description above (case with valid filename)
+    message(io_data, MSG_SAVED, 0, ptr, isjson);
+    if (ptr != param)
+        free(ptr);
+    ptr = NULL;
+}
+```
+
+#### VU #3 - Unauthenticated Information Disclosure: banner / various
+commands leaking details
+
+As seen on shodan and similar search engines cgminer/bfgminer trivially
+leaks valuable information in its server banner
+*invalid command* as well as a series of other commands available in
+*readonly* mode.
+
+Note: use `poc.py <target>` to enumerate available commands for readonly
+mode.
+
+```STATUS=E,When=1518898313,Code=14,Msg=Invalid command,Description=cgminer
+4.9.0|\x00```
+
+
+#### VU #4 - Misc
+
+The API interface (custom tcp socket comm) does not provide any transport
+security.
+
+
+See PoC ref github.
+
+
+Proof of Concept
+----------------
+
+Prerequisites:
+* compatible AMD/NVidia hardware
+* an isolated target machine to verify the vulnerability
+
+
+Usage: poc.py
+
+```
+      example: poc.py [options] <target> [<target>, ...]
+
+      options:
+               --no-capabilities    ...   do not check for supported
+commands [default:False]
+               --havoc              ...   probe all commands for buffer
+overflow
+               --vector=<vector>    ...   <see vectors> - launch specific
+attack vector
+
+      vector   ...  crash_addpool   ...   crash addpool command
+                    crash_failover  ...   crash failover-only command
+                    crash_poolquota ...   crash poolquota command
+                    crash_save      ...   crash save command
+                    traverse_save   ...   path traversal in save command
+
+      target   ... <IP, FQDN:port>
+
+               #> poc.py 1.1.1.1:4028
+               #> poc.py 1.2.3.4:4028
+               #> poc.py --vector=crash_addpool 1.1.1.1:4028
+               #> poc.py --havoc 1.1.1.1:4028
+
+
+      To reproduce launch cgminer in this mode:
+      #> ./cgminer -D --url ltc-eu.give-me-coins.com:3334 --api-listen -T -u
+a -p a --api-allow 0/0
+```
+
+// -- %< -- output omitted -- see
+https://github.com/tintinweb/pub/tree/master/pocs/cve-2018-10058 for
+examples/details
+
+
+Notes
+-----
+
+* Timeline
+
+02/25/2018 - vendor contact: report sent to cgminer / bfgminer
+02/26/2018 - vendor response (cgminer):
+    ACK'd that the informtion was received.
+  vendor response (bfgminer):
+    VU #1: Minor since it only applies to trusted connections. Will plan to
+fix in the next release (do you have a patch already?).
+    VU #2: Intended behaviour, not a bug.
+    VU #3: Not a vulnerability. All information "leaked" is non-sensitive.
+    VU #4: I do not consider this to be a vulnerability. The interface is
+only intended for use on trusted networks.
+03/05/2018 - request for update on patch timeline (cgminer and bfgminer)
+  vendor response (cgminer)
+    no update yet
+  vendor response (bfgminer)
+    - no response -
+06/03/2018 - public disclosure
+
+* Vendor Changelog
+
+06/03/2018 - *still not fixed* and no signs of this ever being tackled
+therefore public disclosure
+
+References
+----------
+
+[1] https://github.com/ckolivas/cgminer/releases
+[2] https://bitcointalk.org/index.php?topic=28402.0
+[3] https://github.com/luke-jr/bfgminer
+[4] http://bfgminer.org/
+[5] https://bitcointalk.org/?topic=877081
+[6]
+https://www.shodan.io/search?query=Msg%3DInvalid+command%2CDescription%3D
+
+Contact
+-------
+
+https://github.com/tintinweb
+

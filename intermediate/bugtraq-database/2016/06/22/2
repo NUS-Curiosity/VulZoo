@@ -1,0 +1,133 @@
+
+Date: Tue, 21 Jun 2016 17:01:31 +0200
+From: Berend-Jan Wever <berendjanwever@...il.com>
+To: fulldisclosure@...lists.org, bugtraq@...urityfocus.com
+Subject: Magic values in 32-bit processes on 64-bit OS-es and how to exploit
+ them
+
+(You can read all this information in more detail on
+http://blog.skylined.nl)
+
+Software components such as memory managers often use magic values to
+mark memory as having a certain state. These magic values can be used
+during debugging to determine the state of the memory, and have often
+(but not always) been chosen to coincide with addresses that fall
+outside of the user-land address space on 32-bit versions of the
+Operating System. This can help detect vulnerabilities by causing an
+access violation when such magic value is used as a pointer as well as
+mitigate exploitation of such vulnerabilities by making it impossible to
+have this "poisoned" pointer refer allocated memory under the attacker's
+control.
+
+For instance, Microsoft's C++ debugging runtime library initializes
+stack memory to 0xCCCCCCCC. When an uninitialized object pointer is used
+to read the value of a property or call a method of the object, this
+reliably causes an access violation on 32-bit versions of Microsoft
+Windows and prevents an easy path to exploitation.
+
+The Wikipedia article on magic values has a list containing some of the
+values and when they are used. You will notice how all of the values
+used on Windows have their high bit set (i.e. >= 0x80000000). As explain
+earlier, this is because on 32-bit versions of Windows these addresses
+cannot be used to allocate memory in user-land by default. Windows does
+have a /3GB switch that allows you to change the upper limit for
+user-land memory to 0xC0000000, but AFAIK this is not used very often
+and still excludes a large number of magic values.
+
+Magic values on 64-bit OS-es
+
+On 64-bit architectures, there is no need to reserve part of the 32-bit
+address space for kernel memory. Consequently, a 32-bit applications
+running on 64-bit versions of Windows is able to allocate memory in
+almost the entire 32-bit address range. This allows 32-bit applications
+to allocate more memory, including at all addresses that these magic
+values can reference. Ever since their introduction over 10 years ago,
+Javascript heap-sprays in web-browsers in particular offers an attacker
+the ability to finely control memory allocations and their content for
+use in exploits.
+
+Proof-of-Concept
+
+Last year I stumbled upon a two different bugs in two different web
+browsers where a magic value was used to mark memory which had not yet
+been initialized. Both vulnerabilities allowed me to get the web
+browsers to use the memory as a pointer before initializing it to a sane
+value. using Javascript, I was able to allocate memory at the magic
+value address the web browsers ended up using and store information at
+this location that allowed me to exploit both of these two
+vulnerabilities. These issues have both been address, so I can discuss
+them in more detail.
+
+CVE-2014-1592 Firefox xul.dll!nsHtml5TreeOperation use of poisoned memory
+
+Mozilla 1088635 <https://bugzilla.mozilla.org/show_bug.cgi?id=1088635>
+covers a bug in Firefox that could it to use data from a freed and
+"poisoned" object through specially crafted HTML, which resulted in
+access violations around address |0x5a5a5a5a| on x86 systems. The memory
+used to back the object was marked with this magic value after it was
+freed. Because this magic value resulted in an address can be allocated
+even on 32-bit versions of Windows, I suggested in Mozilla 1182002
+<https://bugzilla.mozilla.org/show_bug.cgi?id=1182002> that the value
+get updated with something that makes it a little harder to exploit.
+This and other reasons for changing the magic values, led to magic
+values being changed to |0xe4e4e4e4| for uninitialized memory and
+|0xe5e5e5e5| for freed memory.
+
+verifier!AVrfDebugPageHeapAllocate incorrect memory initialization a.k.a
+Google Chrome use of uninitialized FLS pointer
+
+In August last year, I found what appear to be a thread-safety
+vulnerability in Google Chrome when handling audio data, that could lead
+to use of an uninitialized pointer. This issue is only visible when
+running Chrome with page heap enabled, as the memory used to store the
+pointer appears to be set to 0x00000000 after allocation when page heap
+is not enabled. This means this NULL pointer will not be used by the
+code to reference memory. However, when running Chrome with page heap
+enabled, the pointer will be initialized to 0xD0D0D0D0 and gets used in
+code that allows at least freeing of arbitrary memory pointers.
+
+After doing a more thorough analysis, Ricky Zhou explained to me in the
+Chromium bug
+<https://bugs.chromium.org/p/chromium/issues/detail?id=525288> that the
+issue is not in Chromium, but in |verifier.dll|. This DLL is used to
+implement page heap on Windows. The problem is that in
+|verifier!AVrfDebugPageHeapAllocate|, the |HEAP_ZERO_MEMORY| flag is
+sometimes ignored, which in this case caused the memory to get
+initialized with the wrong value. I reported this issue to Microsoft at
+the end of October last year and after getting the MSRC case number
+31596, I never heard back from them again.
+
+Mitigating this type of attack
+
+While working on these issues, I realized that this type of attack is
+easy to mitigate by making sure the magic values point to memory that
+has been reserved and marked inaccessible. That way there is no risk of
+an attacker allocating the memory with data under his/her control for
+use in an exploit: whenever the application would attempt to access
+memory using a magic value as a pointer, this would reliably cause an
+access violation.
+
+Having a memory allocation at the various addresses represented by
+common magic values fragments the address space, reducing the largest
+possible continuous allocation and the total amount of memory available
+to the application. But most 32-bit applications do not depend on being
+able to allocate such large chunks of memory for normal operations, as
+this is impossible on 32-bit versions of Windows. Regardless, should one
+want to prevent this fragmentation, and at the same time organize the
+magic values to be more coherent and intuitive to developers, it might
+be useful to create an API that can be used to generate the magic
+values, and have the generated values be more similar, closer together
+and/or located at either edge of the free memory above address
+|0x80000000|.
+
+I have suggested adding mitigations such as a special API that allows an
+application to request magic values that are guaranteed to point to
+reserved memory to MSRC and they responded in November 2015 that they
+forwarded it to the Windows team for their consideration.
+
+Cheers,
+
+SkyLined
+
+http://twitter.com/berendjanwever
+http://blog.skylined.nl

@@ -1,0 +1,270 @@
+
+Date: Mon, 9 Oct 2023 18:00:00 +0100
+From: Kevin Backhouse <kevinbackhouse@...hub.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2023-43641: out-of-bounds array access in libcue 2.2.1
+
+Today, in coordination with [Ilya
+Lipnitskiy](https://github.com/lipnitsk) (the maintainer of libcue)
+and the [distros mailing
+list](https://oss-security.openwall.org/wiki/mailing-lists/distros),
+the GitHub Security Lab is disclosing
+[CVE-2023-43641](https://github.com/lipnitsk/libcue/security/advisories/GHSA-5982-x7hv-r9cj),
+a memory corruption vulnerability in
+[libcue](https://github.com/lipnitsk/libcue). This message is also
+be available as a blog post (with images and video):
+
+https://github.blog/2023-10-09-coordinated-disclosure-1-click-rce-on-gnome-cve-2023-43641
+
+It’s quite likely that you have never heard of libcue before, and are
+wondering why it’s important. This situation is neatly illustrated by
+xkcd 2347:
+https://xkcd.com/2347
+
+libcue is a library used for parsing [cue
+sheets](https://en.wikipedia.org/wiki/Cue_sheet_%28computing%29)—a
+metadata format for describing the layout of the tracks on a CD. Cue
+sheets are often used in combination with the
+[FLAC](https://en.wikipedia.org/wiki/FLAC) audio file format, which
+means that libcue is a dependency of some audio players, such as
+[Audacious](https://audacious-media-player.org/). But the reason why I
+decided to audit libcue for security vulnerabilities is that it’s used
+by [tracker-miners](https://gitlab.gnome.org/GNOME/tracker-miners): an
+application that’s included with [GNOME](https://www.gnome.org/)—the
+default graphical desktop environment of many open source operating
+systems.[^1] The purpose of tracker-miners is to index the files in
+your home directory to make them easily searchable. For example, the
+index is used by this search bar:
+
+https://github.com/github/securitylab/blob/3cb0ebc37170149ef5e91a3bd641631c4eeedd06/SecurityExploits/libcue/track_set_index_CVE-2023-43641/search-bar-screenshot.png
+
+The index is automatically updated when you add or modify a file in
+certain subdirectories of your home directory, in particular including
+`~/Downloads`. To make a long story short, that means that
+inadvertently clicking a malicious link is all it takes for an
+attacker to exploit CVE-2023-43641 and get code execution on your
+computer:
+
+https://youtu.be/beOwspTnc1Y
+
+The video shows me clicking a link in a webpage[^2], which causes a
+cue sheet to be downloaded. Because the file is saved to
+`~/Downloads`, it is then automatically scanned by tracker-miners. And
+because it has a `.cue` filename extension, tracker-miners uses libcue
+to parse the file. The file exploits the vulnerability in libcue to
+gain code execution and pop a calculator. Cue sheets are just one of
+many file formats supported by tracker-miners. For example, it also
+includes scanners for HTML, JPEG, and PDF:
+
+https://gitlab.gnome.org/GNOME/tracker-miners/-/blob/83054c8c145f12c83289e6c424f55b87a5b609d9/src/tracker-extract/tracker-extract-html.c
+https://gitlab.gnome.org/GNOME/tracker-miners/-/blob/83054c8c145f12c83289e6c424f55b87a5b609d9/src/tracker-extract/tracker-extract-jpeg.c
+https://gitlab.gnome.org/GNOME/tracker-miners/-/blob/83054c8c145f12c83289e6c424f55b87a5b609d9/src/tracker-extract/tracker-extract-pdf.c
+
+I am delaying publication of the proof of concept (PoC) used in the
+video, to give users time to install the patch. But if you’d like to
+test if your system is vulnerable, try downloading [this
+file](https://github.com/github/securitylab/blob/3cb0ebc37170149ef5e91a3bd641631c4eeedd06/SecurityExploits/libcue/track_set_index_CVE-2023-43641/CVE-2023-43641-poc-simple.cue),
+which contains a much simpler version of the PoC that merely causes a
+(benign) crash.
+
+The offsets in the full PoC need to be tuned for different
+distributions. I have _only_ done this for Ubuntu 23.04 and Fedora 38,
+the most recent releases of [Ubuntu](https://ubuntu.com/) and
+[Fedora](https://fedoraproject.org/) at this time. In my testing, I
+have found that the PoC works very reliably when run on the correct
+distribution (and will trigger a SIGSEGV when run on the wrong
+distribution). I have not created PoCs for any other distributions,
+but I believe that all distributions that run GNOME are potentially
+exploitable.
+
+# The bug in libcue
+
+libcue is quite a small project. It’s primarily a
+[bison](https://www.gnu.org/software/bison) grammar for cue sheets,
+with a few data structures for storing the parsed data. A simple
+example of a cue sheet looks like this:
+
+```
+REM GENRE "Pop, dance pop"
+REM DATE 1987
+PERFORMER "Rick Astley"
+TITLE "Whenever You Need Somebody"
+FILE "Whenever You Need Somebody.mp3" MP3
+  TRACK 01 AUDIO
+    TITLE "Never Gonna Give You Up"
+    PERFORMER "Rick Astley"
+    SONGWRITER "Mike Stock, Matt Aitken, Pete Waterman"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Whenever You Need Somebody"
+    PERFORMER "Rick Astley"
+    SONGWRITER "Mike Stock, Matt Aitken, Pete Waterman"
+    INDEX 01 03:35:00
+```
+
+The vulnerability is in the handling of the `INDEX` syntax. Replacing
+one of those `INDEX` statements with this will trigger the bug:
+
+```
+INDEX 4294567296 0
+```
+
+There are two parts to the problem. The first is that the scanner
+([cue_scanner.l, line
+132](https://github.com/lipnitsk/libcue/blob/1b0f3917b8f908c81bb646ce42f29cf7c86443a1/cue_scanner.l#L132))
+uses `atoi` to scan the integers:
+
+```
+[[:digit:]]+    { yylval.ival = atoi(yytext); return NUMBER; }
+```
+
+`atoi` does not check for integer overflow, so it is easy to construct
+a negative index. For example, 4294567296 is converted to -400000 by
+`atoi`.
+
+The second part of the problem (and this is the actual vulnerability)
+is that [`track_set_index`](https://github.com/lipnitsk/libcue/blob/1b0f3917b8f908c81bb646ce42f29cf7c86443a1/cd.c#L340-L348)
+does not check that `i ≥ 0`:
+
+```
+void track_set_index(Track *track, int i, long ind)
+{
+    if (i > MAXINDEX) {
+        fprintf(stderr, "too many indexes\n");
+                return;
+    }
+
+    track->index[i] = ind;
+}
+```
+
+If `i` is negative, then this code can write to an address outside the
+bounds of the array. Since the value of `ind` is also
+attacker-controlled, this is a very powerful vulnerability.
+
+The bug is simple to fix by adding an extra condition to the
+if-statement in `track_set_index`. This is the proposed patch:
+
+```
+diff --git a/cd.c b/cd.c
+index cf77a18..4bbea19 100644
+--- a/cd.c
++++ b/cd.c
+@@ -339,7 +339,7 @@ track_get_rem(const Track* track)
+
+ void track_set_index(Track *track, int i, long ind)
+ {
+-       if (i > MAXINDEX) {
++       if (i < 0 || i > MAXINDEX) {
+                fprintf(stderr, "too many indexes\n");
+                return;
+        }
+```
+
+# More about tracker-miners
+
+I want to be clear that this bug is _not_ a vulnerability in
+tracker-miners. But I have focused on tracker-miners because it
+magnifies the impact of this bug due to the way that it automatically
+scans the files in your `~/Downloads` directory.
+
+tracker-miners consists of two processes:
+
+1. tracker-miner-fs
+2. tracker-extract
+
+The first, tracker-miner-fs, is a background process which is always
+running, whereas the second, tracker-extract, is only started on
+demand to scan new files. tracker-miner-fs uses
+[inotify](https://manpages.ubuntu.com/manpages/jammy/en/man7/inotify.7.html)
+to monitor specific directories, such as `~/Downloads`, `~/Music`, and
+`~/Videos`. When a new file is created, it launches tracker-extract to
+scan the file. tracker-extract sends the results back to
+tracker-miner-fs (which maintains the index) and then usually shuts
+down again after a few seconds. The vulnerability only affects
+tracker-extract, because that’s where libcue is used. Both processes
+run as the current user, so this vulnerability would need to be
+chained with a separate privilege escalation vulnerability for an
+attacker to gain admin privileges.
+
+The vulnerability will not trigger if tracker-miners is not running.
+To check if it is, I use the command `ps aux | grep track`. It usually
+shows that tracker-miner-fs is running and that tracker-extract isn’t.
+If _neither_ is running (which I think is rare), then using the search
+bar (press the “super” key and type something) should automatically
+restart tracker-miner-fs. As far as I know, tracker-miners is quite
+tightly integrated into GNOME, so there’s no easy way to switch it
+off. There’s certainly nothing like a simple checkbox in the settings
+dialog. There’s some discussion
+[here](https://askubuntu.com/a/1187273) about how to switch it off by
+modifying your systemd configuration.
+
+The two-process architecture of tracker-miners is helpful for
+exploitation. Firstly, it’s much easier to predict the memory layout
+in a freshly started process than in one that’s already been running
+for hours, so the fact that tracker-extract is only started on-demand
+is very convenient. Even better, tracker-extract always creates a
+fresh thread to scan the downloaded file, and I’ve found that the heap
+layout in the thread’s malloc arena is _very_ consistent: it varies
+between distributions, so, for example, Ubuntu 23.04 has a slightly
+different layout than Fedora 38, but on the same distribution the
+layout is identical every single time. Secondly, because
+tracker-extract is restarted on demand, an attacker could potentially
+crash it many times until their exploit succeeds. Due to the
+consistency of the heap layout, I’ve found that my exploit works very
+reliably without needing to use this, but I could imagine an attacker
+loading a zip file with thousands of copies of their exploit to
+increase their chance of success when the victim unzips the download.
+
+## tracker-miners seccomp sandbox escape
+
+The difficult part of exploiting this vulnerability was finding a way
+to bypass [ASLR](https://en.wikipedia.org/wiki/Address_space_layout_randomization).
+But what I _didn’t_ realize when I started writing the PoC, is that
+tracker-extract also has a [seccomp
+sandbox](https://gitlab.gnome.org/GNOME/tracker-miners/-/blob/83054c8c145f12c83289e6c424f55b87a5b609d9/src/libtracker-miners-common/tracker-seccomp.c)
+which is intended to prevent this kind of exploit from working. It was
+a nasty surprise when I thought I had all the pieces in place for a
+working PoC and it failed with the error message: `Disallowed syscall
+"close_range" caught in sandbox`. But I still failed to understand
+that I was attempting a sandbox escape here. I just thought I needed
+to take a different code path that didn’t use the `close_range`
+function. So I tried a different route, it worked, and I didn’t give
+it any more thought until the GNOME developers asked how I’d managed
+to escape the sandbox. It turned out that I’d discovered the escape
+entirely by accident: while I was working on the new route, I
+unwittingly made a change to the PoC that solved it. I have since
+discovered that I could have got the original PoC working with a
+one-line change. I’ll go into more detail on this in a follow-up blog
+post when I publish the PoC, but for now I’ll just mention that, in
+response to this, [Carlos Garnacho](https://gitlab.gnome.org/carlosg)
+has very quickly implemented [some
+changes](https://gitlab.gnome.org/GNOME/tracker-miners/-/commit/f0c880a0ec0e650dbdc037c59e58e07442f82fef)
+to strengthen the sandbox, which will prevent this exploitation path
+from working in the future.
+
+# Conclusion
+
+Sometimes a vulnerability in a seemingly innocuous library can have a
+large impact. Due to the way that it’s used by tracker-miners, this
+vulnerability in libcue became a 1-click RCE. If you use GNOME, please
+update today!
+
+I’m delaying the release of the full PoC to give users time to install
+the update, but planning to publish a follow-up blog post soon with
+details of how the full PoC works. Save an unpatched VM with Ubuntu
+23.04 or Fedora 38 if you’d like to test the full PoC when I release
+it.
+
+
+## Notes
+
+[^1]:
+     I currently run Ubuntu 23.04 as my main OS and I _love_ the GNOME
+desktop environment.
+
+[^2]:
+     The webpage in the video is
+[https://bugs.launchpad.net/ubuntu/+source/libcue/+bug/2036595](https://bugs.launchpad.net/ubuntu/+source/libcue/+bug/2036595),
+which is where I first notified Ubuntu’s security team about this
+vulnerability. They suggested that I contact the distros list.

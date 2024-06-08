@@ -1,0 +1,159 @@
+
+Date: Fri, 15 May 2020 04:48:08 +0000
+From: "Singh, Balbir" <sblbir@...zon.com>
+To: "ppandit@...hat.com" <ppandit@...hat.com>,
+	"oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+CC: "matthew.sheets@...ms.com" <matthew.sheets@...ms.com>, "code@...icks.com"
+	<code@...icks.com>, "Mendoza-jonas, Samuel" <samjonas@...zon.com>,
+	"pabeni@...hat.com" <pabeni@...hat.com>
+Subject: [test case][kunit] CVE-2020-10711 Kernel netLabel
+
+I've spent some time writing a kunit test case for CVE-2020-10711 using the
+KUNIT framework. I am attaching the patch below for reference. The patch is
+against the latest linux-next. The details are in the test case, there
+are some TODOs:
+
+1. Add test cases for the ipv6 variant
+2. Add a test case for cipso_v4_parsetag_rpm variant
+
+Please feel to suggest improvements or better ways to test this, this is
+a rough patch, but I still wanted to share it and see if it helps others/
+get comments on the approach to testing it.
+
+Regards,
+Balbir Singh
+
+8<-----------------
+
+From d6801c70f9095113881510abadbbd6b88ccc7c57 Mon Sep 17 00:00:00 2001
+From: Balbir Singh <sblbir@...zon.com>
+Date: Fri, 15 May 2020 14:08:50 +1000
+Subject: [PATCH] kunit: Basic framework for netlabel
+
+This is a basic test for CVE-2020-10711, it's intrusive
+and hacky, in the sense that functions are called with
+assumptions and the data passed to cipso_v4_getattr()
+was cooked up to hit the error condition.
+
+The test cases test the following scenarios:
+
+1. cipso_parsetag_rng() with cat_high and cat_low that causes
+the test to fail without the fix and pass with the fix
+2. NULL PTR test for the net_catmap_long() issue
+
+[sblbir - wrote the test cases]
+Signed-off-by: Samuel Mendoza-Jonas <samjonas@...zon.com>
+Signed-off-by: Balbir Singh <sblbir@...zon.com>
+---
+ net/netlabel/Kconfig          |  4 ++
+ net/netlabel/Makefile         |  2 +
+ net/netlabel/netlabel_kunit.c | 70 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 76 insertions(+)
+ create mode 100644 net/netlabel/netlabel_kunit.c
+
+diff --git a/net/netlabel/Kconfig b/net/netlabel/Kconfig
+index 07b03c306f28..641cd6b4e42f 100644
+--- a/net/netlabel/Kconfig
++++ b/net/netlabel/Kconfig
+@@ -17,3 +17,7 @@ config NETLABEL
+ 	   * https://github.com/netlabel/netlabel_tools
+ 
+ 	  If you are unsure, say N.
++
++config NETLABEL_KUNIT
++	bool "Kunit tests for NetLabel"
++	depends on NETLABEL && KUNIT
+diff --git a/net/netlabel/Makefile b/net/netlabel/Makefile
+index 5a46381a64e7..93f229c987b0 100644
+--- a/net/netlabel/Makefile
++++ b/net/netlabel/Makefile
+@@ -14,3 +14,5 @@ obj-y	+= netlabel_mgmt.o
+ obj-y	+= netlabel_unlabeled.o
+ obj-y	+= netlabel_cipso_v4.o
+ obj-$(subst m,y,$(CONFIG_IPV6)) += netlabel_calipso.o
++
++obj-$(CONFIG_NETLABEL_KUNIT) += netlabel_kunit.o
+diff --git a/net/netlabel/netlabel_kunit.c b/net/netlabel/netlabel_kunit.c
+new file mode 100644
+index 000000000000..7b225229bf9d
+--- /dev/null
++++ b/net/netlabel/netlabel_kunit.c
+@@ -0,0 +1,70 @@
++#include <kunit/test.h>
++#include <net/netlabel.h>
++#include "netlabel_mgmt.h"
++#include <net/cipso_ipv4.h>
++
++static void netlabel_cipso_rng_test(struct kunit *test)
++{
++	struct netlbl_lsm_secattr secattr;
++	struct cipso_v4_doi *doi_def = NULL;
++	struct netlbl_audit audit_info;
++	int i;
++	unsigned char cipso[] = {0x0, 16, 0x0, 0x0, 0x0, 0x1, 0x5, 0x8, 0x0, 0x0, 0x0, 0x1, 0x0, 0x2};
++	int ret;
++
++	memset(&secattr, 0, sizeof(secattr));
++	doi_def = kmalloc(sizeof(*doi_def), GFP_KERNEL);
++	doi_def->type = CIPSO_V4_MAP_PASS;
++
++	doi_def->doi = 1; /* Tag */
++	doi_def->tags[0] = 5; /* Range */
++
++	for (i = 1; i < CIPSO_V4_TAG_MAXCNT; i++)
++		doi_def->tags[i] = CIPSO_V4_TAG_INVALID;
++
++	ret = cipso_v4_doi_add(doi_def, &audit_info);
++	if (ret < 0) {
++		cipso_v4_doi_free(doi_def);
++		pr_warn("Failed to add doi %d\n", ret);
++		KUNIT_FAIL(test, "Failed to setup doi_def %d\n", ret);
++		return;
++	}
++
++	atomic_inc(&netlabel_mgmt_protocount);
++
++	secattr.attr.mls.cat = NULL;
++	ret = cipso_v4_getattr(cipso, &secattr);
++	if (ret < 0) {
++		KUNIT_FAIL(test, "getattr failed %d\n", ret);
++		goto done;
++	}
++
++	KUNIT_EXPECT_TRUE(test, !(secattr.flags & NETLBL_SECATTR_MLS_CAT));
++done:
++	cipso_v4_doi_remove(doi_def->doi, &audit_info);
++}
++
++
++/*
++ * WARNING: This will cause a NULL PTR deref
++ * if called without the fix
++ */
++static void netlabel_bitmap_test_case(struct kunit *test)
++{
++	u32 offset = 0;
++	netlbl_catmap_getlong(NULL, &offset, NULL);
++	KUNIT_EXPECT_TRUE(test, (offset == (u32)-1));
++}
++
++static struct kunit_case netlabel_test_cases[] = {
++	KUNIT_CASE(netlabel_cipso_rng_test),
++	KUNIT_CASE(netlabel_bitmap_test_case),
++	{}
++};
++
++static struct kunit_suite netlabel_test_suite = {
++       .name = "netlabel-tests",
++       .test_cases = netlabel_test_cases,
++};
++
++kunit_test_suite(netlabel_test_suite);
+-- 
+2.17.1
+
+
+
+
+
+

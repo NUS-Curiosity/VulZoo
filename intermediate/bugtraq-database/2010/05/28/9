@@ -1,0 +1,148 @@
+
+Date: Fri, 28 May 2010 09:43:20 -0500 (CDT)
+From: "Patroklos Argyroudis" <argp@...sus-labs.com>
+To: bugtraq@...urityfocus.com
+Subject: CVE-2010-2020: FreeBSD kernel NFS client local vulnerabilities
+
+Census ID:          census-2010-0001
+URL:               
+http://census-labs.com/news/2010/05/26/freebsd-kernel-nfsclient/
+CVE ID:             CVE-2010-2020
+Affected Products:  FreeBSD 8.0-RELEASE, 7.3-RELEASE, 7.2-RELEASE
+Class:              Improper Input Validation (CWE-20)
+Remote:             No
+Discovered by:      Patroklos Argyroudis
+
+We have discovered two improper input validation vulnerabilities in the
+FreeBSD kernel's NFS client-side implementation (FreeBSD 8.0-RELEASE,
+7.3-RELEASE and 7.2-RELEASE) that allow local unprivileged users to
+escalate their privileges, or to crash the system by performing a denial
+of service attack.
+
+Details
+
+FreeBSD (http://www.freebsd.org/) is an advanced operating system which
+focuses on reliability and performance. More information about its
+features can be found at http://www.freebsd.org/about.html.
+
+FreeBSD 8.0-RELEASE, 7.3-RELEASE and 7.2-RELEASE employ an improper input
+validation method in the kernel's NFS client-side implementation.
+Specifically, the first vulnerability is in function nfs_mount() (file
+src/sys/nfsclient/nfs_vfsops.c) which is reachable from the mount(2) and
+nmount(2) system calls. In order for them to be enabled for unprivileged
+users the sysctl(8) variable vfs.usermount must be set to a non-zero
+value.
+
+The function nfs_mount() employs an insufficient input validation method
+for copying data passed in a structure of type nfs_args from userspace to
+kernel. Specifically, the file handle buffer to be mounted (args.fh) and
+its size (args.fhsize) are completely user-controllable. The unbounded copy
+operation is in file src/sys/nfsclient/nfs_vfsops.c (the excerpts are from
+8.0-RELEASE):
+
+1094:      if (!has_fh_opt) {
+1095:            error = copyin((caddr_t)args.fh, (caddr_t)nfh,
+1096:                 args.fhsize);
+1097:          if (error) {
+1098:               goto out;
+1099:            }
+
+The declaration of the variables args and nfh is at:
+
+786: static int
+787: nfs_mount(struct mount *mp)
+788: {
+789:         struct nfs_args args = {
+790:             .version = NFS_ARGSVERSION,
+             ...
+820:         u_char nfh[NFSX_V3FHMAX];
+
+This vulnerability can cause a kernel stack overflow which leads to
+privilege escalation on FreeBSD 7.3-RELEASE and 7.2-RELEASE. On FreeBSD
+8.0-RELEASE the result is a kernel crash/denial of service due to the
+SSP/ProPolice kernel stack-smashing protection which is enabled by
+default. Versions 7.1-RELEASE and earlier do not appear to be
+vulnerable since the bug was introduced in 7.2-RELEASE. In order to
+demonstrate the impact of the vulnerability we have developed a
+proof-of-concept privilege escalation exploit:
+
+http://census-labs.com/media/nfs_mount_ex.c
+
+A sample run of the exploit follows:
+
+[argp@...ius ~]$ uname -rsi
+FreeBSD 7.3-RELEASE GENERIC
+[argp@...ius ~]$ sysctl vfs.usermount
+vfs.usermount: 1
+[argp@...ius ~]$ id
+uid=1001(argp) gid=1001(argp) groups=1001(argp)
+[argp@...ius ~]$ gcc -Wall nfs_mount_ex.c -o nfs_mount_ex
+[argp@...ius ~]$ ./nfs_mount_ex
+[*] calling nmount()
+[!] nmount error: -1030740736
+nmount: Unknown error: -1030740736
+[argp@...ius ~]$ id
+uid=0(root) gid=0(wheel) egid=1001(argp) groups=1001(argp)
+
+The second vulnerability exists in the function mountnfs() that is called
+from function nfs_mount():
+
+1119: error = mountnfs(&args, mp, nam, args.hostname, &vp,
+1120:     curthread->td_ucred);
+
+The function mountnfs() is reachable from the mount(2) and nmount(2) system
+calls by unprivileged users. As with the nfs_mount() case above, this
+requires the sysctl(8) variable vfs.usermount to be set to a non-zero value.
+
+The file handle to be mounted (argp->fh) and its size (argp->fhsize)
+are passed to function mountnfs() from function nfs_mount() and are
+user-controllable. These are subsequently used in an unbounded bcopy()
+call (file src/sys/nfsclient/nfs_vfsops.c):
+
+1219: bcopy((caddr_t)argp->fh, (caddr_t)nmp->nm_fh, argp->fhsize);
+
+The above can cause a kernel heap overflow when argp->fh is bigger than 128
+bytes (the size of nmp->nm_fh) since nmp is an allocated item on the
+Universal Memory Allocator (UMA, the FreeBSD kernel's heap allocator)
+zone nfsmount_zone (again from src/sys/nfsclient/nfs_vfsops.c):
+
+1160: static int
+1161: mountnfs(struct nfs_args *argp, struct mount *mp, struct sockaddr *nam,
+1162:     char *hst, struct vnode **vpp, struct ucred *cred)
+1163: {
+1164:         struct nfsmount *nmp;
+1165:         struct nfsnode *np;
+1166:         int error;
+1167:         struct vattr attrs;
+1168:
+1169:         if (mp->mnt_flag &MNT_UPDATE) {
+1170:                 nmp = VFSTONFS(mp);
+1171:                 printf("%s: MNT_UPDATE is no longer handled here\n",
+__func__);
+1172:                 free(nam, M_SONAME);
+1173:                 return (0);
+1174:         } else {
+1175:                 nmp = uma_zalloc(nfsmount_zone, M_WAITOK);
+
+This kernel heap overflow can lead on FreeBSD 8.0-RELEASE, 7.3-RELEASE and
+7.2-RELEASE to privilege escalation and/or a kernel crash/denial of
+service attack. Similarly to the first vulnerability, FreeBSD 7.1-RELEASE
+and earlier versions do not appear to be vulnerable. We have developed a
+proof-of-concept DoS exploit to demonstrate the vulnerability:
+
+http://census-labs.com/media/mountnfsex.c
+
+Furthermore, we have also developed a privilege escalation exploit for this
+second vulnerability which will not be released at this point.
+
+FreeBSD has released an official advisory and a patch to address both
+vulnerabilities:
+
+http://security.freebsd.org/advisories/FreeBSD-SA-10:06.nfsclient.asc
+
+All affected parties are advised to follow the upgrade instructions
+included in the advisory and patch their systems.
+
+--
+Patroklos Argyroudis
+http://www.census-labs.com/

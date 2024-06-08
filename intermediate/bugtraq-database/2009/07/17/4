@@ -1,0 +1,190 @@
+
+Date: Fri, 17 Jul 2009 12:08:10 +0200
+From: Akita Software Security <lists@...tasecurity.nl>
+To: bugtraq@...urityfocus.com
+Subject: PulseAudio local race condition privilege escalation vulnerability
+
+------------------------------------------------------------------------
+PulseAudio local race condition privilege escalation vulnerability
+------------------------------------------------------------------------
+Yorick Koster, June 2009
+
+------------------------------------------------------------------------
+Abstract
+------------------------------------------------------------------------
+
+The PulseAudio binary is affected by a local race condition. If the 
+binary is installed as SUID root, it is possible to exploit this 
+vulnerability to gain root privileges. This attack requires that a local
+attacker can create hard links on the same hard disk partition on which
+PulseAudio is installed (i.e. /usr/bin and /tmp reside on the same 
+partition).
+
+------------------------------------------------------------------------
+See also
+------------------------------------------------------------------------
+
+- CVE-2009-1894 [2]
+- GLSA 200907-13 [3] PulseAudio: Local privilege escalation
+- USN-804-1 [4] PulseAudio vulnerability
+
+------------------------------------------------------------------------
+Tested version
+------------------------------------------------------------------------
+
+This issue was successfully verified on the following Linux 
+distributions:
+
+- Ubuntu 9.04 running PulseAudio version 0.9.14
+- Debian 5.0 running PulseAudio version 0.9.10
+- Mandriva Linux 2009 Spring running PulseAudio version 0.9.15
+
+------------------------------------------------------------------------
+Fix
+------------------------------------------------------------------------
+
+A patch for PulseAudio was released that addresses this issue. This 
+patch can be obtained from the following location:
+
+http://git.0pointer.de/?p=pulseaudio.git;a=commit;h=84200b423ebfa7e2dad9b1b65f64eac7bf3d2114
+
+As a temporary workaround, remove the SUID bit from the PulseAudio 
+binary.
+
+$ chmod u-s `which pulseaudio`
+
+------------------------------------------------------------------------
+Introduction
+------------------------------------------------------------------------
+
+PulseAudio [5] is a sound server for POSIX and Win32 systems. A sound 
+server is basically a proxy for your sound applications. It allows you 
+to do advanced operations on your sound data as it passes between your 
+application and your hardware.
+
+On some systems, the PulseAudio binary is installed SUID root to enable 
+real-time scheduling. If set, the daemon will drop root privileges 
+immediately on startup, however it will retain the CAP_NICE capability 
+(on systems that support it), but only if the calling user is a member 
+of the pulse-rt group. For all other users all capabilities are dropped 
+immediately.
+
+------------------------------------------------------------------------
+Race condition
+------------------------------------------------------------------------
+
+If the PulseAudio binary is started on Linux systems, it checks if the 
+LD_BIND_NOW environment variable is set. If this is not the case, 
+PulseAudio will set the variable and it will reload itself. It tries to 
+determine its path name by looking at the /proc/self/exe symbolic link. 
+This symbolic link will point to the full path name of the current 
+process.
+
+int main(int argc, char *argv[]) {
+[...]
+#if defined(__linux__) && defined(__OPTIMIZE__)
+	/*
+		Disable lazy relocations to make usage of external libraries
+		more deterministic for our RT threads. We abuse __OPTIMIZE__ as
+		a check whether we are a debug build or not.
+	*/
+	
+	if (!getenv("LD_BIND_NOW")) {
+		char *rp;
+	
+		/* We have to execute ourselves, because the libc caches the
+		* value of $LD_BIND_NOW on initialization. */
+	
+		pa_set_env("LD_BIND_NOW", "1");
+		pa_assert_se(rp = pa_readlink("/proc/self/exe"));
+		pa_assert_se(execv(rp, argv) == 0);
+	}
+#endif
+
+Normally, /proc/self/exe will point to something like 
+/usr/bin/pulseaudio. However by using hard links, it is possible to 
+cause /proc/self/exe to point to a different location.
+
+$ cd /tmp
+$ ls -la /proc/self/exe
+lrwxrwxrwx 1 yorick yorick 0 2009-06-09 16:31 /proc/self/exe -> 
+/bin/ls
+$ ln `which ls` ls
+$ ./ls -la /proc/self/exe
+lrwxrwxrwx 1 yorick yorick 0 2009-06-09 16:31 /proc/self/exe -> 
+/tmp/ls
+
+In addition, if a hard link is created, the SUID bit is preserved.
+
+$ ln `which pulseaudio` pulseaudio
+$ ls -la pulseaudio 
+-rwsr-xr-x 2 root root 71616 2009-04-09 02:12 pulseaudio
+
+A race condition exists in the reload mechanism of PulseAudio. An 
+attacker can exploit this issue by creating a hard link pointing to the 
+PulseAudio binary. After this it can execute this binary through the 
+hard link. At this moment /proc/sef/exe will point to the hard link. 
+Before PulseAudio is restarted, the attacker can replace the hard link 
+with a different (executable) file or (symbolic) link. If PulseAudio is 
+restarted, it will use a path name that at this moment points to a 
+different file, for example a command shell. Root privileges are not 
+dropped when PulseAudio is reloading, thus allowing a local attacker to 
+gain root privileges.
+
+Please note, this attack is only possible if the attacker can create 
+hard links on the same hard disk partition on which PulseAudio is 
+installed (i.e. /usr/bin and /tmp reside on the same partition).
+
+------------------------------------------------------------------------
+Proof of concept
+------------------------------------------------------------------------
+
+The following proof of concept can be used to exploit this issue. The 
+proof of concept tries to exploit this issue by creating hard links in 
+the /tmp directory.
+
+pa_race [6]
+
+$ ./pa_race
+I: caps.c: Limited capabilities successfully to CAP_SYS_NICE.
+I: caps.c: Dropping root privileges.
+I: caps.c: Limited capabilities successfully to CAP_SYS_NICE.
+N: main.c: Called SUID root and real-time and/or high-priority 
+scheduling was requested in the configuration. However, we lack the 
+necessary privileges:
+N: main.c: We are not in group 'pulse-rt', PolicyKit refuse to
+ grant us the requested privileges and we have no increase 
+RLIMIT_NICE/RLIMIT_RTPRIO resource limits.
+N: main.c: For enabling real-time/high-priority scheduling please 
+acquire the appropriate PolicyKit privileges, or become a member of 
+'pulse-rt', or increase the RLIMIT_NICE/RLIMIT_RTPRIO resource
+ limits for this user.
+E: pid.c: Daemon already running.
+E: main.c: pa_pid_file_create() failed.
+[...]
+uid=0(root) gid=0(root) groups=4(adm), 20(dialout), 24(cdrom), 
+25(floppy), 29(audio), 30(dip), 44(video), 46(plugdev), 107(fuse), 
+109(lpadmin), 115(admin), 1000(yorick)
+# 
+
+------------------------------------------------------------------------
+References
+------------------------------------------------------------------------
+
+[1] http://www.akitasecurity.nl/advisory.php?id=AK20090602
+[2] http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2009-1894
+[3] http://www.gentoo.org/security/en/glsa/glsa-200907-13.xml
+[4] http://www.ubuntu.com/usn/usn-804-1
+[5] http://pulseaudio.org/
+[6] http://www.akitasecurity.nl/advisory/AK20090602/pa_race
+
+------------------------------------------------------------------------
+-- 
+------------------------------------------------------------------------
+Akita Software Security (Kvk 37144957)
+http://www.akitasecurity.nl/
+------------------------------------------------------------------------
+Key fingerprint = 5FC0 F50C 8B3A 4A61 7A1F  2BFF 5482 D26E D890 5A65
+http://keyserver.pgp.com/vkd/DownloadKey.event?keyid=0x5482D26ED8905A65
+
+Download attachment "signature.asc" of type "application/pgp-signature" (198 bytes)

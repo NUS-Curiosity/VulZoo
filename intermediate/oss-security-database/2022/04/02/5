@@ -1,0 +1,222 @@
+
+Date: Sat, 2 Apr 2022 16:45:07 +0800 (GMT+08:00)
+From: 周多明 <duoming@....edu.cn>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2022-1199 kernel: Null pointer dereference and use-after-free
+ in ax25_release()
+
+Hello there,
+
+There are null-ptr-deref vulnerability and use-after-free vulnerabilities in net/ax25/af_ax25.c
+of linux that allow attacker to crash linux kernel by simulating ax25 device from user-space.
+
+=*=*=*=*=*=*=*=*=  Bug Details  =*=*=*=*=*=*=*=*=
+
+The null-ptr-deref vulnerability is caused by "ax25->sk = NULL" in ax25_release(). 
+The dereference sites include "bh_lock_sock(ax25->sk)" and "bh_unlock_sock(ax25->sk)"
+in ax25_disconnect(), "lock_sock(s->sk)" and "release_sock(s->sk)" in ax25_kill_by_device(). 
+
+The NPD bug related with bh_lock_sock(ax25->sk) is shown below:
+
+ax25_kill_by_device()                | ax25_release()
+  ax25_disconnect()                  |   ax25_destroy_socket()
+    ...                              |
+    if(ax25->sk != NULL)             |     ...
+      ...                            |     ax25->sk = NULL;
+      bh_lock_sock(ax25->sk); //(1)  |     ...
+      ...                            |
+      bh_unlock_sock(ax25->sk); //(2)|
+
+The NPD bug related with lock_sock(s->sk) is shown below:
+
+ax25_kill_by_device()        | ax25_release()
+                             |   ax25_destroy_socket()
+                             |     ax25_cb_del()
+  ...                        |     ...
+                             |     ax25->sk=NULL;
+  lock_sock(s->sk); //(1)    |
+  s->ax25_dev = NULL;        |     ...
+  release_sock(s->sk); //(2) |
+  ...                        |
+
+The use-after-free vulnerability is caused by "sock_put(sk)" in ax25_release(). The dereference 
+sites include "lock_sock(s->sk)" and "release_sock(s->sk)" in ax25_kill_by_device().
+
+ax25_kill_by_device()        | ax25_release()
+                             |   ax25_destroy_socket()
+  ...                        |   ...
+                             |   sock_put(sk); //FREE
+  lock_sock(s->sk); //(1)    |
+  s->ax25_dev = NULL;        |   ...
+  release_sock(s->sk); //(2) |
+  ...                        |
+
+=*=*=*=*=*=*=*=*=  Bug Effects  =*=*=*=*=*=*=*=*=
+
+We can successfully trigger the vulnerabilities to crash the linux kernel.
+
+The NPD bug related with bh_lock_sock() is shown below.
+
+[  178.776298] BUG: kernel NULL pointer dereference, address: 0000000000000088
+[  178.777929] RIP: 0010:_raw_spin_lock+0x7e/0xd0
+[  178.777929] Code: be 04 00 00 00 c7 44 24 20 00 00 00 00 e8 2a 29 e8 fe be 04 00 00 00 48 8d 7c 24 20 e8 1b 29 e8 fe ba 01 00 00 00 8b 44 24 20 <f0> 0f b1 55 00 75 29 48 b8 00 00 00 00
+[  178.777929] RSP: 0018:ffff888007dcfa48 EFLAGS: 00000297
+[  178.777929] RAX: 0000000000000000 RBX: 1ffff11000fb9f49 RCX: ffffffff82482855
+[  178.777929] RDX: 0000000000000001 RSI: 0000000000000004 RDI: ffff888007dcfa68
+[  178.777929] RBP: 0000000000000088 R08: 0000000000000001 R09: 0000000000000003
+[  178.777929] R10: ffffed1000fb9f4d R11: 0000000000000001 R12: 0000000000000065
+[  178.777929] R13: ffff888009f99800 R14: ffff888009f99860 R15: ffff888009f99800
+[  178.777929] FS:  00007f9651ce3700(0000) GS:ffff88806d480000(0000) knlGS:0000000000000000
+[  178.777929] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  178.777929] CR2: 0000000000000088 CR3: 0000000009876000 CR4: 00000000000006e0
+[  178.777929] Call Trace:
+[  178.777929]  ? _raw_read_lock_irq+0x30/0x30
+[  178.777929]  ? _raw_spin_unlock_bh+0x9/0x20
+[  178.777929]  ? ax25_link_failed+0x40/0x60
+[  178.777929]  ax25_disconnect+0xf6/0x220
+[  178.777929]  ax25_device_event+0x187/0x250
+[  178.777929]  raw_notifier_call_chain+0x5e/0x70
+[  178.777929]  dev_close_many+0x17d/0x230
+[  178.777929]  ? __dev_close_many+0x1c0/0x1c0
+[  178.777929]  rollback_registered_many+0x1f1/0x950
+[  178.777929]  ? _raw_write_lock_irqsave+0xd0/0xd0
+[  178.777929]  ? dev_alloc_name+0xd0/0xd0
+[  178.777929]  ? ldsem_down_read+0x410/0x410
+[  178.777929]  unregister_netdevice_queue+0x133/0x200
+[  178.777929]  ? unregister_netdevice_many+0x20/0x20
+[  178.777929]  ? sixpack_close+0xf8/0x130
+[  178.777929]  unregister_netdev+0x13/0x20
+[  178.777929]  tty_ldisc_hangup+0x1ab/0x2d0
+[  178.777929]  __tty_hangup.part.0+0x306/0x510
+[  178.777929]  tty_release+0x200/0x670
+[  178.777929]  __fput+0x104/0x3b0
+[  178.777929]  task_work_run+0x8f/0xd0
+[  178.777929]  exit_to_user_mode_prepare+0x114/0x120
+[  178.777929]  syscall_exit_to_user_mode+0x1d/0x40
+[  178.777929]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+The NPD bug related with lock_sock() is shown below.
+
+[  727.493561] BUG: kernel NULL pointer dereference, address: 0000000000000088
+[  727.493561] RIP: 0010:_raw_spin_lock_bh+0x89/0xd0
+[  727.493561] Code: be 04 00 00 00 c7 44 24 20 00 00 00 00 e8 5f c6 f1 fd be 04 00 00 00 48 8d 7c 24 20 e8 50 c6 f1 fd ba 01 00 00 00 8b 44 24 20 <f0> 0f b1 55 00 75 29 48 b8 00 00 00 00
+[  727.493561] RSP: 0018:ffff88801569f9c0 EFLAGS: 00000297
+[  727.493561] RAX: 0000000000000000 RBX: 1ffff11002ad3f38 RCX: ffffffff8366d960
+[  727.493561] RDX: 0000000000000001 RSI: 0000000000000004 RDI: ffff88801569f9e0
+[  727.493561] RBP: 0000000000000088 R08: 0000000000000001 R09: 0000000000000003
+[  727.493561] R10: ffffed1002ad3f3c R11: 0000000000000001 R12: 0000000000000088
+[  727.493561] R13: ffff888016166700 R14: ffff888014a57dc8 R15: dffffc0000000000
+[  727.493561] FS:  00007f5cab712700(0000) GS:ffff88806d200000(0000) knlGS:0000000000000000
+[  727.493561] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  727.493561] CR2: 0000000000000088 CR3: 000000000a336000 CR4: 00000000000006f0
+[  727.493561] Call Trace:
+[  727.493561]  ? _raw_spin_lock+0xd0/0xd0
+[  727.493561]  release_sock+0x16/0x170
+[  727.493561]  ax25_device_event+0x1a3/0x270
+[  727.493561]  ? nr_device_event+0xf2/0x140
+[  727.493561]  raw_notifier_call_chain+0x8d/0xd0
+[  727.493561]  dev_close_many+0x227/0x400
+[  727.493561]  ? __dev_close_many+0x290/0x290
+[  727.493561]  ? finish_task_switch.isra.0+0x205/0x620
+[  727.493561]  ? __switch_to+0x572/0xe50
+[  727.493561]  rollback_registered_many+0x2e1/0x1130
+[  727.493561]  ? dev_alloc_name+0xf0/0xf0
+[  727.493561]  ? ldsem_down_read+0x650/0x650
+[  727.493561]  unregister_netdevice_queue+0x1d7/0x3e0
+[  727.493561]  ? unregister_netdevice_many+0x50/0x50
+[  727.493561]  ? _raw_write_lock_bh+0xd0/0xd0
+[  727.493561]  ? down_write_killable+0x120/0x120
+[  727.493561]  unregister_netdev+0x13/0x20
+[  727.493561]  mkiss_close+0x116/0x1f0
+[  727.493561]  tty_ldisc_hangup+0x227/0x5f0
+[  727.493561]  ? fasync_remove_entry+0x28/0x220
+[  727.493561]  __tty_hangup.part.0+0x41c/0x910
+[  727.493561]  tty_release+0x3a8/0xcc0
+[  727.493561]  __fput+0x1e2/0x840
+[  727.493561]  task_work_run+0xe8/0x180
+[  727.493561]  exit_to_user_mode_prepare+0x114/0x120
+[  727.493561]  syscall_exit_to_user_mode+0x1d/0x40
+[  727.493561]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+[  727.493561] RIP: 0033:0x7f6d2c9d4beb
+[  727.493561] Code: 0f 05 48 3d 00 f0 ff ff 77 45 c3 0f 1f 40 00 48 83 ec 18 89 7c 24 0c e8 33 fc ff ff 8b 7c 24 0c 41 89 c0 b8 03 00 00 00 0f 05 <48> 3d 00 f0 ff ff 77 2f 44 89 c7 89 44
+[  727.493561] RSP: 002b:00007f5cab711ec0 EFLAGS: 00000293 ORIG_RAX: 0000000000000003
+[  727.493561] RAX: 0000000000000000 RBX: 0000000000000000 RCX: 00007f6d2c9d4beb
+[  727.493561] RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000003
+[  727.493561] RBP: 00007f5cab711f00 R08: 0000000000000000 R09: 00007f5cab712700
+[  727.493561] R10: 0000000000000000 R11: 0000000000000293 R12: 00007ffee89407be
+[  727.493561] R13: 00007ffee89407bf R14: 00007f5cab711fc0 R15: 00007f5cab712700
+
+The UAF bug related with lock_sock() is shown below.
+
+[  208.472360] BUG: KASAN: use-after-free in _raw_spin_lock_bh+0x71/0xd0
+[  208.472465] Write of size 4 at addr ffff88800a0e8088 by task ax25_clo_bin/1271
+[  208.472465] Call Trace:
+[  208.472465]  dump_stack+0x7d/0xa3
+[  208.472465]  print_address_description.constprop.0+0x18/0x130
+[  208.472465]  ? _raw_spin_lock_bh+0x71/0xd0
+[  208.472465]  ? _raw_spin_lock_bh+0x71/0xd0
+[  208.472465]  kasan_report.cold+0x7f/0x10e
+[  208.472465]  ? _raw_spin_lock_bh+0x71/0xd0
+[  208.472465]  check_memory_region+0xf9/0x1e0
+[  208.472465]  _raw_spin_lock_bh+0x71/0xd0
+[  208.472465]  ? _raw_spin_lock+0xd0/0xd0
+[  208.472465]  ? schedule+0x8e/0x120
+[  208.472465]  __lock_sock+0xd9/0x140
+[  208.472465]  ? sock_omalloc+0xc0/0xc0
+[  208.472465]  ? _raw_spin_lock+0xd0/0xd0
+[  208.472465]  ? wait_woken+0x110/0x110
+[  208.472465]  ? _raw_spin_lock+0xd0/0xd0
+[  208.472465]  ? _raw_spin_lock_bh+0x80/0xd0
+[  208.472465]  ? _raw_spin_lock+0xd0/0xd0
+[  208.472465]  lock_sock_nested+0x72/0x80
+[  208.472465]  ax25_device_event+0xef/0x160
+[  208.472465]  raw_notifier_call_chain+0x5e/0x70
+[  208.472465]  dev_close_many+0x17d/0x230
+[  208.472465]  ? __dev_close_many+0x1c0/0x1c0
+[  208.472465]  ? __schedule+0x494/0xc30
+[  208.472465]  rollback_registered_many+0x1f1/0x950
+[  208.472465]  ? clockevents_program_event+0xd3/0x130
+[  208.472465]  ? dev_alloc_name+0xd0/0xd0
+[  208.472465]  ? ldsem_down_read+0x410/0x410
+[  208.472465]  unregister_netdevice_queue+0x133/0x200
+[  208.472465]  ? unregister_netdevice_many+0x20/0x20
+[  208.472465]  ? _raw_write_lock_bh+0xd0/0xd0
+[  208.472465]  unregister_netdev+0x13/0x20
+[  208.472465]  mkiss_close+0xc4/0x120
+[  208.472465]  tty_ldisc_hangup+0x1ab/0x2d0
+[  208.472465]  __tty_hangup.part.0+0x306/0x510
+[  208.472465]  tty_release+0x200/0x670
+[  208.472465]  __fput+0x104/0x3b0
+[  208.472465]  task_work_run+0x8f/0xd0
+[  208.472465]  exit_to_user_mode_prepare+0x114/0x120
+[  208.472465]  syscall_exit_to_user_mode+0x1d/0x40
+[  208.472465]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+[  208.472465] RIP: 0033:0x7f7900bb1beb
+[  208.472465] Code: 0f 05 48 3d 00 f0 ff ff 77 45 c3 0f 1f 40 00 48 83 ec 18 89 7c 24 0c e8 33 fc ff ff 8b 7c 24 0c 41 89 c0 b8 03 00 00 00 0f 05 <48> 3d 00 f0 ff ff 77 2f 44 89 c7 89 44 24 0c e8 71 fc ff ff 8b 44
+[  208.472465] RSP: 002b:00007f78ff9c8ec0 EFLAGS: 00000293 ORIG_RAX: 0000000000000003
+[  208.472465] RAX: 0000000000000000 RBX: 0000000000000000 RCX: 00007f7900bb1beb
+[  208.472465] RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000003
+[  208.472465] RBP: 00007f78ff9c8f00 R08: 0000000000000000 R09: 00007f78ff9c9700
+[  208.472465] R10: 0000000000000000 R11: 0000000000000293 R12: 00007ffd364d6b9e
+[  208.472465] R13: 00007ffd364d6b9f R14: 00007f78ff9c8fc0 R15: 00007f78ff9c9700
+
+=*=*=*=*=*=*=*=*=  Bug Fix  =*=*=*=*=*=*=*=*=
+
+The patch that have been applied to mainline Linux kernel is shown below.
+https://github.com/torvalds/linux/commit/4e0f718daf97d47cf7dec122da1be970f145c809
+https://github.com/torvalds/linux/commit/7ec02f5ac8a5be5a3f20611731243dc5e1d9ba10
+https://github.com/torvalds/linux/commit/71171ac8eb34ce7fe6b3267dce27c313ab3cb3ac
+
+=*=*=*=*=*=*=*=*=  Timeline  =*=*=*=*=*=*=*=*=
+
+2022-01-28: commit 4e0f718daf97 accepted to mainline kernel
+2022-02-09: commit 7ec02f5ac8a5 accepted to mainline kernel
+2022-03-09: commit 71171ac8eb34 accepted to mainline kernel
+2022-04-01: CVE-2022-1199 is assigned
+
+=*=*=*=*=*=*=*=*=  Credit  =*=*=*=*=*=*=*=*=
+
+Duoming Zhou <duoming@....edu.cn>
+
+Best Regards,
+Duoming Zhou

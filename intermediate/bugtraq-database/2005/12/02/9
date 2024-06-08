@@ -1,0 +1,737 @@
+
+Date: Fri, 2 Dec 2005 03:56:14 -0500 (EST)
+From: "Steven M. Christey" <coley@...re.org>
+To: bugtraq@...urityfocus.com, full-disclosure@...ts.grok.org.uk
+Subject: Format String Vulnerabilities in Perl Programs
+
+
+
+
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+Format String Vulnerabilities in Perl Programs
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+
+Author: Steve Christey
+Date: December 2, 2005
+
+
+**********************************************************************
+Table of Contents
+**********************************************************************
+
+1. Synopsis
+2. Relevant History and Credits
+3. Attack and Impact Details
+4. Some Discussion on Format Strings and the Taint Checker
+5. Real-World Vulnerable Program Examples
+6. Avoiding Format String Vulnerabilities During Development
+7. Suggestions for Further Research
+8. Demonstration Programs 
+9. References
+10. Disclosure History
+
+
+**********************************************************************
+1. Synopsis
+**********************************************************************
+
+Format string vulnerabilities in C programs have been studied
+extensively in recent years.  The focus has been on the execution of
+arbitrary code, although other effects are possible.
+
+For many other programming languages, format string vulnerabilities
+are also possible.  Given the lack of attention to other languages, it
+is highly likely that a large number of applications have these issues
+even when they have been audited for other types of vulnerabilities.
+
+For any language that supports format strings, applications that are
+written in that language could be subject to format string
+vulnerabilities.  The impact is specific to the behaviors that are
+supported by the format strings, and their interaction with language
+internals.
+
+In recent days, Jack Louis of Dyad Security reported on a format
+string issue in a Webmin application that is written in Perl
+(CVE-2005-3912).  He further showed how a problem in the Perl
+interpreter itself could allow modification of memory and code
+execution in vulnerable apps (CVE-2005-3962).
+
+This paper focuses on format string vulnerabilities at the application
+level.  It must be emphasized that even if the interpreter problem is
+fixed, the impact of format string vulnerabilities will only be
+reduced, not completely eliminated.
+
+Excluding problems within the interpreter itself, Perl application
+format string vulnerabilities can allow denials of service (primarily
+memory or disk consumption), information leaks, and modification of
+program variables in ways that may have security implications.
+
+In particular, the sprintf() and printf() functions in Perl can be
+abused if an attacker can control the contents of the format string.
+Since similar functions are used in C, it is possible that these
+functions will be used more frequently by C programmers who are new to
+Perl.
+
+It should be noted that Perl's taint checker does not catch some
+variants of format string attacks.  The behavior differs in Perl 5.004
+and 5.6.1 (5.6.1 can identify additional dangerous inputs).  However,
+modifying the taint checker itself may not be feasible or even
+appropriate.
+
+
+**********************************************************************
+2. Relevant History and Credits
+**********************************************************************
+
+Jean-loup Gailly independently discovered and reported a format string
+problem in a Perl application on September 26, 2002 [1].  Arjan de Vet
+included format strings and the taint checker in a presentation at
+YAPC:Europe in August 2001 [2].  Steve Christey mentioned the
+possibility of format strings in PHP applications on April 3, 2003 [3]
+and format strings in interpreted languages during a lightning round
+talk on vulnerability research gaps at CanSecWest in April 2004 [4].
+Jack Louis reported on a format string problem in a Perl application
+on November 29, 2005 [5], following it with a description of an
+integer wrap within Perl itself that was exploitable via format
+strings on December 1, 2005 [6].  The most notable early research on
+format strings in C was performed by Tim Newsham in September 2000
+[7].
+
+
+**********************************************************************
+3. Attack and Impact Details
+**********************************************************************
+
+Following are some of the more dangerous specifiers, along with their
+implications.
+
+
+1) Memory or disk consumption
+
+   The "%s" specifier, and others that allow field widths to be
+   defined, can be used to consume a large amount of CPU, memory,
+   and/or disk, e.g. "%99999s".  ("%999999999s" is sufficient to
+   consume a gigabyte of memory or disk, but it has been reported that
+   it can also cause the Perl program to crash.)
+
+2) Modification of variables
+
+   Using the "%n" specifier, the attacker can modify the values of
+   certain variables that are provided as arguments to print/sprintf,
+   possibly altering program behavior in ways that have security
+   implications.  The variable is modified to a number, generally a 0.
+
+   The implications of this problem depend on how the program uses the
+   variables.
+
+   Consider the following pseudo-code for an authentication routine:
+
+     $input = GetInputFromUser();
+     if (UserHasAuthenticated($user))
+     {
+       $a = 0;
+     }
+     else
+     {
+       $a = 1;
+     }
+     $str = sprintf($input, $a);
+     if ($a)
+     {
+       PromptUserToAuthenticate($user);
+     }
+     else
+     {
+       DoThingThatOnlyUsersShouldDo($user);
+     }
+
+     If $input is "%10s", then str is formatted with up to 10 spaces
+     of padding and $a is not modified; but if $input is "%n", then $a
+     is changed to 0, and the attacker effectively bypasses the check
+     for authentication.
+
+3) Argument shifting
+
+   The "%p" specifier formats a pointer for the next argument to be
+   processed in the call to *printf.  This effectively misdirects or
+   shifts all remaining arguments to different format specifiers than
+   the programmer intended.  The impact depends on the specific bug.
+
+   Argument shifting could also be used to bypass cleansing operations
+   for other vulnerabilities, by shifting uncleansed values into
+   variables that contain cleansed values.
+
+4) Altering intended outputs
+
+   Any format specifier can alter the intended format of structured
+   output.  This in turn could corrupt files or enable the
+   exploitation of vulnerabilities in other applications that process
+   such output.  For example, the '%p' specifier, which prints out a
+   pointer value, could be used to generate integer values that exceed
+   the expected range of inputs.
+
+   Example:
+
+     $index = GetUserInput();
+     if (($index > 32) || ($index < 0))
+     {
+       print STDERR "Error: Index must be between 0 and 32.";
+     }
+     ($sec,$min,$hour,$mday,$mon,$year) = gmtime(time);
+     printf DATABASE, "$index %4d/%02d/%02d %02d:%02d:%02d\n",
+	    $year+1900, $mon+1, $mday;
+
+   If $index is "1", then the result might be:
+
+     1 2002/10/01 06:58:42
+
+   But if $index is "%p", the error condition is not detected (since
+   the string evaluates to 0), and the result would be:
+
+     130690   10/01/06 58:42:00
+
+   Here, not only does the 'index' value exceed the maximum of 32, but
+   all the other values are wrong!  This is because the %p was used to
+   format a pointer to the $year+1900 expression.  All the other
+   arguments were then misdirected, and applied to the wrong format
+   specifier.  Thus the month value is formatted as the year, the
+   seconds value is formatted as the minute, etc.
+
+5) Bypassing cleansing operations
+
+   Cleansing operations that remove spaces could be tricked by using
+   "%2s" or other format specifiers that generate spaces.  Programs
+   may try to remove spaces when passing arguments to commands, or
+   formatting data.
+
+    Here's one example:
+
+      opendir(DIR, ".");
+      while ($file = readdir(DIR))
+      {
+         if ($file =~ /\s/)
+         {
+            print STDERR "Warning: '$file' has spaces, replacing with _\n";
+            $file =~ s/\s/_/g;
+         }
+	 if ($file =~ /^-(fiprR)+$/)
+	 {
+	    print STDERR "Warning: '$file' matches switches for /bin/cp!\n";
+            # skip this one.
+            next;
+	 }
+         $backup = sprintf("$file.bak");  # C programmers might do this
+         system("/bin/cp $file $backup"); # but this *is* just an example
+      }
+      closedir(DIR);
+
+    If $file is set to "-R%2ssubdir", then the check for "dangerous
+    switches" would fail, and the resulting system call would be:
+
+        system("/bin/cp -R  subdir subdir.bak");
+
+6) Other Attack Scenarios
+
+   Some feasible attack scenarios involve Perl programs that generate
+   log messages or reports:
+
+     - File names containing format specifiers could alter which files
+       are processed
+
+     - IP addresses whose DNS reverse lookup includes format strings
+       could be returned as the result of gethostbyname().
+
+   Log files could be filled easily using "%999s" style strings.
+
+   The possibility of CRLF injection was theorized, but a casual
+   investigation was not successful.
+
+
+**********************************************************************
+4. Some Discussion on Format Strings and the Taint Checker
+**********************************************************************
+
+In 5.004:
+
+   The taint checker apparently does not flag filenames as tainted
+   (e.g. as obtained from the readdir() function).  Presumably, other
+   types of "indirect input" may not be tainted.  However, it does
+   identify more direct sources of input such as stdin and environment
+   variables.
+
+In 5.6.1:
+
+   Filenames are tainted, and the taint checker terminates the
+   program.  While the program is safe from exploitation through
+   dangerous calls, there is still a denial of service, which could be
+   a problem with critical code that is expected to fully complete its
+   task, such as a log processing program (although the programmer
+   should take the possibility of failure into account while running
+   in taint mode anyway!)
+
+   Note that the taint checker does not exit until a *printf-tainted
+   variable is passed to a dangerous call such as system().  So, if
+   the program is not tested with specifiers such as '%n' (which
+   modifies an argument to *printf), then the taint check may not be
+   discovered.
+
+   Attacks such as resource consumption and data format modification
+   will still work; however, changing the taint checker to exit as
+   soon as the printf/sprintf is encountered could break existing
+   programs.
+
+
+This is a factor though: "testing" sprintf/printf with normal file
+names won't directly trigger the taint checker, unless %n is actually
+included in the filename; so, if the programmer tests the Perl code,
+but does not include the '%n' option, they won't necessarily find the
+taint error.  However, a later input with '%n' could cause the program
+to halt unexpectedly due to the taint error.
+
+Note: the taint checker doesn't complain when system() is called with
+arguments in the following fashion:
+
+   system("/bin/echo", $tainted_var1, $tainted_var2);
+
+
+
+The following example properly generates an error from the taint
+checker, using input from stdin:
+
+  $a = <STDIN>;
+  chomp($a);
+  $str = sprintf("$a.txt");
+  system("/bin/echo $str");
+
+The following example also generates an error from the taint checker,
+using input from a directory listing:
+
+  opendir(DIR, ".");
+  while ($file = readdir(DIR))
+  {
+    system("/bin/echo $file");
+  }
+  closedir(DIR);
+
+
+Original bug report:
+
+  http://rt.perl.org/rt2/Ticket/Display.html?id=17698
+  http://www.nntp.perl.org/group/perl.perl5.porters/67239
+
+
+Statement From Perl Language Developer
+--------------------------------------
+
+    These issues do not represent a substantial security hole in perl
+    itself.  Future versions of perl may extend tainting checks to
+    format strings, or just to certain aspects of formats (such as
+    %n).
+
+
+
+**********************************************************************
+5. Real-World Vulnerable Program Examples
+**********************************************************************
+
+In 2002, at least 3 different Perl programs were found vulnerable to
+format string attacks:
+
+1) ftplogcheck
+
+2) perl-nocem
+
+3) WASD OpenVMS web server
+
+
+ftplogcheck
+-----------
+
+ftplogcheck is a program used for processing wu-ftpd logs and
+generating statistics.
+
+It is not part of the wu-ftp distribution.
+
+One portion of ftplogcheck report lists which files were uploaded to
+the server by the "anonymous" user.  The code is:
+
+  printf REPORT "$time $host $filesize $filename $name\n";
+
+If the wu-ftp server is configured to allow uploads from anonymous
+users, then attackers can upload files whose names contain malicious
+format strings, which are then fed into the $filename variable.
+
+In this case, the attacker could consume memory or disk space by
+causing an extremely large report to be generated (if $filename is
+"%999999s") or misrepresent the name of the file that has been
+uploaded (if $filename is "word1%1sword2", which would generate the
+string "word1 word2").
+
+The original developer is:
+
+  koos@...za.hvu.nl
+  http://idefix.net/~koos/ftp.html
+  [ftp://ftp.cetis.hvu.nl/pub/koos/ftplogcheck is apparently down]
+
+This program is archived at:
+
+ http://www.landfield.com/software/ftp.landfield.com/wu-ftpd/tools/ftplogcheck
+
+
+
+perl-nocem
+----------
+
+perl-nocem is a script that was apparently suggested for inclusion in
+INN 2.0 beta, but it was not directly distributed with INN 2.3.3 or
+any 2.x version.
+
+  http://www.isc.org/ml-archives/inn-workers/2001/05/msg00177.html
+
+This script processes NoCeM notices, which can be used by the server
+to process third-party, PGP-signed article cancellation notices.
+
+In do_nocem(), a call is made to sprintf() after inserting the values
+of the $nid and $issuer variables into the format string:
+
+  logmsg(sprintf("processed notice $nid by $issuer"
+          . " ($nr ids, %.5f s, %.1f/s)", $diff, $nr / $diff));
+
+The value of $nid is obtained from a "notice-id" news article header.
+It is not sanity-checked; therefore, malicious format strings can be
+inserted into this sprintf() call.  The $issuer variable is obtained
+from an "issuer" header, but this value must be allowed by the
+perl-nocem control file.  It may be possible to use a wildcard
+character and match any issuer.
+
+The $nr variable contains the total number of articles to be canceled,
+and the $diff variable attempts to measure the amount of time required
+to cancel the articles, generally 0.01 due to an apparent bug.
+
+According to the developer, the scope of this attack is limited: "the
+message is printed only after the nocem notice has been PGP-verified,
+so the attacker must be one of the trusted cancellers."
+
+  Typical input
+
+    Assume that 10 articles are to be canceled ($nr = 10) and $diff is
+    0.01.
+
+    With a $nid (Notice-ID header) of "NID" and a $issuer (Issuer
+    header) of "ISSUER@...mple.com", the log message output would be:
+
+     processed notice NID by ISSUER@...mple.com (10 ids, 0.01000 s, 1000.0/s)
+
+  Memory/disk consumption
+
+    With a Notice-ID of "%9999999s", a large amount of memory and/or
+    log file space is consumed:
+
+     processed notice                                                  
+                                                                       
+     [etc.]
+
+  Modification of the $diff variable
+
+    With a notice-id of "%n", perl-nocem changes the $diff variable to
+    17 (the length of the "processed notice " substring), as opposed
+    to its original value (typically 0.01).  This changes the error
+    message to misrepresent how long it took to cancel the articles:
+
+      processed notice  by ISSUER@...mple.com (10 ids, 1000.00000 s, 0.0/s)
+
+    (notice the double-space in "notice  by" where the notice-id would
+     be).
+
+    Note that if perl-nocem had used a format string that began with
+    the "$nid" variable (e.g. "$nid notice processed" instead of
+    "processed notice $nid"), then the $diff variable would have been
+    set to 0, and the "$nr / $diff" expression would have caused the
+    program to exit with a division-by-zero error.
+
+  Other output modifications
+
+    With a notice-id of "%p", the resulting log message would be like:
+
+      processed notice 130498 by [ISSUER] (10 ids, 0.50000 s, 0.0/s)
+
+    where the "130498" is an incorrect notice id.
+
+
+Developer statement:
+
+   [This is] not easily exploitable, the message is printed only after
+   the nocem notice has been PGP-verified, so the attacker must be one
+   of the trusted cancellers.
+
+Solution:
+
+   
+
+
+WASD
+----
+
+Jean-loup Gailly suggested the presence of a format string issue in
+the WASD OpenVMS web server [1].
+
+A sample program, PerlRTE_example1.pl, contained the following
+vulnerable code:
+
+   printf ("$name=\"$ENV{$name}\"\n");
+
+where the $name variable can be altered by an attacker to contain
+format strings (e.g. through a query string).
+
+
+************************************************************************
+6. Avoiding Format String Vulnerabilities During Development
+************************************************************************
+
+When writing Perl programs, follow these guidelines.
+
+1) Use constant strings for formatting.
+
+2) Do not feed Perl variables directly into format strings, e.g.
+   "$bad %10s"    or     $bad . " %10s"
+
+3) Where possible, avoid using printf and sprintf
+
+4) If absolutely necessary, consider quoting the "%" specifier before
+   including a user-controlled input into a format string.
+
+5) Run your program with taint checking enabled, which can help
+   protect against many of the problems identified here.
+
+
+
+Notes on Detecting Vulnerabilities in Source Code
+-------------------------------------------------
+
+Detection of suspicious code is slightly more difficult than it is for
+C code.  Constant strings can contain Perl entities such as variables
+or references, which are inserted into the string before it is passed
+to printf/sprintf.
+
+  $fmt = <USER_INPUT>;
+  printf("THIS IS A POTENTIALLY VULNERABLE $fmt FORMAT STRING\n");
+
+
+************************************************************************
+7. Suggestions for Further Research
+************************************************************************
+
+This paper is not an exhaustive work, so further research is needed.
+
+Software developers and vulnerability researchers are encouraged to
+actively search for format string issues in all programming languages,
+not just C and Perl.
+
+Suggested research topics include:
+
+ - for each programming language, identify and publicize all builtin
+   or common library functions that use format strings.
+
+ - extend source and binary code analysis tools to look for improper
+   use of these functions
+
+ - audit individual applications that have been previously deemed free
+   of obvious vulnerabilities, with a focus on format strings
+
+ - study the implications of interactions between a high-level
+   language and the language it is implemented in.  For example, there
+   may be format string analogues to the problems of the null byte in
+   Perl and PHP programs and their interaction with the underlying C
+   code.
+
+ - further examination of the taint checker (see below)
+
+Note: in the author's limited experience, format string
+vulnerabilities do not appear as frequently in Perl or PHP
+applications as they do in C programs.  However, more focused efforts
+are needed before this suspicion can be confirmed.
+
+
+**********************************************************************
+8. Demonstration Programs 
+**********************************************************************
+
+These programs demonstrate some the problems described above.
+
+1) Argument modification
+
+#!/bin/env perl
+
+# when run with taint checking (-T), this seems to properly barf about
+# dependency errors (try a "clean" format string like "5s%s%s" vs. a
+# dirty one with a "%n" in it).
+
+$ENV{"PATH"} = "";
+
+# try as input:  "%s%n%s" --> modifies $b
+
+$a = "A";
+$b = "B";
+$c = "C";
+$x = sprintf($ARGV[0], $a, $b, $c);
+
+print "\$a='$a'; \$b='$b'; \$c='$c'\n";
+
+print "$x\n";
+
+system("/bin/echo $a $b $c");
+
+************** End Sample Vulnerable Program **************
+
+
+
+********* Sample 2 **********
+
+# Create a directory that contains files with these names:
+# X%10sX
+# %p
+# %s
+# abc%ndef
+
+
+# This was gleaned from some real-world code, but the print was
+# changed to printf.
+
+# Change what filenames are processed via format strings in
+# the filenames, such as a file named "%p%n"
+#
+# You can "erase" a filename by using '%s', and having this "blank"
+# filename could throw off the argument count to system or exec calls,
+# which could alter behavior.  Consider a backup command like
+# exec("/bin/cp", file1, file2) where file1 can be "blanked" out
+#
+# Similarly, you could "erase" portions of a filename with "%n" or
+# "%s".  The filename ABC.TXT would be equivalent to ABC%n.%nTXT
+#
+# You can create very long filenames by using '%999s' (for example).
+
+opendir(DIR, ".");
+while ($file = readdir(DIR))
+{
+    print "Real filename: $file\n";
+    printf "Filename in format string: $file\n\n";
+}
+closedir(DIR);
+
+
+2) Misuse of format string in log processing, for which many Perl
+   programs have been written.  Could cause larger strings than
+   expected to be written to files or sent to processes; code that
+   depends on well-formatted input from the program may be subject to
+   buffer overflow or other issues.
+
+   I've seen several programs that do something like this:
+
+   printf "A=$a\n"
+
+******** End Sample 2 ************
+
+
+
+**********************************************************************
+9. References
+**********************************************************************
+
+[1] Jean-loup Gailly <jloup@...lly.net>
+    "remote SYSTEM compromise in WASD OpenVMS http server"
+    Bugtraq post
+    September 26, 2002
+    http://marc.theaimsgroup.com/?l=bugtraq&m=103307640806862&w=2
+
+[2] Arjan de Vet
+    "Security aware programming with Perl"
+    http://www.madison-gurkha.com/publications/yapc2001/text0.htm
+
+[3] Steve Christey
+    "An Alternate View of Recently Reported PHP Vulnerabilities"
+    Bugtraq
+    http://seclists.org/lists/bugtraq/2003/Apr/0085.html
+
+[4] http://www.cansecwest.com/archives.html
+
+[5] Jack Louis
+    "Webmin miniserv.pl format string vulnerability"
+    November 29, 2005
+    http://lists.immunitysec.com/pipermail/dailydave/2005-November/002685.html
+
+[6] Jack Louis
+    "Perl format string integer wrap vulnerability"
+    December 1, 2005
+    http://marc.theaimsgroup.com/?l=full-disclosure&m=113345191421286&w=2
+
+[8] WASD PerlRTE_example1.pl
+
+    http://wasd.vsm.com.au/ht_root/src/perl/readmore.html
+
+[9] perl-nocem:
+
+    http://www.isc.org/ml-archives/inn-workers/2001/05/msg00177.html
+
+[10] INN-workers security report
+
+    http://marc.theaimsgroup.com/?l=inn-workers&m=103643921519928&w=2
+    http://marc.theaimsgroup.com/?l=inn-workers&m=103644050021431&w=2
+
+
+**********************************************************************
+10. Disclosure History
+**********************************************************************
+
+Jun 10, 2002 - Theorized issue; began discovery and investigation;
+               search for potentially vulnerable programs initially
+               unsuccessful
+Sep 26, 2002 - Jean-loup Gailly (jloup@...lly.net) posts Perl format
+               string problem in OpenVMS
+Sep 28, 2002 - deeper investigation into format specifiers, other
+               vulnerable programs
+Sep 30, 2002 - more writing on security advisory; investigated whether
+               taint checker did "the right thing"
+Sep 30, 2002 - tried to find a way to report a security vuln to Perl
+               developers (in case taint issue is a Perl bug, and to
+               consult on possibility of buffer overflows).
+               Registered to site, only to be told by a web page to
+               email my report to a certain address.  Left out details
+               in the email because I had no idea who would be viewing
+               the report at that address.  This turned out to be a
+               good decision, as that post has been publicly archived.
+Sep 30, 2002 - investigated taint checker issues, %p
+Sep 30, 2002 - initial response from Perl contact (within 50 minutes)
+               saying it was OK to post details to that address, gave
+               an alternate POC just in case.
+Oct  1, 2002 - provided Perl developer list with details
+Oct  1, 2002 - notified CERT/CC
+Oct  8, 2002 - sent followup inquiry to Perl developer list and
+               primary Perl POC; haven't heard anything back, do they
+               plan to modify the taint checker?
+Oct 10, 2002 - asked a colleague to try contacting Perl developers
+Oct 11, 2002 - response from hv@...pt.org saying that message had not
+               been forwarded to the mailing list.  Replied to various
+               points; suggested possible statement on taint checker.
+Oct 17, 2002 - Statement modified and approved from hv@...pt.org
+Nov  1, 2002 - notified Mark.Daniel@...d.vsm.com.au (WASD developer)
+               http://wasd.vsm.com.au/ht_root/src/perl/readmore.html
+Nov  1, 2002 - more investigation into perl-nocem
+Nov  1, 2002 - notified perl-nocem author, Marco d'Itri (md@...ux.it)
+Nov  3, 2002 - received acknowledgement from perl-nocem author
+Nov  3, 2002 - received acknowledgement from WASD author, approval to
+               release
+Dec  5, 2002 - inquiry to perl-nocem author; are patches available?
+Dec  5, 2002 - perl-nocem patches had been made
+Dec  5, 2002 - investigation of ftplogcheck
+Dec 19, 2002 - refined advisory, cleaned up demonstration code
+Nov 29, 2005 - posted to DailyDave
+Dec 1, 2005 - Jack Louis releases Perl integer wrap advisory
+Dec 2, 2005 - further edits, table of contents, enhancement of
+              argument shifting
+Dec 2, 2005 - posted to Bugtraq, Full-Disclosure
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
+
+

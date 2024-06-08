@@ -1,0 +1,226 @@
+
+Date: Mon, 07 May 2007 16:44:46 +0200
+From: Reversemode <advisories@...ersemode.com>
+To: Securityfocus <bugtraq@...urityfocus.com>
+Subject: [Reversemode Advisory] VMware Products - GPF Denial of Service
+
+                  VMWARE PRODUCTS 		
+   VMWARE MEMORY MANAGER - GPF DENIAL OF SERVICE
+			
+   Rubén Santamarta <ruben@...ersemode.com>
+ 															07.05.2007
+Affected products:
+All VMware products with a hypervisor are affected
+ 	+ VMware WorkStation 5.5.3 and earlier
+ 	+ VMware Player 	1.0.3 and earlier
+ 	+ VMware Server 	1.0.2 and earlier
+ 	+ VMware ACE 		1.0.2 and earlier
+
+Introduction
+
+Vmware Virtualization products are affected by a design flaw which can
+lead to a local DoS vulnerability within the Guest OS. The flaw is due
+to improper handling of GPF  in Windows Guest Operating Systems (x86) .
+
+Flaw
+
+x86 processors running Protected Mode generate a General Protection
+exception (#GP) on any attempt to load an invalid segment selector in
+certain segment registers like FS,DS,GS or ES.
+
+Using documented Win32  API any user-mode thread can modify its  own
+context in such a way that the Kernel will try to load a specially
+crafted invalid segment selector, pointing to the LDT, in FS (pop fs)
+just before returning to user-mode.
+
+On a physical,meaning opposite to virtual, machine this attempt triggers
+a General Protection Fault  which is handled internally by KiTrap0D.
+
+KiTrap0D looks for this type of invalid instructions  and sanitizes the
+wrong selector.
+
+
+Let's see:
+Ntoskrnl.exe
+Windows XP SP2
+_KTRAP_FRAME
+   +0x000 DbgEbp           	: Uint4B
+   +0x004 DbgEip           	: Uint4B
+   +0x008 DbgArgMark       	: Uint4B
+   +0x00c DbgArgPointer    	: Uint4B
+   +0x010 TempSegCs        	: Uint4B
+   +0x014 TempEsp          	: Uint4B
+   +0x018 Dr0              	: Uint4B
+   +0x01c Dr1              	: Uint4B
+   +0x020 Dr2              	: Uint4B
+   +0x024 Dr3              	: Uint4B
+   +0x028 Dr6              	: Uint4B
+   +0x02c Dr7             	 : Uint4B
+   +0x030 SegGs            	: Uint4B    		
+   +0x034 SegEs            	: Uint4B			
+   +0x038 SegDs            	: Uint4B			
+   +0x03c Edx              	: Uint4B
+   +0x040 Ecx              	: Uint4B
+   +0x044 Eax              	: Uint4B
+   +0x048 PreviousPreviousMode : Uint4B
+   +0x04c ExceptionList    : Ptr32 _EXCEPTION_REGISTRATION_RECORD
+   +0x050 SegFs            	: Uint4B			
+   +0x054 Edi              	: Uint4B
+   +0x058 Esi              	: Uint4B
+   +0x05c Ebx              	: Uint4B
+   +0x060 Ebp              	: Uint4B
+   +0x064 ErrCode          	: Uint4B
+   +0x068 Eip              	: Uint4B
+   +0x06c SegCs            	: Uint4B
+   +0x070 EFlags           	: Uint4B
+   +0x074 HardwareEsp      	: Uint4B
+   +0x078 HardwareSegSs    : Uint4B
+   +0x07c V86Es            	: Uint4B
+   +0x080 V86Ds            	: Uint4B
+   +0x084 V86Fs            	: Uint4B
+   +0x088 V86Gs            	: Uint4B
+
+KiTrap0D
+{...}
+.text:0040A116        mov     eax, [ebp+68h]  	; Eip faulting
+.text:0040A119        mov     eax, [eax]		; opcode
+.text:0040A11B        mov     edx, [ebp+60h]  	; TrapFrame
+.text:0040A11E        add     edx, 38h	 	; TrapFrame.SegDs	
+.text:0040A121        cmp     al, 1Fh		; Opcode 1F = POP DS
+.text:0040A123        jz      loc_40A224
+.text:0040A129        add     edx, 0FFFFFFFCh	; TrapFrame.SegES
+.text:0040A12C        cmp     al, 7		; Opcode 07 = POP ES
+.text:0040A12E        jz      loc_40A224
+.text:0040A134        add     edx, 1Ch		; TrapFrame.SegFS
+.text:0040A137        cmp     ax, 0A10Fh	; Opcode 0FA1 = POP FS
+.text:0040A13B        jz      loc_40A224
+.text:0040A141        add     edx, 0FFFFFFE0h	; TrapFrame.SegGS
+.text:0040A144        cmp     ax, 0A90Fh	; Opcode 0FA9 = POP GS
+.text:0040A148        jz      loc_40A224
+{...}
+.text:0040A224 loc_40A224:
+.text:0040A224        xor     eax, eax		; Sanitizing invalid selector
+.text:0040A226        mov     [edx], eax  ;TrapFrame.Seg(D,E,F,G)S=0
+
+
+However, Vmware assumes a non-null and initialized LDT. Hence, Vmware
+prioritizes a #PF deprecating the GPF, so a wrong segment selector
+pointing to the LDT is generating a Page Fault instead of the proper
+GPF.  Please,note that  Windows allocates  LDT(s) from non-paged  memory.
+
+The final result is that the VMM is delivering a PF instead of a GPF to
+the Guest OS. When the Guest's Kernel receives that PF, it will bugcheck
+due to a physical memory error.
+
+Workaround
+
+Under certain circumstances this flaw cannot be reproduced. On the other
+hand, analyzing  this behaviour a workaround comes to light.
+
+Explanation:
+
+This flaw can be mitigated initializing the LDTR register with the
+KGDT_LDT selector. This task cannot be directly performed  from
+user-mode  since “lldt” is a privileged instruction. However,
+elaborating the correct path using native API we can do it.
+
+1.NtSetLdtEntries -> 2. PsSetLdtEntries -> 3.KiLoadLdtr
+       Ring3/Ring0		Ring0		Ring0
+
+Let's see:
+
+Ntoskrnl.exe
+Windows XP SP2
+
+ NTSTATUS
+__stdcall
+NtSetLdtEntries(ULONG Selector1,
+			LDT_ENTRY LdtEntry1,
+			ULONG Selector2,
+			LDT_ENTRY LdtEntry2)
+
+PAGE:00555E57
+PAGE:00555E57 Selector1       = dword ptr  8
+PAGE:00555E57 LdtEntry1       = LDT_ENTRY ptr  0Ch
+PAGE:00555E57 Selector2       = dword ptr  14h
+PAGE:00555E57 LdtEntry2       = LDT_ENTRY ptr  18h
+PAGE:00555E57
+PAGE:00555E57                 mov     edi, edi
+PAGE:00555E59                 push    ebp
+PAGE:00555E5A                 mov     ebp, esp
+PAGE:00555E5C                 pop     ebp
+PAGE:00555E5D                 jmp     _PsSetLdtEntries@24 ;
+PsSetLdtEntries(x,x,x,x,x,x)
+PAGE:00555E5D _NtSetLdtEntries@24 endp
+{...}
+int
+__stdcall
+PsSetLdtEntries(int,int,PVOID P,int,int,int)
+{...}
+.text:0047170E ; __stdcall Ke386SetLdtProcess(x, x, x)
+.text:0047170E _Ke386SetLdtProcess@12 proc near        ; CODE XREF:
+PsSetLdtEntries(x,x,x,x,x,x)+107#p
+.text:0047170E                                      ;
+PsSetLdtEntries(x,x,x,x,x,x)+14C#p ...
+.text:0047170E var_8           = dword ptr -8
+
+[...]
+.text:00471780                 call    _KiLoadLdtr@0   ; KiLoadLdtr()
+
+.text:00441892 ; __stdcall KiLoadLdtr()
+.text:00441892 _KiLoadLdtr@0   proc near               ; CODE XREF:
+Ke386SetLdtProcess(x,x,x)+72#p
+.text:00441892                push    esi
+.text:00441893                push    edi
+.text:00441894                mov     eax, large fs:124h		;
+PCR.PcrData.CurrentThread
+.text:0044189A                 mov     eax, [eax+44h]		; CurrentProcess
+.text:0044189D                 lea     esi, [eax+20h]		;
+KPROCESS.LdtDescriptor
+.text:004418A0                 xor     dx, dx
+.text:004418A3                 cmp     word ptr [esi], 0
+.text:004418A7                 jz      short loc_4418B9
+.text:004418A9                 mov     edi, large fs:3Ch	; PCR.GDT
+.text:004418B0                 add     edi, 48h	; GDT+KGDT_LDT
+.text:004418B3                 movsd	; Copy descriptor
+.text:004418B4                 movsd
+.text:004418B5                 mov     dx, 48h			; KGDT_LDT
+.text:004418B9
+.text:004418B9 loc_4418B9:                             ; CODE XREF:
+KiLoadLdtr()+15#j
+.text:004418B9                 lldt    dx				; Initializing ldtr
+.text:004418BC                 pop     edi
+.text:004418BD                 pop     esi
+.text:004418BE                 call    _KiFlushDescriptors@0 ;
+KiFlushDescriptors()
+.text:004418C3                 retn
+.text:004418C3 _KiLoadLdtr@0   endp
+
+Disclosure Timeline
+10.01.2007 – Initial vendor notification.
+13.01.2007 – Vendor response. Vulnerability confirmed.
+07.05.2007 – Coordinated Disclosure.
+
+Exploits
+This update is specially recommended for  malware research labs or
+Honeynets since  malware can easily exploit this flaw in order to avoid
+virtualized enviroments.
+No exploits are released. Ethical security companies can contact for
+requesting samples : contact@...ersemode.com
+
+Special thanks to Mario Ballano for providing additional exploit code.
+
+
+References
+
+
+
+http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2007-1877
+www.vmware.com
+http://www.reversemode.com/index.php?option=com_remository&Itemid=2&func=fileinfo&id=49
+(PDF)
+
+-----
+Reversemode
+Advanced Reverse Engineering Services
+http://www.reversemode.com | http://corporate.reversemode.com

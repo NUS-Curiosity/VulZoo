@@ -1,0 +1,271 @@
+
+Date: Tue, 18 Mar 2008 14:15:34 -0400 (EDT)
+From: raeburn@....EDU
+To: bugtraq@...urityfocus.com
+Subject: MITKRB5-SA-2008-001: double-free, uninitialized data vulnerabilities in krb5kdc
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+MITKRB5-SA-2008-002
+
+MIT krb5 Security Advisory 2008-002
+Original release: 2008-03-18
+Last update: 2008-03-18
+
+Topic: array overrun in RPC library used by kadmind
+
+CVE-2008-0947, CVE-2008-0948
+VU#374121
+Use of high-numbered file descriptors in the RPC library, used by
+kadmind, can cause references past the end of an array.
+
+CVSSv2 Vector: AV:N/AC:L/Au:N/C:C/I:C/A:C/E:P/RL:T/RC:C
+
+CVSSv2 Base Score:      10
+
+Access Vector:          Network
+Access Complexity:      Low
+Authentication:         None
+Confidentiality Impact: Complete
+Integrity Impact:       Complete
+Availability Impact:    Complete
+
+CVSSv2 Temporal Score:  7.8
+
+Exploitability:         Proof-of-Concept
+Remediation Level:      Official fix
+Report Confidence:      Confirmed
+
+SUMMARY
+=======
+
+Two bugs in the RPC library server code, used in the kadmin server,
+causes an array overrun if too many file descriptors are opened.
+Memory corruption can result.
+
+IMPACT
+======
+
+An unauthenticated remote attacker can cause memory corruption in the
+kadmind process, which is likely to cause kadmind to crash, resulting
+in a denial of service.  It is at least theoretically possible for
+such corruption to result in database corruption or arbitrary code
+execution, though we have no such exploit and are not aware of any
+such exploits in use in the wild.
+
+CVE-2008-0947: In 1.4 and later, this bug can only be triggered in
+configurations that allow large numbers of open file descriptors in a
+process.
+
+CVE-2008-0948: In versions before 1.3, this bug can be triggered in
+similar circumstances, but is further limited to platforms not
+defining certain macros in certain C system header files.  Solaris 10
+and Mac OS X 10.4 appear to be unaffected, while GNU libc systems
+(e.g., many GNU/Linux distributions) are.  It appears that in at least
+some cases kadmind will simply exit after getting a "bad file
+descriptor" error, but this cannot be guaranteed.
+
+AFFECTED SOFTWARE
+=================
+
+CVE-2008-0947: libgssrpc and kadmind, from krb5-1.4 through krb5-1.6.3
+
+CVE-2008-0948: libgssrpc and kadmind, in krb5-1.2.2 and probably most
+other versions before 1.3, on systems where <unistd.h> does not define
+FD_SETSIZE.
+
+FIXES
+=====
+
+* Workaround: Check the system header files for the value of
+  FD_SETSIZE.  Use "ulimit -n" or "limit descriptors" in the shell
+  invoking kadmind to limit the number of open file descriptors to
+  FD_SETSIZE or less, before starting kadmind.  Then the operating
+  system will prevent the use of file descriptors large enough to
+  exploit this bug.
+
+* Apply the following patch for krb5-1.4 and later:
+
+=== src/lib/rpc/svc.c
+==================================================================
+- --- src/lib/rpc/svc.c	(revision 1666)
++++ src/lib/rpc/svc.c	(local)
+@@ -109,15 +109,17 @@
+ 	if (sock < FD_SETSIZE) {
+ 		xports[sock] = xprt;
+ 		FD_SET(sock, &svc_fdset);
++		if (sock > svc_maxfd)
++			svc_maxfd = sock;
+ 	}
+ #else
+ 	if (sock < NOFILE) {
+ 		xports[sock] = xprt;
+ 		svc_fds |= (1 << sock);
++		if (sock > svc_maxfd)
++			svc_maxfd = sock;
+ 	}
+ #endif /* def FD_SETSIZE */
+- -	if (sock > svc_maxfd)
+- -		svc_maxfd = sock;
+ }
+ 
+ /*
+=== src/lib/rpc/svc_tcp.c
+==================================================================
+- --- src/lib/rpc/svc_tcp.c	(revision 1666)
++++ src/lib/rpc/svc_tcp.c	(local)
+@@ -54,6 +54,14 @@
+ extern errno;
+ */
+ 
++#ifndef FD_SETSIZE
++#ifdef NBBY
++#define NOFILE (sizeof(int) * NBBY)
++#else
++#define NOFILE (sizeof(int) * 8)
++#endif
++#endif
++
+ /*
+  * Ops vector for TCP/IP based rpc service handle
+  */
+@@ -215,6 +223,19 @@
+ 	register SVCXPRT *xprt;
+ 	register struct tcp_conn *cd;
+  
++#ifdef FD_SETSIZE
++	if (fd >= FD_SETSIZE) {
++		(void) fprintf(stderr, "svc_tcp: makefd_xprt: fd too high\n");
++		xprt = NULL;
++		goto done;
++	}
++#else
++	if (fd >= NOFILE) {
++		(void) fprintf(stderr, "svc_tcp: makefd_xprt: fd too high\n");
++		xprt = NULL;
++		goto done;
++	}
++#endif
+ 	xprt = (SVCXPRT *)mem_alloc(sizeof(SVCXPRT));
+ 	if (xprt == (SVCXPRT *)NULL) {
+ 		(void) fprintf(stderr, "svc_tcp: makefd_xprt: out of memory\n");
+@@ -271,6 +292,10 @@
+ 	 * make a new transporter (re-uses xprt)
+ 	 */
+ 	xprt = makefd_xprt(sock, r->sendsize, r->recvsize);
++	if (xprt == NULL) {
++		close(sock);
++		return (FALSE);
++	}
+ 	xprt->xp_raddr = addr;
+ 	xprt->xp_addrlen = len;
+ 	xprt->xp_laddr = laddr;
+
+  This patch will result in too-high-numbered file descriptors being
+  immediately closed after the connection comes in.  Clients will see
+  connections established, and then closed; a "GSS-API (or Kerberos)
+  error while initializing kadmin interface" will eventually result.
+  Once some of the lower-numbered file descriptors are closed, clients
+  will be able to get useful connections again.
+
+* Apply the following patch for krb5-1.2.2 and probably other pre-1.3
+  versions:
+
+Index: src/lib/rpc/rpc_dtablesize.c
+===================================================================
+- --- src/lib/rpc/rpc_dtablesize.c	(revision 20237)
++++ src/lib/rpc/rpc_dtablesize.c	(working copy)
+@@ -32,6 +32,7 @@
+ #endif
+ 
+ #include <unistd.h>
++#include <gssrpc/rpc.h>
+ 
+ /*
+  * Cache the result of getdtablesize(), so we don't have to do an
+
+
+* The next release from MIT (1.6.4) will include a fix.
+
+REFERENCES
+==========
+
+This announcement is posted at:
+
+  http://web.mit.edu/kerberos/advisories/MITKRB5-SA-2008-002.txt
+
+This announcement and related security advisories may be found on the
+MIT Kerberos security advisory page at:
+
+        http://web.mit.edu/kerberos/advisories/index.html
+
+The main MIT Kerberos web page is at:
+
+        http://web.mit.edu/kerberos/index.html
+
+CVSSv2:
+
+    http://www.first.org/cvss/cvss-guide.html
+    http://nvd.nist.gov/cvss.cfm?calculator&adv&version=2
+
+CVE: CVE-2008-0947
+http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2008-0947
+
+CVE: CVE-2008-0948
+http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2008-0948
+
+CERT: VU#374121
+http://www.kb.cert.org/vuls/id/374121
+
+ACKNOWLEDGMENTS
+===============
+
+Thanks to Jeff Altman of Secure Endpoints for discovering and
+reporting this problem in 1.6.3.
+
+Thanks to the Red Hat Security Response Team for noting that 1.2.2 was
+also affected by the same problem, for different reasons.
+
+CONTACT
+=======
+
+The MIT Kerberos Team security contact address is
+<krbcore-security@....edu>.  When sending sensitive information,
+please PGP-encrypt it using the following key:
+
+pub   1024D/2915318C 2008-01-18 [expires: 2009-02-01]
+uid     MIT Kerberos Team Security Contact <krbcore-security@....edu>
+sub   2048g/3A91A276 2008-01-18 [expires: 2009-02-01]
+
+DETAILS
+=======
+
+The variable svc_maxfd tracks the highest-numbered file descriptor
+registered with the RPC library as a transport handle.  While the
+registration function does check that the file descriptor number is
+less than FD_SETSIZE for array references, the code for updating
+svc_maxfd is not so protected.  Elsewhere, svc_maxfd is used as an
+upper bound for array indexing, and as the maximum file descriptor
+number to pass to select().
+
+In 1.2.2, the variable is called max_xport, and is checked against the
+value returned by _gssrpc_rpc_dtablesize(), but while that function
+checks FD_SETSIZE if it's defined, the source file containing it only
+includes unistd.h, which doesn't define FD_SETSIZE on all platforms.
+In kadmind, the value from _gssrpc_rpc_dtablesize() is also passed to
+select() as the maximum file descriptor number.
+
+REVISION HISTORY
+================
+
+2008-03-18      original release
+
+Copyright (C) 2008 Massachusetts Institute of Technology
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.7 (Darwin)
+
+iD8DBQFH3/21UqOaDMQ+e5gRAj38AJ97qJdFUkcnvPwI19DMKTnDsuXYMgCeMmdw
+ZbfG/YXurbX8hTe4+cJiZBM=
+=1O1O
+-----END PGP SIGNATURE-----

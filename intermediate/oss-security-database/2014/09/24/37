@@ -1,0 +1,202 @@
+
+Date: Wed, 24 Sep 2014 18:08:21 -0400
+From: Jason Cooper <osssecurity@...edaemon.net>
+To: oss-security@...ts.openwall.com
+Cc: chet.ramey@...e.edu
+Subject: Re: CVE-2014-6271: remote code execution through
+ bash
+
+Solar,
+
+On Wed, Sep 24, 2014 at 07:16:20PM +0400, Solar Designer wrote:
+> On Wed, Sep 24, 2014 at 04:05:51PM +0200, Florian Weimer wrote:
+> > Stephane Chazelas discovered a vulnerability in bash, related to how
+> > environment variables are processed: trailing code in function
+> > definitions was executed, independent of the variable name.
+> > 
+> > In many common configurations, this vulnerability is exploitable over
+> > the network.
+> > 
+> > Chet Ramey, the GNU bash upstream maintainer, will soon release
+> > official upstream patches.
+> 
+> More detail is already out:
+> 
+> https://securityblog.redhat.com/2014/09/24/bash-specially-crafted-environment-variables-code-injection-attack/
+> http://www.csoonline.com/article/2687265/application-security/remote-exploit-in-bash-cve-2014-6271.html
+> 
+> Florian posted a Debian security advisory on this ([DSA 3032-1] bash
+> security update) to the debian-security-announce list, but somehow it is
+> not yet seen at:
+> 
+> https://www.debian.org/security/
+> https://lists.debian.org/debian-security-announce/2014/
+> 
+> (I guess it will be very soon.)
+> 
+> I've just confirmed that the issue can be exploited via OpenSSH setting
+> SSH_ORIGINAL_COMMAND:
+> 
+> $ ssh -o 'rsaauthentication yes' 0 '() { ignored; }; /usr/bin/id' 
+> uid=500(sandbox) gid=500(sandbox) groups=500(sandbox)
+> Received disconnect from 127.0.0.1: Command terminated on signal 11.
+> 
+> This is with command="set" in .ssh/authorized_keys for the key being
+> used.  (Without the "; /usr/bin/id" portion, the command prints the
+> environment variables, including SSH_ORIGINAL_COMMAND being the function
+> with just "ignored" in its body.)  As we can see, the command runs, and
+> moreover in this case bash happened to segfault after having run "id".
+> 
+> I see no good workaround.  Starting the forced command with "unset
+> SSH_ORIGINAL_COMMAND &&" does not help - we'd need to unset the variable
+> before starting bash, not from bash.
+
+I wrote some code a while ago to automate git push via single-purpose
+ssh keys. [1]  By design, it wipes the environment, sets vars found in
+the config, and accepts only configured commands for
+SSH_ORIGINAL_COMMAND.  I've tested the latest HEAD against this attack,
+and it appears to mitigate it:
+
+[jason@...alhost] $ ssh -i .ssh/test_key -o 'rsaauthentication yes' 0 '() { ignored; }; /usr/bin/id'
+uid=1000(jason) gid=1000(jason) groups=1000(jason)
+[jason@...alhost] $ # add 'command=/path/to/secsh -f /path/to/test.rc' in .ssh/authorized_keys on server
+[jason@...alhost] $ ssh -i .ssh/test_key -o 'rsaauthentication yes' 0 '() { ignored; }; /usr/bin/id'
+secsh v0.8-rc1-2-ga86f09832fa2: access denied.
+
+
+Please note: While published, it has had little to no outside review;
+assistance/patches appreciated.
+
+Theoretically, you could set 'cmd /bin/bash' in the secsh config file
+and it would automatically wipe the environment.  I have *not*
+thoroughly explored the security implications of this configuration.
+It's not what secsh was designed for.  Comments welcome.
+
+The correct answer is to upgrade bash.  After that, secsh may be a
+useful addition to a system's security posture.
+
+I've appended the readme below.
+
+thx,
+
+Jason.
+
+[1] http://git.infradead.org/users/jcooper/secsh.git
+
+--- secsh README --------------------->8---------------------------------------
+
+Description
+-----------
+
+[secsh][1] - a small program to sanitize and filter commands received via ssh
+single-purpose keys
+
+Problem
+-------
+
+The other day I set out to find a way to restrict git push access to a given
+repository on a per ssh key basis.  I could've just used single-purpose ssh
+keys and copied the rsync solution on the net:
+
+  [http://jimmyg.org/blog/2008/beginners-guide-to-ssh-keys-with-ssh2.html][2]
+    "Handling backups" near the bottom
+
+I've reproduced the script here:
+
+	------>8---------------
+	#!/bin/sh
+
+	case "$SSH_ORIGINAL_COMMAND" in
+	    *\&* | *\;* | *\|*)
+	        echo "Access denied"
+	        ;;
+	    rsync\ --server*)
+	        $SSH_ORIGINAL_COMMAND
+	        ;;
+	    *)
+	        echo "Access denied"
+	        ;;
+	esac
+	------>8---------------
+
+But there are a few problems with this.  First, it executes a shell, and we
+don't need to.  That's a pretty large, unnecessary attack surface.  Second, it
+blacklists a few bad ascii characters and then allows anything starting with
+'rsync --server'.  I much prefer to whitelist.
+
+I decided to try my hand at writing secure code.  That small pop you heard
+behind you is the sound of the universe imploding. ;-)
+
+Solution
+--------
+
+The result of this feeble attempt is secsh.  You basically add an ssh public
+key to your ~/.ssh/authorized_keys file, and pre-pend the following:
+
+command="/home/jason/bin/secsh -f /home/jason/.secsh/test.rc",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-rsa...
+
+~/.secsh/test.rc (or whatever you want to name it) should have something like
+the following:
+
+	------>8---------------
+	# secsh example configuration file
+	# comments and blank lines ignored
+
+	# iff secsh was compiled with DEBUG, you can use the following for determining
+	# what funky command was sent by the client.  I could've used this figuring out
+	# rsync :)
+	#
+	# To use it, set a file name here, touch the file, and attempt to connect.
+	# The raw buffer containing the command that was sent will be written to the
+	# file.
+	#
+	# Note: secsh will only write to the file if all the conditions are met:
+	#  - file must exist
+	#  - it must *only* be a regular file
+	#  - not executable
+	#  - not hardlinked
+	#  - must be empty (that means you _must_ truncate it each time you want to
+	#      record the attempted command.)
+	#
+	# Also, the config file parser will only accept the first declaration of this
+	# option.  So, you may want to set this if DEBUG is enabled.  It depends on how
+	# likely it is that someone could append a line to your config.
+	#debug_file /home/user/.secsh/attempted_command
+
+	# If it isn't specified here, it doesn't exist
+	#env HOME=/home/user
+	#env USER=user
+	env PATH=/usr/bin:/bin
+
+	# git example
+	#cmd git-receive-pack '/path/to/linux.git'
+
+	# rsync example (set HOME and USER)
+	#cmd rsync --server -vulogDtprce.iLsf --delete . path/to/top/
+	------>8---------------
+
+For git in particular, the single quotes around the path to the repo are
+needed.  secsh is stupid simple.  If the value of $SSH_ORIGINAL_COMMAND matches
+the rest of the config line after 'cmd ' then it works.  Otherwise, access
+denied.
+
+The example rsync command is what we receive when the client does:
+
+	$ rsync -avu --delete --rsh="ssh" top/ hostname:path/to/top/
+
+Contact
+-------
+
+The mailing list may be found at:
+
+  [http://lists.infradead.org/mailman/listinfo/secsh][3]
+
+If you are interested in helping out, please see the TODO file.
+
+thx,
+
+Jason.
+
+[1]: http://git.infradead.org/users/jcooper/secsh.git/blob/HEAD:/README
+[2]: http://jimmyg.org/blog/2008/beginners-guide-to-ssh-keys-with-ssh2.html
+[3]: http://lists.infradead.org/mailman/listinfo/secsh

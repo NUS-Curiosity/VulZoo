@@ -1,0 +1,237 @@
+
+Date: Sat, 24 Dec 2016 16:18:33 +0100
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Qt QXmlSimpleReader
+
+Hi,
+
+To what extent has Qt's QXmlSimpleReader class been reviewed for
+vulnerabilities?  I found only Florian Weimer's CVE-2013-4549
+"XML entity expansion denial of service", which Red Hat somehow chose
+not to fix (no intent to parse untrusted XML?) even though they got
+upstream to fix it.
+
+https://bugzilla.redhat.com/show_bug.cgi?id=955375
+http://lists.qt-project.org/pipermail/announce/2013-December/000036.html
+https://codereview.qt-project.org/#/c/71010/
+http://blog.qt.io/blog/2014/04/24/qt-4-8-6-released/
+
+Is high memory consumption for large XML files/inputs expected by users
+of this library, or is there an expectation that there would be some
+safety limits in place in the library?  In my testing, for very long tag
+names or element contents, memory consumption is 4x their size - e.g.,
+about 8 GB for an almost 2 GB tag or element.
+
+I guess CVE-2013-4549 was worse than that?  Did it result in recursive
+expansion, meaning that even a tiny input would exhaust all memory?
+(I didn't try triggering it specifically.)
+
+I just found that (at least for a rebuild of the RHEL7 package of
+qt-4.8.5-12) it is possible to trigger a stack overflow by nesting many
+XML opening tags.  Luckily, there doesn't appear to be a way to jump
+over the guard page to another thread's stack on RHEL7/x86_64, but
+that's platform specific.
+
+Sample crash 1:
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7fd13c395700 (LWP 875129)]
+0x00007fd176289ee1 in _int_malloc () from /lib64/libc.so.6
+(gdb) bt
+#0  0x00007fd176289ee1 in _int_malloc () from /lib64/libc.so.6
+#1  0x00007fd17628c26c in malloc () from /lib64/libc.so.6
+#2  0x00007fd176b450cd in operator new(unsigned long) () from /lib64/libstdc++.so.6
+#3  0x00007fd1776365b0 in QDomDocumentPrivate::createElement(QString const&) () from /lib64/libQtXml.so.4
+#4  0x00007fd17763c3a0 in QDomHandler::startElement(QString const&, QString const&, QString const&, QXmlAttributes const&) () from /lib64/libQtXml.so.4
+#5  0x00007fd177650c27 in QXmlSimpleReaderPrivate::parseElement() () from /lib64/libQtXml.so.4
+#6  0x00007fd177651398 in QXmlSimpleReaderPrivate::parseContent() () from /lib64/libQtXml.so.4
+#7  0x00007fd177650b00 in QXmlSimpleReaderPrivate::parseElement() () from /lib64/libQtXml.so.4
+#8  0x00007fd177651398 in QXmlSimpleReaderPrivate::parseContent() () from /lib64/libQtXml.so.4
+#9  0x00007fd177650b00 in QXmlSimpleReaderPrivate::parseElement() () from /lib64/libQtXml.so.4
+#10 0x00007fd177651398 in QXmlSimpleReaderPrivate::parseContent() () from /lib64/libQtXml.so.4
+#11 0x00007fd177650b00 in QXmlSimpleReaderPrivate::parseElement() () from /lib64/libQtXml.so.4
+#12 0x00007fd177651398 in QXmlSimpleReaderPrivate::parseContent() () from /lib64/libQtXml.so.4
+
+   0x00007fd176289ed0 <+384>:   callq  0x7fd1762879a0 <malloc_consolidate>
+   0x00007fd176289ed5 <+389>:   mov    0x8(%rsp),%r9
+   0x00007fd176289eda <+394>:   mov    (%rsp),%r10d
+   0x00007fd176289ede <+398>:   mov    %r14d,%eax
+=> 0x00007fd176289ee1 <+401>:   movq   $0x1,(%rsp)
+   0x00007fd176289ee9 <+409>:   lea    0x58(%rbp),%r15
+   0x00007fd176289eed <+413>:   shr    $0x4,%eax
+   0x00007fd176289ef0 <+416>:   mov    %r9,%r12
+   0x00007fd176289ef3 <+419>:   mov    %eax,0x8(%rsp)
+
+(gdb) p $rsp
+$1 = (void *) 0x7fd13c295fd0
+
+7fd13c295000-7fd13c296000 ---p 00000000 00:00 0 
+7fd13c296000-7fd13e361000 rw-p 00000000 00:00 0                          [stack:875129]
+
+Sample crash 2 (combining nested tags with long content in each element,
+but maybe the difference from the above crash is actually just luck):
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7f21a85f7700 (LWP 876178)]
+0x00007f21c2a405a9 in sysmalloc () from /lib64/libc.so.6
+(gdb) bt
+#0  0x00007f21c2a405a9 in sysmalloc () from /lib64/libc.so.6
+#1  0x00007f21c2a416c5 in _int_malloc () from /lib64/libc.so.6
+#2  0x00007f21c2a4241c in _int_realloc () from /lib64/libc.so.6
+#3  0x00007f21c2a438b2 in realloc () from /lib64/libc.so.6
+#4  0x00007f21c366eb68 in QString::realloc(int) () from /lib64/libQtCore.so.4
+#5  0x00007f21c366ec8d in QString::resize(int) () from /lib64/libQtCore.so.4
+#6  0x00007f21c3df6a8d in updateValue(QString&, QChar const*, int&, int&) () from /lib64/libQtXml.so.4
+#7  0x00007f21c3e08706 in QXmlSimpleReaderPrivate::parseContent() () from /lib64/libQtXml.so.4
+#8  0x00007f21c3e07b00 in QXmlSimpleReaderPrivate::parseElement() () from /lib64/libQtXml.so.4
+#9  0x00007f21c3e08398 in QXmlSimpleReaderPrivate::parseContent() () from /lib64/libQtXml.so.4
+#10 0x00007f21c3e07b00 in QXmlSimpleReaderPrivate::parseElement() () from /lib64/libQtXml.so.4
+#11 0x00007f21c3e08398 in QXmlSimpleReaderPrivate::parseContent() () from /lib64/libQtXml.so.4
+#12 0x00007f21c3e07b00 in QXmlSimpleReaderPrivate::parseElement() () from /lib64/libQtXml.so.4
+
+   0x00007f21c2a40596 <sysmalloc+38>:   je     0x7f21c2a406ca <sysmalloc+346>
+   0x00007f21c2a4059c <sysmalloc+44>:   cmp    %rdi,0x33dc0d(%rip)        # 0x7f21c2d7e1b0 <mp_+16>
+   0x00007f21c2a405a3 <sysmalloc+51>:   jbe    0x7f21c2a406b8 <sysmalloc+328>
+=> 0x00007f21c2a405a9 <sysmalloc+57>:   movb   $0x0,0x8(%rsp)
+   0x00007f21c2a405ae <sysmalloc+62>:   mov    0x58(%rbx),%r12
+   0x00007f21c2a405b2 <sysmalloc+66>:   lea    0x33e1a7(%rip),%r15        # 0x7f21c2d7e760 <main_arena>
+   0x00007f21c2a405b9 <sysmalloc+73>:   mov    0x8(%r12),%r13
+
+(gdb) p $rsp
+$1 = (void *) 0x7f21a83f7fd0
+
+7f21a83f7000-7f21a83f8000 ---p 00000000 00:00 0 
+7f21a83f8000-7f21a85f8000 rw-p 00000000 00:00 0                          [stack:876178]
+
+So parseElement() and parseContent() call each other recursively.
+
+Since thread stacks are typically tiny this issue is easy to trigger
+with small XML files/streams.
+
+Looking further at the source code for a version of Qt similar to RHEL7's:
+
+http://cep.xray.aps.anl.gov/software/qt4-x11-4.8.6-browser/d6/d5d/qxml_8cpp_source.html
+
+I notice this:
+
+ 8187 inline static void updateValue(QString &value, const QChar *array, int &arrayPos, int &valueLen)
+ 8188 {
+ 8189     value.resize(valueLen + arrayPos);
+ 8190     memcpy(value.data() + valueLen, array, arrayPos * sizeof(QChar));
+ 8191     valueLen += arrayPos;
+ 8192     arrayPos = 0;
+ 8193 }
+
+Here, arrayPos is at most 256, but valueLen might be large.  Can this
+signed int overflow on "valueLen + arrayPos" and "valueLen += arrayPos"?
+I guess so.  (Unfortunately, the specific app I am testing with limits
+me to passing < 2 GB, so I can't test this easily.  Someone should write
+a testcase.)
+
+This would be UB, but since it's not detectable as UB at compile time, I
+guess in practice and in typical builds the value will wrap around.
+
+Then there's value.resize(), which also accepts a signed int (so the
+above code's use of signed int may have been justified, after all):
+
+http://doc.qt.io/qt-4.8/qstring.html#resize
+
+"If size is greater than the current size, the string is extended to
+make it size characters long with the extra characters added to the end.
+The new characters are uninitialized.
+
+If size is less than the current size, characters are removed from the end."
+
+No clear explanation on what will happen on a negative size, and besides
+it might also be possible to exceed 4 GB and get to positive values again.
+
+Is there anything at higher layers, yet applicable to all published Qt's
+APIs, consistenly limiting XML inputs to below 2 GB?  If so, this may be
+OK (but a comment would be nice).  If not, we have a problem.
+
+Speaking of the CVE-2013-4549 fix, it also looks susceptible to integer
+overflows, albeit possibly only for inputs so ridiculously large that
+mitigating that original DoS is irrelevant?  In the code below
+"++referencesToOtherEntities[toSearch][entityName];" and/or
+"*expandedIt += expandedSizes.value(referenceTo) * references +
+literalEntitySizes.value(referenceTo) * references;" might overflow,
+including possibly in ways that the second main loop doesn't run or that
+the check "*expandedIt > entityCharacterLimit" is false.
+
+  429     // The entity at (QMap<QString,) referenced the entities at (QMap<QString,) (int>) times.
+  430     QHash<QString, QHash<QString, int> > referencesToOtherEntities;
+  431     QHash<QString, int> expandedSizes;
+
+ 6651 bool QXmlSimpleReaderPrivate::isExpandedEntityValueTooLarge(QString *errorMessage)
+ 6652 {
+ 6653     QString entityNameBuffer;
+ 6654 
+ 6655     // For every entity, check how many times all entity names were referenced in its value.
+ 6656     for (QMap<QString,QString>::const_iterator toSearchIt = entities.constBegin();
+ 6657          toSearchIt != entities.constEnd();
+ 6658          ++toSearchIt) {
+ 6659         const QString &toSearch = toSearchIt.key();
+ 6660 
+ 6661         // Don't check the same entities twice.
+ 6662         if (!literalEntitySizes.contains(toSearch)) {
+ 6663             // The amount of characters that weren't entity names, but literals, like 'X'.
+ 6664             QString leftOvers = entities.value(toSearch);
+ 6665             // How many times was entityName referenced by toSearch?
+ 6666             for (QMap<QString,QString>::const_iterator referencedIt = entities.constBegin();
+ 6667                  referencedIt != entities.constEnd();
+ 6668                  ++referencedIt) {
+ 6669                 const QString &entityName = referencedIt.key();
+ 6670 
+ 6671                 for (int i = 0; i < leftOvers.size() && i != -1; ) {
+ 6672                     entityNameBuffer = QLatin1Char('&') + entityName + QLatin1Char(';');
+ 6673 
+ 6674                     i = leftOvers.indexOf(entityNameBuffer, i);
+ 6675                     if (i != -1) {
+ 6676                         leftOvers.remove(i, entityName.size() + 2);
+ 6677                         // The entityName we're currently trying to find was matched in this string; increase our count.
+ 6678                         ++referencesToOtherEntities[toSearch][entityName];
+ 6679                     }
+ 6680                 }
+ 6681             }
+ 6682             literalEntitySizes[toSearch] = leftOvers.size();
+ 6683         }
+ 6684     }
+ 6685 
+ 6686     for (QHash<QString, QHash<QString, int> >::const_iterator entityIt = referencesToOtherEntities.constBegin();
+ 6687          entityIt != referencesToOtherEntities.constEnd();
+ 6688          ++entityIt) {
+ 6689         const QString &entity = entityIt.key();
+ 6690 
+ 6691         QHash<QString, int>::iterator expandedIt = expandedSizes.find(entity);
+ 6692         if (expandedIt == expandedSizes.end()) {
+ 6693             expandedIt = expandedSizes.insert(entity, literalEntitySizes.value(entity));
+ 6694             for (QHash<QString, int>::const_iterator referenceIt = entityIt->constBegin();
+ 6695                  referenceIt != entityIt->constEnd();
+ 6696                  ++referenceIt) {
+ 6697                 const QString &referenceTo = referenceIt.key();
+ 6698                 const int references = referencesToOtherEntities.value(entity).value(referenceTo);
+ 6699                 // The total size of an entity's value is the expanded size of all of its referenced entities, plus its literal size.
+ 6700                 *expandedIt += expandedSizes.value(referenceTo) * references + literalEntitySizes.value(referenceTo) * references;
+ 6701             }
+ 6702 
+ 6703             if (*expandedIt > entityCharacterLimit) {
+ 6704                 if (errorMessage) {
+ 6705                     *errorMessage = QString::fromLatin1("The XML entity \"%1\" expands to a string that is too large to process (%2 characters > %3).")
+ 6706                         .arg(entity, *expandedIt, entityCharacterLimit);
+ 6707                 }
+ 6708                 return true;
+ 6709             }
+ 6710         }
+ 6711     }
+ 6712     return false;
+ 6713 }
+
+I'd appreciate any comments, especially from Florian and from upstream.
+
+I am Bcc'ing this to the address given at
+https://wiki.qt.io/Qt_Project_Security_Policy so that they have this
+message with the Message-ID for replies to the same thread, and I will
+also notify them separately.
+
+Alexander

@@ -1,0 +1,1037 @@
+
+Date: Tue, 26 Oct 2021 15:18:20 +0200
+From: Charles Fol <c.fol@...fo.fr>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2021-21703: PHP-FPM 5.3.7 <= 8.0.12 Local Root
+
+PHP-FPM (PHP's FastCGI server) is vulnerable to a privilege escalation
+vulnerability due to the usage of pointers in a shared memory region.
+
+The bug has been assigned CVE-2021-21703.
+
+What follows is the text/markdown version of the article posted on
+https://www.ambionics.io/blog/php-fpm-local-root.
+
+
+# Introduction
+
+Two years ago we published CARPE DIEM, an Apache HTTPd local root
+vulnerability.
+Today we are releasing the details of a similar vulnerability that
+affects PHP-FPM. Similar not only because they have the same impact
+and affect the same kind of targets, but also because they originate
+from the same problem: insecure shared memory usage. The primitive
+is different though, and the exploitation, as a consequence, is as
+well.
+
+The vulnerability allows a low-privilege user (such as *www-data*)
+to **escalate his privileges to root** using a bug in PHP-FPM, which
+has been present for 10 years.
+
+PHP-FPM (FastCGI Process Manager) is the official PHP FastCGI server.
+It is used in conjunction with an **HTTP server** such as **Apache
+or NGINX** to handle the processing of PHP files. It generally listens
+for connections over either a UNIX socket or on TCP port 9000. When
+the HTTP server needs to run a PHP file, it will forward parameters,
+such as the file path, PHP variables, and configuration to PHP-FPM,
+which will send back a response.
+
+If you're wondering if you are vulnerable: if you are using **Apache**
+and PHP, you **might be** using PHP-FPM. If you're using **NGINX**
+and PHP, you **are** using PHP-FPM. If you are using PHP-FPM, you
+are vulnerable.
+
+# Overview of the bug
+
+A low-privilege process can read and write an array of pointers used
+by the main process, running as root, through shared memory. An attacker
+can leverage this problem to change a 32-bit integer from zero to
+one in the main process's memory, or clear a memory region. By leveraging
+the primitive multiple times, it is possible to reach another bug,
+make the main process execute code, and thus escalate privileges.
+
+# Overview of PHP-FPM
+
+*The behaviour of PHP-FPM is governed by its configuration; we'll
+use the standard configuration to explain how it works. YMMV.*
+
+## Main process and workers
+
+PHP-FPM is a FastCGI server. The main process, which generally runs
+as `root`, manages less privileged (`www-data`, `nobody`) workers.
+When a request is received, the main process forwards it to an idle
+worker for processing. The worker sends back a response. The system
+is "on demand": if every worker is busy handling a request, the main
+process can spawn one or several new workers. Conversely, if there
+is not much traffic, the main process can kill workers to save resources.
+If a worker somehow crashes or exits, the main process spawns a new
+process to take its place. By default, PHP-FPM starts with 2 workers,
+and can handle at most 5 concurrent requests (*i.e.* 5 concurrent
+workers).
+
+## Scoreboards
+
+In order to know what each worker is doing, each worker manages a
+scoreboard (`struct fpm_scoreboard_proc_s`) [1]
+. These structures contain a PID, the current state of the worker
+(is it handling a request or idle ? Which PHP file is it processing
+?), and a few stats alongside (memory and CPU time used).
+
+```cpp
+pwndbg> p *fpm_worker_all_pools->scoreboard->procs[0] //
+fpm_scoreboard_proc_s
+$8 = {
+  {
+    lock = 0,
+    dummy = '\000' <repeats 15 times>
+  },
+  used = 1,
+  start_epoch = 1619077029,
+  pid = 1444,
+  requests = 0,
+  request_stage = FPM_REQUEST_ACCEPTING,
+  ...
+  request_uri = '\000' <repeats 127 times>,
+  query_string = '\000' <repeats 511 times>,
+  request_method = '\000' <repeats 15 times>,
+  ...
+}
+```
+*Example of a worker scoreboard*
+
+Additionally, the main process aggregates some of these infos in a
+main scoreboard (`struct fpm_scoreboard_s`). In there, you can find
+the number of active workers (`active`), the number of idle workers
+(`idle`), the timestamp at which PHP-FPM started (`start_epoch`)...
+
+```cpp
+pwndbg> p *fpm_worker_all_pools->scoreboard // fpm_scoreboard_s
+$7 = {
+  {
+    lock = 0,
+    dummy = '\000' <repeats 15 times>
+  },
+  pool = "www", '\000' <repeats 28 times>,
+  pm = 2,
+  start_epoch = 1619077029,
+  idle = 2,
+  active = 0,
+  active_max = 0,
+  requests = 0,
+  max_children_reached = 0,
+  lq = 0,
+  lq_max = 0,
+  lq_len = 0,
+  nprocs = 5, // size of the procs array
+  free_proc = 2,
+  slow_rq = 0,
+  procs = 0x7ff114945078 // fpm_scoreboard_proc_s*[] // <---- [1]
+}
+```
+*Main scoreboard*
+
+One of these fields is of interest: the last field of the structure,
+`procs`, is an array of pointers to the sub-scoreboards described
+right before. When the root process needs to access a sub-scoreboard,
+it refers to this array and dereferences its elements.
+
+This implies that the main process has access to the sub-scoreboards,
+although they are maintained by workers. How can this be ?
+
+## IPC through SHM
+
+When PHP-FPM starts, it creates a shared memory mapping to store
+sub-scoreboards.
+Along with the main process, each worker can read and modify the data
+in this mapping. It seems insecure: as a worker, you could for instance
+modify the scoreboard of other workers, and pretend they are busy,
+which could DOS the application. However, this is not dramatic.
+
+Here's what is: the main scoreboard is *also* located in the SHM.
+The pointers in `fpm_scoreboard_s.procs[]` are therefore writable
+by any worker.
+When the root process tries to use sub-scoreboards, we can make it
+read or write outside the SHM, right inside its own memory !
+
+*As a quick test, you can set `scoreboard->procs[0]` to an unmapped
+address from a worker process and watch the main process crash almost
+instantly, as it tries to dereference it.*
+
+Using PHP sandbox escape bugs, like the one described
+[here](https://ssd-disclosure.com/ssd-advisory-php-spldoublylinkedlist-uaf-sandbox-escape/),
+one can get full control over a worker's memory, and use it to modify
+the `fpm_scoreboard_s.procs[]` pointers, in order to make the main
+process use fake `fpm_scoreboard_proc_s` structures.
+
+However, unlike with the Apache HTTPd exploit, there is no easy way
+to reach an arbitrary function call from this bug. In fact, there's
+actually not much we can do with it! We'll go over this in the next
+section.
+
+# Process scoreboard management and the bad primitive
+
+In order to understand what we can do with these pointers, we need
+to understand how PHP-FPM manages sub-scoreboards during the shutdown
+and creation of workers.
+
+PHP-FPM maintains, while running, a linked list of running children
+(workers), each represented by a `fpm_child_s` structure. They are
+stored on the heap (libc's, not PHP's).
+
+Additionally, PHP-FPM wishes to collect a few stats about its running
+workers. Therefore, when it starts, the main process allocates, **in
+the shared memory**, the main scoreboard (`fpm_scoreboard_s`), and
+a number of `fpm_scoreboard_proc_s` structures equal to the maximum
+number of workers (by default, 5). It then fills the
+`fpm_scoreboard->procs[]`
+array with pointers to these.
+
+Before it spawns a new worker, the main process needs to find it a
+scoreboard to use. To do so, picks an unused sub-scoreboard, marks
+it as used, and links it to the worker.
+
+When a worker dies, it does not need a sub-scoreboard anymore. PHP-FPM
+finds its index through another structure, and then wipes the whole
+structure.
+
+Both operations happen **in the main process, as root**. They are
+respectively done by the following functions: `fpm_scoreboard_proc_alloc()`
+and `fpm_scoreboard_proc_free()`. Let's rapidly check the code for
+both functions.
+
+
+```cpp
+// fpm_scoreboard.c
+
+int fpm_scoreboard_proc_alloc(struct fpm_scoreboard_s *scoreboard,
+int *child_index) /* {{{ */
+{
+    int i = -1;
+
+    [...]
+
+    /* first try the slot which is supposed to be free */
+    if (scoreboard->free_proc >= 0 && (unsigned int)scoreboard->free_proc
+< scoreboard->nprocs) {
+        if (scoreboard->procs[scoreboard->free_proc] &&
+!scoreboard->procs[scoreboard->free_proc]->used)
+{
+            i = scoreboard->free_proc;
+        }
+    }
+
+    // [1]
+    if (i < 0) { /* the supposed free slot is not, let's search for a
+free slot */
+        zlog(ZLOG_DEBUG, "[pool %s] the proc->free_slot was not free. Let's
+search", scoreboard->pool);
+        for (i = 0; i < (int)scoreboard->nprocs; i++) {
+            if (scoreboard->procs[i] && !scoreboard->procs[i]->used) {
+/* found
+*/
+                break;
+            }
+        }
+    }
+
+    /* no free slot */
+    if (i < 0 || i >= (int)scoreboard->nprocs) {
+        zlog(ZLOG_ERROR, "[pool %s] no free scoreboard slot",
+scoreboard->pool);
+        return -1;
+    }
+
+    scoreboard->procs[i]->used = 1; // [2]
+    *child_index = i; // [3]
+
+    /* supposed next slot is free */
+    if (i + 1 >= (int)scoreboard->nprocs) {
+        scoreboard->free_proc = 0;
+    } else {
+        scoreboard->free_proc = i + 1;
+    }
+
+    return 0;
+}
+```
+
+The first function will find an unused structure [1], mark it as used
+[2], and return its index [3].
+
+```cpp
+void fpm_scoreboard_proc_free(struct fpm_scoreboard_s *scoreboard,
+int child_index) /* {{{ */
+{
+    if (!scoreboard) {
+        return;
+    }
+
+    if (child_index < 0 || (unsigned int)child_index >= scoreboard->nprocs)
+{
+        return;
+    }
+
+    if (scoreboard->procs[child_index] &&
+scoreboard->procs[child_index]->used
+> 0) { // [4]
+        memset(scoreboard->procs[child_index], 0, sizeof(struct
+fpm_scoreboard_proc_s));
+// [5]
+    }
+
+    /* set this slot as free to avoid search on next alloc */
+    scoreboard->free_proc = child_index;
+}
+```
+
+The second function will receive the index of the sub-scoreboard of
+a dying child, and clear it [5], but only if its `used` flag is superior
+to zero [4].
+
+To speed up the allocation process, the field `scoreboard->free_proc`
+keeps track of the sub-scoreboard that was freed last. When a sub-scoreboard
+needs to be allocated, this index will be checked first.
+
+The array containing addresses of every sub-scoreboard,
+`scoreboard->procs[]`,
+is located in the shared memory: it can be modified by any worker
+process. Furthermore, the process of allocating a sub-scoreboard can
+be easily triggered as a worker by creating several concurrent requests,
+and freeing a sub-scoreboard can be done by killing a worker.
+
+As such, we can trigger those functions as an attacker: we can use
+this to make the main process change a 32-bit integer from zero to
+one (using *2*), or clear a huge memory region (using *5*).
+
+## An example
+
+Let's say we want to set an integer at address `0x555600000038` in
+the main process' heap to `1`. It is originally `0`.
+
+We set `scoreboard->procs[2]` to `0x555600000028` (`used` is at offset
+`0x10`), and kill the associated worker.
+`fpm_scoreboard_proc_free(scoreboard,
+2)` is called, and since `scoreboard->procs[2]->used`  (`0x555600000038`)
+is zero, it just sets `scoreboard->free_proc` to `2` and returns.
+
+Then, before spawning a new worker, `fpm_scoreboard_proc_alloc()`
+gets called. It checks `scoreboard->procs[scoreboard->free_proc]->used`,
+sees that is it *zero*, and sets it to *one*. It then sets
+`scoreboard->free_proc`
+to `2+1=3` and returns.
+
+However, if, for some reason, the integer at address `0x555600000038`
+happens to be *not* zero, the impact is very different.
+`fpm_scoreboard_proc_free()`
+checks `scoreboard->procs[2]->used`, sees that it is nonzero, and
+therefore calls `memset(0x555600000028, 0, 1168)`, destroying a significant
+part of memory around (and mostly after) the address.
+
+This is a risky primitive: due to the small size of internal PHP-FPM
+structures, 1168 represents a huge size. If we somehow mess up, we
+could destroy important data, and probably crash the main process.
+
+However, we got our primitives: we make an element of `scoreboard->procs[]`
+point to wherever we want, and kill the associated worker. Depending
+on the value of its `used` field, it will either be set to `1`, or
+clear 1168 bytes around it.
+
+*From now on, these primitives will be named respectively the* set-0-to-1
+*and* clear-1168-bytes *primitives*.
+
+# Exploitation
+
+From now on, we assume that we have complete read/write in workers
+using a [PHP sandbox escape (*e.g.* `SplDoublyLinkedList::offsetUnset`).
+We can force the creation of workers by sending several concurrent
+requests, and kill any worker by sending it a `SIGKILL` signal.
+
+We want to escalate from a full read-write access in a worker process
+to code execution in the root process.
+
+To do so, we have a few things going for us:
+
+- Since workers are forked from the main process, they share the same
+memory mappings (ASLR is insignificant).
+- Their heap is similar as well: although a lot of allocs/deallocs
+happen when a worker spawns, we can still get a decent idea of the
+contents of the heap of the main process by reading its child's memory.
+- Finally, if we somehow crash a child during the exploitation, the
+main process will restart it.
+
+However, we also have a few problems:
+
+- The primitive is bad: if `used` does not have the value we expect,
+we'll destroy 1168 bytes of memory instead of just changing one bit
+from `0` to `1`; generally, this means a crash. If the main process
+crashes, it's game over for you and the website. Even if we manage
+to not mess it up, we can clear a huge memory range or change a zero
+into a one. That's not much to work with.
+- After a fork, the worker will free lots of structures, because they
+are only used by the main process. If somehow the newly-spawned worker
+has an incorrect heap state when it spawns, it will exit or crash.
+And the main process will therefore spawn a new, still messed up,
+worker. Which will exit again. This will go on indefinitely, and cause
+a DOS.
+- In order to control our primitive, we will have to spawn and kill
+workers in rapid succession. If a normal user browses the website
+at an inconvenient time, he might mess up our exploit, which might
+crash the root process.
+
+In short, there are many ways to destroy the main process, and there
+aren't many ways to get code execution.
+
+## Tailoring the primitive
+
+Although we have a decent idea of the main process' memory layout,
+we can't always be 100% sure that a given 32-bit integer is zero.
+Thus, our two primitives might get mixed-up, and we may as a result
+crash the process.
+
+To avoid this, we first kill a worker, and then change the
+`scoreboard->procs[]`
+element only after `fpm_scoreboard_free_proc()` has been killed. This
+can easily be done by monitoring the value of `scoreboard->free_proc`,
+which is changed at the end of the function. Then, as soon as
+`fpm_scoreboard_free_alloc()`
+has been called, we reset the pointer (again, we can monitor `free_proc`
+for this).
+
+With a few additional tricks involving the scoreboard structure and
+out-of-scope of the article, we can garantee that, although we don't
+always win the race, we never break anything.
+
+Our *set-0-to-1* primitive just got a little better: we cannot trigger
+`memset()` by mistake anymore, and have one less way to destroy PHP-FPM.
+Other are coming.
+
+## Reaching the heap: setting `catch_workers_output`
+
+Now that our *set-0-to-1* primitive is safe, we need to find a use
+for it. By itself, it is not much use: we can corrupt a length, or
+a chunk size for instance, but we cannot create arbitrary data in
+the main process (except in the shared memory segment). In other words,
+maybe we can make something bigger, but we can't make it contain data
+we control.
+
+We therefore need a way to send data to the main process, and there's
+a perfect solution in the worker pool configuration:
+
+```cpp
+pwndbg> p *fpm_worker_all_pools->config
+$2 = {
+  name = 0x559e247bf020 "www",
+  prefix = 0x0,
+  user = 0x559e247b73d0 "www-data",
+  group = 0x559e247b73f0 "www-data",
+  listen_address = 0x559e247b73a0 "/run/php/php7.4-fpm.sock",
+  listen_backlog = 511,
+  listen_owner = 0x559e247b7440 "www-data",
+  listen_group = 0x559e247b7460 "www-data",
+  listen_mode = 0x0,
+  listen_allowed_clients = 0x0,
+  process_priority = 64,
+  process_dumpable = 0,
+  pm = 2,
+  ...
+  rlimit_files = 0,
+  rlimit_core = 0,
+  chroot = 0x0,
+  chdir = 0x0,
+  catch_workers_output = 0, // <-----------------
+  decorate_workers_output = 1,
+  clear_env = 1,
+  security_limit_extensions = 0x559e247b7480 ".php .phar",
+  env = 0x0,
+  php_admin_values = 0x0,
+  php_values = 0x0,
+  apparmor_hat = 0x0,
+  listen_acl_users = 0x0,
+  listen_acl_groups = 0x0
+}
+```
+
+There are a lot of things in there, but one looks very interesting:
+`catch_workers_output`. Its use is to aggregate the output from workers
+into a single log file, `php-fpm.log`.
+
+As such, when set, if a worker writes to *stdout* or *stderr*, the
+data is sent to the root process, which buffers it until a newline
+is encountered. When this happens, the line is stored into the log
+file, and the buffer gets flushed. This buffer is by default of fixed
+size, `1024`, and allocated on the heap.
+
+`catch_workers_output` is *OFF* (`0`) by default. We use the primitive
+to set it to `1`.
+We can now send *almost* arbitrary data in the main process' heap;
+we just need to write into workers' *stderr*.
+
+## Good enough ?
+
+Now that we can send (almost) arbitrary data in the root process'
+heap, and have two primitive, we could easily go for an heap attack.
+By using the *set-0-to-1* primitive, we could for instance change
+a chunk size; by using the other primitive, we could clear a tcache
+pointer LSB...
+
+An example: we could use 3 workers to force the allocation of 3 contiguous
+log buffers, and free them in a chosen order. Since they all fit in
+the tcache, we could overwrite the LSB of the pointer of the first
+chunk using our *clear-1168-bytes* primitive, and we'd have a good
+starting point.
+
+However, this attack, along with many others, rely on having, at some
+point, an unstable heap.
+If a legitimate client were to send a request at this point in time,
+it would probably have very bad effects: crash, DOS, ...
+
+Even using different approaches, the conclusion remains the same:
+however good an exploitation strategy is in theory, if legitimate
+requests (and their potential errors) were handled at critical stage
+of the exploit, a crash would be very likely. We need to find a way
+to keep the server to ourselves.
+
+## All your bases
+
+Between each step of the exploit, a number of legitimate requests
+can happen. This causes a few problems.
+
+### Persistent worker control
+
+If we were to send an FCGI request for each "action" we want a worker
+to perform, there'd be no garantee that the process that executes
+the first request is the same as the one handling the second one.
+Furthermore, as legitimate requests get intertwined with ours, we
+often get unpredictable behaviour.
+
+We therefore build the exploit as a python **C&C server** which spawns
+PHP workers and keeps them alive for as long as required. The server
+and the workers communicate through a custom IPC mechanism (*read:
+a JSON file and a few `while(true)` loops*).
+
+This enables us to create workers, make them execute commands, and
+then stop or kill them at will. In other words, we know which process
+executes which actions, and that it does not execute anything else
+in between.
+
+However, standard requests can still be assigned to workers we do
+not control, or slip in when we kill a worker and try to take control
+of a new one.
+
+### Capping the number of workers
+
+Whenever a new worker is forked from the main process, it gets rid
+of unneeded structures. Such structures include all workers' `zlog_stream`
+and `buffer`. It'll also allocate new stuff, which will trigger
+`malloc_consolidate()`.
+In each of our exploitation ideas, the heap is, for very short times,
+in an invalid state: a chunk header could be invalid, an entry could
+be present twice in the tcache... Say a worker gets spawned at this
+time. It inherits the bad heap, tries to use it... and the libc shouts
+an error and raises `SIGABRT`. Usually we would not care: PHP-FPM
+restarts its crashed children. However, since we enabled
+`catch_workers_output`,
+the error message is sent back to the main process, which, as it's
+supposed to, creates a log buffer to receive the error. The heap being
+broken in main process as well, the main process ends up crashing too!
+
+Even if the worker process crashes silently, the main process respawns
+it before doing anything else. It'll crash again, resulting an endless
+loop of birth and death for processes.
+
+Consequently, we need a way to block the main process from spawning
+workers. Remember, before spawning a worker, the main process will
+make sure that a sub-scoreboard is available for it to use. An obvious
+idea is to set the `->used` flag of every `scoreboard->procs[]` to
+`1`. However, this proves really hard when the main process repeatedly
+spawns new workers: you need to set it right after the structure has
+been nulled. Luckily, `fpm_scoreboard_proc_free()` and
+`fpm_scoreboard_proc_alloc()`
+behave a little bit differently:
+
+```cpp
+// fpm_scoreboard.c
+
+int fpm_scoreboard_proc_alloc(struct fpm_scoreboard_s *scoreboard,
+int *child_index) /* {{{ */
+{
+    [...]
+
+    if (i < 0) { /* the supposed free slot is not, let's search for a
+free slot */
+        zlog(ZLOG_DEBUG, "[pool %s] the proc->free_slot was not free. Let's
+search", scoreboard->pool);
+        for (i = 0; i < (int)scoreboard->nprocs; i++) {
+            if (scoreboard->procs[i] && !scoreboard->procs[i]->used) {
+/* found
+*/ // <--- HERE
+                break;
+            }
+        }
+    }
+
+    [...]
+}
+
+void fpm_scoreboard_proc_free(struct fpm_scoreboard_s *scoreboard,
+int child_index) /* {{{ */
+{
+    if (scoreboard->procs[child_index] &&
+scoreboard->procs[child_index]->used
+> 0) { // <--- HERE
+        memset(scoreboard->procs[child_index], 0, sizeof(struct
+fpm_scoreboard_proc_s));
+    }
+}
+```
+
+If you look at the code again, you'll notice that
+`fpm_scoreboard_proc_free()`
+checks that `used` is *superior* to zero, while
+`fpm_scoreboard_proc_alloc()`
+checks that it is *different* from zero. As such, **setting `used`
+to `-1` blocks both functions from doing anything**.
+
+This allows us to block workers from spawning, and thus cap the maximum
+number of workers. For instance, in the default configuration, which
+allows *5* concurrent workers at most, if we set `used` to `-1` on
+*3* sub-scoreboards, PHP-FPM will only be able to spawn *2*.
+
+Furthermore, when we kill a worker, we can even preemptively set its
+`used` flag to `-1`, making sure PHP won't respawn one right after.
+
+Another consequence is that we can now tailor our exploit for the
+default configuration of 5 maximum concurrent workers. If the targeted
+PHP-FPM service happens to allow more, we'll just cap this number
+back to 5. We can build a configuration-agnostic exploit.
+
+### Closed FD
+
+Because of our hotfix of `catch_workers_output`, when PHP-FPM spawns
+workers at a very heavy rate, a race condition can happen where the
+*fd* supposed to receive CGI requests is closed right before it is
+used. This causes the worker to exit straight away (if it can't receive
+requests, what's the point of being alive), leading the main process
+to respawn it. However, the immediate respawn yields exactly the same
+problem, and the worker exits again. Infinite loop. Luckily, this
+can be solved by blocking the spawn of workers for a few moments,
+using the same technique as described above.
+
+There's one thing left to tackle: legitimate requests which produce
+errors.
+
+### Error-free PHP
+
+Let's say it: PHP is probably one of the web language that produces
+the most errors without crashing. Warning, Notice, Deprecation, the
+list goes on.
+
+Those errors become annoying as soon as we enable `catch_workers_output`:
+they get written to *stderr*, and as such are transfered to the main
+process, which will create log streams and buffers to store them.
+Since these heap chunks are the only we can control, we'd like to
+keep them to ourselves.
+
+Luckily, before a PHP error is written to an FD, lots of things happen.
+Here's an example stack trace in a worker process which yields an
+error:
+
+```cpp
+pwndbg> bt
+...
+#2  0x00007f8b43e71cb8 in persistent_error_cb (type=2,
+error_filename=0x4121d7c0
+"/var/www/html/gid.php", error_lineno=6, message=0x7f8b43c02200) at
+./ext/opcache/ZendAccelerator.c:1671
+#3  0x000055e53ff5069c in zend_error_impl (orig_type=orig_type@...ry=2,
+error_filename=0x4121d7c0 "/var/www/html/gid.php", error_lineno=<optimized
+out>, message=message@...ry=0x7f8b43c02200) at ./Zend/zend.c:1339
+#4  0x000055e53ff50e6c in zend_error_zstr (type=type@...ry=2,
+message=message@...ry=0x7f8b43c02200)
+at ./Zend/zend.c:1530
+#5  0x000055e53ff4c348 in php_verror (docref=<optimized out>,
+params=<optimized
+out>, type=2, format=<optimized out>, args=args@...ry=0x7fff7e7df170)
+at ./main/main.c:1064
+#6  0x000055e53ff4c6e9 in php_error_docref1 (docref=docref@...ry=0x0,
+param1=param1@...ry=0x7f8b43c61010 "/etc/shadow", type=type@...ry=2,
+format=format@...ry=0x55e5401fc498 "%s: %s") at ./main/main.c:1088
+#7  0x000055e5400c8d64 in php_stream_display_wrapper_errors
+(wrapper=wrapper@...ry=0x55e540314320
+<php_plain_files_wrapper>, path=path@...ry=0x40b99ff8 "/etc/shadow",
+caption=caption@...ry=0x55e5401fecf6 "Failed to open stream") at
+./main/streams/streams.c:213
+...
+#19 0x000055e53ff6ccae in _start () at ./ext/standard/file.c:2428
+```
+
+In `persistent_error_cb()`, we have the following code:
+
+```cpp
+// ext/opcache/ZendAccelerator.c
+static void persistent_error_cb(int type, const char *error_filename,
+const uint32_t error_lineno, zend_string *message) {
+    if (ZCG(record_warnings)) { // [1]
+        zend_recorded_warning *warning =
+emalloc(sizeof(zend_recorded_warning));
+        warning->type = type;
+        warning->error_lineno = error_lineno;
+        warning->error_filename = zend_string_init(error_filename,
+strlen(error_filename),
+0);
+        warning->error_message = zend_string_copy(message);
+
+        ZCG(num_warnings)++;
+        ZCG(warnings) = erealloc(ZCG(warnings),
+sizeof(zend_recorded_warning)
+* ZCG(num_warnings)); // [2]
+        ZCG(warnings)[ZCG(num_warnings)-1] = warning;
+    }
+    accelerator_orig_zend_error_cb(type, error_filename, error_lineno,
+message);
+}
+```
+
+`ZCG(some_key)` expands to `accel_globals.some_key`. This `accel_globals`
+structure is inherited from the main process, and contains many empty
+fields, like `ZCG(record_warnings)` [1] and `ZCG(warnings)` [2]. **By
+setting both to `1` using our *set-0-to-1* primitive, each worker
+process will inherit the values**. As a consequence, any PHP error
+will cause `persistent_error_cb()` to enter the `if` block, and will
+end up calling `erealloc()` with `1` at its first parameter, thus
+crashing the worker. Since the worker crashes before it writes to
+*stderr*, the error is never received by the main process, and no
+heap chunks are allocated.
+
+Using all these tweaks, we are able to gracefully control which worker
+executes what, how many workers spawn, and block PHP errors from messing
+up our exploit.
+
+## Problem-free exploitation tactics
+
+With all these problems behind us, we are ready to find a valid exploitation
+idea. Remember the overlapping chunk attack discussed in the previous
+section ?
+
+In practice, this is way harder: since we hotfixed `catch_workers_output`,
+PHP-FPM did not get the chance to set up the FDs it needs to interact
+with the workers. As such, some workers can only send data to the
+main process using *stdout*, other only with *stderr*. Others cannot
+send anything. Even worse, sometimes, workers write on behalf of others.
+It makes it really hard to have three contiguous chunks. And this
+is only the first requirement of our attack.
+
+## Managing streams: `zlog_stream`
+
+In order to manage *stderr* buffers in the main process, PHP-FPM allocates,
+for each worker, another structure: `zlog_stream`. It contains the
+address of the buffer, its size, the number of characters written
+into it, etc.
+
+Let's look at a bit more.
+
+```cpp
+pwndbg> p *fpm_worker_all_pools->children->next->log_stream
+$1 = {
+  ...
+  child_pid = 1844634,
+  function = 0x0,
+  buf = {
+    data = 0x0, // buffer pointer
+    size = 0 // buffer size
+  },
+  len = 0, // position of the write cursor in the buffer
+  buf_init_size = 1024, // default size to allocate buffer with
+  ...
+  msg_prefix = 0x564794d2a860 "[pool www] child 1844634 said into
+stderr: ",
+  ...
+}
+```
+*Example of `zlog_stream` structure.*
+
+When a worker sends its first bytes to stderr, the `zlog_stream` gets
+created. At first, no buffer gets allocated: `stream->buf.data` is
+`NULL`, and `stream->buf.size` is `0`. The position of the cursor,
+`stream->len`, is also zero.
+
+When *stderr* is not an empty line, the log stream creates a buffer
+to store the sent characters. Sending `test\n` results in the following
+changes:
+
+```cpp
+pwndbg> p *fpm_worker_all_pools->children->next->log_stream
+$1 = {
+  ...
+  child_pid = 1844634,
+  function = 0x0,
+  buf = {
+    data = 0x55ec5bed7a40 "[31-May-2021 16:10:35] WARNING: [pool www]
+child 1844635 said into stderr: \"test\"\n",
+    size = 1024
+  },
+  len = 48,
+  buf_init_size = 1024, // default size to allocate buffer with
+  ...
+  msg_prefix = 0x564794d2a860 "[pool www] child 1844634 said into
+stderr: ",
+  ...
+}
+```
+*Example of `zlog_stream` structure.*
+
+A buffer of size `1024` was created, and our 4-letter payload was
+written, but with a little twist: a prefix was added by PHP-FPM. It
+does this so that, when this string finally gets written into the
+log file, one can to find out which worker wrote what.
+
+Now that we have a basic (but sufficient) overview of log streams,
+lets dive into the code responsible for appending data to a buffer.
+
+## Unreachable heap overflow
+
+As mentioned previously, whenever a worker writes to *stderr*, the
+first step achieved by the main process is to create a `zlog_stream`
+structure (if it has not been done already).
+
+After this, it reads from the corresponding FD, and calls
+`zlog_stream_str()`,
+which, if something was read, calls `zlog_stream_buf_append()` [1]:
+
+```cpp
+static ssize_t zlog_stream_buf_append(
+        struct zlog_stream *stream, const char *str, size_t str_len) //
+[1]
+{
+    int over_limit = 0;
+    size_t available_len, required_len, reserved_len;
+
+    if (stream->len == 0) {
+        stream->len = zlog_stream_prefix_ex(stream, stream->function,
+stream->line);
+// [2]
+    }
+
+    /* msg_suffix_len and msg_quote are used only for wrapping */
+    reserved_len = stream->len + stream->msg_suffix_len + stream->msg_quote;
+    required_len = reserved_len + str_len;
+    if (required_len >= zlog_limit) { // [3]
+        over_limit = 1;
+        available_len = zlog_limit - reserved_len - 1;
+    } else {
+        available_len = str_len;
+    }
+
+    if (zlog_stream_buf_copy_cstr(stream, str, available_len) < 0) {
+// [4]
+        return -1;
+    }
+
+    if (!over_limit) {
+        return available_len;
+    }
+
+    ...
+    return available_len;
+}
+```
+
+Let's review the arguments: `stream` is the log stream responsible
+for the worker, `str` contains the bytes written to `stderr`, and
+`str_len` the number of bytes written.
+
+If nothing has been written to the buffer yet (`stream->len` is zero),
+`zlog_stream_prefix_ex()` gets called. If `stream->buf.data` is not
+allocated yet, this is done, with size `stream->buf_init_size` (1024).
+After this, `stream->msg_prefix` is added to the beginning of the
+message, and `len` is incremented accordingly [2].
+
+Then, PHP-FPM verifies that the total size required to store the data
+is not over the global maximum, `zlog_limit` [3]. This is an integer
+which is equal to 1024. This is as simple as this: you cannot write
+more than 1024 bytes in `stream->buf.data`, ever.
+
+Then comes the call to `zlog_stream_buf_copy_cstr()` [4]:
+
+```cpp
+static inline ssize_t zlog_stream_buf_copy_cstr(
+        struct zlog_stream *stream, const char *str, size_t str_len) /*
+{{{ */
+{
+    if (stream->buf.size - stream->len <= str_len /* [5] */
+        && !zlog_stream_buf_alloc_ex(stream, str_len) /* [6] */) {
+        return -1;
+    }
+
+    memcpy(stream->buf.data + stream->len, str, str_len); // [7]
+    stream->len += str_len;
+
+    return str_len;
+}
+```
+
+If there is not enough size remaining in the buffer[5], it is
+reallocated[6].
+We enter the last function, `zlog_stream_buf_alloc_ex()`:
+
+```cpp
+static zlog_bool zlog_stream_buf_alloc_ex(struct zlog_stream *stream,
+size_t needed)  /* {{{ */
+{
+    char *buf;
+    size_t size = stream->buf.size ?: stream->buf_init_size;
+
+    if (stream->buf.data) {
+        size = MIN(zlog_limit, MAX(size * 2, needed));
+        buf = realloc(stream->buf.data, size);
+    } else {
+        size = MIN(zlog_limit, MAX(size, needed));
+        buf = malloc(size);
+    }
+
+    if (buf == NULL) {
+        return 0;
+    }
+
+    stream->buf.data = buf;
+    stream->buf.size = size;
+
+    return 1;
+}
+```
+
+As you can see, an horrible error happens: the buffer is (re)allocated
+in function of `needed`, while `stream->len` is completely disregarded.
+This causes an overflow on the `memcpy()` call [7] of the parent function,
+which goes as far as `stream->len + str_len`, while the size of the
+buffer is `str_len`.
+
+However, as previously mentioned, when the first bytes of *stderr*
+make their way to the main process, a prefix will be prepended, thus
+creating a buffer of size `1024` [2]. The code snippet right after
+forbids us from writing more than `1024` bytes into a buffer; this
+prevents us from triggering the overflow in a normal situation.
+
+## Faking the streams, getting root
+
+### Heap overflow
+
+We still have one thing going for us: our beloved *set-0-to-1* primitive.
+
+We can spoof `stream->len` and `stream->buf.size` using it, but `zlog_limit`
+acts as an upper bound. As such, when they are zero, we can only give
+them one of 3 possible values: `1`, `0x100`, and `0x101` (because
+`0x10000 > zlog_limit`).
+
+Let's say we set both to `L`, and we write `N` bytes to *stderr* (with
+`L + N < zlog_limit - 2`). This happens:
+
+1. `zlog_stream_buf_append(stream, str, N)`.
+2. `zlog_stream_prefix_ex()` is not called, and `stream->buf.data`
+stays `NULL`.
+3. `required_len < zlog_limit`, thus `available_len = N`.
+4. `zlog_stream_buf_copy_cstr(stream, str, N)` called.
+5. Since both `buf.size` and `len` are equal, the check is always
+true.
+6. `zlog_stream_buf_alloc_ex(stream, N)` gets called, and it allocates
+`N` bytes.
+7. `memcpy(stream->buf.data + L, str, N)` is called, overflowing of
+`L` bytes.
+
+We can thus create a log buffer of any size `N`, and overflow `L`
+(`1`, `0x100` or `0x101`) bytes after it.
+
+However, the objects contained in the heap are pretty small; these
+overflow sizes are either way too tiny or a little too much for our
+liking. We need to go a little bit further. First, we exploit with
+`L=1`, and we obtain the following `log_stream` structure:
+
+```cpp
+stream->buf.data = malloc(N)
+stream->buf.size = N
+stream->len = N + 1
+```
+
+Then, we can apply the primitive again on the third byte of `buf.size`.
+We get:
+
+```cpp
+stream->buf.data = malloc(N)
+stream->buf.size = 0x10000 | N
+stream->len = N + 1
+```
+
+Then, if we write `M` additional bytes to *stderr*, we have:
+
+1. `zlog_stream_buf_append(stream, str, M)`.
+2. `zlog_stream_prefix_ex()` is not called
+3. `required_len < zlog_limit`, thus `available_len = M`.
+4. `zlog_stream_buf_copy_cstr(stream, str, M)` called.
+5. Since `buf.size` is huge, and `len` is small, the check is always
+false.
+6. `zlog_stream_buf_alloc_ex(stream, N)` not called
+7. `memcpy(stream->buf.data + 1 + N, str, M)` is called, overflowing
+of `1 + M` bytes.
+
+We now have an overflow of size `M + 1`, on a buffer of size `N`,
+with both variables almost arbitrary.
+
+#### Arbitrary write
+
+Creating a log stream will yield a `zlog_stream` chunk (`0x80`), and
+a `msg_prefix` chunk (`0x40`). We can create one for any worker. We
+create as many as possible, and look for a stream chunk (refered to
+as `@...rflowed`) which is immediately preceeded by either a stream
+chunk or a msg prefix chunk, `@...laced`. We also pick another log
+stream, which we name `@...rupted`.
+
+By applying the *set-0-to-1* primitive to `@...rupted->buf.size` and
+`@...rupted->len`, we can allocate a chunk of any size `N` by sending
+`N` bytes to `@...rupted`'s *stderr*. We use this to allocate where
+`@...laced` was located. `@...rupted->buf.data` now points on the
+chunk right before `@...rflowed`.
+
+We now apply the primitive one last time, so that `@...rupted->buf.size`
+gets incremented by `0x10000`. We can now write out-of-bounds, *i.e.*
+overwrite `@...rflowed`. We can make its `buf.data` point to anything
+! However, we can only do it once.
+
+We therefore make `@...rflowed->buf.data` point to `@...rupted`. By
+writing in `@...rflowed`'s *stderr*, we can modify `@...rupted`
+(`zlog_stream`),
+and the address its buffer points to. We can then write to `@...rupted`'s
+*stderr* to write what we want, where we want it.
+
+
+This way, we have one log stream that writes another: we got recurrent
+arbitrary write.
+From there, we can fix the configuration, the heap, and finally overwrite
+function pointers to get code execution.
+
+# Demo
+
+See on link.
+
+# Vulnerable versions
+
+The exploit technique documented here makes use of a feature that
+appeared in PHP 7.2. However, the pointers in the SHM have been present
+from the first implementation, dating from PHP 5.3.7.
+!
+
+The bug was patched by converting `scoreboard->procs` to an array
+of scoreboards (no pointers anymore) and making sure `scoreboard->nprocs`
+only gets used by workers. You can find the main commit here:
+https://github.com/php/php-src/commit/fadb1f8c1d08ae62b4f0a16917040fde57a3b93b
+The patched release is PHP-8.0.12.
+
+# Conclusion
+
+Due to the growing adoption of NGINX instead of Apache, a good look
+at PHP-FPM was in order. An oversight in the design of the shared
+memory region lead to half-decent exploitation primitives, which in
+turn lead to a `root` privilege escalation.
+
+The exploit will be available at a later date.
+
+

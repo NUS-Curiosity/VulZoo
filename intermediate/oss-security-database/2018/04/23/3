@@ -1,0 +1,355 @@
+
+Date: Mon, 23 Apr 2018 16:44:01 +0200
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: Multiple local root vulnerabilities involving PackageKit
+ CVE-2018-1106
+
+Hello list,
+
+I am forwarding this email which was previously disclosed to the
+linux-distros mailing list. I made only minor modifications to the
+original report (marked with "Update" where appropriate).
+
+Following is an analysis of PackageKit and the discussion of a number of
+vulnerabilities that I found to be exploitable in its context.
+
+# 1. What is PackageKit?
+
+PackageKit is a software suite designed to allow easy software
+installation and maintenance for end-users across distributions. It
+abstracts the various package management software found in today's Linux
+distributions and provides a unified interface for graphical user
+interface programs to interact with the package management.
+
+PackageKit's main component is a daemon `packagekitd` which implements a
+D-Bus interface. Clients can retrieve information about installed
+packages and can request package management actions to be performed.
+
+A backend within `packagekitd` translates the abstract PackageKit
+commands into actual package management commands. Backends exist for all
+major Linux package management systems like zypper, yum, apt and others.
+PackageKit is enabled by default on most if not all major Linux
+distributions when a fully integrated desktop environment like GNOME or
+KDE is installed.
+
+For the purposes of this analysis I looked into openSUSE Leap 42.3,
+Debian 9 Strech, Ubuntu 17.10, CentOS 7.4.1708 and Fedora 27 which
+covers the major backends zypper, apt, yum and dnf. I will leave out the
+version numbers for the rest of this analysis for brevity. There exist a
+number of additional backends that I did not look into.
+
+Upstream repository: https://github.com/hughsie/PackageKit.git
+Upstream website: https://www.freedesktop.org/software/PackageKit/
+
+# 2. PackageKit's Security Approach
+
+PackageKit uses the polkit permissions framework to authorize individual
+operations. It has been a code review of the implementation of these
+polkit actions within PackageKit that led me to the findings discussed
+in this analysis.
+
+One important decision that upstream made is that it is deemed safe that
+regular users can install validly signed packages in the system without
+requiring administrator authentication. The motivation for this seems to
+be improved usability for end users. This is also documented here:
+
+https://github.com/hughsie/PackageKit/blob/master/policy/org.freedesktop.packagekit.policy.in#L33
+
+> - Normal users do not need authentication to install signed packages
+>   from signed repositories, as this cannot exploit a system.
+> - Paranoid users (or parents!) can change this to 'auth_admin' or
+> 'auth_admin_keep'.
+
+The related polkit action is named `org.freedesktop.packagekit.package-install`.
+
+The Linux distributions considered in this analysis ship a polkit policy
+file that requires `auth_admin` or `auth_admin_keep` for the
+installation of signed packages as well. However, there is also a custom
+polkit rule shipped by PackageKit that allows local users in an active
+session and that are members of the group `wheel` to install signed
+packages without admin authorization:
+
+https://github.com/hughsie/PackageKit/blob/master/policy/org.freedesktop.packagekit.rules
+
+This rule file is installed on openSUSE, Fedora and CentOS unmodified.
+Ubuntu and Debian ship a different rule file that does not allow this.
+
+# 3. Installation of Signed Packages without Administrator Authentication (Security Issue 1)
+
+During my code review I found a section of code that indicated that
+regardless of what the polkit configuration consists of it is always
+possible to install signed packages without any form of authentication.
+The relevant code location is here:
+
+https://github.com/hughsie/PackageKit/blob/master/src/pk-transaction.c#L2354
+
+If reinstallation of packages is allowed, then an authentication attempt
+is made by `packagekitd` but the outcome is ignored. The flag
+`PK_TRANSACTION_FLAG_ENUM_ALLOW_REINSTALL` is under user control,
+however. There is currently no way to avoid this loophole in PackageKit
+by means of configuration files.
+
+PackageKit comes with a command line utility called `pkcon` that can be
+used to perform PackageKit operations. There are two general
+possibilities how to install packages:
+
+- `pkcon install [options] <package>` installs a package from the
+  configured package manager system repositories by name.
+- `pkcon install-local [options] <package>` installs a package from a
+  user supplied package manager archive file (e.g. rpm or deb archive).
+
+The reinstall loophole can be used interactively like this:
+
+```
+# performed on CentOS 7.4.1708, the download paths in /var/cache differ
+# between distributions.
+
+$ pkcon install --only-download zsh
+$ pkcon install-local --allow-reinstall /var/cache/yum/x86_64/7/base/packages/zsh-5.0.2-28.el7.x86_64.rpm
+```
+
+The second `pkcon` call will trigger the authentication dialog, but even
+if the password is wrong or the dialog is canceled, the installation of
+the package will continue.
+
+The only distribution I looked into that does not allow this is Fedora
+which seems to use the dnf backend instead of the yum backend. The
+current Fedora release can therefore be considered not affected by the
+issues discussed in this analysis.
+
+Update: This security issue was assigned CVE-2018-1106. The bugfix
+performed by upstream is found in attachment
+0001-Do-not-set-JUST_REINSTALL-on-any-kind-of-auth-failur.patch.
+
+# 4. Downgrade of Existing Packages (Security Issue 2)
+
+Even though installation of signed packages by regular users is
+considered safe by upstream, it should not be possible to downgrade
+existing packages. A separate polkit action
+`org.freedesktop.packagekit.package-downgrade` should be triggered in
+this case. The individual PackageKit backends are responsible to
+implement this logic, however. It turned out that not every backend
+implements this correctly. Using the above approach with `pkcon
+install-local --allow-reinstall` it is possible to downgrade even
+important system packages without entering the administrator password in
+the following cases:
+
+- apt backend (tested on Ubuntu, Debian)
+- zypp backend (tested on openSUSE)
+
+Only the yum and dnf backends (tested on CentOS, Fedora) implement the
+downgrade protection correctly.
+
+Using this possiblity a regular user can downgrade packages to
+vulnerable versions that open up further attack vectors for gaining
+privileges.
+
+I have attached a number of proof of concept scripts that demonstrate
+this:
+
+- `pk_downgrade_debian_bash.py`: this downgrades bash on Debian 9
+  Stretch to an old one that is still vulnerable to "Shell Shock".
+- `pk_downgrade_opensuse_systemd.py`: This downgrades systemd on
+  openSUSE version 228 that is vulnerable to CVE-2016-10156. This one is
+  accompanied by `opensuse_exploit_systemd.py` to complete the root
+  exploit. This is not a 100 % root exploit, it requires some extra
+  opportunity that requires systemd to create a new timer stamp file in
+  /var/lib/systemd/timers.
+
+# 5. Installation of Signed Packages is Still Dangerous (Security Issue 3)
+
+Even if a user is not able to downgrade existing packages without
+administrator privileges there is still a security issue to consider. A
+regular user can install local package files downloaded from the
+Internet that carry a valid signature. When the package in question is
+not installed yet in the system then this does not count as a downgrade
+but as a fresh installation.
+
+This opens a surprisingly large action space to regular users:
+
+- tools for constructing exploits can be easily obtained from the system
+  repositories or the Internet.
+- outdated software with known bugs can be installed in some
+  circumstances. On some distributions year old packages with valid
+  signatures can be installed this way.
+- packages can contain scriptlets for performing runtime package setup.
+  These scriptlets may provide additional attack surface when they can
+  be triggered at the discretion of regular users.
+
+I have attached two further PoC scripts that demonstrate some of these
+points:
+
+- `pk_root_debian_ntfs3g.py`: This installs an old ntfs-3g package on
+  Debian that is vulnerable to CVE-2017-0358 and exploits it. This
+  variant works only if the `fuse` kernel module is not yet loaded.
+- `pk_root_ubuntu_firejail.py`: This installs an old firejail package
+  on Ubuntu that is vulnerable to CVE-2017-5180 and exploits it.
+
+On CentOS I have been able to construct an attack (no PoC) using CentOS
+7.0 packages for abrt 2.1.11-12.el7 which is vulnerable to
+CVE-2015-1862. This only worked if abrt was not yet installed, however
+(and it is installed by default). There may be systems out there that
+fulfill this condition though.
+
+These PoCs also show that all necessary tools like compiler, kernel
+headers etc. can be easily installed to construct the attack.
+
+My tests showed that on Ubuntu packages dating back to at least 2012 can
+be installed as signed packages. On Debian packages dating back to 2001
+can be installed. But this may also be due to the issue described in the
+following section 7). On CentOS 7.4 any packages dating back to CentOS
+7.0 can be installed as signed packages. On openSUSE Leap 42.3 packages
+from openSUSE 11.4 dating from the year 2012 can be installed as signed
+packages. On Fedora (27) only packages for the same major/minor version
+can be installed.
+
+There exist probably other attacks that can be constructed by installing
+outdated packages this way.
+
+# 6. Missing Sanitization and Safety Measure of User Supplied Input Files
+
+I followed the track of the user supplied archive paths passed to
+`packagekitd` to find out how the user owned archives are handled by the
+daemon. It turned out that the common `packagekitd` code takes no
+precautions to copy the file into a safe space that is no longer
+accessible by the client. This is the job of the backends. The zypp and
+yum backends do this and copy the file over into a temporary directory
+owned by root. They subsequently build a local RPM repository from the
+copied RPM file and operate on it.
+
+The apt backend, however, does not do this. The path passed from the
+client is passed unmodified into the libapt-pkg code. I am not sure
+whether the libapt-pkg code is prepared to process a file under user
+control. My worry was and is that there could be race condition involved
+that would allow the user to replace all or part of the supplied deb
+archive by something malicious after the signature verification passed.
+
+I also found that the client side code makes some effort to sanitize
+archive paths in `pk_client_convert_real_paths()`:
+
+https://github.com/hughsie/PackageKit/blob/master/lib/packagekit-glib2/pk-client.c#L308
+
+The daemon code itself performs no such sanitization, however. I have
+not found any actual attack vectors based on this yet. But it is
+possible to pass symlink paths and relative paths to the daemon and the
+daemon passes it to its backends. I am just adding this to the report
+for completeness, maybe someone else is interested in this and finds out
+more.
+
+# 7. Lacking Signature Check in the apt backend? (Security Issue 4)
+
+While I looked into the situation described in 6) I encountered an even
+worse condition in the apt backend: It seems to be possible to install
+modified deb packages without admin authentication. This is demonstrated
+in the attached PoC `pk_apt_install_modified.py`. This PoC works on
+Debian and Ubuntu. It downloads a validly signed package, injects a
+setuid-root binary, installs it and runs it to gain root privileges.
+
+I have not further analyzed where this security leak originates, because
+I am not familiar with the libapt-pkg code and I need the help of the
+community to identify possible further security issues involved.
+
+Update: I was told by Debian maintainers that individual deb packages
+don't carry a signature but only repositories. So it looks like the apt
+backend would need to handle installation of local deb files completely
+different to perform signature verification.
+
+# 8. Affected Versions
+
+The basic issue described in 3) that allows to circumvent the polkit
+configuration was introduced via git commit:
+f176976e24e8c17b80eff222572275517c16bdad and affected versions
+include >= 1.0.10 up until current 1.1.9.
+
+The missing downgrade protection described in 4) has probably been
+always present in the affected backends but I did not check up on it.
+
+The issue of installing new signed packages without admin authorization
+as described in 5) is by PackageKit design and exploitability depends on
+the distribution's configuration and on the existence of issue 3).
+
+Since I don't know what exactly the problem is that causes modified
+packages to be installed in the apt backend as described in 7) I can't
+make any statements here at the moment.
+
+Update: With security issue 1 (CVE-2018-1106) fixed, the other findings
+in this report should not pose an immediate danger as long as the
+polkit configuration requires root privileges for the involved polkit
+actions. Only administrators should then be able to reach the code
+paths in question.
+
+# 9. Recommendations
+
+My personal recommendation to prevent the issues described in 3), 4) and
+5) is to not allow regular users to perform any of the involved actions
+without admin authentication. To achieve this there must be no code in
+place that circumvents the polkit configuration. The upstream polkit
+rules file that allows active local users in the group wheel to install
+packages without authentication should be dropped.
+
+Update: The attached patch provided by upstream will fix security issue
+3) and thereby allow to configure PackageKit safely.
+
+Regarding the issue described in 4) the backends should additionally
+correctly implement the detection of downgrades and call the appropriate
+polkit actions.
+
+Regarding the issue described in 7) I have not enough insight to give
+any recommendation (except of course, not to allow installation of
+untrusted packages without at least asking for authorization for
+org.freedesktop.packagekit.package-install-untrusted).
+
+The discussed PackageKit backends may be used by other distributions
+than considered in this report. These distributions should be identified
+and checked as well. Also the less widespread backends that have not
+been considered in this analysis should be checked for their behaviour
+and affectedness.
+
+# 10. Timeline
+
+- 2018-03-26: I found out about the issues described in 3) and 4) and contacted
+  upstream about the issue and voiced some general concerns. Upstream
+  basically told me installing signed packages without authentication is "by
+  design" and unless I can show some working exploit this would not be worth a
+  CVE. Preventing downgrades would be the job of the backends and is no issue in
+  packagekitd itself.
+- 2018-04-03: After further analysis and testing I was able to devise the
+  PoCs presented in 5).
+- 2018-04-05: I noticed the situation described and exploited in 7).
+- 2018-04-09: Finished writing this report and putting together PoCs.
+  Published on linux-distros.
+- 2018-04-11: Red Hat Product Security assigned CVE-2018-1106 for
+  security issue 1 described in 3).
+- 2018-04-23: Published on oss-sec.
+
+Cheers
+
+Matthias
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Dipl.-Wirtsch.-Inf. (FH), Security Engineer
+https://www.suse.com/security
+Telefon: +49 911 740 53 290
+GPG Key ID: 0x14C405C971923553
+
+SUSE Linux GmbH
+GF: Felix Imendörffer, Jane Smithard, Graham Norton
+HRB 21284 (AG Nuernberg)
+
+View attachment "opensuse_exploit_systemd.py" of type "text/x-python" (5197 bytes)
+
+View attachment "pk_apt_install_modified.py" of type "text/x-python" (6264 bytes)
+
+View attachment "pk_downgrade_debian_bash.py" of type "text/x-python" (2578 bytes)
+
+View attachment "pk_downgrade_opensuse_systemd.py" of type "text/x-python" (2773 bytes)
+
+View attachment "pk_root_debian_ntfs3g.py" of type "text/x-python" (5114 bytes)
+
+View attachment "pk_root_ubuntu_firejail.py" of type "text/x-python" (8319 bytes)
+
+View attachment "0001-Do-not-set-JUST_REINSTALL-on-any-kind-of-auth-failur.patch" of type "text/x-patch" (2334 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (820 bytes)

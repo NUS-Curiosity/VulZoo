@@ -1,0 +1,236 @@
+
+Date: Wed, 10 Jul 2013 02:21:21 GMT
+From: chanam.park@...co.kr
+To: bugtraq@...urityfocus.com
+Subject: (CVE-2013-1059) Linux Kernel libceph Null Pointer Dereference
+ Vulnerability
+
+Original URL: http://hkpco.kr/advisory/CVE-2013-1059.txt
+
+< Linux Kernel libceph Null Pointer Dereference Vulnerability (CVE-2013-1059) >
+
+
+Author   - Chanam Park (@hkpco)
+Website - http://hkpco.kr/
+Date      - 2013. 07. 06
+
+
+
+0. Introduction
+
+This is very brief advisory just to record the vulnerability which I discovered in my spare time.
+A remote attacker, malicious ceph monitor, can make an exploit to cause a denial-of-service condition by sending the crafted auth_reply message.
+It could possibly lead to another impacts such as remote code execution if some other vulnerabilities are combined.
+An explanation is based on linux kernel 3.10 which is latest version now.
+
+
+
+1. What's Ceph?
+
+Check these links below.
+
+http://en.wikipedia.org/wiki/Ceph_(storage)
+http://ceph.com/
+
+
+
+2. Vulnerability
+
+The vulnerability is triggered by a null pointer dereferencing problem which can raise a kernel crash remotely.
+
+Here, I will show you the code flow about vulnerability.
+
+Let's start with the dispatch() function which handles incoming auth message from the ceph monitor.
+
+http://lxr.linux.no/linux+v3.10/net/ceph/mon_client.c
+-------
+ 963 static void dispatch(struct ceph_connection *con, struct ceph_msg *msg)
+ 964 {
+ 965        struct ceph_mon_client *monc = con->private;
+ 966        int type = le16_to_cpu(msg->hdr.type);
+ 967
+ 968        if (!monc)
+ 969                return;
+ 970
+ 971        switch (type) {
+ 972        case CEPH_MSG_AUTH_REPLY:
+ 973                handle_auth_reply(monc, msg);	*** [1] ***
+ 974                break;
+..
+-------
+
+As shown in part [1], It calls handle_auth_reply() once ceph client receives the auth reply message from monitor.
+
+See handle_auth_reply() implementation in the same module, then.
+
+-------
+ 886 static void handle_auth_reply(struct ceph_mon_client *monc,
+ 887                              struct ceph_msg *msg)
+ 888 {
+ 889        int ret;
+ 890        int was_auth = 0;
+ 891        int had_debugfs_info, init_debugfs = 0;
+ 892
+ 893        mutex_lock(&monc->mutex);
+ 894        had_debugfs_info = have_debugfs_info(monc);
+ 895        was_auth = ceph_auth_is_authenticated(monc->auth);
+ 896        monc->pending_auth = 0;
+ 897        ret = ceph_handle_auth_reply(monc->auth, msg->front.iov_base,	*** [2] ***
+ 898                                     msg->front.iov_len,
+ 899                                     monc->m_auth->front.iov_base,
+ 900                                     monc->m_auth->front_max);
+..
+-------
+
+At in part [2], It calls ceph_handle_auth_reply().
+
+Move to take a look at the function.
+
+http://lxr.linux.no/linux+v3.10/net/ceph/auth.c
+-------
+ 174 int ceph_handle_auth_reply(struct ceph_auth_client *ac,
+ 175                           void *buf, size_t len,
+ 176                           void *reply_buf, size_t reply_len)
+ 177 {
+ 178        void *p = buf;
+ 179        void *end = buf + len;
+ 180        int protocol;
+..
+ 239        ret = ac->ops->handle_reply(ac, result, payload, payload_end);
+ 240        if (ret == -EAGAIN) {
+ 241                ret = ceph_build_auth_request(ac, reply_buf, reply_len);	*** [3] ***
+ 242        } else if (ret) {
+ 243                pr_err("auth method '%s' error %d\n", ac->ops->name, ret);
+ 244        }
+-------
+
+As you can see in the part [3] above, ceph_build_auth_request() contains a vulnerable code to cause the null pointer dereference.
+
+Let's see how the function implements a vulnerable code below.
+
+http://lxr.linux.no/linux+v3.10/net/ceph/auth.c
+-------
+ 144 static int ceph_build_auth_request(struct ceph_auth_client *ac,
+ 145                                   void *msg_buf, size_t msg_len)
+ 146 {
+ 147        struct ceph_mon_request_header *monhdr = msg_buf;
+ 148        void *p = monhdr + 1;
+ 149        void *end = msg_buf + msg_len;
+ 150        int ret;
+ 151
+ 152        monhdr->have_version = 0;
+ 153        monhdr->session_mon = cpu_to_le16(-1);
+ 154        monhdr->session_mon_tid = 0;
+ 155
+ 156        ceph_encode_32(&p, ac->protocol);
+ 157
+ 158        ret = ac->ops->build_request(ac, p + sizeof(u32), end);	*** [3] ***
+ 159        if (ret < 0) {
+ 160                pr_err("error %d building auth method %s request\n", ret,
+ 161                       ac->ops->name);
+ 162                goto out;
+ 163        }
+ 164        dout(" built request %d bytes\n", ret);
+ 165        ceph_encode_32(&p, ret);
+ 166        ret = p + ret - msg_buf;
+ 167 out:
+ 168        return ret;
+ 169 }
+-------
+
+The code above, at part [3], calls a function pointer from ceph_auth_client structure without any value checking whether it's null or something else.
+
+Moreover, you can see in the next part soon, some function pointers in the structure hasn't been defined at all.
+
+Here's the problematic structure prototypes below.
+
+http://lxr.linux.no/linux+v3.9.6/include/linux/ceph/auth.h
+-------
+..
+  25 struct ceph_auth_client_ops {
+  26        const char *name;
+  27
+..
+  40        /*
+  41         * build requests and process replies during monitor
+  42         * handshake.  if handle_reply returns -EAGAIN, we build
+  43         * another request.
+  44         */
+  45        int (*build_request)(struct ceph_auth_client *ac, void *buf, void *end);	*** [4] ***
+..
+  71 struct ceph_auth_client {
+  72        u32 protocol;           /* CEPH_AUTH_* */
+  73        void *private;          /* for use by protocol implementation */
+  74        const struct ceph_auth_client_ops *ops;  /* null iff protocol==0 */		*** [5] ***
+..
+-------
+
+At part [4], ceph_auth_client_ops structure has a build_request() as a member variable.
+
+At part [5], ceph_auth_client_ops is defined within ceph_auth_client structure.
+
+If we confirm that the ceph_auth_client_ops structure does not initialize the build_request() function pointer, and that's being used as it is,
+
+the null pointer dereference can easily occur.
+
+Let's see.
+
+http://lxr.linux.no/linux+v3.10/net/ceph/auth_none.c
+-------
+ 103 static const struct ceph_auth_client_ops ceph_auth_none_ops = {
+ 104        .name = "none",
+ 105        .reset = reset,
+ 106        .destroy = destroy,
+ 107        .is_authenticated = is_authenticated,
+ 108        .should_authenticate = should_authenticate,
+ 109        .handle_reply = handle_reply,
+ 110        .create_authorizer = ceph_auth_none_create_authorizer,
+ 111        .destroy_authorizer = ceph_auth_none_destroy_authorizer,
+ 112 };
+ 113
+ 114 int ceph_auth_none_init(struct ceph_auth_client *ac)
+ 115 {
+ 116        struct ceph_auth_none_info *xi;
+ 117
+ 118        dout("ceph_auth_none_init %p\n", ac);
+ 119        xi = kzalloc(sizeof(*xi), GFP_NOFS);
+ 120        if (!xi)
+ 121                return -ENOMEM;
+ 122
+ 123        xi->starting = true;
+ 124        xi->built_authorizer = false;
+ 125
+ 126        ac->protocol = CEPH_AUTH_NONE;
+ 127        ac->private = xi;
+ 128        ac->ops = &ceph_auth_none_ops;	*** [6] ***
+ 129        return 0;
+ 130 }
+-------
+
+As shown in the part [6] above, ceph_auth_none_ops structure is being used as a ceph operation with no build_request definition.
+
+Boom!,
+
+
+
+3. Patch
+
+Tyler Hicks made a fix for it.
+https://git.kernel.org/cgit/linux/kernel/git/sage/ceph-client.git/commit/?id=2cb33cac622afde897aa02d3dcd9fbba8bae839e
+
+
+
+4. Credit
+
+Chanam Park discovered this bug.
+http://seclists.org/oss-sec/2013/q3/61
+
+
+
+5. References
+
+http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2013-1059
+http://www.cvedetails.com/cve/CVE-2013-1059/
+http://www.openwall.com/lists/oss-security/2013/07/09/7
+https://bugzilla.redhat.com/show_bug.cgi?id=977356
+http://ceph.com/git/?p=ceph-client.git;a=commit;h=2cb33cac622afde897aa02d3dcd9fbba8bae839e

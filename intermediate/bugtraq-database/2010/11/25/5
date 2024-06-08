@@ -1,0 +1,204 @@
+
+Date: Thu, 25 Nov 2010 17:12:00 +0100
+From: Advisories Toucan-System <advisories@...can-system.com>
+To: bugtraq@...urityfocus.com
+Subject: TSSA-2010-01 Ghostscript library Ins_MINDEX() integer overflow and
+ heap corruption
+
+--------------------------------------------------------------------------------------
+*           Ghostscript library Ins_MINDEX() off by one,        *
+*               integer overflow and heapcorruption                  *
+--------------------------------------------------------------------------------------
+
+
+--[ Vulnerability Summary:
+
+Date Published: 31/08/2010
+Last Update: 31/08/2010
+Advisory ID: TSSA-2010-01
+CVE Name: CVE-2009-3743
+Title: Ghostscript library Ins_MINDEX() integer overflow and heap corruption
+Class: Heap Corruption
+Remotely Exploitable: Yes
+Locally Exploitable: No
+Impact: Remote Denial of Service
+Advisory URL: http://www.toucan-system.com/advisories/tssa-2010-01.txt
+
+
+
+--[ Synopsis:
+
+    An off by one in the library libgs.so.8 shipped with Ghostscript in
+    versions <= 8.70 generates an integer overflow, which in turn
+    produces a heap corruption, resulting in a (remote) Denial of Service
+    (crash) in several applications using this library when processing a
+    specially crafted font.
+    This vulnerability cannot be exploited to execute arbitrary code under
+    GNU/Linux x86, to the best of our knowledge. Other targets, in
+    particular Windows have not been tested and may or may not allow
+    execution of arbitrary code.
+
+--[ Vulnerability details:
+
+memove() is defined in string.h and has the following prototype:
+
+    void *memmove(void *dest, const void *src, size_t n);
+
+It is worth noticing that size_t is a signed integer.
+
+In ghostscript-8.70.dfsg.1/base/ttinterp.c we can find the following code
+snippet:
+
+/*******************************************/
+/* MINDEX[]  : move indexed element        */
+/* CodeRange : $26                         */
+
+  static void  Ins_MINDEX( INS_ARG )
+  {
+    Long  L, K;                    [0]
+
+
+    L = args[0];                [1]
+
+    if ( L<0 || L > CUR.args )            [2]
+    {
+      CUR.error = TT_Err_Invalid_Reference;
+      return;
+    }
+
+    K = CUR.stack[CUR.args - L];        [3]
+
+    memmove( (&CUR.stack[CUR.args - L    ]),    [4]
+              (&CUR.stack[CUR.args - L + 1]),
+              (L - 1) * sizeof ( Long ) );
+
+    CUR.stack[ CUR.args-1 ] = K;
+  }
+
+
+[0] L is actually an unsigned long on x86.
+[1] L is user controled.
+[2] what if L is null then ?
+[3] will work fine with L null...
+[4] if L was null, then the sized passed to memmove is casted from an
+unsigned long to a signed integer (size_t) worthing
+111111111111111111111111111111 in binary, or 0x3fffffff.
+
+
+Let's now consider the third argument passed to memmove in [4]. This
+value is used as a counter in register ecx, resulting in the copy of a very
+large chunk of memory (0x3fffffff ~= 1Gb). At this time, the destination being
+somewhere in the heap, the appliation will eventually fill the heap segment
+with (unexpected) data, and the copy will fail when trying to write to the
+first non mapped address after the heap in the address space, generating a
+segmentation fault.
+
+Experimentally, reaching this codepath has shown to be possible.
+The values of the registers (in particular ecx and edi) at crash time are
+coherent with our expectations and the explaination above :
+
+Program received signal SIGSEGV, Segmentation fault.
+-------------------------------------------------------------------------[
+regs
+     eax:FFFFFFFC ebx:405B6FF4  ecx:3FF85061  edx:0807C844
+eflags:00010216
+     esi:0826A000 edi:08269FFC  esp:BFFFDD18  ebp:BFFFDD58     eip:408EFA83
+     cs:0073  ds:007B  es:007B  fs:0000  gs:0033  ss:007B    o d I t s z
+A P c
+[007B:BFFFDD18]---------------------------------------------------------[stack]
+BFFFDD48 : E0 13 F9 FF  F4 6F 5B 40 - 44 C8 07 08  00 00 00 00
+.....o[@D.......
+BFFFDD38 : 00 00 00 00  00 00 00 00 - 01 00 00 00  0D 00 00 00
+................
+BFFFDD28 : FC FF FF FF  AE 42 0F 40 - 44 C8 07 08  34 CA 07 08
+.....B.@....4...
+BFFFDD18 : 26 00 00 00  09 69 0F 40 - 84 E1 07 08  88 E1 07 08
+&....i.@........
+[007B:0826A000]---------------------------------------------------------[ data]
+<memmove+35>:    rep movs DWORD PTR es:[edi],DWORD PTR ds:[esi]
+
+
+Arbitrary code execution would require to corrupt the heap with a bit more than
+1Gb of copied data without writting to invalid memory. Having the heap
+allocate so much data is not belived to be possible in the current situation
+under x86 GNU/linux.
+
+
+--[ Vulnerable applications:
+
+    Vulnerable applications include at least the following applications,
+who are linked with libgs.so : gs, ghostscript, lpdomatic,foomatic-rip,
+and directomatic.
+
+endrazine@...ckbox:~/gs/ghostscript-8.70.dfsg.1$ ldd /bin/* /sbin/* \
+/usr/sbin/* /usr/local/bin/* \
+/usr/local/sbin/* /usr/bin/* 2>/dev/null |grep "libgs.so\|:"|grep
+"libgs" -B 1
+/usr/sbin/lpdomatic:
+    libgs.so.8 => /usr/lib/libgs.so.8 (0xb7785000)
+--
+/usr/bin/directomatic:
+    libgs.so.8 => /usr/lib/libgs.so.8 (0xb7785000)
+--
+/usr/bin/foomatic-rip:
+    libgs.so.8 => /usr/lib/libgs.so.8 (0xb7785000)
+--
+/usr/bin/ghostscript:
+    libgs.so.8 => /usr/lib/libgs.so.8 (0xb7785000)
+--
+/usr/bin/gs:
+    libgs.so.8 => /usr/lib/libgs.so.8 (0xb7785000)
+endrazine@...ckbox:~/gs/ghostscript-8.70.dfsg.1$
+
+    Third party applications linking to this library may also be vulnerable.
+
+--[ Patch:
+
+    This off by one can be mitigated by applying the following patch in
+    ghostscript-8.70.dfsg.1/base/ttinterp.c :
+
+-    if ( L<0 || L > CUR.args )
++    if ( L<=0 || L > CUR.args )
+
+    The patch that has actually been merged to Ghostscript is strictly
+    equivalent.
+
+
+
+--[ Disclosure timeline:
+
+* 19/10/2009: Contact Vendor.
+* 19/10/2009: Vendor replies to our mail asking for details.
+* 26/10/2009: Recontact vendor, ask for a valid pgp key.
+* 05/11/2009: Recontact vendor who failed at providing a valid pgp key.
+* 15/11/2009: Receive a valid pgp key from vendor. Provide details,
+              including two PoCs to the Vendor.
+* 16/12/2009: Recontact the vendor who doesn't get back to us.
+* 05/01/2010: Vendor asks for more details including a complete bug analysis
+              and patches.
+* 06/01/2010: Provide full analysis and patches to the vendor.
+* 06/01/2010: Vendor claims to have silently patched the vulnerability in
+              their development branch.
+* 01/03/2010: Ping vendor, who remains silent...
+* 22/03/2010: Ping vendor, who remains silent...
+* 20/07/2010: Inform the CERT about the vulnearbility.
+* 20/07/2010: Recontact CERT about this vulnerability.
+* 03/08/2010: CERT gets back to us asking for details.
+* 09/08/2010: Send available information to the CERT.
+* 13/08/2010: The CERT compares our patch and the applied patch in addition
+              to the material we provided and concludes the vendor actually
+              did fix the vulnerability as we suggested, but silently, denying
+              us any kind of credit.
+* 14/08/2010: The CERT assigns CVE number CVE-2009-3743 to this vulnerability.
+* 25/11/2010: Public disclosure.
+
+Note: The vendor claims to follow a bounty program for coders fixing bugs
+      in their software. From our experience, they do not practice such a
+      thing but silently patch reported bugs instead. We hope this was
+      merely an exception.
+
+
+--[ Credits:
+    This vulnerability was discovered by Jonathan Brossard from Toucan System.
+
+--[ About Toucan System:

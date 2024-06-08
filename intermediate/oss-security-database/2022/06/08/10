@@ -1,0 +1,205 @@
+
+Date: Wed, 8 Jun 2022 14:48:47 +0200
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: firejail: local root exploit reachable via --join logic
+ (CVE-2022-31214)
+
+Hello list,
+
+the following report describes a local root exploit vulnerability in
+Firejail [1] version 0.9.68 (and likely various older versions). Any
+source code references in this report are based on the 0.9.68 version
+tag in the upstream Git repository.
+
+Introduction
+============
+
+Firejail is a setuid-root command line program that allows to execute
+programs in isolated sandboxes. The details of execution are controlled
+by configuration files and command line switches. The isolation features
+are implemented based on Linux namespace mechanisms.
+
+Among the many features of Firejail there exists the possibility to join
+an existing Firejail container setup using the `firejail --join=<pid>`
+style invocation. This join feature is the attack vector for the
+vulnerability described in this report.
+
+Join Logic
+==========
+
+Most of the logic behind the join feature is found in the source code
+file `src/firejail/join.c`. Critical sections of code are running with
+elevated privileges (effective UID 0). The process ID passed as command
+line argument is inspected to determine whether it is a Firejail
+container and to determine certain of its properties that will be
+applied likewise to the newly joining process.
+
+The main criterion for deciding whether joining the target process
+succeeds is the presence of a file in the mount namespace of the target
+process found at /run/firejail/mnt/join. This check is performed in the
+`is_ready_for_join()` function. The file is opened using
+`O_RDONLY|O_CLOEXEC` flags and the follow-up `fstat()` result needs to
+fulfil the following requirements:
+
+- the file needs to be a regular file.
+- the file needs to be owned by user ID 0 (as seen from the initial user
+  namespace).
+- the file needs to have a size of 1 byte.
+
+Then in a follow-up `read()` call the first byte of the file needs to
+equal the ASCII '1' character (`SANDBOX_DONE` preprocessor define in the
+source).
+
+If this check succeeds then the various namespaces the target process is
+in will be joined and further preparations are made to containerise the
+newly joining process.
+
+The Vulnerability
+=================
+
+An unprivileged user in the system can fake a legit Firejail process by
+providing a symlink at /run/firejail/mnt/join that points to a file that
+fulfils the requirements listed in the previous section. By creating a
+custom user and mount namespace the attacker can create an environment
+of its own where mounting tmpfs file systems in arbitrary locations is
+possible. Thus /run/firejail can be made writeable within the separate
+mount namespace. Since the `open()` call in `join.c:335` follows
+symlinks, the target file can reside anywhere else within the accessible
+file system tree. Using bind mounting a suitable "join" file could also
+be placed there without using symlinks, though.
+
+A file owned by root that contains a '1' character is not that unlikely
+to exist somewhere on the system. If the attacker has local system
+access and automounting of removable storage devices is available then
+attaching a storage device that contains such a file could also be an
+option. Even simpler, however, is using Firejail itself to provide the
+file. Creating a Firejail instance without security profiles applied
+(switch `--noprofile`) will make its "join" file accessible also from
+within the initial mount namespace in the system via its
+/proc/<pid>/root entry.
+
+Once a suitable file is staged in a fake Firejail instance, the fake
+Firejail process will be basically accepted by Firejail for joining it.
+Firejail by default sets the `NO_NEW_PRIVS` `prctl()` for sandboxed
+processes. When using `firejail --noprofile` or when faking a Firejail
+instance, the setting will not be applied, however. Firejail's join
+logic is trusting the target process, and copies this property from it.
+Next Firejail will join the target process's namespaces (`join.c:441`),
+particularly interesting for this attack, the mount namespace. Then,
+after forking a new child process for the join operation, the logic
+attempts to drop privileges by joining the target user namespace
+(`join.c:497`).
+
+For joining the user namespace not the target process is used but the
+init process with PID 1. The consideration behind this is probably that
+it is always expected that the Firejail container is running in its own
+PID namespace and the init process inside it can be trusted for having
+the correct user namespace assigned. In this attack scenario there is no
+separate PID namespace, so the initial PID namespace will still be
+visible in /proc. Regardless of this the attacker controlled mount
+namespace (of which the joining Firejail process already is a member of
+by now) can blend in a tmpfs in /proc/1, thereby controlling which user
+namespace the Firejail join operation will actually join.
+
+Joining an actual separate user namespace is not what is desired for
+this attack (although this could also be interesting for joining
+arbitrary other users' containers and sandboxes). The aim of this attack
+is not to join any user namespace at all. Attempting to join the initial
+user namespace will fail, because joining the current user namespace
+again is denied by the kernel. To avoid this, a symlink can be placed in
+/proc/1/ns/user that points to an arbitrary different namespace object.
+In this example the symlink will point to the *time* namespace of the
+current process. Joining the time namespace will succeed and Firejail
+will not detect an error.
+
+The resulting "joined" shell will now live in the initial user
+namespace, holding still the original normal user privileges, however
+the mount namespace will be the one controlled by the attacker. Since
+the nonewprivs setting has not been applied, the attacker is now able to
+run setuid-root programs within this mount namespace. From here on all
+that needs to be done is changing file system contents in a way that
+typical setuid-root binaries like `su` or `sudo` will grant full root
+privileges. The attached proof of concept exploit I wrote for this
+vulnerability does this by replacing the PAM stack configuration.
+
+Workarounds / Mitigations
+=========================
+
+System administrators can mitigate this vulnerability via the Firejail
+configuration file in /etc/firejail/firejail.config. Either one of these
+options will prevent the attack from succeeding:
+
+- "force-nonewprivs yes"
+- "join no"
+
+Upstream informed me that in contrast to this the compile time option
+"enable-force-nonewprivs" does not neutralize this particular exploit.
+This fact is also investigated and possibly patched by upstream in the
+future.
+
+Proof of Concept Exploit
+========================
+
+Attached is a proof of concept Python program that has been tested on
+current openSUSE, Debian, Arch, Gentoo and Fedora distributions. The
+only precondition for the exploit is that Firejail is installed and
+accessible to the user. On openSUSE only members of the firejail group
+may run firejail, thus the impact is constrained a bit. On Fedora the
+attack is hindered a bit by (likely) SELinux rules that prevent a user
+from mounting a tmpfs below /proc. The exploit still works by mounting a
+tmpfs over all of /proc though.
+
+Upstream Bugfix
+===============
+
+Upstream published a comprehensive bugfix for this issue just today [2].
+The following changes make up the core of the bugfix:
+
+- obtaining information about and performing operations on process
+  namespaces is now based on `openat()` system calls relative to the
+  /proc/<pid> directory of the target process. This mainly avoids race
+  conditions.
+- it is checked that the target process is actually owned by root and
+  not controlled by an unprivileged user.
+- the `setns()` system calls now pass the expected `nstype` parameter to
+  avoid being tricked into joining a completely different type of
+  namespace object.
+- as an additional hardening a check is performed whether the mnt
+  namespace to be joined is actually owned by the user namespace to be
+  joined.
+
+Timeline
+========
+
+2022-05-03: I contacted the upstream security contact with the
+            vulnerability details and offered coordinated disclosure.
+2022-05-13: There have been technical problems reaching the security
+            contact by email, by creating a GitHub issue we've been able
+	    to get the attention of the upstream developer team and
+	    finally to forward the vulnerability details.
+2022-05-19: I obtained CVE-2022-31214 from Mitre to track this finding.
+2022-05-30: The upstream developers and myself started reviewing the
+            first version of the bugfix.
+2022-06-08: After multiple iterations all parties agreed on the final
+            version of the patch. Upstream published the patch.
+
+References
+==========
+
+[1]: https://github.com/netblue30/firejail
+[2]: https://github.com/netblue30/firejail/commit/27cde3d7d1e4e16d4190932347c7151dc2a84c50
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Security Engineer
+https://www.suse.com/security
+GPG Key ID: 0x14C405C971923553
+ 
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev
+
+View attachment "firejoin.py" of type "text/plain" (8649 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

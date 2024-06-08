@@ -1,0 +1,149 @@
+
+Date: Thu, 13 Sep 2018 09:24:44 +0200
+From: Antoine Neuenschwander <antoine@...oggi.org>
+To: bugtraq@...urityfocus.com
+Subject: CVE-2018-16242 - oBike Electronic Lock Bypass
+
+################################################################################
+#                                                                              #
+# CVE-2018-16242 - oBike Electronic Lock Bypass                                #
+#                                                                              #
+################################################################################
+#                                                                              #
+# Product:   oBike bicycle-sharing service                                     #
+# Vendor:    oBike Inc.                                                        #
+# CVE ID:    CVE-2018-16242                                                    #
+# Subject:   Access control bypass by replay attack on predictable nonce       #
+# Effect:    Unauthorized unlocking of bikes, cirumventing the ride-fees       #
+# Author:    Antoine Neuenschwander (@ant0inet)                                #
+# Date:      2018-09-13                                                        #
+#                                                                              #
+################################################################################
+
+
+Vendor/product description:
+-----------------------------
+oBike is (was) a Singaporean stationless bicycle-sharing system with operations
+in several countries [1].
+
+Introduction:
+-------------
+The bikes have a built-in Bluetooth lock [2]. Clients use their smartphone to
+locate a bicycle. Once nearby, they unlock the bicycle directly from the app or
+by scanning a QR code. Unlike traditional rental services, which require bikes
+to be returned to a fixed docking station, users are free to leave the bikes
+at any suitable bike parking spot.
+
+Affected:
+---------
+As of August 2018, this issue seems to affect the whole oBike fleet (or what is
+left of it).
+
+Technical Description:
+----------------------
+The oBike lock consists of a TI CC2541 microcontroller, a power-optimized
+System on a Chip (SoC) used for Bluetooth Low Energy (BLE) applications. The
+lock itself has no IP connectivity; it piggybacks the mobile device's 3G/4G
+connection to communicate with the oBike backend. The lock communicates via
+BLE with the oBike app on the mobile device. Protocol messages are then relayed
+to the oBike backend via a REST API.
+
+
+ oBike Lock          (BLE)     Mobile Device    (HTTPS)           oBike Backend
+------------+------------------------+---------------------------+--------------
+            |                        |                           |
+            | (1) hello(lat, lng)    |                           |
+            | <--------------------- |                           |
+Generate    |                        |                           |
+32bit       | (2) keySource          |                           |
+Challenge   | ---------------------> | (3) unlockPass(keySource) |
+            |                        | ========================> | Compute
+            |                        |                           | Response
+            | (5)                    | (4) encKey, keys          |
+            | sendKeys(encKey, keys) | <======================== |
+!Unlock     | <--------------------- |                           |
+ Bike!      |                        |                           |
+            |                        |                           |
+Generate    |                        |                           |
+Acknowledge | (6) macKey, index      | (7)                       |
+Message     | ---------------------> | lockMessage(macKey,index) |
+            |                        | ========================> | Register
+            |                        |                           | Ride (start
+            |                        |                           | billing)
+
+Steps:
+(1) BLE send `hello` message, push GPS coordinates to lock.
+(2) BLE receive `keySource`, a 32bit value used as a challenge.
+(3) HTTPS send `keySource` to oBike backend via the `unlockPass` REST call.
+(4) HTTPS receive `encKey` (key index) and a 128bit ciphertext in `keys`.
+(5) BLE send `keys` (truncated to 96bits) and the `encKey`. At that point, the
+    bike will unlock.
+(6) BLE receive `macKey` and `index`, an acknowledgement that the unlocking was
+    successful.
+(7) HTTPS send `lockMessage`, with the corresponding values (`macKey` and
+   `index`). At that point, the oBike backend will register the ride and start
+   billing.
+
+A first vulnerability [3] was found prior to this advisory, which consists in
+leaving out the acknowledgement in step (7). By omitting this message, the
+lock is opened but the ride is not registered at the oBike backend, therefore
+not being billed.
+
+Analysis of the `keySource` field (32 bit challenge) in step (2) showed that
+the values generated by the lock are not random as expected. Rather, the
+values represent the number of milliseconds since the chip was powered on. This
+corresponds to a time window of roughly 50 days (2^32 milliseconds).
+
+The 128bit ciphertext in `keys` from step (5) is used to unlock the bike. Its
+value as returned by the oBike backend is the result of an unknown cryptographic
+operation based on the `keySource` field (generated by the lock), and the
+`encKey` value (given by the backend). Taken from the CC2541 specifications
+and the length of `keys`, the value corresponds most probably to an AES-128
+ciphertext. The `encKey` in turn selects the encryption key from a set of
+64 distinct indices, which is chosen randomly by the backend.
+
+Given fixed `keySource` and `encKey` values it was observed that the resulting
+`keys` value is always equal, allowing for replay attacks. To this end, all
+possible `keySource` values are enumerated and the corresponding `keys` and
+`encKey` values captured. It is possible to replay these values offline at a
+later point in time.
+
+To limit the number of values to be enumerated, A BLE command was discovered
+that provokes a chip reset. Given this condition, the generated `keySource`
+lies within a predictable time window, which greatly simplifies the attack.
+Now, only several seconds worth of `keySource` values are needed to implement
+the replay attack.
+
+A description of the BLE and REST protocols can be found in [4].
+
+Workaround / Fix:
+-----------------
+No known fix/workaround available. The attack works offline, there is no known
+possiblity to detect or to prevent it on the backend.
+
+Timeline:
+---------
+2018-08-21:    Found vulnerability
+2018-08-22:    Contact request sent to oBike Inc. support
+2018-08-24:    Contact request sent to SingCERT
+2018-08-28:    Another attempt contacting oBike Inc. support
+2018-08-28:    CVE-ID requested
+2018-08-29:    Another attempt contacting SingCERT
+2018-08-29:    Contact request sent to oBike Italy
+2018-08-30:    Response from SingCERT
+2018-08-30:    CVE ID assigned CVE-2018-16242
+2018-09-13:    No response from oBike, vulnerability disclosure
+
+References:
+-----------
+[1] oBike Inc. https://www.o.bike/
+
+[2] Smart Locker HBT203 by Hangzhou Luoping Electronics Co.,Ltd
+    https://fccid.io/2ALWC-HBT203
+
+[3] "Exploration of Weakness in Bike Sharing System"
+    National University of Singapore, School of Computing
+    CS3235 Student Projects 2017/2018
+
+[4] Reverse engineering of the oBike protocol communication (BLE and HTTP)
+    https://github.com/antoinet/obike
