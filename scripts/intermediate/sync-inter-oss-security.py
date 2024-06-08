@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
 import os
+import json
 import re
 
-
+cve_mail_mapping_file = "../../intermediate/cve-mail-mappings.json"
 raw_data_dir = "../../raw-data/oss-security-database"
 raw_data_index_file = "oss-security-msg-links.json"
 intermediate_data_dir = "../../intermediate/oss-security-database"
@@ -31,7 +32,7 @@ def get_subject(text):
             subject += line
     # replace multi-whitespaces with a single whitespace
     subject = ' '.join(subject.split())
-    return subject    
+    return subject
 
 
 def _is_mail_of_interest_by_subject(subject):
@@ -41,17 +42,24 @@ def _is_mail_of_interest_by_subject(subject):
     return cve_id_pattern.search(subject) is not None
 
 
-def _is_mail_of_interest_by_text(text):
+def _is_mail_of_interest_by_text(text, filename, cve_mail_mappings):
     # check whether the mail text contains a CVE ID with regex
     # the CVE ID is in the format CVE-\d{4}-\d{4,7}
     cve_id_pattern = re.compile(r"CVE-\d{4}-\d{4,7}")
-    return cve_id_pattern.search(text) is not None
+    # if there are CVEs, add the cve-mail mappings to the cve_mail_mappings dictionary and return True
+    # if there are no CVEs, return False
+    for cve_id in cve_id_pattern.findall(text):
+        if cve_id not in cve_mail_mappings:
+            cve_mail_mappings[cve_id] = []
+        if f"oss-security-database/{filename}" not in cve_mail_mappings[cve_id]:
+            cve_mail_mappings[cve_id].append(f"oss-security-database/{filename}")
+    return len(cve_id_pattern.findall(text)) > 0
 
 
-def is_mail_of_interest(mail_text):
+def is_mail_of_interest(mail_text, filename, cve_mail_mappings):
     # subject = get_subject(mail_text)
     # return _is_mail_of_interest_by_subject(subject)
-    return _is_mail_of_interest_by_text(mail_text)
+    return _is_mail_of_interest_by_text(mail_text, filename, cve_mail_mappings)
 
 
 def read_file(file):
@@ -66,7 +74,8 @@ def write_file(file, content):
 
 if __name__ == '__main__':
     ensure_dir(intermediate_data_dir)
-    manifest = read_file(manifest_file).split('\n')    
+    manifest = read_file(manifest_file).split('\n')
+    cve_mail_mappings = json.loads(read_file(cve_mail_mapping_file))
     # each mail text is stored in a separate file, e.g., "2012/06/01/1"
     # iterate over all mail text files in raw_data_dir and process each file
     # skip the raw_data_index_file in the raw_data_dir
@@ -80,7 +89,7 @@ if __name__ == '__main__':
                 continue
             
             mail_text = read_file(file_path)
-            if is_mail_of_interest(mail_text):
+            if is_mail_of_interest(mail_text, date_path, cve_mail_mappings):
                 # store the mail text in the intermediate_data_dir
                 intermediate_file_path = os.path.join(intermediate_data_dir, date_path)
                 ensure_dir(os.path.dirname(intermediate_file_path))
@@ -90,4 +99,5 @@ if __name__ == '__main__':
     
     # update the manifest file
     write_file(manifest_file, '\n'.join(manifest))
-
+    # update the cve-mail-mappings file
+    write_file(cve_mail_mapping_file, json.dumps(cve_mail_mappings, indent=4))
