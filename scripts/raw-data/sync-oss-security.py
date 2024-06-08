@@ -7,7 +7,7 @@ import os
 import time
 import json
 
-dest_dir = "../raw-data/oss-security-database"
+dest_dir = "../../raw-data/oss-security-database"
 link_index = f"{dest_dir}/oss-security-msg-links.json"
 oss_security_url = 'https://www.openwall.com/lists/oss-security'
 
