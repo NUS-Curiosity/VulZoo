@@ -30,21 +30,24 @@ git clone --recurse-submodules https://github.com/brant-ruan/VulZoo
 VulZoo provides some useful scripts to help you manage the data. As some scripts require specific Python packages, it is recommended to install the required packages first:
 
 ```bash
-cd VulZoo/
 pip install -r requirements.txt
 ```
 
 You can run the `sync-raw-data.sh` script to incrementally update the local raw data:
 
 ```bash
-cd VulZoo/
 ./sync-raw-data.sh
 ```
 
-TODO: You can run the `sync-vulzoo.sh` script to incrementally update the processed data:
+Then, you can run the `sync-intermediate.sh` script to process the raw data and synchronize the intermediate data with the latest raw data:
 
 ```bash
-cd VulZoo/
+./sync-intermediate.sh
+```
+
+Finally, you can run the `sync-vulzoo.sh` script to generate the processed data:
+
+```bash
 ./sync-vulzoo.sh
 ```
 
