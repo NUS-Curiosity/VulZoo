@@ -8,9 +8,10 @@ VulZoo is a large-scale vulnerability intelligence dataset that integrates vario
 
 Related tasks: vulnerability detection, assessment, and prioritization.
 
-This dataset is divided into two parts: 
+This dataset is divided into three parts: 
 
 - `raw-data/`: contains the raw data from different sources.
+- `intermediate/`: contains the intermediate data that is preliminarily processed or filtered.
 - `vulzoo/`: contains the processed data that is more structured and easier to use.
 
 ## How to Use
