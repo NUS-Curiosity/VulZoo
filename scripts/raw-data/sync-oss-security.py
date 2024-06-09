@@ -225,7 +225,7 @@ if __name__ == '__main__':
                 print(f"[!] {link_index} is outdated, updating the link index", file=sys.stderr)
                 update_index_with_delta(msg_links, delta, lly, llm, lld)
         else:
-            print(f"[!] {link_index} found, fetching links from the website", file=sys.stderr)
+            print(f"[!] {link_index} not found, fetching links from the website", file=sys.stderr)
             with open(link_index, 'w') as f:
                 msg_links = fetch_msg_links(oss_security_url, interval=1, print_result=sys.stdout)
                 f.write(json.dumps(msg_links))

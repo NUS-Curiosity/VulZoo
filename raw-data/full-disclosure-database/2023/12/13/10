@@ -1,0 +1,343 @@
+
+Date: Tue, 5 Dec 2023 07:51:21 +0000
+From: "SEC Consult Vulnerability Lab,
+ Research via Fulldisclosure" <fulldisclosure@...lists.org>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] SEC Consult SA-20231205 :: Argument injection leading to
+ unauthenticated RCE and authentication bypass in Atos Unify OpenScape
+ Session Border Controller (SBC), Branch, BCF
+
+SEC Consult Vulnerability Lab Security Advisory < 20231205-0 >
+=======================================================================
+               title: Argument injection leading to unauthenticated RCE and
+                      authentication bypass
+             product: Atos Unify OpenScape Session Border Controller (SBC)
+                      Atos Unify OpenScape Branch
+                      Atos Unify OpenScape BCF
+  vulnerable version: OpenScape SBC before V10 R3.4.0
+                      OpenScape Branch before V10 R3.4.0
+                      OpenScape BCF V10 before V10 R10.12.00 and V10 R11.05.02
+       fixed version: OpenScape SBC V10 R3.4.0 or higher
+                      OpenScape Branch V10 R3.4.0 or higher
+                      OpenScape BCF V10 R10.12.00 or higher, V10 R11.05.02
+          CVE number: CVE-2023-6269
+              impact: Critical
+            homepage: https://unify.com/
+               found: 2023-09-01
+                  by: Armin Weihbold (Office Linz)
+                      SEC Consult Vulnerability Lab
+
+                      An integrated part of SEC Consult, an Eviden business
+                      Europe | Asia
+
+                      https://www.sec-consult.com
+
+=======================================================================
+
+Vendor description:
+-------------------
+"Unify is is the Atos brand for communication and collaboration solutions
+Unify is the newest member of the Atos family, combining Atos’ knowledge and
+reputation in the IT services market with Unify’s expertise in unified
+communications and collaboration to provide customers with seamless services
+solutions for their entire digital portfolio. Within Atos, Unify continues to
+deliver a unique integrated proposition for unified communications and real
+time capabilities."
+
+Source: https://unify.com/en/expert/unify
+
+
+Business recommendation:
+------------------------
+SEC Consult recommends users of this solution to immediately install the latest
+patch from the vendor.
+
+Furthermore, an in-depth security analysis performed by security professionals
+is highly advised, as the software may be affected from other security issues.
+
+
+Vulnerability overview/description:
+-----------------------------------
+1) Argument injection leading to unauthenticated RCE and authentication bypass (CVE-2023-6269)
+The administrative web interface insufficiently escapes supplied login
+credentials before passing them to a user management application, leading to
+an unauthenticated attacker being able to gain root access to the appliance
+via SSH.
+
+Another possibility to exploit this vulnerability is to append a special
+argument during logon to completely bypass the authentication of the web interface.
+A previously unauthenticated attacker can logon as administrator without any
+known credentials.
+
+
+Proof of concept:
+-----------------
+1) Argument injection leading to unauthenticated RCE and authentication bypass (CVE-2023-6269)
+Example 1) Gaining unauthenticated SSH root access
+
+The file receiving data from the login page is `auth.php`, here the
+user-provided credentials are passed on to the function
+`PasswordMgr::authPassword` after some checks on the supplied username.
+
+```php
+// /srv/www/htdocs/auth.php
+// [...]
+     $ret=false;
+     $real_user='';
+     $error = '';
+     $local_user=strip_tags($_POST['username']);
+// [...]
+     if( !sessionLimitReached() )
+     {
+         // Authenticate user/password...
+         $privilege = PasswordMgr::getUserPrivilege($local_user);
+         if (($local_user == 'assistant') || ($local_user == 'cdr') || (!PasswordMgr::isUserEnabled($local_user))){
+             $ret = false;
+         }
+         else {
+             switch ($privilege) {
+                 case 'admin':
+                     $ret = PasswordMgr::authPassword($_POST["username"], $_POST["password"], $error, $real_user, $local_user, FALSE);
+                     break;
+                 // [...]
+             }
+         }
+         // [...]
+     }
+// [...]
+
+```
+
+The function `PasswordMgr::authPassword` in `core/PasswordMgr.php` is just a
+wrapper around `call_osbpasswd` in the same file.
+
+
+```php
+// /srv/www/htdocs/core/PasswordMgr.php
+
+public static function authPassword($username, $password, &$error, &$real_user, &$local_user, $local = FALSE)
+{
+     $error='';
+     if ( PasswordMgr::call_osbpasswd("auth", $username, $password, $error, $real_user, $local_user, $local ) )
+     {
+         $error='Current Password does not match user';
+         return false;
+     }
+     return true;
+}
+```
+
+The function `call_osbpasswd` is responsible for anything related to user
+management, it does this by constructing shell arguments and supplying them to
+the executable `/osb/bin/osbpasswd` which is executed with root privileges via
+`cfgUtilExecSudo`. This executable handles the actual authentication, creation
+of users, and other tasks.
+In the case of authentication the arguments are written to a temporary file
+and read from there.
+Before that the supplied password is escaped using `escapeshellcmd` instead of
+`escapeshellarg`. This means that space characters (hex 0x20) in the password
+are left intact allowing for argument injection.
+
+```php
+// /srv/www/htdocs/core/PasswordMgr.php
+
+public static function call_osbpasswd( $method, $username, $password, &$output, &$real_user, &$local_user, $local, $extraArg = '' )
+{
+     // [...]
+     $curruser = 'GUI';
+     // [...]
+
+     $params = "$method";
+     if ($local)          $params .= ' --local';
+     if ($username != '') $params .= " --user $username";
+     if ($curruser != '') $params .= " --curruser $curruser";
+     if ($extraArg != '') $params .= "$extraArg";
+
+     $file = '';
+     // [...]
+     else {
+         $params .= " --password ";
+         $fakePar = $params."xxxxxx";
+         $params .= escapeshellcmd($password);
+         $params .= "\n";
+         $file = tempnam('/osb/var/tmp','osbpasswd.'.md5($params).'.');
+         /*E.g.: /opt/openbranch/var/tmp/osbpasswd.f9e2a9fcf29c6275830257316d560e27.CG4IcQ */
+         cfgUtilEcho( $params, $file );
+         $command = "/osb/bin/osbpasswd ".$fakePar." --file ".$file;
+     }
+
+     $outArray = array();
+     $ret = cfgUtilExecSudo($command, $outArray, FALSE, TRUE);
+     // [...]
+     return $ret;
+}
+```
+
+The function that is responsible for parsing command line arguments
+in the called application `/osb/bin/osbpasswd` iterates over arguments and
+sets global variables based on them. This is done in a loop and no check is
+done if that argument was already set. This means an attacker can override all
+parameters by specifying them again.
+
+```C
+int parse_arguments(int argc, char **argv, int n)
+{
+   // [...]
+   while ( n < argc && argv[n] ) {
+     // [...]
+     else if ( !strcmp("--user", argv[n]) ) {
+         if ( ++n < argc )
+            arg_user = argv[n];
+     }
+     else if ( !strcmp("--shell", argv[n]) ) {
+         if ( ++n < argc )
+             arg_shell = argv[n];
+     }
+     // [...]
+     else if ( !strcmp("auth", argv[n]) ) {
+         arg_command_name = argv[n];
+         arg_command_number = 1;
+     }
+     else if ( !strcmp("add", argv[n]) ) {
+         arg_command_name = argv[n];
+         arg_command_number = 6;
+     }
+     // [...]
+     ++n;
+   }
+   return 0LL;
+}
+```
+
+The combination of faulty escaping of the supplied password and overly
+permissive parsing of arguments in the called binary leads to an attacker being
+able to request arbitrary operations from the `/osb/bin/osbpasswd` binary with
+arbitrary arguments. An attacker could for example create a new user with SSH
+access and change the password of the root user leading to a complete
+compromise of the system.
+
+To demonstrate the vulnerability, it is sufficient to [...]
+
+[ Proof of concept removed ]
+
+- this creates a new user with SSH access, the second one [...]
+
+[ Proof of concept removed ]
+
+which changes the password of the root user. The attacker can then login [...]
+to gain root access.
+
+
+
+Example 2) Bypassing the web interface logon as administrator
+As described in example 1, the same vulnerability can also be exploited to
+bypass the logon for the web interface and immediately gain access as
+administrator because the arguments for the command-line tool are passed and
+evaluated.
+
+By supplying the [...] following [...] string [...], it is possible to logon
+without known credentials:
+
+[ Proof of concept removed ]
+
+[...]
+Afterwards the attacker is logged on as administrator (or any other supplied
+user account).
+
+
+Vulnerable / tested versions:
+-----------------------------
+The following version has been tested which was the latest version available
+at the time of the test:
+
+* Atos Unify OpenScape Session Border Controler (SBC) Firmware Version V10 R3.3.0
+
+According to vendor, versions before V10 R3.3.0 are affected as well.
+
+The vendor confirmed that the following products are vulnerable:
+* Atos Unify OpenScape SBC V10 before V10 R3.4.0
+* Atos Unify OpenScape Branch V10 before V10 R3.4.0
+* Atos Unify OpenScape BCF V10 before V10R10.12.00 and V10R11.05.02
+
+
+Vendor contact timeline:
+------------------------
+2023-09-13: Contacting vendor through email obso@...s.net; sending
+             encrypted advisory (S/MIME)
+2023-09-25: Call with vendor, patch has already been developed, available
+             internally for testing & QA since 22nd.
+2023-09-26: Preliminary vendor security advisory available, giving feedback
+             regarding recommendations. Vendor informs customers in advance
+             (TLP:AMBER), patch planned for 2023-09-27.
+2023-10-04: Vendor security advisory public release (TLP:WHITE).
+2023-10-06: Asking regarding next steps for affected product Atos Unify
+             OpenScape BCF.
+2023-10-10: Vendor confirms that OpenScape BCF is affected as well and added
+             it to their advisory.
+2023-11-27: Reserving CVE-2023-6269 and sending it to vendor, defining
+             release date of 5th December.
+2023-12-05: Coordinated release of security advisory.
+
+
+Solution:
+---------
+The vendor provides a patch for the affected products:
+* Atos Unify OpenScape Session Border Controller Firmware Version V10 >=R3.4.0
+* Atos Unify OpenScape Branch version V10 >=R3.4.0
+* Atos Unify OpenScape BCF version V10 >=V10R10.12.00 and V10R11.05.02
+
+The patches can be obtained for registered customers through the vendor's
+download server:
+https://sws.unify.com/SWSIntranet/SWSIntra.aspx or via
+https://unify.com/en/partner/partnerportal
+https://unify.com/en/support/kunden-support-portal
+
+Furthermore, the vendor has also released a security advisory which is
+available here:
+https://networks.unify.com/security/advisories/OBSO-2310-01.pdf
+
+
+Workaround:
+-----------
+In addition to deploying the patch, limit access to the administrative
+web application and SSH ports to authorized personnel on the network level.
+
+
+Advisory URL:
+-------------
+https://sec-consult.com/vulnerability-lab/
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SEC Consult Vulnerability Lab
+An integrated part of SEC Consult, an Eviden business
+Europe | Asia
+
+About SEC Consult Vulnerability Lab
+The SEC Consult Vulnerability Lab is an integrated part of SEC Consult, an
+Eviden business. It ensures the continued knowledge gain of SEC Consult in the
+field of network and application security to stay ahead of the attacker. The
+SEC Consult Vulnerability Lab supports high-quality penetration testing and
+the evaluation of new offensive and defensive technologies for our customers.
+Hence our customers obtain the most current information about vulnerabilities
+and valid recommendation about the risk profile of new technologies.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Interested to work with the experts of SEC Consult?
+Send us your application https://sec-consult.com/career/
+
+Interested in improving your cyber security with the experts of SEC Consult?
+Contact our local offices https://sec-consult.com/contact/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Mail: security-research at sec-consult dot com
+Web: https://www.sec-consult.com
+Blog: https://blog.sec-consult.com
+Twitter: https://twitter.com/sec_consult
+
+EOF A. Weihbold / @2023
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/

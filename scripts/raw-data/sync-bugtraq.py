@@ -149,7 +149,7 @@ if __name__ == '__main__':
                 msg_links = json.load(f)
                 delta = msg_links
         else:
-            print(f"[!] {link_index} found, fetching links from the website", file=sys.stderr)
+            print(f"[!] {link_index} not found, fetching links from the website", file=sys.stderr)
             with open(link_index, 'w') as f:
                 msg_links = fetch_msg_links(bugtraq_url, interval=1, print_result=sys.stdout)
                 f.write(json.dumps(msg_links))

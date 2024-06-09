@@ -7,6 +7,10 @@ import os
 import time
 import json
 
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'
+}
+
 dest_dir = "../../raw-data/full-disclosure-database"
 link_index = f"{dest_dir}/full-disclosure-msg-links.json"
 full_disclosure_url = 'https://lists.openwall.net/full-disclosure'
@@ -101,7 +105,12 @@ def fetch_msg_links(url, interval=5, print_result=sys.stdout):
 
 
 def fetch_msg(url, print_result=sys.stdout):
-    r = requests.get(url)
+    try:
+        r = requests.get(url, headers=headers)
+    except (requests.exceptions.RequestException, requests.exceptions.ConnectionError) as e:
+        time.sleep(10)
+        print(f"Retrying {url}", file=sys.stderr)
+        r = requests.get(url, headers=headers)
     if r.status_code != 200:
         print(f"[-] Failed to fetch message from {url}", file=sys.stderr)
         return None
@@ -225,14 +234,14 @@ if __name__ == '__main__':
                 print(f"[!] {link_index} is outdated, updating the link index", file=sys.stderr)
                 update_index_with_delta(msg_links, delta, lly, llm, lld)
         else:
-            print(f"[!] {link_index} found, fetching links from the website", file=sys.stderr)
+            print(f"[!] {link_index} not found, fetching links from the website", file=sys.stderr)
             with open(link_index, 'w') as f:
-                msg_links = fetch_msg_links(full_disclosure_url, interval=1, print_result=sys.stdout)
+                msg_links = fetch_msg_links(full_disclosure_url, interval=5, print_result=sys.stdout)
                 f.write(json.dumps(msg_links))
             delta = msg_links
         # downloading the messages
         if delta:
-            download_messages(delta, interval=2, print_result=sys.stdout)
+            download_messages(delta, interval=5, print_result=sys.stdout)
         else:
             print("[+] full-disclosure database is up-to-date", file=sys.stderr)
     except KeyboardInterrupt:
