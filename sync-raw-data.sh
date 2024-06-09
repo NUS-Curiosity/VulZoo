@@ -3,7 +3,7 @@
 # Vulnerabilities: cve, nvd, zdi, github, att&ck, 
 # Exploits: exploit-db,
 # Mail lists: Linux vulns,
-git pull --recurse-submodules
+git submodule update --remote
 
 RAW_DATA_DIR=raw-data
 
