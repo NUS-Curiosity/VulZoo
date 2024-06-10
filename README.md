@@ -64,6 +64,7 @@ Finally, you can run the `sync-vulzoo.sh` script to generate the processed data:
 - [GitHub Advisory](https://github.com/github/advisory-database)
 - [MITRE ATT&CK](https://github.com/mitre-attack/attack-stix-data.git)
 - [MITRE D3FEND](https://d3fend.mitre.org/)
+- [AttackerKB](https://attackerkb.com/)
 
 ### Unstructural
 
