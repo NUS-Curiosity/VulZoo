@@ -1,0 +1,417 @@
+
+Date: Wed, 1 Sep 2021 13:21:41 -0500
+From: KoreLogic Disclosures via Fulldisclosure <fulldisclosure@...lists.org>
+To: fulldisclosure@...lists.org
+Subject: [FD] KL-001-2021-009: CyberArk Credential Provider Race Condition
+ And Authorization Bypass
+
+KL-001-2021-009: CyberArk Credential Provider Race Condition And Authorization Bypass
+
+Title: CyberArk Credential Provider Race Condition And Authorization Bypass
+Advisory ID: KL-001-2021-009
+Publication Date: 2021.09.01
+Publication URL: https://korelogic.com/Resources/Advisories/KL-001-2021-009.txt
+
+
+1. Vulnerability Details
+
+     Affected Vendor: CyberArk
+     Affected Product: Application Access Manager/Credential Provider
+     Affected Version: Prior to 12.1
+     Platform: Linux/Windows/zOS
+     CWE Classification: CWE-326: Inadequate Encryption Strength,
+                         CWE-362: Concurrent Execution using Shared Resource with Improper Synchronization ('Race
+Condition'),
+                         CWE-923: Improper Restriction of Communication Channel to Intended Endpoints
+     CVE ID: CVE-2021-31797
+
+
+2. Vulnerability Description
+
+     CyberArk's Credential Provider loopback communications on TCP
+     port 18923 are encrypted with key material that has extremely
+     low entropy. In all currently-known use cases, the effective
+     key space is less than 2^16. For an attacker who understands the
+     key derivation scheme and encryption mechanics, knowledge of the
+     source port and access to the payloads of a given client-server
+     exchange are sufficient to reduce effective key space to one. In
+     cases where the source port is not known, the encrypted payloads
+     will be unable to withstand a brute force attack.
+
+     Additionally, the user identification mechanism used
+     by CyberArk's Credential Provider is vulnerable to a race
+     condition where an unauthorized/unprivileged user can submit
+     one or more encrypted query requests. If the race is won,
+     the attacker will be able to retrieve sensitive information
+     including passwords and password metadata.
+
+
+3. Technical Description
+
+     Based on analysis and observations, the key derivation process
+     for CyberArk's Credential Provider loopback communications on
+     TCP port 18923 can be summarized as follows:
+
+       - start a SHA1 hash (Hash1)
+       - update Hash1 with the decimal representation of the source port
+       - update Hash1 with an undocumented, hard-coded byte sequence
+       - finalize Hash1
+       - construct encryption key using Hash1[0:16]
+
+     Capturing loopback communications (e.g., with a sniffer)
+     requires elevated privilege. Thus, the risk associated with
+     this attack vector can be partially mitigated through basic
+     system hardening.
+
+     However, access to loopback communications is not the only
+     method by which the Credential Provider can be attacked. An
+     unprivileged user can simply open a connection, submit an
+     encrypted request, and if the conditions are right, the
+     Credential Provider may be "tricked" into generating a valid
+     response.
+
+     Below, a summary of two distinct races is given. Each race
+     consists of two query requests: one made by an authorized user
+     (u_auth) and the other made by an unauthorized/unprivileged user
+     (u_unauth). Observe (see details provided below) that only the
+     authorized query is satisfied in the first race, while both
+     queries are satisfied in the second race. By piggybacking on a
+     lock file created during u_auth's request, the user controlling
+     u_unauth's account is able to retrieve information s/he is
+     not authorized to view/possess. Clearly, this is a security
+     breach. Factors that make this attack possible include:
+
+       - The key material generated for these communications is
+       weak. The effective key space is less than 2^16 because
+       the key is derived from the TCP source port used to make
+       the request and an undocumented, hard-coded byte sequence
+       embedded in the key derivation code (henceforth referred to
+       as Suffix1).
+
+       - The user identification mechanism used by the Credential
+       Provider is vulnerable to a race condition where a shared,
+       ephemeral lock file exists in a common folder from the
+       time that the client makes its request to the time that the
+       Credential Provider's response is received/processed. The
+       window of time in which this file persists affords an
+       unauthorized user the opportunity to submit one or more
+       distinct requests that subsequently induce the provider
+       to reuse the yet-to-be-removed lock file. At that point,
+       pending requests (piggyback requests) will be deemed to have
+       originated from the same user as the first request (original
+       request), and if that user is authorized to make each request,
+       then each will be satisfied by the Credential Provider so
+       long as the lock file persists. An attacker who understands
+       how this mechanism works, can simply wait for a lock file
+       to come into existence (or predict its existence based
+       on process table monitoring and TCP port allocation). Once
+       detected (or predicted), a piggyback request can be submitted
+       provided that it originates from the "same" source port as
+       the original request.
+
+       - Requests originating from loopback addresses other than
+       127.0.0.1 (e.g., 127.0.0.{2,3,4}, etc.) are honored by the
+       Credential Provider. This makes it possible for an attacker
+       to make a piggyback request from the "same" source port
+       as the original request. Without the SO_REUSEPORT socket
+       option and cooperating processes, each source address/port
+       tuple must be unique on a given system. In other words,
+       two non-cooperating processes can't simultaneously bind to
+       the same source address/port (e.g., 127.0.0.1:10000). One or
+       the other will be rejected by the operating system. However,
+       since 127.0.0.1:10000 and 127.0.0.2:10000 are distinct tuples,
+       they are viewed as distinct endpoints (by the operating
+       system) and are therefore allowed to coexist. The Credential
+       Provider, upon receiving a request from either endpoint,
+       ignores (or discards) the source address, and incorrectly
+       associates that communication as having originated from the
+       "same" port (i.e., port 10000 per the example at hand).
+
+       - Note that if the Credential Provider is unable to
+       communicate with the Vault, it will continue to answer cached
+       queries. If log records are world readable, they can reveal
+       past queries that were both legitimate and successful. If
+       the provider is configured to maintain a cache, those query
+       results are likely still resident in the cache. Thus, an
+       attacker may use knowledge of cache behavior and available
+       log records to construct piggyback requests that are likely
+       to be satisfied when the race is won.
+
+     Below, a sanitized excerpt of the authorization policy
+     recovered from the Credential Provider's local cache
+     (appprovider_cache.dat) on [NAME REDACTED] is shown. Observe
+     that u_auth is listed as an authorized user. The scope of this
+     authorization is not fully known. Through testing, it was
+     determined that u_auth is authorized to make password queries
+     from at least two distinct safes (AIM_SAFE1 and AIM_SAFE2).
+
+       --- policy ---
+       <?xml version="1.0" encoding="UTF-8"?>
+       <AppMetaData>
+         <AIM>
+           <AuthMechanism Type="AppID" />
+             <AuthReq LastID="142">
+               <IPAuth>
+                 <IPReqData ReqVal="10.10.1.11" ID="11" />
+                 <IPReqData ReqVal="10.10.1.12" ID="12" />
+                 ...
+                 <IPReqData ReqVal="10.10.1.140" ID="140" />
+               </IPAuth>
+               <OSUserAuth>
+                 ...
+                 <OSUserReqData ReqVal="u_auth" ID="6" />
+                 ...
+               </OSUserAuth>
+             </AuthReq>
+           <ExtendedApplicationRestrictions isEnable="True" />
+         </AIM>
+       </AppMetaData>
+       --- policy ---
+
+     Below, the result of an authorized query made by u_auth to
+     retrieve app_123's password located in the AIM_SAFE1 safe
+     is shown. Note that the CyberArk "clipasswordsdk" utility
+     transparently encrypts the request and decrypts the response.
+
+       $ clipasswordsdk GetPassword -p AppDescs.AppID=APP_ID -p Query="Address=enco;TokenID=APP123Pass;Env=env1" -o Password
+       --- output ---
+       [PASSWORD REDACTED]
+       --- output ---
+
+     Below, the result of two unauthorized queries made by u_unauth
+     are shown. These queries attempt to retrieve app_456's password
+     located in the AIM_SAFE2 safe. Note that these responses
+     are essentially what an observer could capture if sniffing
+     the loopback interface. Also note that the Elements field
+     contains encrypted query results. Once decrypted (as shown
+     farther below), it is evident that the first response contains
+     an error message indicating that the query failed. Hence,
+     that race was lost. However, the second response clearly
+     contains valid data. Hence, that race was won. This implies
+     that no single race is a sure bet. Rather, factors such as
+     current system load, number of processors, processor speed,
+     etc. will influence the outcome of any given race. Note that
+     an unconstrained user may be able to influence system load
+     sufficiently to consistently win the race.
+
+       --- RESPONSE_1_BEGIN [TCP_PORT=44222] ---
+       <?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+       <Message>
+         <Header>
+           <ProtocolVersion>995000</ProtocolVersion>
+           <ProtocolInfo>3</ProtocolInfo>
+         </Header>
+        
+<Elements>9232456D7707CEBCC280184CB311F0871521DBFF0546A5E858974FE9E4AC8B4260FB4C579ACFB603905D1CFD1CA8EF76CD9AC32AE6C7CD6EC85FA57BD3E035514EEB72E767FBEA3FF2F4FA45D6F3D7E34B0DDACF9E2A3443E43C24D84544534A65046A6A4CCBED7CF6C72733F7B05CFD2F805E51B277100E1A9D42DA8D759EE6DE43F0D26ED41750EE428F82481CC96C8A3177C09F8A882138C294A4ADBDC270DE55128ABDCFCD6A5451A692DF4AE4035CB8D23C38176E78669903C680C89C14B00798568718FECAA1B7143ABAEEE612CE394DA4B7BD550338DB319BE607EED7F57EBCA05AA52CFAC03B02A4EC49F8F6B9E60375C32CEAA963017F590E3FBBAF4652664FC79AB355CB23EF50581A76FFC207731975FAF04CAAFD32F10B508E16660F0BCF6A55FDF3C2322110FBA425CFD06530B373B493957EF76E62100788D9FF1954BD12CBDD9D4E0393D3F6F411BD28AC788A55D6291BCDC439D895AA24E3A307A479EF420524AA3131C137F2EB9F</Elements>
+       </Message>
+       --- RESPONSE_1_END [TCP_PORT=44222] ---
+
+       --- RESPONSE_2_BEGIN [TCP_PORT=44228] ---
+       <?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+       <Message>
+         <Header>
+           <ProtocolVersion>995000</ProtocolVersion>
+           <ProtocolInfo>3</ProtocolInfo>
+         </Header>
+        
+<Elements>3681C9C1467C74EC3FFB7982B5E2639602D87E70D4E00EDCD6A65AFAF2093077B7CA27126C26A6F23DAEFB90287E9CDF99C20ED9F1835BC849855F8B7CFA437F72C8EF57EA077FA14DA625FAE93C0AAA0883FC130DA386E03622C80439A2F35F6508D08218E8ABE0D2000A2944908D13B5AE20854C4D8DCF30E790E25D6C4642BE52C6BA494FDDAB5A422C644C1D4A4688A9E9450F681BFD0949AB1A3358A355DFA797F2D416A9B1C2EF4C960A2A0B4C2F6F278B0B705D29F3DC3CFC9DA79B43B341D1AD8C45F602796CF627D5721DE7278B984E59CA5B5364A62CEFFAF0EDB9E7E33DCE349781AD0934DDD58E0A27EE669879D4641170C74FF237AD69C2F2C74263F48433213952F3E436EAFA65A69E12833EE189416F5F29A7A420D284180ED3C37D58DBE06600E4F3E01FF13C8AC98A101396E2FB0C382CF2C44C5E9487A31BE8665C2C6CC03F8982E719928537F2446068A849397A7132245F5521C990CA037C9C88C707F661CDD688AC9C45CC23A4B508EEE5E858E47E1C0BC31843BE43522F80DD29F0D6CD4233622D1F95A563C5425DEC73DBD47655525DCA19BBE64C177F8A0462D073FE99F135F2C056108D1F3D7B91CF055681DE5FBB12ABC92C08F872FACCE86C703B2F5CBFD49DB85DFBB484AB4C9308E804053F96D73E2DFD79D1EC55AE26358F4C02D33D0719300627B336B4FF99C294E0A713B6D33381DAB0241448A409E8346AA35F8352E1B0851BC1338EA6863E49DDB98B8CAB8EBB566C257F079BA16B6C28C4F1BA590B61B8F301E941867D3162231016DAA0C738C64C7B4DF355A8C8FCB08B866B81D9C23B9CAB626FFE53601D114D04E370D085B97473E8EE56DE4B7083D645C7E11CC51EF8BEA72A424BFD7FE3DCB6DF2EB58D95D907347627E450E83DD8CFEDA1F438953BFFAF52BEE65A3980F50DED183D6AFA6F0CD1C4B4F28A0FC16540055B76E063015D13100BE3492B9B32C02F45819506B39247CF4CA65CF04BE4BCDCF38EB4E3F44696299AFF93177E9F3E0B8ABD14BF51C35E3493B604173E83B6C00E85B580639A57B961A340881738D925068817F15E5FA565C95B8E913E200F82E21AA51C23C751AD75C3CE32C50B3BCF7B10C680A7CBA7356D2A8027D138AC6B0294AD760F1C71BA7DA8F53B997E60B185998A72693C3A88C43817648D285BFAFCC9F26CD3C37B96862BCED33EB48E536EDA29DBB1E0D7EC5680478BD99361D2C04B5F9E079EE8DC0D2CD76362507C8C13759156D450F1EE283171D3A5D9C8C3B9D284D3BF3B7729529E0FACC3424B27C1A62392B9A127AAF98982318459F20B5A1C60B9DB4AAA1F9AD0F2EEE373E46DC0231FF106</Elements>
+       </Message>
+       --- RESPONSE_2_END [TCP_PORT=44228] ---
+
+       --- DECRYPTED_ELEMENTS_RESPONSE_1_BEGIN [TCP_PORT=44222] ---
+       <Elements>
+         <Element>
+           <ElementType>ErrorResponse</ElementType>
+           <ResponseBase>
+             <ResponseId>1</ResponseId>
+             <ErrorResponse>
+               <ErrorCode>-1</ErrorCode>
+               <ErrorMsg>APPAP087E Application authentication failure</ErrorMsg>
+             </ErrorResponse>
+           </ResponseBase>
+         </Element>
+       </Elements>
+       --- DECRYPTED_ELEMENTS_RESPONSE_1_END [TCP_PORT=44222] ---
+
+       --- DECRYPTED_ELEMENTS_RESPONSE_2_BEGIN [TCP_PORT=44228] ---
+       <Elements>
+         <Element>
+           <ElementType>PasswordResponse</ElementType>
+           <ResponseBase>
+             <ResponseId>1</ResponseId>
+             <PasswordResponse>
+               <Password>REDACTED</Password>
+               <Flags>0</Flags>
+               <AlterPassword></AlterPassword>
+               <PassProps>
+                 <Address>appprodapplication</Address>
+                 <ApplicationName>APP</ApplicationName>
+                 <ClassType>Class H</ClassType>
+                 <CreationMethod>PVWA</CreationMethod>
+                 <Description>SR0118365</Description>
+                 <DeviceType>Operating System</DeviceType>
+                 <Env>all-prod</Env>
+                 <PolicyID>H_SRV_GENERIC_Q_XXX_APC</PolicyID>
+                 <RegSCI>ISCI</RegSCI>
+                 <TokenID>APPPassword</TokenID>
+                 <UserName>app_456</UserName>
+               </PassProps>
+               <PasswordChangeInProcess>false</PasswordChangeInProcess>
+             </PasswordResponse>
+           </ResponseBase>
+         </Element>
+       </Elements>
+       --- DECRYPTED_ELEMENTS_RESPONSE_2_END [TCP_PORT=44228] ---
+
+     Below, the relevant log entries generated for queries made
+     during the first race are shown. Note how all timestamps
+     are identical. Note also that the reason the race was lost is
+     revealed by the first record in APPConsole.log. Essentially, the
+     authorized query (first entry in APPAudit.log) was satisfied
+     and its associated lock file (/tmp/AIM44222) was removed
+     before the unauthorized query (second entry in APPAudit.log)
+     could be processed by the Credential Provider. And since the
+     lock file was removed, the provider had no means to look up
+     the process ID of the requesting process.
+
+       --- APPAudit.log ---
+       [DATE | 18:09:08] |  ::  | APPAU001I Provider Prov_[REDACTED] has successfully fetched password
+[safe=AIM_SAFE1,folder=Root,name=[REDACTED]] with query [Address=enco;TokenID=APP123Pass;Env=env1] for application
+[APP_ID]. Fetch reason: []
+       [DATE | 18:09:08] |  ::  | APPAU002E Provider Prov_[REDACTED] has failed to fetch password with query
+[Address=appprodapplication;Env=all-prod;TokenID=APPPassword] for application [APP_ID]. Fetch reason: []. Failure
+reason: [APPAP087E Application authentication failure]
+       --- APPAudit.log ---
+
+       --- APPConsole.log ---
+       [DATE | 18:09:08] |  ::  | APPAP087E Application authentication failure for Application APP_ID (CASCU086E Failed
+to find application process id. (Error: The lock file (/tmp/AIM44222) couldn't be opened, Error code: 2).)
+       [DATE | 18:09:08] |  ::  | APPAP002E Provider Prov_[REDACTED] has failed to fetch password with query
+[Address=appprodapplication;Env=all-prod;TokenID=APPPassword] for application [APP_ID]. Fetch reason: []. Failure
+reason: [APPAP087E Application authentication failure]
+       --- APPConsole.log ---
+
+     Below, the relevant log entries generated for queries made
+     during the second race are shown. Note how all timestamps are
+     identical. The authorized query corresponds to the first entry
+     in APPAudit.log, and the unauthorized query corresponds to the
+     second entry. Note how two distinct safes were queried. This
+     suggests that safes not normally accessed/queried by a given
+     Credential Provider may be targeted by an attacker from
+     a different system. Clients should be cautioned that the
+     contents of any given safe should be confined to a single
+     security domain.
+
+       --- APPAudit.log ---
+       [DATE | 18:09:13] |  ::  | APPAU001I Provider Prov_[REDACTED] has successfully fetched password
+[safe=AIM_SAFE1,folder=Root,name=[REDACTED]] with query [Address=enco;TokenID=APP123Pass;Env=env1] for application
+[APP_ID]. Fetch reason: []
+       [DATE | 18:09:13] |  ::  | APPAU001I Provider Prov_[REDACTED] has successfully fetched password
+[safe=AIM_SAFE2,folder=Root,name=[REDACTED]] with query [Address=appprodapplication;Env=all-prod;TokenID=APPPassword]
+for application [APP_ID]. Fetch reason: []
+       --- APPAudit.log ---
+
+
+4. Mitigation and Remediation Recommendation
+
+     The vendor has released an updated version (v12.1) which
+     remediates the described vulnerability. Release notes are
+     available at:
+
+    
+https://docs.cyberark.com/Product-Doc/OnlineHelp/PAS/Latest/en/Content/Release%20Notes/RN-WhatsNew12-1-CPs.htm?tocpath=Get%20Started%7CWhat%E2%80%99s%20New%7CRelease%20Notes%7C_____4
+
+
+5. Credit
+
+     This vulnerability was discovered by Klayton Monroe of
+     KoreLogic, Inc.
+
+
+6. Disclosure Timeline
+
+     2020.11.04 - KoreLogic submits vulnerability details to
+                  CyberArk.
+     2020.11.05 - CyberArk acknowledges receipt and the intention
+                  to investigate.
+     2020.11.16 - KoreLogic and CyberArk meet to discuss the
+                  details of this and other reported
+                  vulnerabilities. Both parties agree that the
+                  remediation timeline will extend significantly
+                  longer than the standard 45 business days specified
+                  in the KoreLogic Public Disclosure Policy.
+     2021.01.14 - 45 business days have elapsed since the
+                  vulnerability was reported to CyberArk.
+     2021.01.21 - KoreLogic and CyberArk meet to discuss proposed
+                  remediation efforts for this and other reported
+                  vulnerabilities.
+     2021.03.24 - 90 business days have elapsed since the
+                  vulnerability was reported to CyberArk.
+     2021.04.22 - CyberArk notifies KoreLogic that the reported
+                  vulnerability will be mitigated in a version
+                  scheduled for release in late May, 2021.
+     2021.05.10 - 120 business days have elapsed since the
+                  vulnerability was reported to CyberArk.
+     2021.05.10 - CyberArk provides KoreLogic with the CVE for this
+                  vulnerability. Vendor requests KoreLogic delay
+                  public disclosure until the end of June, 2021.
+     2021.06.08 - KoreLogic and CyberArk meet to discuss the details
+                  of the product release and revisit timeline for
+                  public disclosure. CyberArk informs KoreLogic that
+                  the Linux/Windows version of the Credential
+                  Provider will be released at the end of June, 2021.
+                  A Credential Provider for the zOS platform will be
+                  released at the end of July, 2021. KoreLogic agrees
+                  to delay public disclosure of this and other
+                  reported vulnerabilities until 2021.08.15.
+     2021.06.23 - CyberArk releases Credential Provider v12.1 for
+                  Linux/Windows platforms.
+     2021.08.05 - 180 business days have elapsed since the
+                  vulnerability was reported to CyberArk.
+     2021.08.10 - CyberArk informs KoreLogic that the zOS Credential
+                  Provider update has been released to their
+                  customers. Requests that KoreLogic forgo
+                  publication of the Proof of Concept code as an
+                  unforseen issue prevents some customers from
+                  updating in the near term.
+     2021.08.27 - KoreLogic suggests delaying the release of the
+                  Proof of Concept until a to-be-determined future
+                  date.
+     2021.08.30 - CyberArk tenders 2022.01.01 release date for the
+                  Proof of Concept.
+     2021.09.01 - KoreLogic public disclosure.
+
+
+7. Proof of Concept
+
+     At the vendor's request, KoreLogic has agreed to delay
+     publication of the Proof of Concept while customers continue
+     to deploy the updated versions of the product.
+
+
+
+The contents of this advisory are copyright(c) 2021
+KoreLogic, Inc. and are licensed under a Creative Commons
+Attribution Share-Alike 4.0 (United States) License:
+http://creativecommons.org/licenses/by-sa/4.0/
+
+KoreLogic, Inc. is a founder-owned and operated company with a
+proven track record of providing security services to entities
+ranging from Fortune 500 to small and mid-sized companies. We
+are a highly skilled team of senior security consultants doing
+by-hand security assessments for the most important networks in
+the U.S. and around the world. We are also developers of various
+tools and resources aimed at helping the security community.
+https://www.korelogic.com/about-korelogic.html
+
+Our public vulnerability disclosure policy is available at:
+https://korelogic.com/KoreLogic-Public-Vulnerability-Disclosure-Policy.v2.3.txt
+
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

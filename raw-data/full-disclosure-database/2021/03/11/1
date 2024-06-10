@@ -1,0 +1,194 @@
+
+Date: Thu, 11 Mar 2021 12:09:10 +0000
+From: research <research@...-inspector.com>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] [CVE-2021-28144] Authenticated Command Injection in D-Link
+ DIR-3060 Web Interface
+
+IoT Inspector Research Lab Security Advisory IOT-20210311-0
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+              title: Authenticated Command Injection in D-Link DIR-3060 Web 
+                     Interface 
+     vendor/product: D-Link DIR-3060 (https://www.dlink.com/)
+ vulnerable version: v1.11b04 & Below
+      fixed version: v1.11b04 Hotfix 2
+         CVE number: CVE-2021-28144
+             impact: 8.8 (high) CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H
+           reported: 2020-11-27
+        publication: 2021-03-11
+                 by: T Shiomitsu, IoT Inspector Research Lab
+                     https://www.iot-inspector.com/
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Vendor description:
+-------------------
+D-Link Corporation is a Taiwanese multinational networking equipment 
+manufacturing corporation. The DIR-3060 (also known as the EXO AC3000 Smart 
+Mesh Wi-Fi Router) is one of their higher-end home/small business routers. 
+
+
+Vulnerability overview/description:
+-----------------------------------
+The D-Link DIR-3060 is affected by a post-authentication command injection
+vulnerability. Any person who is able to gain authenticated access to a 
+DIR-3060 would be able to run arbitrary system commands on the device as the 
+system "admin" user, with root privileges. 
+
+
+Proof of concept:
+-----------------
+When a SOAP request is made to the SetVirtualServerSettings SOAP endpoint, the
+function at 00461918 in prog.cgi is invoked. This function traverses the SOAP
+XML request body, stores expected SOAP field values, and takes different paths
+depending on the values. 
+
+If a request with a non-null LocalIPAddress, Enabled set to “true”, an 
+InternalPort of “9” and a ProtocolType of “UDP” is sent, the function 
+CheckArpTables (named by me, based at 0046163c) is invoked.
+
+// ...snip 
+      iVar5 = strcmp(Enabled,"true"); 
+      if ((((iVar5 == 0) && (LocalIPAddress != (char *)0x0)) && 
+          (iVar5 = strcmp(InternalPort,"9"), iVar5 == 0)) && 
+         (iVar5 = strcmp(ProtocolType,"UDP"), iVar5 == 0)) { 
+        local_4154 = local_4154 + 1; 
+        iVar5 = CheckArpTables(LocalIPAddress, InternalPort, ProtocolType, 0xdc, local_4154); 
+        if (iVar5 == -1) { 
+            local_4160 = 0xb; 
+            goto LAB_00462504; 
+        } 
+      } 
+// ...snip
+
+Interestingly, UDP/9 correlates to the canonical Discard Protocol, which is the
+TCP/UDP/IP equivalent of /dev/null. 
+
+The CheckArpTables() function attempts to check the device ARP records, by 
+calling the arp system command and grep’ing the output. However, the user-
+controlled value passed as the LocalIPAddress is written directly into the 
+command line format string with snprint(). This string is then passed directly
+to a function called FCGI_popen(), which is a library function imported from 
+libfcgi.so.
+
+undefined CheckArpTables(char *LocalIPAddress, char *InternalPort, char *ProtocolType, undefined param_4, int param_5) {
+    // ...snip...
+    memset(buffer, 0, 0x40);
+    // ...snip...
+    snprintf(buffer, 0x40, "arp | grep %s | awk \'{printf $4}\'", LocalIPAddress);
+    iVar1 = FCGI_popen(buffer, "r");
+    // ...snip... 
+}
+
+We can see in libfcgi.so that FCGI_popen() is essentially only a thin wrapper 
+around the stdio popen() library function. Arguments passed to FCGI_popen() 
+get passed directly to popen().
+
+
+int FCGI_popen(char *param_1, char *param_2) 
+{
+  FILE *__stream; 
+  int iVar1; 
+  __stream = popen(param_1,param_2); 
+  iVar1 = FCGI_OpenFromFILE(__stream); 
+  if ((__stream != (FILE *)0x0) && (iVar1 == 0)) { 
+    pclose(__stream); 
+  } 
+  return iVar1; 
+}
+
+Since the LocalIPAddress value is not sanitized or checked in any way, a 
+crafted command injection string can be passed as the LocalIPAddress, which 
+will then be written to the arp command format string, and passed (almost) 
+directly to popen(). 
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Vulnerable / tested versions:
+-----------------------------
+DIR-3060 v1.11b04
+
+
+Solution:
+---------
+Apply D-Link-supplied patch, v1.11b04 Hotfix 2.
+
+
+Advisory URL:
+-------------
+https://www.iot-inspector.com/blog/advisory-d-link-dir-3060/
+
+
+Vendor contact timeline:
+------------------------
+2020-11-16: Initial contact made to ipsecure@...nkcorp.com to request keys for 
+            encryption.
+2020-11-20: No reply received, so follow-up e-mail sent.
+2020-11-27: No reply received, so advisory sent by e-mail without encryption.
+2021-02-03: No reply received, so follow-up e-mail sent.
+2021-02-12: No reply received, so inquiry sent using the forms at 
+            support.dlink.com and eu.dlink.com/uk/en/contact-d-link.
+2021-02-17: Response from the US D-Link support team, pointing us towards the 
+            US-specific D-Link security page.
+2021-02-17: Sent e-mail to this new US-specific D-Link security e-mail address.
+2021-02-19: Response from a member of the D-Link USA SIRT.
+2021-02-19: We request a public key from D-Link USA for transmission of the 
+            advisory.
+2021-02-19: PGP public key is provided by D-Link USA.
+2021-02-19: Advisory is sent to D-Link USA with encryption.
+2021-02-19: Receipt of advisory is confirmed by D-Link USA SIRT.
+2021-02-19: We reply and ask for D-Link USA to keep us updated.
+2021-02-20: D-Link “ipsecure” finally answers our e-mail, saying that 
+            security@...nk.com should be the official e-mail, and the 
+            ipsecure@...nkcorp.com e-mail (the only one listed on the main 
+            D-Link security disclosure page) is only a backup address.
+2021-02-22: D-Link USA responds, confirming that the e-mail address listed 
+            on the main D-Link security page has been changed.
+2021-03-02: We e-mail D-Link USA to ask for a status update.
+2021-03-02: D-Link USA responds with status update.
+2021-03-08: D-Link USA provides patched firmware for testing.
+2021-03-08: We respond asking for assigned CVE number.
+2021-03-08: D-Link USA notes that they do not apply for, or manage CVE numbers
+            related to their own products.
+2021-03-08: We apply for a CVE number for this issue.
+2021-03-08: D-Link USA publishes public advisory.
+2021-03-11: CVE is assigned & IoT Inspector Research Lab publishes advisory.
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The IoT Inspector Research Lab is an integrated part of IoT Inspector.
+
+IoT Inspector is a platform for automated security analysis and compliance 
+checks of IoT firmware. Our mission is to secure the Internet of Things. In 
+order to discover vulnerabilities and vulnerability patterns within IoT devices
+and to further enhance automated identification that allows for scalable 
+detection within IoT Inspector, we conduct excessive security research in the
+area of IoT. 
+
+Whenever the IoT Inspector Research Lab discovers vulnerabilities in IoT 
+firmware, we aim to responsibly disclose relevant information to the vendor
+of the affected IoT device as well as the general public in a way that 
+minimizes potential harm and encourages further security analyses of IoT 
+systems.
+
+You can find our responsible disclosure policy here:
+https://www.iot-inspector.com/responsible-disclosure-policy/
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Interested in using IoT Inspector for your research or product?
+
+Mail: research at iot-inspector dot com
+Web: https://www.iot-inspector.com
+Blog: https://www.iot-inspector.com/blog/
+Twitter: https://twitter.com/iotinspector
+
+EOF T Shiomitsu / @2021
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

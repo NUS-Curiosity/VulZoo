@@ -1,0 +1,168 @@
+
+Date: Sun, 13 Jun 2021 12:33:20 +0900
+From: KJ Jung <x90cx90c1@...il.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] popo:: linux kernel vulns of it.
+
+I reproduce the report and i can audit it.
+bond_do_ioctl funtion in the bonding net driver of linux kernel 5.4.
+it has a bug of stack buffer overflow.
+I will show it for you to know or understanding help to know kernel hacks.
+
+buffer overflow in bonding drivers.
+latest.
+
+----
+https://lxr.missinglinkelectronics.com/linux/drivers/net/bonding/bond_main.c#L1051
+3
+469static int bond_do_ioctl(struct net_device *bond_dev, struct ifreq *ifr,
+int cmd)
+3470{
+3471        struct bonding *bond = netdev_priv(bond_dev);
+3472        struct net_device *slave_dev = NULL; // [1]:: ... net_device
+*slave_dev!
+3473        struct ifbond k_binfo;
+3474        struct ifbond __user *u_binfo = NULL;
+3475        struct ifslave k_sinfo;
+3476        struct ifslave __user *u_sinfo = NULL;
+3477        struct mii_ioctl_data *mii = NULL;
+3478        struct bond_opt_value newval;
+3479        struct net *net;
+3480        int res = 0;
+3481
+3482        netdev_dbg(bond_dev, "bond_ioctl: cmd=%d\n", cmd);
+3483
+3484        switch (cmd) {
+3485        case SIOCGMIIPHY:
+3486                mii = if_mii(ifr);
+3487                if (!mii)
+3488                        return -EINVAL;
+3489
+3490                mii->phy_id = 0;
+3491                /* Fall Through */
+3492        case SIOCGMIIREG:
+3493                /* We do this again just in case we were called by
+SIOCGMIIREG
+3494                 * instead of SIOCGMIIPHY.
+3495                 */
+3496                mii = if_mii(ifr);
+3497                if (!mii)
+3498                        return -EINVAL;
+3499
+3500                if (mii->reg_num == 1) {
+3501                        mii->val_out = 0;
+3502                        if (netif_carrier_ok(bond->dev))
+3503                                mii->val_out = BMSR_LSTATUS;
+3504                }
+3505
+3506                return 0;
+3507        case BOND_INFO_QUERY_OLD:
+3508        case SIOCBONDINFOQUERY:
+3509                u_binfo = (struct ifbond __user *)ifr->ifr_data;
+3510
+3511                if (copy_from_user(&k_binfo, u_binfo, sizeof(ifbond)))
+3512                        return -EFAULT;
+3513
+3514                bond_info_query(bond_dev, &k_binfo);
+3515                if (copy_to_user(u_binfo, &k_binfo, sizeof(ifbond)))
+3516                        return -EFAULT;
+3517
+3518                return 0;
+3519        case BOND_SLAVE_INFO_QUERY_OLD:
+3520        case SIOCBONDSLAVEINFOQUERY:
+3521                u_sinfo = (struct ifslave __user *)ifr->ifr_data;
+3522
+3523                if (copy_from_user(&k_sinfo, u_sinfo, sizeof(ifslave)))
+3524                        return -EFAULT;
+3525
+3526                res = bond_slave_info_query(bond_dev, &k_sinfo);
+3527                if (res == 0 &&
+3528                    copy_to_user(u_sinfo, &k_sinfo, sizeof(ifslave)))
+3529                        return -EFAULT;
+3530
+3531                return res;
+3532        default:
+3533                break;
+3534        }
+3535
+3536        net = dev_net(bond_dev);
+3537
+3538        if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
+3539                return -EPERM;
+3540
+            // [2]:: slave_dev = ifr->ifr_slave (user controlled)
+3541        slave_dev = __dev_get_by_name(net, ifr->ifr_slave);
+3542
+3543        slave_dbg(bond_dev, slave_dev, "slave_dev=%p:\n", slave_dev);
+3544
+3545        if (!slave_dev)
+3546                return -ENODEV;
+3547
+3548        switch (cmd) {
+3549        case BOND_ENSLAVE_OLD:
+3550        case SIOCBONDENSLAVE:
+3551                res = bond_enslave(bond_dev, slave_dev, NULL);
+3552                break;
+3553        case BOND_RELEASE_OLD:
+3554        case SIOCBONDRELEASE:
+3555                res = bond_release(bond_dev, slave_dev);
+3556                break;
+3557        case BOND_SETHWADDR_OLD:
+3558        case SIOCBONDSETHWADDR:
+                    // [3]:: SIOCBONDSETHWADDR case enter to vulnerable
+function bond_set_dev_addr with slave_dev.
+3559                res = bond_set_dev_addr(bond_dev, slave_dev);
+3560                break;
+3561        case BOND_CHANGE_ACTIVE_OLD:
+3562        case SIOCBONDCHANGEACTIVE:
+3563                bond_opt_initstr(&newval, slave_dev->name);
+3564                res = __bond_opt_set_notify(bond, BOND_OPT_ACTIVE_SLAVE,
+3565                                            &newval);
+3566                break;
+3567        default:
+3568                res = -EOPNOTSUPP;
+3569        }
+3570
+3571        return res;
+3572}
+
+
+ 604/**
+ 605 * bond_set_dev_addr - clone slave's address to bond
+ 606 * @bond_dev: bond net device
+ 607 * @slave_dev: slave net device
+ 608 *
+ 609 * Should be called with RTNL held.
+ 610 */
+ 611static int bond_set_dev_addr(struct net_device *bond_dev,
+ 612                             struct net_device *slave_dev)
+ 613{
+ 614        int err;
+ 615
+ 616        slave_dbg(bond_dev, slave_dev, "bond_dev=%p slave_dev=%p
+slave_dev->addr_len=%d\n",
+ 617                  bond_dev, slave_dev, slave_dev->addr_len);
+ 618        err = dev_pre_changeaddr_notify(bond_dev, slave_dev->dev_addr,
+NULL);
+ 619        if (err)
+ 620                return err;
+ 621
+            // [4]:: x90: Trigger point: slave_dev->dev_addr,
+slave_dev->addr_len two variables controlled by user in memcpy
+                     API.
+ 622        memcpy(bond_dev->dev_addr, slave_dev->dev_addr,
+slave_dev->addr_len);
+ 623        bond_dev->addr_assign_type = NET_ADDR_STOLEN;
+ 624        call_netdevice_notifiers(NETDEV_CHANGEADDR, bond_dev);
+ 625        return 0;
+ 626}
+ 627
+--------
+
+
+--Author:: x90
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

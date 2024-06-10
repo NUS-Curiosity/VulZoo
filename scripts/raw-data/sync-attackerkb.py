@@ -35,7 +35,7 @@ def save_json(data, path):
 def get_topics():
     ensure_dir(topic_dir)
     still_more = True
-    cur_req = "/v1/topics?page=0&size=500&sort=created:asc"
+    cur_req = "/v1/topics?page=0&size=500&sort=created:asc&expand=references"
     cnt = 0
     while still_more:
         r = requests.get(f"{base_url}{cur_req}", headers=headers)
@@ -59,5 +59,33 @@ def get_topics():
             break
 
 
+def get_assessments():
+    ensure_dir(assessment_dir)
+    still_more = True
+    cur_req = "/v1/assessments?page=0&size=100&sort=created:asc&expand=tags"
+    cnt = 0
+    while still_more:
+        r = requests.get(f"{base_url}{cur_req}", headers=headers)
+        if r.status_code != 200:
+            print(f"Failed to get assessment list: {r.text}")
+            break
+        
+        # get page and size numbers from cur_req
+        self_req = r.json()["links"]["self"]["href"]
+        page = int(self_req.split("page=")[1].split("&")[0])
+        size = int(self_req.split("size=")[1].split("&")[0])
+        save_json(r.json(), f"{assessment_dir}/assessments_{page}_{size}.json")
+        cnt += 1
+        if cnt == 80:
+            time.sleep(5 * 60)
+            cnt = 0
+        try:
+            cur_req = r.json()["links"]['next']['href']
+            print(f"Next href: {cur_req}")
+        except KeyError:
+            break
+
+
 if __name__ == "__main__":
     get_topics()
+    get_assessments()

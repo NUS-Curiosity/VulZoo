@@ -1,0 +1,1019 @@
+
+Date: Thu, 2 Apr 2020 12:19:19 -0400
+From: hyp3rlinx <apparitionsec@...il.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Recon-Informer v1 - Intel for offensive systems tool.
+
+import logging,os,ctypes,sys,argparse,time,re
+from subprocess import *
+from datetime import datetime
+from pkgutil import iter_modules
+import pkg_resources
+
+#Recon-Informer (c)
+#By John Page (Hyp3rlinx)
+#ApparitionSec
+#hyp3rlinx.altervista.org
+#twitter.com/hyp3rlinx
+#apparitionsec@...il.com
+#PoC Video URL: https://www.youtube.com/watch?v=XM-G9Udbphc
+#==========================================================
+#
+#Recon-Informer is a basic real-time anti-reconnaissance detection
+tool for offensive
+#security systems, useful for penetration testers. It runs on
+Windows/Linux and leverages scapy.
+#
+#Purpose:
+#Recon-Informer is NOT meant for protecting public facing or lan
+critical enterprise systems whatsoever.
+#Its purpose is detect possible recon against our attacker system on a
+LAN to provide us defensive intel.
+#Therefore, this script is most useful for basic short-term defensive
+visibility.
+#
+#Features:
+#Attempt to detect and identify typical port scans generated using
+Nmap including scan type.
+#-sS, -sC, -F, -sR, -sT, -sA, -sW, -sN, -sF, -sX, -sM, -sZ, -sY, -sO,
+-sV, -sP, -sn, -f (fragment scan), -D (Decoy).
+#
+#FYI, scans such as FIN don't work well on windows OS and firewalls
+can make scans return incorrect result.
+#XMAS scans work against systems following RFC 793 for TCP/IP and
+don’t work against any Windows versions,
+#NULL is another type that don't work well on Windows.
+#
+#However, Fin, Null and Xmas scans can work on Linux machines.
+Therefore, Recon-Informer checks the OS
+#its run on and reports on scans that affect that OS, unless the -s
+"scan_type" flag is supplied.
+#With -s flag you can add extra scan types to detect that otherwise
+would be ignored.
+#
+#PING SWEEP (-sP, -sn, -sn -PY, -sY -PY) disabled by default.
+#Not enabled by default as most Nmap scans begin with an ARP who-has
+request, when using -p flag you
+#will see this detection preceding most scans. Also, you may see
+(noise) non-reconaissance related ARP
+#requests or even ones resulting from your own ICMP pings, this
+exclusive detection may fail if a scan uses -Pn flag.
+#
+#ICMP
+#Note: If nmap --disable-arp-ping flag is supplied for the scan it
+will be detected as ICMP ping.
+#
+#BLOCK -b offending IP(s) default is no blocking as packets can be
+spoofed causing DoS.
+#Firewall rule for blocks are in-bound "ANY" but still allows out-bound.
+#FW rules are named like ReconInformer_<HOST-IP>.
+#
+#DELETE FW RULE -d <IP-ADDR> to remove FW rules for blocked hosts.
+#
+#WHITELIST -w HOST-IP(s) you never want to block on.
+#
+#FILTER DEST PORTS -f (filter_dst_port) cut down noisy ports like TCP
+2869, NetBIOs 137 etc.
+#ignore packets destined for specific ports to try reduce false
+positive probe alerts.
+#
+#IGNORE HOST -n don't process packets from specific hosts, e.g.
+intranet-apps, printers and ACKS
+#from SMB connected shares to try reduce false positives.
+#
+#LOG -l flag, default size limit for writing to disk is 1MB.
+#
+#UDP protocol is ignored by default to try reduce false positives from
+sources like NetBIOS, SNMP etc.
+#To detect UDP scans use the -u flag, then can also combine with -f port filter
+#(reduce noise) on specific dest ports like 137,161,1900,2869,7680.
+#
+#PCAP saving -s flag, default size limit is also 1MB.
+#
+#RESTORE CONSOLE -r focus the console window (Win OS) if console is
+minimized on port scan detect.
+#
+#Private Network range:
+#Wrote this for basic LAN visibility for my attacker machine, packets
+from public IP ranges are ignored.
+#
+#BYPASS examples --scanflags and custom packet window sizes:
+#Recon-Informer does not try to detect every case of --scanflags or
+specially crafted packets.
+#
+#These scans can bypass Recon-Informer and correctly report open ports found.
+#nmap -n -Pn -sS --scanflags PSHSYN x.x.x.x -p139
+#nmap -P0 -T4 -sS --scanflags=SYNPSH x.x.x.x
+#
+#Therefore, I accounted for some of these in Recon-Informer to report
+these detections.
+#
+#SCANFLAGS
+#nmap -P0 -T4 -sS --scanflags=SYNURG x.x.x.x -p139 (returns correct)
+#nmap -P0 -T4 -sS --scanflags=PSHSYNURG x.x.x.x -p21-445 (returns correct)
+#nmap -P0 -T4 -sS --scanflags=ECE x.x.x.x shows up as NULL scan
+(nothin useful returned)
+#nmap -n -Pn -sS --scanflags 0x42 x.x.x.x -p139 (useful)
+#nmap -n -Pn -sS --scanflags=SYNPSH x.x.x.x -p135 (useful)
+#
+#The above scanflag examples, would have bypassed detection if we
+didn't check packets for them.
+#Useful scanflags that return open ports and bypassed Recon-Informer
+prior to scanflag checks:
+#
+#10=(0x00a) SYNPSH
+#34= (0x22) SYNURG
+#42=(0x02a) SYNPSHURG
+#66 (0x42) SYNECN
+#74 (0x04a) SYNPSHECN
+#98 (0x062) SYNURGECN
+#106 (0x06a) SYNPSHURGECN
+#130 (0x082) SYNCWR
+#138 (0x08a) SYNPSHCWR
+#162 (0x0a2) SYNURGCWR
+#170 (0x0aa) SYNPSHURGCWR
+#194  (0x0c2) SYNECNCWR
+#202 (0x0ca) SYNPSHECNCWR
+#226 (0x0e2) SYNURGECNCWR
+#234 (0x0ea) SYNPSHURGECNCWR
+#
+#Custom packet window size from 1024 typical of Nmap SYN scans to a
+size of 666 for the bypass!.
+#ip=IP(dst="192.168.1.104")
+#syn=TCP(sport=54030,dport=139,window=666,flags="S")
+#send(ip/syn)
+#
+#Custom packet tests were tested on Kali to Win7/10 machines.
+#Recon-Informer trys to inform about most typical out-of-the-box type of scans.
+#
+#Service scans -A detection:
+#nmap -n -Pn -T4 -A x.x.x.x -p22
+#If we scan from Kali Linux to Windows machine port 23 using -A we see
+SYN followed by XMAS
+#also we see an immediate high port of like 30000 or more.
+#
+#But scanning Windows ports 135 - 139 we see FSPU flags set so we can
+be fairly confident
+#it is a Service scan -A also it usually is followed by scanning high
+ports of 30000 or greater.
+#
+#However, I found that an easier way to pick up service -A scans is
+checking the window size.
+#If the window size is 65535 we can be fairly certain its a service -A scan.
+#Sometimes -A scan seems only to be detected when certain ports are hit.
+#
+#Example, Windows ports 135,139 or Kali Linux ports 1, 22 etc...
+#If not targeting port 135/139 (windows) -A detect may get missed.
+#Testing on newest nmap on Kali seemed to be easier to detect -A scan
+on ports other than 135/139.
+#Anyway, added this to try get more intel about possible incoming probes.
+#
+#DECOY SCAN -D detection set to a threshold of two or more ip-addresses.
+#
+#Examples:
+#capture TCP packets only, restores console on detection, detect ping
+sweep and ICMP
+#Recon-Informer.py -i <ATTACKER-BOX> -r -p
+#
+#capture UDP, whitelist ips, block, log, restore console, save pcap,
+detect XMAS,NULL on Win OS box.
+#Recon-Informer.py -i <ATTACKER-BOX> -u  -w -b -l -r -a -s X,N
+#
+#capture UDP, filter ports, whitelist ips, block and deletes a previous FW rule
+#Recon-Informer.py -i <ATTACKER-BOX> -u -f 137,161  -w -b -d <HOST-IP>
+#
+#ignore specific hosts for whatever reason you may have
+#Recon-Informer.py -i <ATTACKER-BOX> -n host1, host2
+#
+#capture TCP packets block all offending hosts (in-bound only) on
+detection, filter port 7680 MS WUDO
+#Recon-Informer.py -i <ATTACKER-BOX> -b -f 7680
+#
+#Dependencies:
+#npcap or winpcap, scapy, clint and pygetwindow.
+#
+#Tested Win7/10/Linux/Kali - Wired Ethernet LAN and Wifi networks.
+#
+#Scapy Errors:
+#If get scapy runtime error "NameError: global name 'log_runtime' is
+not defined on scapy"
+#OR you get "ImportError: cannot import name NPCAP_PATH"
+#Download the latest https://github.com/secdev/scapy
+#They were bugs in scapy thats been fixed in 2.4.3.
+#
+#========================================================================================
+#Packet window size tests:
+#
+#CONNECT -sT scan window size anomalies and example of port detection bypass.
+#Whats nice about detecting CONNECT scans is if someone does a telnet
+x.x.x.x <port> it
+#should also get flagged by Recon-Informer. FYI, if SYN scan is run as
+non-root user
+#it becomes CONNECT scan.
+#
+#1) Custom scapy CONNECT scan from Kali to Win7/Win10 box with SYN
+flag set window size is 8192
+#2) Nmap -sT CONNECT Win10 to Win7 used window size of 64240
+#3) Nmap -sT CONNECT i686 i386 GNU/Linux box with Nmap v4.11 to
+Win7/Win10 had window size 5840
+#4) Nmap -sT CONNECT Kali to Win7/Win10 used window size of 29200
+#5) Nmap -sT CONNECT Win7 to Win10 also window size was 8192 as in case 1)
+#
+#Nmap versions 4.11, 7.70 and 7.80 were used for port scan testing:
+#However, we may not be able to catch them all, like when custom
+window size is used.
+#
+#False positives:
+#Some ports (MS UPNP Host port 2869) as they show up as CONNECT or MAIMON
+#scans on some noisy networks. HTTP GET requests can also be flagged
+as CONNECT scans.
+#TCP source port 443 can also get picked up from web browsers or webapps.
+#=======================================================================================
+#
+#VM and NAT setups:
+#
+#TEST -sZ COOKIE_ECHO:
+#1) Kali to Win (NAT) we see 3-way handshake and no SCTP packets
+#2) Win to Win 10. range we see the SCTP packets
+#
+#TEST -sT CONNECT
+#1) Win to Win 10.x.x.x range we see correct packets in wireshark
+#SYN packet with a large amount of TCP options
+#
+#If use NAT mode on VM the machine may perform 3-way handshake
+#Recon-Informer may report SYN scans as CONNECT scans as they become ambigous.
+#
+#
+#DISCLAIMER:
+#Author is NOT responsible for any damages whatsoever by using this software,
+#by using Recon Informer you assume and accept all risk implied or otherwise.
+#=======================================================================================
+BANNER="""
+    ____                           ____      ____
+   / __ \___  _________  ____     /  _/___  / __/___  _________ ___  ___  _____
+  / /_/ / _ \/ ___/ __ \/ __ \    / // __ \/ /_/ __ \/ ___/ __ `__ \/ _ \/ ___/
+ / _, _/  __/ /__/ /_/ / / / /  _/ // / / / __/ /_/ / /  / / / / / /  __/ /
+/_/ |_|\___/\___/\____/_/ /_/  /___/_/ /_/_/  \____/_/  /_/ /_/ /_/\___/_/
+                                                                        v1
+    Intel for offensive systems
+    ---------------------------
+    By Hyp3rlinx
+    ApparitionSec
+
+"""
+
+local_ip_address=""
+OS="win32"
+whitelist_conf="Recon-Whitelist.txt"
+ip_whitelist=set()
+attacker_ip_set=set()
+priv24 = re.compile("^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+priv20 = re.compile("^192\.168\.\d{1,3}.\d{1,3}$")
+priv16 = re.compile("^172.(1[6-9]|2[0-9]|3[0-1]).[0-9]{1,3}.[0-9]{1,3}$")
+recon_log="ReconLog.txt"
+pcap_file="ReconPcap.pcap"
+max_log_sz=1024.0  #1MB default log and pcap file size limit
+service_scan_win_sz=65535 #Detect -A scan
+ip_proto_scan_lst=[] #Detect -sO scan
+scan_detect_lst=[] #Deal with OS and scans like FIN,NUL,XMAS
+
+#Enforce run as admin.
+def isAdmin():
+    try:
+        is_admin = (os.getuid() == 0)
+    except AttributeError:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+    if not is_admin:
+        print("[!] Run me from an elevated command line.")
+        exit()
+
+
+#Check FW rules exist.
+def getFirewall_rules(IP):
+    global OS
+    try:
+        if OS=="win32":
+            CMD="netsh advfirewall firewall show rule
+name=ReconInformer_"+IP+" verbose"
+        else:
+            CMD="iptables -L INPUT -v -n"
+        net=Popen(CMD, shell=True, stderr=PIPE, stdout=PIPE )
+        output, errors =  net.communicate()
+        if IP in output:
+            return True
+        else:
+            return False
+    except Exception as e:
+        pass
+    return False
+
+
+#Block IP in-bound, allow out.
+def firewall_ip(ip):
+    global OS
+    try:
+        if OS=="win32":
+            if not getFirewall_rules(IP):
+                os.system("netsh advfirewall firewall add rule
+name=ReconInformer_"+ip+" dir=in interface=any action=block
+remoteip="+ip+ ">nul 2>&1")
+        else:
+            #Block ANY new in-bound connection but allow outbound.
+            if not getFirewall_rules(IP):
+                os.system("iptables -A INPUT -s "+ip+" -m  state
+--state NEW -j DROP")
+    except Exception as e:
+        print(str(e))
+
+
+#Delete FW rules.
+def rem_firewall_rule(ip_lst):
+    global OS
+    try:
+        for addr in ip_lst:
+            time.sleep(0.3)
+            if is_ip_private(addr):
+                CMD="netsh advfirewall firewall delete rule
+name=ReconInformer_"+addr
+                if OS!="win32":
+                    CMD="iptables -D INPUT -s "+addr+" -m state
+--state NEW -j DROP"
+                if getFirewall_rules(addr):
+                    os.system(CMD)
+                    print(colored.cyan("[!] deleted fw rule:
+ReconInformer_"+addr))
+                    time.sleep(2)
+                else:
+                    print(colored.cyan("[!] Firewall rule:
+ReconInformer_"+addr+" does not exist."))
+            else:
+                print(colored.cyan("[!] Invalid or non private ip-address."))
+            sys.stdout.flush()
+    except Exception as e:
+        print(str(e))
+
+
+def valid_ip(addr):
+    try:
+        socket.inet_aton(addr)
+        return True
+    except socket.error:
+        return False
+
+
+#Never block on specified hosts
+def whitelist():
+    global whitelist_conf, ip_whitelist
+    if os.path.exists(whitelist_conf):
+        if os.stat(whitelist_conf).st_size == 0:
+            print(colored.cyan("[!] Recon_Whitelist.txt is empty."))
+            exit()
+        wl=open(whitelist_conf, "r")
+        for ip in wl:
+            ip = ip.strip()
+            if not valid_ip(ip):
+                print(colored.cyan("[!] Invalid IP: "+ip))
+            else: #Check IP is in LAN range.
+                if is_ip_private(ip):
+                    ip_whitelist.add(ip)
+                else:
+                    print(colored.cyan("[!] Non private IP(s) will not
+be added: "+ip))
+            print(colored.cyan("[-] Whitelisting: ")+colored.green(ip))
+            time.sleep(0.1)
+        wl.close()
+        print("\n")
+    else:
+        print(colored.cyan(whitelist_conf+" does not exist."))
+        exit()
+    sys.stdout.flush()
+
+
+
+#Disk write chk.
+def getsize(log_file):
+    sz=0
+    try:
+        if os.path.exists(log_file):
+            sz = round(os.path.getsize(log_file)/float(1<<10))
+    except Exception as e:
+        pass
+    return sz
+
+
+def log(data):
+    global recon_log, max_log_sz
+    try:
+        if getsize(recon_log) < max_log_sz:
+            f=open(recon_log,"a")
+            f.write(data+"\r\n")
+            f.close()
+        else:
+            print(colored.cyan("[!] Log size of "+str(max_log_sz)+"
+limit reached, logging stopped."))
+            sys.stdout.flush()
+    except Exception as e:
+        pass
+
+
+def detection_time():
+    recon_time = str(datetime.now())
+    recon_time = recon_time.replace(":","-").replace(" ","_")
+    return recon_time
+
+
+
+#Filter.
+def capture_filter(udp_capture, ping_sweep):
+    global local_ip_address
+    HOST="(dst net "+local_ip_address+")"
+    WINDOW_SZ="tcp[14:2]==1024||tcp[14:2]==2048||tcp[14:2]==3072||tcp[14:2]==4096||tcp[14:2]==29200||tcp[14:2]==5840||tcp[14:2]==8192||tcp[14:2]==64240"
+    SYN_SCAN="tcp[13]==2 && tcp[13]!=16"
+    NULL_SCAN="tcp[13]==0"
+    XMAS="tcp[13] & 1!=0 && tcp[13] & 32!=0 && tcp[13] & 8!=0"
+    SCTP="sctp"
+    FRAG="ip[6] = 32 or icmp[1]==4"
+    ICMP="icmp"
+    ARP="arp[6:2]==1" #opcode 1 (request) or 2 (reply).
+    if udp_capture and not ping_sweep:
+        return (HOST+"&&"+SYN_SCAN+"||"+XMAS+"||"+NULL_SCAN+"||"+WINDOW_SZ+"||"+SCTP+"||"+"udp"+"&&"+"dst
+net "+local_ip_address)
+    elif udp_capture and ping_sweep:
+        return (HOST+"&&"+SYN_SCAN+"||"+XMAS+"||"+NULL_SCAN+"||"+WINDOW_SZ+"||"+SCTP+"||"+ARP+"||"+"udp"+"&&"+"dst
+net "+local_ip_address)
+    elif ping_sweep:
+        return (HOST+"&&"+SYN_SCAN+"||"+XMAS+"||"+NULL_SCAN+"||"+WINDOW_SZ
++"||"+SCTP+"||"+ICMP+"||"+FRAG+"||"+ARP+"&&"+"dst net
+"+local_ip_address)
+    else:
+        return (HOST+"&&"+SYN_SCAN+"||"+XMAS+"||"+NULL_SCAN+"||"+WINDOW_SZ
++"||"+SCTP+"||"+ICMP+"||"+FRAG+"&&"+"dst net "+local_ip_address)
+
+
+#Private ip range.
+def is_ip_private(ip):
+    global priv24,priv20,priv16
+    res =  priv24.match(ip) or priv20.match(ip) or priv16.match(ip)
+    return res is not None
+
+
+def fw_block_inbound(addr):
+    fw_rules = getFirewall_rules(addr)
+    if not fw_rules and addr in ip_whitelist:
+        return colored.cyan("[!] Machine whitelisted.")
+    elif not fw_rules and addr not in ip_whitelist:
+        #Extra network range check
+        if is_ip_private(addr):
+            firewall_ip(addr)
+            return colored.cyan(colored.magenta("[+] Blocking IP: "+addr))
+    else:
+        return colored.cyan("[!] "+addr+" is blocked at the Firewall.")
+    sys.stdout.flush()
+
+
+def save_pcap(pkt):
+    global pcap_file, max_log_sz
+    if getsize(pcap_file) < max_log_sz:
+        try:
+            wrpcap(pcap_file, pkt, append=True)
+        except Exception as e:
+            pass
+    else:
+        print(colored.cyan("[!] Pcap size of "+str(max_log_sz)+" limit
+reached, pcap not saved."))
+        sys.stdout.flush()
+
+
+def restore_console():
+    global recon_win, OS
+    if recon_win and OS=="win32":
+        #Restore console if minimized
+        try:
+            recon_win.restore()
+        except Exception as e:
+            pass
+
+
+def doit(pkt):
+
+    global local_ip_address, _args, attacker_ip_set,
+ip_proto_scan_lst, OS, recon_win
+    global gw, no_report_scan_list, dst_port_whitelist, scan_detect_lst
+
+    SCAN_TYPE=""
+    scan_flags=""
+    service_scan=""
+    fragmented=False
+    addr=""
+    dest=""
+    mac=""
+    pnum=""
+    lines=60
+
+    #Deal with ping sweep -sn -sP
+    try:
+        if pkt.haslayer(ARP):
+            addr = str(pkt[ARP].psrc)
+            mac = str(pkt[Ether].src)
+            print(colored.red("[+] Recon:"+" "*(len("ARP Ping
+sweep")-1)+"IP:"+" "*(len(addr)+2)+"MAC:"+" "*(len(mac)+1)))
+            print(colored.cyan("[*] ARP Ping sweep" +"  |  " + addr +
+"  |  " + str(mac)))
+            print(colored.red("-"*lines))
+            sys.stdout.flush()
+
+        #IP layer, LAN and Check Target
+        if IP not in pkt or not is_ip_private(pkt[0][IP].src) or
+pkt[0][IP].dst != local_ip_address:
+            return
+
+        #Ping
+        if str(pkt.haslayer(ICMP)):
+            if str(pkt.getlayer(ICMP).type) == "8":
+                print(colored.cyan("[*] Ping detected from: "+pkt[0][IP].src))
+                print(colored.red("-"*lines))
+                sys.stdout.flush()
+    except Exception as e:
+        pass
+
+
+    #Handle fragmented packets -f
+    if str(pkt[0][IP].flags)=="MF":
+        fragmented=True
+
+    try:
+        dest=str(pkt[0][IP].dst)
+        addr=str(pkt[0][IP].src)
+        mac=str(pkt[Ether].src)
+        pnum=str(pkt[IP].dport)
+        win_sz = pkt[0][IP].window
+
+        #Skip ignored hosts or filtered dest ports.
+        if addr in no_report_scan_list or pnum in dst_port_whitelist:
+            return
+    except Exception as e:
+        pass
+
+
+    #Report fragmented packets -f.
+    if fragmented==True:
+        SCAN_TYPE="Fragmented"
+        try:
+            if pnum != "":
+                print(colored.red("[+] Recon:"+"
+"*(len("Fragmented")-1)+"IP:"+" "*(len(addr)+2)+"MAC:"+"
+"*(len(mac)+1)+"Port: "))
+                print(colored.cyan("[*] Fragmented" +"  |  " + addr +
+"  |  " + str(mac)+ "  |  " + pnum))
+            else:
+                print(colored.red("[+] Recon:"+"
+"*(len("Fragmented")-1)+"IP:"+" "*(len(addr)+2)+"MAC:"+"
+"*(len(mac)+1)))
+                print(colored.cyan("[*] Fragmented" +"  |  " + addr +
+"  |  " + str(mac)))
+            print(colored.red("-"*lines))
+            sys.stdout.flush()
+        except Exception as e:
+            pass
+
+        if _args.block_mode:
+            print(fw_block_inbound(addr))
+
+        if _args.log_probe:
+            info = "Source: " +addr +  " | " + "Dest: "+dest + " | " +
+mac + " | " + "Fragmented packet | " + detection_time()
+            log(info)
+
+        if _args.archive:
+            save_pcap(pkt)
+
+        if recon_win and OS=="win32":
+            restore_console()
+
+        return
+
+    #Noisy port
+    if OS == "win32" and pnum == "2869":
+        print(colored.cyan("[!] Port 2869 MS UPNP noise?, see -f flag"))
+        sys.stdout.flush()
+
+    #Noisy port
+    if pnum == "7680":
+        print(colored.cyan("[!] Port 7680 MS WUDO noise?, see -f flag"))
+        sys.stdout.flush()
+
+    if UDP in pkt[0]:
+        SCAN_TYPE = "UDP"
+
+    if TCP in pkt:
+
+        try:
+            flags = str(pkt[0][TCP].flags)
+            options = str(pkt[0][TCP].options)
+
+            if (flags=="S" or pkt[0][TCP].flags==0x002) and len(flags)==1:
+                SCAN_TYPE = "SYN"
+
+            #Handle useful --scanflags 0 - 255
+            if (flags=="SP") or (pkt[0][TCP].flags==0x00a) and len(flags)==2:
+                SCAN_TYPE = "SYN"
+                scan_flags="SYN, PSH"
+
+            if (flags=="SU") or (pkt[0][TCP].flags==0x022) and len(flags)==2:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, URG"
+
+            if (flags=="SPU") or (pkt[0][TCP].flags==0x02a) and len(flags)==3:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, PSH, URG"
+
+            if (flags=="SE") or (pkt[0][TCP].flags==0x42) and len(flags)==2:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, ECN"
+
+            if (flags=="SPE") or (pkt[0][TCP].flags==0x04a) and len(flags)==3:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, PSH, ECN"
+
+            if (flags=="SUE") or (pkt[0][TCP].flags==0x062) and len(flags)==3:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, URG, ECN"
+
+            if (flags=="SPUE") or (pkt[0][TCP].flags==0x06a) and len(flags)==4:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, PSH, URG, ECN"
+
+            if (flags=="SC") or (pkt[0][TCP].flags==0x082) and len(flags)==2:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, CWR"
+
+            if (flags=="SPC") or (pkt[0][TCP].flags==0x08a) and len(flags)==3:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, PSH, CWR"
+
+            if (flags=="SUC") or (pkt[0][TCP].flags==0x0a2) and len(flags)==3:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, URG, CWR"
+
+            if (flags=="SPUC") or (pkt[0][TCP].flags==0x0a2) and len(flags)==4:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, PSH, URG, CWR"
+
+            if (flags=="SPUC") or (pkt[0][TCP].flags==0x0aa) and len(flags)==4:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, PSH, URG, CWR"
+
+            if (flags=="SEC") or (pkt[0][TCP].flags==0x0c2) and len(flags)==3:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, ECN, CWR"
+
+            if (flags=="SPEC") or (pkt[0][TCP].flags==0x0ca) and len(flags)==4:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, PSH, ECN, CWR"
+
+            if (flags=="SUEC") or (pkt[0][TCP].flags==0x0e2) and len(flags)==4:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, URG, ECN, CWR"
+
+            if (flags=="SPUEC") or (pkt[0][TCP].flags==0x0ea) and len(flags)==5:
+                SCAN_TYPE = "SYN"
+                scan_flags = "SYN, PSH, URG, ECN, CWR"
+
+            #Handle -A Service scans.
+            if (flags=="SE" or pkt[0][TCP].flags==0x042) and len(flags)==2:
+                #We can miss detects from old systems unless hits port
+135/139 (Win OS).
+                service_scan="Service Scan -A"
+
+            if (flags=="SEC" or pkt[0][TCP].flags==0x8c2) and len(flags)==3:
+                service_scan="Service Scan -A"
+
+            if (flags=="FSPU" or pkt[0][TCP].flags==0x02b) and len(flags)==4:
+                service_scan="Service Scan -A"
+
+            if win_sz == service_scan_win_sz:
+                service_scan="Service Scan -A"
+
+            if (flags=="S" or pkt[0][TCP].flags==0x002) and
+len(flags)==1 and len(options)>15:
+                SCAN_TYPE = "CONNECT"
+                lines=58
+
+            #FW scan -sA
+            if (flags=="A" or pkt[0][TCP].flags==0x010) and len(flags)==1:
+                SCAN_TYPE = "ACK"
+
+            if "F" in scan_detect_lst or OS != "win32":
+                if (flags=="F" or pkt[0][TCP].flags==0x001) and len(flags)==1:
+                    SCAN_TYPE = "FIN"
+
+            if "N" in scan_detect_lst or OS != "win32":
+                if (flags=="" or pkt[0][TCP].flags==0x000) and len(flags)==0:
+                    SCAN_TYPE = "NULL"
+
+            if "X" in scan_detect_lst or OS != "win32":
+                if (flags=="FPU" or pkt[0][TCP].flags==0x029) and len(flags)==3:
+                    SCAN_TYPE = "XMAS"
+
+            if "M" in scan_detect_lst or OS != "win32":
+                if (flags=="FA" or pkt[0][TCP].flags==0x011) and len(flags)==2:
+                    SCAN_TYPE = "MAIMON"
+                    lines=58
+        except Exception as e:
+            pass
+    else:
+        try:
+            if IP in pkt:
+                if "SCTP":
+                    if (str(pkt[0][IP].flags)=="" or pkt[0][IP].flags
+== 0) and pkt[0][IP].len==52 and pkt[0][IP].type==1:
+                        SCAN_TYPE = "SCTP"
+
+                if "SCTP_COOKIE_ECHO":
+                    if (str(pkt[0][IP].flags)=="" or
+pkt[0][IP].flags==0) and pkt[0][IP].type==10:
+                        SCAN_TYPE = "SCTP_COOKIE_ECHO"
+                        lines=69
+        except Exception as e:
+            pass
+
+    #Bail if no scan type.
+    if SCAN_TYPE=="":
+        return
+
+    #Try detect IP Protocol scan, not full proof as consecutive ACK,
+SCTP packets will be flagged.
+    if SCAN_TYPE=="ACK" or SCAN_TYPE=="SCTP" and len(ip_proto_scan_lst) < 2:
+        #Don't add same scan type twice.
+        if SCAN_TYPE not in ip_proto_scan_lst:
+            ip_proto_scan_lst.append(SCAN_TYPE)
+        if len(ip_proto_scan_lst)==2:
+            print(colored.cyan("[*] Possible IP Protocol Scan -sO"))
+            sys.stdout.flush()
+            #Reset the list.
+            ip_proto_scan_lst=[]
+        #Clear any old one off ACK or SCTP scan flags hanging around.
+    elif SCAN_TYPE != "ACK" or SCAN_TYPE != "SCTP":
+        ip_proto_scan_lst=[]
+
+    print(colored.red("[+] Recon:"+" "*(len(SCAN_TYPE)-1)+"IP:"+"
+"*(len(addr)+2)+"MAC:"+" "*(len(mac)+1)+"Port: "))
+    print(colored.green("[+] "+SCAN_TYPE +  "  |  " + addr + "  |  " +
+str(mac) + "  |  " + pnum))
+
+    if scan_flags != "":
+        print(colored.cyan("[*] --scanflags "+scan_flags))
+
+    if service_scan != "":
+        print(colored.cyan("[*] "+service_scan))
+
+    if _args.block_mode:
+        print(fw_block_inbound(addr))
+
+    if addr not in attacker_ip_set:
+        attacker_ip_set.add(addr)
+
+    if len(attacker_ip_set) >= 2:
+        print(colored.cyan("[!] Multiple hosts detected, possible -D
+decoy scan."))
+        attacker_ip_set=set()
+
+    print(colored.red("-"*lines))
+    sys.stdout.flush()
+
+    #Log
+    if _args.log_probe:
+        try:
+            info = ("Source: "+ addr + " | " + "Dest:
+"+local_ip_address+" | "+SCAN_TYPE+" | "+
+                    "MAC: "+str(pkt[0][Ether].src)+" | "+ "Port: " +
+str(pkt[0][IP].dport)+" | "+detection_time())
+            if scan_flags != "":
+                info = info + " | " + "--scanflags: " + scan_flags
+            elif service_scan != "":
+                info = info + " | " + service_scan
+            elif scan_flags != "" and service_scan != "":
+                info = info + " | " + "--scanflags: " +  scan_flags +
+" | " + service_scan
+        except Exception as e:
+            pass
+        finally:
+            log(info)
+
+    #Save PCAP
+    if _args.archive:
+        save_pcap(pkt)
+
+    #Restore console
+    if recon_win and OS=="win32":
+        restore_console()
+
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-i", "--ip_addr", required=True,
+help="<ATTACKER-IP-ADDR>.")
+    parser.add_argument("-b", "--block_mode", nargs="?", const="1",
+help="Block IP at Firewall, default block any in-bound, allow out.")
+    parser.add_argument("-d", "--delete_fw", help="Unblock firewalled
+IP(s) <-d host1, host2>.")
+    parser.add_argument("-u", "--udp", nargs="?", const="1", help="UDP
+capture.")
+    parser.add_argument("-s", "--scan_type", help="Report non-workable
+anomalous (on Windows OS) scan types XMAS,FIN,NULL,MAIMON <-s X, F, N,
+M>.")
+    parser.add_argument("-p", "--ping_sweep", nargs="?", const="1",
+help="Detect ping sweeps -sP, -sn, may fail if -Pn is used in the
+scan.")
+    parser.add_argument("-f", "--filter_dst_port", help="Filter dest
+ports <-f 53,137,161,2869,..> reduce noise NBNS, DNS etc.")
+    parser.add_argument("-w", "--whitelist", nargs="?", const="1",
+help="Whitelist IP from FW block.")
+    parser.add_argument("-n", "--no_report", help="Ignore packets from
+server <-n host1, host2>.")
+    parser.add_argument("-r", "--restore_console", nargs="?",
+const="1", help="Restores console window if minimized (Window only).")
+    parser.add_argument("-a", "--archive",  nargs="?", const="1",
+help="Save PCAP (appends to pcap) size limit 1MB.")
+    parser.add_argument("-l", "--log_probe", nargs="?", const="1",
+help="Log detected probes (appends log) size limit set at 1MB.")
+    return parser.parse_args()
+
+
+#Ensure module exists
+def haslib(lib):
+    if not lib in (name for loader, name, ispkg in iter_modules()):
+        print("[!] "+lib+ " does not exist, pip install "+lib)
+        exit()
+    return True
+
+
+#Try deal with known bugs in some scapy versions so people don't lose
+their minds.
+def scapy_ver():
+    ver = pkg_resources.get_distribution("scapy").version
+    if ver=="2.4.1" or ver=="2.4.2":
+        print("[!] Known bugs in scapy versions 2.4.1 and 2.4.2")
+        print("[!] Scapy version detected is " +ver+" update to 2.4.3
+or latest.")
+        return False
+    return True
+
+
+def recon_init(udp, ping_sweep):
+    while True:
+        try:
+            sniff(filter = capture_filter(udp, ping_sweep), prn=doit,
+count=10, store=0)
+            time.sleep(1)
+        except Exception as e:
+            pass
+
+
+def main(args):
+
+    global _args, local_ip_address, OS, block_ip, recon_log, dst_port_whitelist
+    global pcap_file, recon_win, gw, no_report_scan_list, scan_detect_lst
+
+
+    if len(sys.argv)==1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+
+    #Assign args to global var to ref in other functions.
+    _args = args
+
+    print(colored.red("[*] Packets can be forged."))
+    print(colored.red("[*] False positives may occur."))
+    print(colored.red("[*] Attackers need protection too."))
+    print(colored.red("[*] Anything can be bypass, use at own risk."))
+    print(colored.red("[/] Listening...\n"))
+    sys.stdout.flush()
+
+    _os = sys.platform
+
+    if _os!="win32":
+        OS="Linux"
+
+    recon_win=False
+    dst_port_whitelist=""
+    no_report_scan_list=""
+    src_port_whitelist=""
+
+    if OS=="win32":
+        ctypes.windll.kernel32.SetConsoleTitleA("Recon-Informer v1")
+    else:
+        sys.stdout.write(b'\33]0;Recon-Informer v1\a')
+        sys.stdout.flush()
+
+    if args.restore_console and OS=="win32":
+        try:
+            import pygetwindow as gw
+            recon_win = gw.getWindowsWithTitle("Recon-Informer v1")[0]
+        except Exception as e:
+            pass
+    elif args.restore_console and OS!="win32":
+        print(colored.cyan("[!] Skipped -r Windows only."))
+
+    if args.ip_addr:
+        if not valid_ip(args.ip_addr):
+            print(colored.cyan("[!] Invalid IP."))
+            exit()
+        else:
+            local_ip_address=args.ip_addr
+
+    if args.block_mode:
+        print(colored.cyan("[!] Warning -b, spoofing can DoS in-bound."))
+        if not args.whitelist:
+            print(colored.cyan("[!] No whitelist, all IPs blocked."))
+
+    if args.udp:
+        print(colored.cyan("[!] udp equals more noise, see -f or -n flags."))
+
+    if args.ping_sweep:
+        print(colored.cyan("[!] I see your using -p, most Nmap scans
+start with ARP anyway."))
+
+    if args.filter_dst_port:
+        dst_port_whitelist=args.filter_dst_port.upper().split(",")
+
+    if OS=="win32" and args.scan_type:
+        scan_detect_lst=args.scan_type.upper().split(",")
+    elif OS != "win32" and args.scan_type:
+        print(colored.cyan("[!] Ignoring -s flag, Non Windows OS."))
+
+    if OS=="win32" and len(scan_detect_lst)==0:
+        print(colored.cyan("[!] FIN,NULL,XMAS,MAIMON scans are ignored
+on Windows"))
+        print(colored.cyan("[!] Still wish to detect them? use -s
+flag, see -h."))
+
+    if args.whitelist and not args.block_mode:
+        print(colored.cyan("[!] -w has no block mode (-b)."))
+        exit()
+
+    if args.block_mode and args.whitelist:
+        whitelist()
+
+    if args.no_report:
+        no_report_scan_list=args.no_report.split(",")
+
+    if args.log_probe:
+        if os.path.exists(recon_log):
+            if round(os.path.getsize(recon_log)/float(1<<10)) >= max_log_sz:
+                print(colored.cyan("[!] Log file size of
+"+str(max_log_sz)+" limit reached, delete log file to continue
+logging."))
+                exit()
+
+    if args.archive:
+        if os.path.exists(pcap_file):
+            if round(os.path.getsize(pcap_file)/float(1<<10)) >= max_log_sz:
+                print(colored.cyan("[!] PCAP file size of
+"+str(max_log_sz)+" limit reached, delete pcap to continue saving."))
+                exit()
+
+    if args.delete_fw:
+        rem_firewall_rule(args.delete_fw.split(","))
+
+    #Listen for recon attempts.
+    recon_init(args.udp, args.ping_sweep)
+
+
+if __name__=="__main__":
+
+    isAdmin()
+
+    try:
+        if haslib("scapy"):
+            from scapy.all import *
+            scapy_ver()
+    except Exception as e:
+        if str(e) == "cannot import name NPCAP_PATH":
+            scapy_ver()
+    try:
+        if haslib("clint"):
+            from clint.textui import colored
+    except Exception as e:
+        print(str(e))
+
+    try:
+        print(colored.red(BANNER))
+        time.sleep(0.2)
+        sys.stdout.flush()
+    except Exception as e:
+        print(str(e))
+
+    parser = argparse.ArgumentParser()
+
+    if len(sys.argv)==1:
+        parser.print_help(sys.stderr)
+        exit()
+
+    main(parse_args())
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/
