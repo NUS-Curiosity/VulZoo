@@ -10,6 +10,7 @@ function print_yellow {
 }
 
 RAW_DATA_DIR=raw-data
+PROCESSED_DIR=processed
 
 # Vulnerabilities: cve, nvd, zdi, github, att&ck, 
 # Exploits: exploit-db,
@@ -19,7 +20,7 @@ git submodule update --remote
 
 # cisa-kev
 print_green "[*][$RAW_DATA_DIR] Updating CISA KEV"
-wget https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json -O $RAW_DATA_DIR/cisa-kev-database/kev.json
+wget https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json -O $PROCESSED_DIR/cisa-kev-database/kev.json
 
 # cwe
 print_green "[*][$RAW_DATA_DIR] Updating CWE"
