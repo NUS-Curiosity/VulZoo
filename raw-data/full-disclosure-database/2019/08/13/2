@@ -1,0 +1,87 @@
+
+Date: Mon, 12 Aug 2019 17:56:03 -0500
+From: John Doe <johndoetouhou@...il.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Some interesting facts about gitlab runners
+
+So generally when you create a docker container, you specify what network
+you want to create it on right? Well due to historical reasons if you don't
+the container is created on the default "bridge0" network.
+
+This network doesn't have service discovery in the proper sense. To have
+containers talk to each other by name you need to "link" them, in the
+legacy docker sense. But in fact it's possible for any container on this
+network, to communicate with any other container on this network, over any
+port, whether the containers are linked or not. Sure you need to guess the
+IP address but you only have 255 to choose from so it's not that difficult.
+
+The fun fact is that gitlab runners are actually using this bridge0
+network. You'd think that each job would create its own network for it and
+its services, but as of right now gitlab uses docker's legacy "link"
+functionality. Which allows sharing environment variables easily, but
+forces them to use the bridge0 network. Using a network per job is actually
+one of the many many gitlab TODOs. See here:
+
+https://gitlab.com/gitlab-org/gitlab-runner/issues/1042
+
+Looks like this one was recently backlogged! Oops!
+
+So this means that jobs on a gitlab runner can communicate over the network
+with any other job concurrently running on the same gitlab runner. But wait
+gitlab jobs don't listen over the network generally right? Well gitlab
+services do! https://docs.gitlab.com/ee/ci/services/
+
+Take the following scenario. Alice is running a CI job in a shared gitlab
+runner from some place that provides hosted gitlab or something. This job
+does the following and is a very common use case:
+* Starts a mysql service with the password "p4ssw0rd" (she figures she
+doesn't need to use a secure password because it's just a job running
+internally, at least mysql's docker image will make you put a password on
+your service container unlike redis for instance)
+* Downloads a copy of her company's production database from the cache
+* Restores it to the mysql service of the gitlab job
+* Runs unit tests against it
+
+Meanwhile Bob, who is not an employee at Alice's company creates a gitlab
+job that does the following:
+* Uses a port scanner to see if there's any containers listening on port
+3306 in the IP range of the bridge0 network they're connected to
+* If there are attempts to mysql connect to them using username root and a
+table of common passwords. Remember the IP of the user isn't restricted
+since Bob's IP range is the same as Alice's
+* If it's able to connect, do mysqldump | aws s3 cp or something to stream
+Alice's internal company data to Bob's S3 compatible storage
+
+If Bob's gitlab job ends up running on the same server as Alice's then
+he'll be able to steal her company data.
+
+IMPORTANT NOTES:
+
+gitlab.com is NOT vulnerable, because their shared runners only run one
+concurrent job, so Bob's gitlab job will never end up running on the same
+server as Alice's.
+
+Your company is probably not vulnerable, because everyone with access to
+your internal gitlab goes out to lunch together and gives each other hugs
+when they're feeling down and is totally trustworthy.
+
+If you're using some shared runner that allows multiple concurrent jobs
+potentially from people you don't trust, and the services in your gitlab
+jobs don't require authentication to connect to them, you should probably
+stop doing that.
+
+MITIGATION:
+
+Do one or more of the following:
+
+* Don't share gitlab runners with strangers. You should host your own
+gitlab runners.
+* Use concurrency=1 for your gitlab runners, which is the default, so that
+they can only run one job at a time.
+* Make sure any gitlab services you use utilize authentication with strong
+passwords.
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

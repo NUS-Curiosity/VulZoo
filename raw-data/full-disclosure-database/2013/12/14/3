@@ -1,0 +1,340 @@
+
+Date: Fri, 13 Dec 2013 07:41:09 -0800
+From: Ben Pfaff <blp@...stanford.edu>
+To: full-disclosure@...ts.grok.org.uk
+Subject: cryptographic flaws in IBM SPSS data file
+	encryption
+
+IBM SPSS 21 and later support a form of encrypted data files.  The
+cryptographic scheme used, which is not publicly documented, has
+recently come to my attention.  It is flawed enough that I feel I must
+present it publicly.
+
+The encrypted data file format is identical to the pre-existing
+plaintext file format (which isn't important here), except that each
+16-byte block is encrypted with AES-256 in ECB mode.  The AES-256 key
+is derived from a password by a single AES-256 CMAC operation, as:
+
+        CMAC-AES-256(password, constant)
+
+where password is the literal password typed by the user (padded on
+the right with zeros to fill out a 32-byte AES-256 key, since CMAC
+needs a real cryptographic key not just any random string of bytes
+like HMAC) and constant is a particular 73-byte constant.  This only
+produces a 16-byte result.  AES-256 needs a 32-byte key, so the
+16-byte result is repeated twice to expand it to 32 bytes.
+
+(I think that the authors of the implementation must have thought they
+were doing something smart, because the 73-byte constant is in the
+right form for the NIST SP 800-108 key derivation function in counter
+mode.  But that KDF is meant for deriving one cryptographic key from
+another, not from a password.)
+
+The problems I see:
+
+    - ECB mode.
+
+    - Cheap password derivation function (single round of CMAC)
+      instead of an intentionally expensive function like PBKDF2 with
+      thousands of iterations.
+
+    - No salt, and the first 16 bytes of plaintext are essentially
+      constant (as a magic number).  I believe that this means rainbow
+      tables are possible.
+
+    - Password is silently truncated after 10 bytes, limiting actual
+      entropy in the key to 80 bits at the very most and probably more
+      like 40 to 60 bits realistically.  (AES-256 is obviously
+      overkill.)
+
+Other issues:
+
+    - Governments, universities, and companies use SPSS to analyze
+      survey data that sometimes contain people's personal information
+      that must not become public, so confidentiality is actually
+      important here.  Mitigating that a little, this encrypted format
+      is new in the last year or two, and a lot of organizations don't
+      upgrade SPSS frequently because it is very expensive, so the
+      encrypted format may not be widely used yet.
+
+    - SPSS documentation talks about "encrypted passwords" that can be
+      used in SPSS program syntax in place of plaintext passwords.
+      However, calling these passwords "encrypted" is a misnomer,
+      because the encoding algorithm is simple, fixed, and unkeyed.
+
+I'm appending a program that decrypts such a data file, given the
+plaintext or "encrypted" password.  Compile and link against libcrypto
+(from OpenSSL).
+
+--8<--------------------------cut here-------------------------->8--
+
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <openssl/aes.h>
+#include <openssl/cmac.h>
+
+/* Initializes AES from PASSWORD.  Returns true if CIPHERTEXT is the first
+   ciphertext block in an encrypted .sav file for PASSWORD, false if PASSWORD
+   is wrong. */
+static bool
+init(const char *password, const uint8_t ciphertext[16], AES_KEY *aes)
+{
+  /* NIST SP 800-108 fixed data. */
+  static const uint8_t fixed[] = {
+    /* i */
+    0x00, 0x00, 0x00, 0x01,
+
+    /* label */
+    0x35, 0x27, 0x13, 0xcc, 0x53, 0xa7, 0x78, 0x89,
+    0x87, 0x53, 0x22, 0x11, 0xd6, 0x5b, 0x31, 0x58,
+    0xdc, 0xfe, 0x2e, 0x7e, 0x94, 0xda, 0x2f, 0x00,
+    0xcc, 0x15, 0x71, 0x80, 0x0a, 0x6c, 0x63, 0x53,
+
+    /* delimiter */
+    0x00,
+
+    /* context */
+    0x38, 0xc3, 0x38, 0xac, 0x22, 0xf3, 0x63, 0x62,
+    0x0e, 0xce, 0x85, 0x3f, 0xb8, 0x07, 0x4c, 0x4e,
+    0x2b, 0x77, 0xc7, 0x21, 0xf5, 0x1a, 0x80, 0x1d,
+    0x67, 0xfb, 0xe1, 0xe1, 0x83, 0x07, 0xd8, 0x0d,
+
+    /* L */
+    0x00, 0x00, 0x01, 0x00,
+  };
+
+  char padded_password[32];
+  uint8_t plaintext[16];
+  size_t password_len;
+  uint8_t cmac[16];
+  uint8_t key[32];
+  size_t cmac_len;
+  CMAC_CTX *ctx;
+  int retval;
+
+  /* Truncate password to at most 10 bytes. */
+  password_len = strlen (password);
+  if (password_len > 10)
+    password_len = 10;
+
+  /* padded_password = password padded with zeros to 32 bytes. */
+  memset (padded_password, 0, sizeof padded_password);
+  memcpy (padded_password, password, password_len);
+
+  /* cmac = CMAC(padded_password, fixed). */
+  ctx = CMAC_CTX_new ();
+  assert (ctx != NULL);
+
+  retval = CMAC_Init (ctx, padded_password, sizeof padded_password,
+                      EVP_aes_256_cbc (), NULL);
+  assert (retval == 1);
+
+  retval = CMAC_Update (ctx, fixed, sizeof fixed);
+  assert (retval == 1);
+
+  cmac_len = sizeof cmac;
+  retval = CMAC_Final (ctx, cmac, &cmac_len);
+  assert (retval == 1);
+  assert (cmac_len == 16);
+
+  /* The key is the cmac repeated twice. */
+  memcpy(key, cmac, 16);
+  memcpy(key + 16, cmac, 16);
+
+  /* Use key to initialize AES. */
+  assert (sizeof key == 32);
+  retval = AES_set_decrypt_key (key, sizeof key * 8, aes);
+  assert (retval >= 0);
+
+  /* Check for magic number "$FL" always present in SPSS .sav file. */
+  AES_ecb_encrypt (ciphertext, plaintext, aes, AES_DECRYPT);
+  return !memcmp (plaintext, "$FL", 3);
+}
+.
+/* Password decoding. */
+
+#define b(x) (1 << (x))
+
+static const uint16_t m0[4][2] = {
+  { b(2),                         b(2) | b(3) | b(6) | b(7) },
+  { b(3),                         b(0) | b(1) | b(4) | b(5) },
+  { b(4) | b(7),                  b(8) | b(9) | b(12) | b(14) },
+  { b(5) | b(6),                  b(10) | b(11) | b(14) | b(15) },
+};
+
+static const uint16_t m1[4][2] = {
+  { b(0) | b(3) | b(12) | b(15),  b(0) | b(1) | b(4) | b(5) },
+  { b(1) | b(2) | b(13) | b(14),  b(2) | b(3) | b(6) | b(7) },
+  { b(4) | b(7) | b(8) | b(11),   b(8) | b(9) | b(12) | b(13) },
+  { b(5) | b(6) | b(9) | b(10),   b(10) | b(11) | b(14) | b(15) },
+};
+
+static const uint16_t m2[4][2] = {
+  { b(2),                         b(1) | b(3) | b(9) | b(11) },
+  { b(3),                         b(0) | b(2) | b(8) | b(10) },
+  { b(4) | b(7),                  b(4) | b(6) | b(12) | b(14) },
+  { b(5) | b(6),                  b(5) | b(7) | b(13) | b(15) },
+};
+
+static const uint16_t m3[4][2] = {
+  { b(0) | b(3) | b(12) | b(15),  b(0) | b(2) | b(8) | b(10) },
+  { b(1) | b(2) | b(13) | b(14),  b(1) | b(3) | b(9) | b(11) },
+  { b(4) | b(7) | b(8) | b(11),   b(4) | b(6) | b(12) | b(14) },
+  { b(5) | b(6) | b(9) | b(10),   b(5) | b(7) | b(13) | b(15) },
+};
+
+static int
+decode_nibble (const uint16_t table[4][2], int nibble)
+{
+  int i;
+
+  for (i = 0; i < 4; i++)
+    if (table[i][0] & (1 << nibble))
+      return table[i][1];
+
+  return 0;
+}
+
+/* Returns true if X has exactly one 1-bit, false otherwise. */
+static bool
+is_pow2 (int x)
+{
+  return x && (x & (x - 1)) == 0;
+}
+
+/* If X has exactly one 1-bit, returns its index, where bit 0 is the LSB.
+   Otherwise, returns 0. */
+static int
+find_1bit (uint16_t x)
+{
+  int i;
+
+  if (!is_pow2 (x))
+    return -1;
+
+  for (i = 0; i < 16; i++)
+    if (x & (1u << i))
+      return i;
+
+  abort ();
+}
+
+/* Attempts to decode a pair of encoded password characters A and B into a
+   single byte of the plaintext password.  Returns 0 if A and B are not a valid
+   encoded password pair, otherwise a byte of the plaintext password. */
+static int
+decode_password_2bytes (uint8_t a, uint8_t b)
+{
+  int x = find_1bit (decode_nibble (m0, a >> 4) & decode_nibble (m2, b >> 4));
+  int y = find_1bit (decode_nibble (m1, a & 15) & decode_nibble (m3, b & 15));
+  return x < 0 || y < 0 ? 0 : (x << 4) | y;
+}
+
+/* Decodes an SPSS so-called "encrypted" password INPUT into OUTPUT.
+
+   An encoded password is always an even number of bytes long and no longer
+   than 20 bytes.  A decoded password is never longer than 10 bytes plus a null
+   terminator.
+
+   Returns true if successful, otherwise false. */
+static bool
+decode_password (const char *input, char output[11])
+{
+  size_t len;
+
+  len = strlen (input);
+  if (len > 20 || len % 2)
+    return false;
+
+  for (; *input; input += 2)
+    {
+      int c = decode_password_2bytes (input[0], input[1]);
+      if (!c)
+        return false;
+      *output++ = c;
+    }
+  *output = '\0';
+
+  return true;
+}
+.
+/* Main program. */
+
+static void
+xfread (void *data, size_t size, size_t count, FILE *stream)
+{
+  if (fread (data, size, count, stream) != count)
+    {
+      if (ferror (stream))
+        fprintf (stderr, "read error (%s)", strerror (errno));
+      else
+        fprintf (stderr, "unexpected end of input\n");
+      exit (1);
+    }
+}
+
+int
+main (int argc, char *argv[])
+{
+  uint8_t in[36];
+  char pw[11];
+  AES_KEY aes;
+
+  if (argc != 2)
+    {
+      fprintf (stderr,
+               "usage: %s PASSWORD < ENCRYPTED > DECRYPTED\n"
+               "where ENCRYPTED is an encrypted system file,\n"
+               "      DECRYPTED is the decrypted version,\n"
+               "  and PASSWORD is the plaintext or encoded password.\n",
+               argv[0]);
+      exit (1);
+    }
+  if (isatty (1))
+    {
+      fprintf (stderr, "not writing output to a terminal, please "
+               "redirect to a file\n");
+      exit (1);
+    }
+
+  /* Read and discard 36-byte header, which only serves as a magic number. */
+  xfread (in, 36, 1, stdin);
+
+  /* Read first ciphertext block and use it to verify the password.  Try the
+     password as plaintext first, then try decoding it. */
+  xfread (in, 16, 1, stdin);
+  if (!init (argv[1], in, &aes)
+      && !(decode_password (argv[1], pw) && init (pw, in, &aes)))
+    {
+      fprintf (stderr, "wrong password, sorry\n");
+      exit (1);
+    }
+
+  /* Decrypt entire input. */
+  do
+    {
+      uint8_t out[16];
+
+      AES_ecb_encrypt (in, out, &aes, AES_DECRYPT);
+      fwrite (out, 16, 1, stdout);
+    }
+  while (fread (in, 16, 1, stdin));
+
+  return 0;
+}
+
+/*
+   Local variables:
+   compile-command: "gcc -Wall -Wextra decrypt.c -o decrypt -lcrypto"
+   End:
+*/
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

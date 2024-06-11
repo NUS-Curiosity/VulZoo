@@ -1,0 +1,448 @@
+
+Date: Mon, 2 Jun 2014 13:13:56 -0700
+From: David Fifield <david@...software.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] GoAgent vulnerabilities: CA cert with known private key,
+	TLS MITM
+
+There is an HTML version of this document with screenshots at
+https://www.bamsoftware.com/sec/goagent-advisory.html.
+
+  * GoAgent installs a root CA certificate with a known private key
+      * Test page
+      * Mitigation
+      * How to remove the GoAgent certificate
+  * Improper TLS validation makes GoAgent susceptible to
+    man-in-the-middle attacks
+      * Mitigation
+
+  * GoAgent 导入公开私钥根证书的问题
+      * 测试页面
+      * 如何防止风险
+      * 如何删除 GoAgent CA 证书
+  * GoAgent 没有进行正确的 TLS 验证，存在中间人攻击的风险
+      * 如何防止风险
+
+GoAgent (https://github.com/goagent/goagent) is a popular censorship
+circumvention tool that uses Google App Engine as a proxy to bypass
+China's Great Firewall. GoAgent has serious security flaws that put its
+users at risk of man-in-the-middle attacks.
+
+  * At startup, GoAgent installs trusted root "GoAgent CA" certificate
+    whose private key is publicly known. With this private key, anyone
+    may impersonate a certificate authority to attack GoAgent users. The
+    risk of this flaw exists even when not using GoAgent, if GoAgent has
+    been used any time in the past.
+  * Improper TLS validation, and a lack of validation by default, mean
+    that the HTTPS tunnel used by GoAgent can be subverted by an active
+    attacker.
+
+These flaws have been previously identified on GoAgent's issue tracker,
+but are not yet widely disclosed, especially among the non-Chinese
+community.
+
+    https://code.google.com/p/goagent/issues/detail?id=11091
+    http://translate.google.com/translate?hl=en&ie=UTF8&sl=zh-CN&tl=en&u=http://code.google.com/p/goagent/issues/detail%3Fid%3D11091
+
+    https://code.google.com/p/goagent/issues/detail?id=8031
+    http://translate.google.com/translate?hl=en&ie=UTF8&sl=zh-CN&tl=en&u=http://code.google.com/p/goagent/issues/detail%3Fid%3D8031
+
+
+== GoAgent installs a root CA certificate with a known private key ==
+
+At startup, GoAgent installs a system-wide root CA certificate with a
+fixed and publicly known private key. Because the private key is known,
+anyone can impersonate the "GoAgent CA" and sign certificates for almost
+any web site. The trusted root CA certificate remains installed even
+after GoAgent is turned off or removed. Depending on the circumstances
+of GoAgent's installation, the certificate may also affect browsers
+other than the one used with GoAgent, and other users of the same
+computer.
+
+The root CA certificate that GoAgent installs has the fingerprints:
+
+    SHA1 Fingerprint=AB:70:2C:DF:18:EB:E8:B4:38:C5:28:69:CD:4A:5D:EF:48:B4:0E:33
+    MD5 Fingerprint=56:B1:20:86:1B:0A:B0:61:38:00:1B:C3:67:CF:0C:CC
+
+The file with "-----BEGIN RSA PRIVATE KEY-----" may be downloaded at
+this URL, along with the certificate for "GoAgent CA":
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/local/CA.crt
+
+According to the version history, the key has been the same since June
+2011 or earlier:
+
+    https://github.com/goagent/goagent/blob/fa9959e577395e48a477fd5495afbc2363a51baa/local/CA.key
+
+GoAgent has two parts: a local proxy program, proxy.py, that runs on a
+user's computer, and a remote proxy program, gae.py, that runs on App
+Engine.
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/local/proxy.py
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/server/gae/gae.py
+
+Users upload a personal copy of gae.py to App Engine. The user's browser
+talks to proxy.py on localhost, and proxy.py talks to gae.py on App
+Engine.
+
+When run, GoAgent attempts to install the GoAgent CA certificate. The
+responsible function is CertUtil.import_ca:
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/local/proxy.py#L337
+
+The installation code is different for different operating systems, and
+varies as to what browsers and users it affects. In some cases it
+requires administrator privileges. On Windows, it calls the
+CertAddEncodedCertificateToStore function. On OS X, it runs the command
+
+    security find-certificate -a -c "GoAgent" | grep "GoAgent" >/dev/null || security add-trusted-cert -d -r trustRoot -k "/Library/Keychains/System.keychain" "<pwd>/CA.crt"
+
+On Ubuntu, it copies the certificate file to
+/usr/local/share/ca-certificates and calls update-ca-certificates. On
+other varieties of GNU/Linux, it attempts to modify the NSS database
+with the command
+
+    certutil -L -d sql:$HOME/.pki/nssdb | grep "GoAgent" || certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "GoAgent" -i "<pwd>/CA.crt"
+
+The automatic installation is ineffective for Firefox, which has its own
+certificate store. GoAgent's installation guide and FAQ show how to
+import the certificate into Firefox manually.
+
+    https://code.google.com/p/goagent/wiki/InstallGuide
+    http://translate.google.com/translate?hl=en&ie=UTF8&sl=zh-CN&tl=en&u=http://code.google.com/p/goagent/wiki/InstallGuide
+
+    https://code.google.com/p/goagent/wiki/FAQ
+    http://translate.google.com/translate?hl=en&ie=UTF8&sl=zh-CN&tl=en&u=http://code.google.com/p/goagent/wiki/FAQ
+
+The GoAgent CA certificate is used to do a local (intentional)
+man-in-the-middle of HTTPS connections between the browser and proxy.py.
+GoAgent works by encoding HTTP requests received by proxy.py and sending
+them to gae.py, where gae.py makes the encoded request. gae.py then
+encodes the HTTP response and sends it back to proxy.py, where it is
+decoded and returned to the browser. In order for GoAgent to work with
+HTTPS sites, it needs to undo the encryption so that gae.py will know
+what URL to request. When proxy.py receives a CONNECT request (meaning
+an HTTPS site is requested), it generates and serves a fake certificate
+signed by the GoAgent CA. From the user's point of view, all HTTPS sites
+are verified by "GoAgent". In some browsers, certificate pinning
+prevents the GoAgent technique from working for a small number of sites.
+(A consequence of GoAgent's model is that HTTPS is not end-to-end. It is
+HTTPS between the user and App Engine, and HTTPS between App Engine and
+the web site, but App Engine gets to see the plaintext.)
+
+
+=== Test page ===
+
+To test whether you are affected by the GoAgent CA vulnerability, access
+this web page:
+
+    https://goagent-cert-test.bamsoftware.com/ 
+
+The web page uses a certificate signed by the GoAgent CA. If you are not
+vulnerable, your browser will display a certificate warning. If you are
+vulnerable, the web page will be shown with no warning.
+
+
+=== Mitigation ===
+
+GoAgent has the ability to regenerate CA.crt with a new, truly private
+key. Delete the file local/CA.crt and start GoAgent again. The new
+certificate and private key will be unique to your installation, and
+only those with access to your computer will be able to attack your
+HTTPS sessions.
+
+This patch file removes the CA.crt file from a GoAgent Git repository.
+Apply it with the command "git am 0001-Remove-static-CA.crt.patch". If
+you have a copy of the code that is not a Git repository, delete the
+file local/CA.crt manually.
+
+    https://www.bamsoftware.com/sec/0001-Remove-static-CA.crt.patch
+
+If you have ever run GoAgent in the past, it is important to also remove
+the "GoAgent CA" certificate with SHA-1 fingerprint
+AB:70:2C:DF:18:EB:E8:B4:38:C5:28:69:CD:4A:5D:EF:48:B4:0E:33 from
+anywhere it might be installed. See the next section for how to do that
+on selected operating systems.
+
+
+=== How to remove the GoAgent certificate ===
+
+In Firefox, open the preferences, then go to Advanced, Certificates,
+View Certificates, Authorities, and select "GoAgent CA" in the list.
+Click the "Delete or Distrust..." button, then click OK.
+
+On Ubuntu, delete the file /usr/local/share/ca-certificates/GoAgent.crt
+and run the command
+
+    update-ca-certificates --fresh
+
+On Windows, refer to these instructions:
+
+    http://technet.microsoft.com/en-us/library/cc754841.aspx#BKMK_addlocal 
+
+Follow the instructions under "Adding certificates to the Trusted Root
+Certification Authorities store for a local computer", but at step 8,
+right-click on "GoAgent CA" and select "Delete".
+
+A screenshot of the Windows Trusted Root Certification Authorities store
+with "GoAgent CA" selected
+
+On Mac OS X, open the application called Keychain Access. Click the lock
+to unlock it and enter your password. In the side panel, select "System"
+and "Certificates". Highlight "GoAgent CA" and press the delete key on
+the keyboard. Click the "Delete" button and enter your password again.
+
+
+== Improper TLS validation makes GoAgent susceptible to man-in-the-middle attacks ==
+
+By default, GoAgent establishes an HTTPS tunnel between the local
+proxy.py and gae.py running on App Engine. (In the default proxy.ini
+configuration file, the default setting is gae.mode=https.) However by
+default, it does not validate the server's certificate (gae.validate=0),
+making possible an HTTPS man-in-the-middle attack between GoAgent and
+App Engine. Further, the gae.validate option also controls whether
+validation is done between App Engine and the remote web server, so that
+is disabled by default as well, enabling HTTPS man-in-the-middle between
+App Engine and the destination web site.
+
+Even when validation is enabled (gae.validate=1), the validation works
+differently than usual: It does not match against the remote hostname,
+but rather checks that the certificate's organizationName begins with
+"Google ".
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/local/proxy.py#L1623
+
+Setting gae.validate=1 causes gae.py to validate its HTTP transactions.
+Except that validation is not enabled by default, there doesn't appear
+to be a problem with the validation in gae.py.
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/server/gae/gae.py#L184
+
+GoAgent optionally obfuscates its encoded HTTP requests and responses by
+encrypting them with RC4 and a password-derived key. The obfuscation
+option is enabled by setting gae.password and gae.options=rc4 in the
+proxy.ini configuration file, as well as the __password__ variable in
+gae.py.
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/server/gae/gae.py#L5
+
+However, the RC4 encryption is intended only for obfuscation, and does
+not mitigate a man-in-the-middle attack. It offers no confidentiality,
+because the password is sent along with each ciphertext in a G-password
+header. Also, the same keystream is reused for all messages in both
+directions, making it possible to XOR ciphertexts and get the XOR of
+plaintexts. The RC4 feature prevents other users from trivially using up
+your App Engine bandwidth quota, but doesn't provide additional
+protection against a network adversary.
+
+
+=== Mitigation ===
+
+In the proxy.ini configuration file, make sure to set gae.mode=https
+(the default) and gae.validate=1 (not the default). These settings
+enable validation both between GoAgent and App Engine, and between App
+Engine and the remote web site. There remains a risk of
+man-in-the-middle by someone able to get a valid certificate with
+"Google " in the organizationName.
+
+
+------------------------------------------------------------------------
+
+
+GoAgent (https://github.com/goagent/goagent) 利用 Google App Engine
+(GAE) 来绕过 GFW 的封锁，以免费、快速、稳定的特点深受网民的欢迎。但
+是，GoAgent 的安装和配置中存在两点严重安全风险的问题却鲜为人知。这两点安
+全风险都可能被攻击者利用进行 “中间人攻击（man-in-the-middle attack）” 来
+窃取 GoAgent 用户的网络帐号密码等敏感信息，其概括描述如下：
+
+  * GoAgent 在启动时会尝试自动往系统的可信根证书中导入一个名为 “GoAgent
+    CA” 的证书。由于这个证书的私钥是公开的，导致任何人都可以利用这个私钥
+    来伪造任意网站的证书进行 HTTPS 中间人攻击。即使在不开启 GoAgent 时，
+    这种攻击的风险仍然存在。换而言之，一旦这个证书被导入，攻击者可以用此
+    绕过几乎所有网站的 HTTPS 保护。
+  * GoAgent 本身对 TLS 证书的认证存在问题，而且默认时不对证书进行检查，
+    这导致在使用 GoAgent 时存在 HTTPS 中间人攻击的风险。
+
+事实上曾经有用户在 GoAgent 主页上的问题跟踪列表中指出了这两个安全问题
+（见以下链接），但既没有修复也没有广泛公开，多数用户，尤其是非中文用户可
+能并不知情。下面是这两个问题的详细解释。
+
+    https://code.google.com/p/goagent/issues/detail?id=11091
+    https://code.google.com/p/goagent/issues/detail?id=8031 
+
+== GoAgent 导入公开私钥根证书的问题 ==
+
+GoAgent 在启动时会尝试在系统中导入一个根证书来避免访问 HTTPS 网站时的证
+书报警，但在默认情况下所导入证书的私钥是公开的。因为私钥公开，任何人可以
+作为 “GoAgent CA” 来签发任何网站的证书。即使在 GoAgent 没有启动甚至卸载
+的情况下，这个公钥仍会遗留在系统中。在有些系统中，GoAgent 所导入的根证书
+不仅被 GoAgent 默认使用的浏览器信任，其他的浏览器也可能会信任这一根证
+书，从而受到这一问题的影响。
+
+GoAgent 所导入的这一公开私钥根证书的指纹是：
+
+    SHA1 Fingerprint=AB:70:2C:DF:18:EB:E8:B4:38:C5:28:69:CD:4A:5D:EF:48:B4:0E:33
+    MD5 Fingerprint=56:B1:20:86:1B:0A:B0:61:38:00:1B:C3:67:CF:0C:CC
+
+包含这一 “GoAgent CA” 证书以其私钥（文件中 “-----BEGIN RSA PRIVATE
+KEY-----” 位置）的文件 URL 为：
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/local/CA.crt
+
+根据版本信息，这一证书和私钥从 2011 年 6 月甚至更早的时间以来一直保持不变。
+
+    https://github.com/goagent/goagent/blob/fa9959e577395e48a477fd5495afbc2363a51baa/local/CA.key
+
+GoAgent 主要包含两个部分：一个在用户计算机上运行的本地代理程序
+proxy.py，以及一个在 GAE 上运行的远程代理程序 gae.py。
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/local/proxy.py
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/server/gae/gae.py
+
+安装时，用户需要上传 gae.py 到 GAE。用户浏览器通过设置一个本地代理将
+HTTP/HTTPS 请求转发到 proxy.py，再由 proxy.py 和 gae.py 进行通信。
+
+默认情况下，GoAgent 在启动时试图导入上述 GoAgent CA 证书。具体的代码为
+proxy.py 中的 CertUtil.import_ca：
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/local/proxy.py#L337
+
+这个函数会根据用户操作系统通过不同的方式尝试导入证书，在某些情况下会需要
+管理员 （root/administrator）权限。在 Windows 下，这个函数会调用
+CertAddEncodedCertificateToStore 这一 API。在 OS X 下，会尝试执行系统命令
+
+    security find-certificate -a -c "GoAgent" | grep "GoAgent" >/dev/null || security add-trusted-cert -d -r trustRoot -k "/Library/Keychains/System.keychain" "<pwd>/CA.crt"
+
+在 Ubuntu 下，会拷贝证书文件到 /usr/local/share/ca-certificates 然后执
+行 update-ca-certificates。在其他 GNU/Linux 发行版中，会尝试执行以下命
+令更改 NSS 数据库：
+
+    certutil -L -d sql:$HOME/.pki/nssdb | grep "GoAgent" || certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "GoAgent" -i "<pwd>/CA.crt"
+
+由于 Firefox 采用了不同的方式存储证书，这一自动安装过程不会导入 GoAgent
+CA 证书到 Firefox 中。但是 GoAgent 的安装指南和 FAQ 中说明了如何手动导入
+这一证书：
+
+    https://code.google.com/p/goagent/wiki/InstallGuide
+    https://code.google.com/p/goagent/wiki/FAQ 
+
+这一证书随后被 proxy.py 用来作为 HTTPS 中间人来避免浏览器在访问 HTTPS
+网站时出现报警。GoAgent 的工作原理如下：首先 proxy.py 将浏览器的 HTTP
+请求进行编码并转发给 gae.py，gae.py 完成收到的请求然后将结果进行编码
+后返回给 proxy.py，最后 proxy.py 将结果转发给浏览器来完成 “翻墙” 过
+程。由于 GAE 的限制 （免费 app 无法使用 socket 接口），对于 HTTPS 请
+求，proxy.py 无法进行透明转发，只能作为中间人先和浏览器完成连接，然后
+获得其中的明文请求以后在转发给 gae.py。当收到 CONNECT 请求（这意味着
+浏览器正在浏览一个 HTTPS 网站）， proxy.py 首先利用 GoAgent CA 签发一
+个假的证书来和浏览器完成握手，从用户的角度，所有的 HTTPS 网站的证书都是
+由事先导入的 “GoAgent CA” 认证的，所以不会报警。有些浏览器会对少数网站的
+证书进行特别的检查（Certificate Pinning），这种情况下 "GoAgent CA” 所签
+发的证书可能会触发证书不安全的报警。GoAgent 的这种工作方式导致 HTTPS 不
+再是浏览器到网站的端到端安全通信，而变成了 proxy.py 到 GAE，以及 GAE
+到网站两段独立的 HTTPS 连接，GAE 能够看到请求和应答的明文。
+
+
+=== 测试页面===
+
+请访问
+
+    https://goagent-cert-test.bamsoftware.com/ 
+
+来进行测试。这个页面使用了一个由 GoAgent CA 签发的证书。如果你的浏览器没
+有受到影响，会显示报警信息；如果没有看到报警，则表明你的浏览器导入了公开
+的 GoAgent CA 证书，存在严重安全风险。
+
+
+=== 如何防止风险 ===
+
+GoAgent 本身带有生成证书文件 CA.crt 的功能。只需要删除 local/CA.crt 文件
+就能保证 GoAgent 所导入的证书是唯一的，不会被网络上的攻击者利用来进行攻击。
+
+下面的 “补丁（patch）” 文件会帮助你从 GoAgent 的 git 仓库中删除 CA.crt
+文件，请下载补丁文件并执行以下命令：
+git am 0001-Remove-static-CA.crt.patch. 如果你不是通过 git 获得
+GoAgent（例如直接从 http://code.google.com/p/goagent/ 上的链接下载得到）
+，请手动删除 local/CA.crt 文件。
+
+    https://www.bamsoftware.com/sec/0001-Remove-static-CA.crt.patch
+
+如果你以前曾经使用过 GoAgent，务必要检查系统中任何可能的地方，删除 SHA-1
+指纹为 AB:70:2C:DF:18:EB:E8:B4:38:C5:28:69:CD:4A:5D:EF:48:B4:0E:33 的
+“GoAgent CA” 证书（建议使用浏览器访问上面的测试页面进行检查）。下面说明
+在常见系统中检查和删除 GoAgent CA 证书的方法。
+
+
+=== 如何删除 GoAgent CA 证书 ===
+
+Firefox 中，打开 “preferences”，”Advanced”, “Certificates”, “View
+Certificates”, “Authorities”，然后在证书列表中找到 “GoAgent CA”，选中并
+点击 “Delete or Distrust...” 按钮，然后确认。
+
+Ubuntu 下，删除 /usr/local/share/ca-certificates/GoAgent.crt 然后执行
+
+    update-ca-certificates --fresh
+
+Windows 下，请参考以下链接：
+
+    http://technet.microsoft.com/en-us/library/cc754841.aspx#BKMK_addlocal 
+
+中 "Adding certificates to the Trusted Root Certification Authorities
+store for a local computer" 的步骤，但是在 step 8 时右键选中 "GoAgent
+CA" 然后选择 "Delete"。
+
+在 Mac OS X下，打开 “Keychain Access” 应用，点击锁图标并输入密码解锁。在
+边上的控制面板中，选择 "System" 以及 "Certificates"，选中 "GoAgent CA"
+然后按 “Delete” 键，点击 "Delete" 按钮并输入你的密码确认。
+
+
+== GoAgent 没有进行正确的 TLS 验证，存在中间人攻击的风险 ==
+
+默认情况下，GoAgent 会通过 HTTPS 来保护本地 proxy.py 和 GAE 服务器上
+的 gae.py 之间的通信 （在配置文件 proxy.ini 中相关的设置默认为
+gae.mode=https）。但是同样在默认情况下，GoAgent 不会要求对 GAE 服务器
+的证书进行验证（gae.validate=0），这导致本地 proxy.py 和 App Engine
+服务器之间的通信存在 HTTPS 中间人攻击的风险。此外， gae.validate 配置
+项同样控制 App Engine 上的 gae.py 是否对网站服务器的证书进行验证，默认
+配置下这一配置为 0 导致 gae.py 也不会对网站证书进行验证，使得 gae.py
+和网站之间的通信同样存在 HTTPS 中间人攻击的风险
+
+即使修改配置启用证书验证（gae.validate=1），GoAgent 对 App Engine 服务
+器证书的验证也并不严格：在 proxy.py 中只是对证书的 organizationName 进
+行了粗略的检查（是否为 “Google ” 开头），而没有对主机名（hostname）进行
+匹配。
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/local/proxy.py#L1623
+
+将配置改为 gae.validate=1 同时会启用 gae.py 段对网站服务器证书的验
+证，这部分的事先没有明显的问题。
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/server/gae/gae.py#L184
+
+GoAgent 还提供了一个可选功能，通过 RC4 和一个共享密钥来对 proxy.py 和
+gae.py 之间的数据进行进一步的混淆。启用这一功能需要在 proxy.ini 中设置
+gae.password，以及 gae.options=rc4，并在 gae.py 中设置
+__password__ 变量。
+
+    https://github.com/goagent/goagent/blob/c4386808ea943e2ebed25f1e5264943354e3f9cb/server/gae/gae.py#L5
+
+但是，这里的 RC4 加密只能起到一个简单的混淆作用，无法在不启用 HTTPS 的情
+况下利用这一功能来防止中间人攻击。GoAgent 中的 RC4 无法实现数据的机密
+性，因为密码本身会通过一个 G-password 头在 proxy.py 和 gae.py 中传
+送，而且在两段通信中会使用同样的密码流（keystream），导致攻击者很容易通
+过密文的 XOR 操作来获得 XOR 过的明文（见流密码的重用问题，Stream Cipher
+Key Reuse），进而得到明文。在这里 RC4 只能起到防止其他 GoAgent 用户共享
+服务端流量的目的，无法提供更多的保护来防止网络攻击。
+
+=== 如何防止风险 ===
+
+确认在 proxy.ini 中设置了 gae.mode=https （默认），并且启用了证书验
+证 gae.validate=1（非默认）。这样的设定基本上能够防止 proxy.py 和
+GAE 服务器，以及 GAE 服务器和网站服务器之间的 HTTPS 中间人攻击。由于
+proxy.py 中没有对证书的主机名进行严格匹配，proxy.py 和 GAE 服务器 的
+通信仍存在（相对较小的）风险，如果有人能够申请到 organizationName 字段以
+“Google ” 开头的证书，仍然能够成功进行HTTPS 中间人攻击。
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+http://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

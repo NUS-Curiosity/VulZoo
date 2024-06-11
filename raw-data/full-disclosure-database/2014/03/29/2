@@ -1,0 +1,156 @@
+
+Date: Sat, 29 Mar 2014 21:06:26 +0100
+From: Jann Horn <jann@...jh.net>
+To: fulldisclosure@...lists.org
+Subject: [FD] PoC: End-to-end correlation for Tor connections using an
+ active timing attack
+
+This is a very simple implementation of an active timing attack on Tor. Please note that
+the Tor developers are aware of issues like this –
+https://blog.torproject.org/blog/one-cell-enough states:
+
+> The Tor design doesn't try to protect against an attacker who can see
+> or measure both traffic going into the Tor network and also traffic
+> coming out of the Tor network.
+> [...]
+> The way we generally explain it is that Tor tries to protect against
+> traffic analysis, where an attacker tries to learn whom to investigate,
+> but Tor can't protect against traffic confirmation (also known as
+> end-to-end correlation), where an attacker tries to confirm a
+> hypothesis by monitoring the right locations in the network and then
+> doing the math.
+
+That page also links to this really scary paper:
+<http://petworkshop.org/2007/papers/PET2007_preproc_Sampled_traffic.pdf>
+
+So, this is a known problem, but I wanted to see how easy it really is to do this,
+and I wanted to try it myself, so I built a PoC.
+
+The requirements are:
+ - The user points his browser to an attacker's webserver and stays on that server
+   long enough (a bit over 4 minutes in my implementation)
+ - An attacker controls the webserver or the exit node (or something between them)
+   (in my implementation, he controls the webserver)
+ - An attacker can measure the internet traffic of all possible users
+ - The attacking machines have their time synced over NTP or so
+
+It is NOT required, however, that the webserver is run by the same attacker who also
+runs the passive traffic analysis near the users – they can be two distinct attackers
+who decide to collaborate after-the-fact. The webserver owner only needs to save the
+64-bit ID he generated, the traffic analysis attacker needs to save one bit every four
+seconds for every connection.
+
+Also, it is NOT required that the victim's browser supports JavaScript or so. curl would
+already be sufficient.
+
+In my implementation, the attacking server can encode 64 bits into a pattern
+of data bursts – simplified, a zero becomes "first data, then nothing" and a one
+becomes "first nothing, then data". The server then sends those data bursts back to
+the client.
+The attacker measures the traffic of all possible users and decodes every TCP data
+stream back into bits using the data burst encoding. Then, he scans all the decoded
+data for the bits he sent to the user to find out which user connected to his server
+through Tor.
+This is really just a simple one-day-project implementation without any sophisticated
+stuff that would probably improve the accuracy and speed a lot.
+
+
+
+===== PoC LINK AND USAGE =====
+My proof-of-concept code is at <http://git.thejh.net/?p=detour.git;a=tree>.
+It needs libpcap and works on Linux. It probably won't work on Windows.
+
+Compile with "./compile.sh".
+On the server, run "./pulser". This will open an HTTP server on port 4422.
+On the monitoring device (just run it on your computer if you just want to
+test it for yourself), run "./pulserecord eth0" as root (replace eth0 with the
+right interface if it's wrong).
+Generate a new bit pattern with "./random_bits" (or anything else).
+In the victim browser that uses Tor, navigate to "http://<your server>/<random bits>".
+After the page has loaded in the victim browser, run
+"./pulsehunter <random bits> | sort -n | tail"
+(with the same bits you used in the browser) on the monitoring device. The number on
+the left side is how many bits matched, the TCP connection data (IPs and ports) is on
+the right side.
+
+
+
+===== TEST RESULTS =====
+So, with my PoC ready, I tried it on myself in three different scenarios:
+
+ - no other traffic over Tor
+ - reading news articles over Tor
+ - watching Youtube videos over Tor (with switching to another video after the first
+   one had buffered completely)
+
+Here are the results.
+
+
+--- DOING NOTHING ---
+$ ./random_bits 
+1010101010110011101101110010110010011101000000000100101000100101
+$ sudo rm out/*
+$ sudo ./pulserecord eth0
+Device: eth0
+^C$ ./pulsehunter 1010101010110011101101110010110010011101000000000100101000100101 | sort -n | tail
+[...]
+64      ***.***.***.***:59254 -> ***.***.***.***:443
+64      ***.***.***.***:443 -> ***.***.***.***:59254
+
+=> All 64 bits correct in both directions – that's a really solid hit.
+
+
+
+--- READING NEWS ARTICLES ---
+$ ./random_bits 
+1100001100001111110101110000101000111110001111010111110011011111
+$ sudo rm out/*
+$ sudo ./pulserecord eth0
+Device: eth0
+^C$ ./pulsehunter 1100001100001111110101110000101000111110001111010111110011011111 | sort -n | tail
+[...]
+60      ***.***.***.***:443 -> ***.***.***.***:59254
+61      ***.***.***.***:59254 -> ***.***.***.***:443
+
+60 bits for incoming Tor, 61 bits for outgoing Tor. How solid is that hit? Let's ask Wolfram Alpha:
+
+http://www.wolframalpha.com/input/?i=p%3D0.5+n%3D64&a=*MC.p%3D0!.5+n%3D64-_*Formula.dflt-&a=FSelect_**BinomialProbabilities-.dflt-&f3=60&f=BinomialProbabilities.x_60&a=*FVarOpt.1-_***BinomialProbabilities.x--.***BinomialProbabilities.l-.*BinomialProbabilities.r---.*--
+
+probability for 61 or more bits to appear at random: 2.331*10^-15
+Wolfram Alpha says there are roughly 1 200 000 000 personal computers on earth (as of 2011)
+1200000000*100*2.331*10^-15 = 0.00028
+
+=> Even if you're monitoring the internet use of every personal PC on earth and every one of those PCs
+   is communicating over 100 connections at the time of interest, you're still usually not going to get
+   any false positives. This is a solid hit.
+
+
+
+--- YOUTUBE ---
+I watched youtube and switched to a new video when the first one finished buffering.
+
+$ ./random_bits 
+0101100100001100011011001001101101110000011110000011100011110000
+$ sudo rm out/*
+$ sudo ./pulserecord eth0
+Device: eth0
+^C$ ./pulsehunter 0101100100001100011011001001101101110000011110000011100011110000 | sort -n | tail
+[...]
+41      ***.***.***.***:40307 -> ***.***.***.***:443
+43      ***.***.***.***:443 -> ***.***.***.***:40307
+
+43 is incoming Tor, 41 is outgoing Tor
+
+http://www.wolframalpha.com/input/?i=p%3D0.5+n%3D64&a=*MC.p%3D0!.5+n%3D64-_*Formula.dflt-&a=FSelect_**BinomialProbabilities-.dflt-&f3=42&f=BinomialProbabilities.x_42&a=*FVarOpt.1-_***BinomialProbabilities.x--.***BinomialProbabilities.l-.*BinomialProbabilities.r---.*--
+
+0.4073% probability for 43 or more bits to appear at random
+
+=> Significant, but if you look at >100 connections, you might well get some false positives.
+
+Download attachment "signature.asc" of type "application/pgp-signature" (837 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+http://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

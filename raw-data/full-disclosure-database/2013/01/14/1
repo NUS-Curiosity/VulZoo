@@ -1,0 +1,420 @@
+
+Date: Sun, 13 Jan 2013 13:01:37 +0100
+From: Security Explorations <contact@...urity-explorations.com>
+To: bugtraq@...urityfocus.com, full-disclosure@...ts.grok.org.uk
+Subject: [SE-2012-01] More details on Issue 32 and
+	Oracle's 'fix' for it
+
+
+Hello All,
+
+We would like to share a few more words regarding the recent Java
+0-day [1] and its relation to our Issue 32 [2]. This is primarily
+done in a response to Immunity Inc. [3] write-up [4] containing
+the analysis we cannot agree with.
+
+We stand in whole by the claims that we've made recently [5]. While
+the post sent to the Bugtraq / Full Disclosure mailing lists was
+a really quick work and it does contain some minor errors, our
+primary point behind the analysis made has not changed a bit.
+The 0-day attack code (in the form found in the wild) would not
+be possible if Issue 32 had been correctly resolved by Oracle in
+Oct 2012 Java SE CPU.
+
+In order to defend our claims, we would like to provide you with
+more detailed information regarding Issue 32 and the fix for it.
+
+As some of you remember Issue 32 was found on Aug 30, 2012, hours
+after Oracle released its out-of-band patch for the 0-day attack
+exploited in the wild [6]. We have published information about
+Issue 32 as part of our SE-2012-01 project disclosure on Nov 16
+2012.
+
+Our technical paper [7] states that at the core of Issue 32 is a
+call to the native invokeExact method of the MethodHandle class
+used from a wrapper invokeWithArguments (page 36). To illustrate
+this we provided a decompiled source code of the vulnerable method,
+which is also illustrated below:
+
+public transient Object invokeWithArguments(Object aobj[])
+      throws Throwable {
+
+      int i = aobj != null ? aobj.length : 0;
+
+      MethodType methodtype = type();
+
+      if (methodtype.parameterCount() != i || isVarargsCollector()) {
+          return 
+asType(MethodType.genericMethodType(i)).invokeWithArguments(aobj);
+      } else {
+          MethodHandle methodhandle = 
+methodtype.invokers().varargsInvoker();
+          return methodhandle.invokeExact(this, aobj);
+      }
+
+The above method contains a vulnerability because it allows to
+call arbitrary methods with a system class (from NULL Class Loader
+namespace) set as a caller class (as seen on the call stack by
+stack walking routines such as Reflection.getCallerClass one).
+Such a condition is dangerous because there are many locations in
+Java SE code that conduct security checks based on the caller of
+the given method. The class that would be visible to the security
+checks would be the one declaring invokeWithArguments method. For
+calls made through invokeWithArguments method this would be the
+java.lang.invoke.MethodHandle class.
+
+On page 37 of our paper we state that the call looked similar to
+the problem related to Core Reflection API and the invoke method
+in particular (arbitrary invoke call done from a system class with
+user provided arguments).
+
+Finally, on page 44 we summarize Issue 32 and provide the following
+description for it:
+  origin: java.lang.invoke.MethodHandle
+  cause:  the possibility to call invokeExact from a system wrapper
+          method
+  impact: bypass of security checks based on the immediate caller
+  type:   complete security bypass vulnerability
+
+That was rather humble description, but should be sufficient taking
+into account our paper describing the nature of Reflection API based
+issues (the reliance on the caller class for all various sorts of
+security checks).
+
+In order to complete the picture and feeling that information provided
+so far is not enough, we decided to publish our original report that
+was sent to Oracle and that described the cause of Issue 32. We have
+made it available for download from here:
+
+http://www.security-explorations.com/materials/SE-2012-01-ORACLE-5.pdf
+
+This report states the following among other things:
+
+"The new weakness has its origin in java.lang.invoke.MethodHandle
+class. It allows to invoke arbitrary (both static and virtual)
+methods with an immediate caller originating in a null class
+loader namespace. The problem stems from the fact that
+invokeWithArguments method of MethodHandle class can be used
+as a wrapper method for the actual invokeExact method invocation.
+Such a wrapper call leads to the additional stack frame of a
+system class being asserted into the call stack, which allows
+to bypass security checks based on the immediate caller of a given
+security sensitive method. Examples, of such methods include
+Reflection API based ones, but also getUnsafe of sun.misc.Unsafe
+class.
+
+The above should serve as a better summary of Issue 32.
+
+Now, let us go into the fix that was implemented by Oracle and
+that tried to address Issue 32.
+
+Oracle decided to detect attempts to acquire MethoHandle objects
+pointing to security sensitive methods that conduct security
+checks based on the caller class. New maybeBindCaller method was
+introduced to the code of MethodHandles.Lookup class. This method
+returns original instance of the target MethodHandle to the caller
+of a corresponding new Reflection API call (findVirtual, findStatic,
+etc.) if either the lookup object is fully trusted or the target
+method is not sensitive. The check for method sensitiveness is
+conducted by isCallerSensitive method of MethodHandleNatives class.
+This is illustrated below:
+
+private MethodHandle maybeBindCaller(MemberName membername, MethodHandle 
+methodhandle)
+     throws IllegalAccessException {
+
+     if (allowedModes == -1 || 
+!MethodHandleNatives.isCallerSensitive(membername))
+         return methodhandle;
+
+     Class class1 = lookupClass;
+
+     if ((allowedModes & 2) == 0) class1 = null;
+
+     MethodHandle methodhandle1 = 
+MethodHandleImpl.bindCaller(methodhandle, class1);
+     methodhandle1 = fixVarargs(methodhandle1, methodhandle);
+     return methodhandle1;
+}
+
+A look at the isCallerSensitive method reveals that sensitive
+caller corresponds to all methods that rely directly / indirectly
+on Reflection.getCallerClass method. This is the reason for many
+core Reflection API methods to be treated as sensitive. But, this
+is not all as there are many more methods in Java SE that rely on
+a caller (class or class loader) prior to making certain security
+decisions. This is the reason for paving the way into the blacklist
+for the following methods (among others) as well:
+- doPrivileged method of AccessController class
+- invoke method of java.lang.reflect.Method class
+- get, getBoolean, getByte, getChar, getShort, getInt, getLong,
+   getFloat, getDouble, set, setBoolean, setByte, setChar, setShort,
+   setInt, setLong, setFloat and setDouble methods of 
+java.lang.reflect.Field
+   class
+- getUnsafe method of sun.misc.Unsafe class
+- ...
+
+Among sensitive methods there is only one coming from new Reflection
+API. This is the lookup method of MethodHandles.Lookup class.
+
+For sensitive methods, instead of returnig DirectMethodHandle
+object, an instance of AdapterMethodHandle is returned as a result
+of a call to findVirtual, findStatic, etc. This is the handle that
+is "bound" to the caller and is used for all security sensitive
+methods detected by isCallerSensitive call.
+
+When such a bound AdapterMethodHandle is used as a base for the
+invokeWithArguments method call, the call to invokeExact is done
+through a trampoline caller class (MethodHandleImpl.BindCaller.T
+class to be precise) defined in a separate Class Loader namespace.
+This is the usual technique for mitigating the risks related to
+insecure Reflection API implementation. Separate stack frame coming
+from a non-null, unprivileged Class Loader namespace is injected
+into the call stack prior to the call to the target method. As a
+result, all security checks are conducted with respect to such an
+unprivileged caller class, not the system caller.
+
+So, what's the problem with Oracle patch for Issue 32 ? This patch
+missed findVirtual, findStatic and other new Reflection API methods
+in its detection process for security sensitive methods that might
+be invoked through invokeWithArguments. The lookup method of the
+MethodHandles.Lookup class was the only method of new Reflection
+API which was blacklisted. It's implementation is provided below:
+
+     public static Lookup lookup()
+     {
+         return new Lookup();
+     }
+
+A look at the constructor of the Lookup class reveals that it
+indeed relies on the caller for security reasons among other
+things:
+
+         Lookup()
+         {
+             this(getCallerClassAtEntryPoint(false), 15);
+             checkUnprivilegedlookupClass(lookupClass);
+         }
+
+
+But, getCallerClassAtEntryPoint method is also invoked by the base
+security check method used by other new Reflection API methods. This
+is accomplished indirectly by the means of checkSecurityManager call:
+
+void checkSecurityManager(Class class1, MemberName membername) {
+     SecurityManager securitymanager = System.getSecurityManager();
+     if (securitymanager == null) return;
+
+     if (allowedModes == -1) return;
+
+     securitymanager.checkMemberAccess(class1, 0);
+
+     Class class2 = (allowedModes & 2) == 0 ?
+                       getCallerClassAtEntryPoint(true) : lookupClass;
+
+     if (!VerifyAccess.classLoaderIsAncestor(lookupClass, class1) ||
+        class2 != lookupClass && 
+!VerifyAccess.classLoaderIsAncestor(class2, class1))
+ 
+securitymanager.checkPackageAccess(VerifyAccess.getPackageName(class1));
+
+     if (membername.isPublic()) return;
+
+     Class class3 = membername.getDeclaringClass();
+
+     securitymanager.checkMemberAccess(class3, 1);
+
+     if (class3 != class1)
+ 
+securitymanager.checkPackageAccess(VerifyAccess.getPackageName(class3));
+}
+
+The above security check makes sure that the caller of findVirtual,
+findStatic, etc. methods comes from same Class Loader namespace as
+the target class upon which a lookup for method / constructor is
+conducted and that it is no different than the namespace of the
+lookupClass object.
+
+The reliance on the caller class for security reasons should result
+in blacklisting all new Reflection API calls that make use of the
+checkSecurityManager method. But, this did not happen.
+
+New Reflection API methods that were missed from being put into the
+blacklist are the following methods of MethodHandles.Lookup class:
+- findStatic
+- findVirtual
+- findConstructor
+- findSpecial
+- findGetter
+- findSetter
+- findStaticGetter
+- findStaticSetter
+- bind
+
+With the background provided above, we are ready to discuss the 0-day
+and its correspondence to Security Explorations' Issue 32.
+
+As it was indicated in our previous post, the 0-day code makes use of
+two vulnerabilities. The MBeanInstantiator issue used for obtaining
+references to restricted classes is a completely new vulnerability.
+
+The other issue makes use of the invokeWithArguments of MethoHandle
+class. This call is used in order to trick the called method (such
+as findVirtual and findConstructor in particular) that the caller
+is trusted. And this is actually the core cause of Issue 32.
+
+The bypassing of the security check in checkSecurityManager method
+happens due to the following:
+1) callerClass is a system class from NULL Class Loader namespace
+    (java.lang.invoke.MethodHandle class asserted into the call stack
+    by invokeWithArguments method, the target MethodHandle is not
+    bound)
+2) lookupClass is a public lookup based on java.lang.Object, it is
+    naturally coming from the same Class Loader namespace as any other
+    system class (such as a restricted class for which a given find
+    call was invoked)
+3) callerClass is from the same Class Loader namespace as as any
+    othe system class (such as a restricted class for which a given find
+    call was invoked)
+
+The key bug used by the recent Java 0-day code relies on exactly the
+same thing as Issue 32 that we reported to Oracle on Aug 31, 2012.
+It exploits the fact that several new Reflection API calls were not
+put into the blacklist even though they rely on the caller class for
+security checks (indirect reliance on Reflection.getCallerClass). If
+these methods were put into the MethodHandleNatives blacklist,
+callerClass would be the dummy class injected into the call stack as
+a result of MethodHandle binding operation. This would further trigger
+the security check inside checkSecurityManager method (a call to
+checkPackageAccess of Security Manager). This call would result in
+a security exception being thrown (access denied to restricted class).
+
+The quick experiment confirms all of the above. We added the following
+code to isCallerSensitive method in order to protect the two find calls
+used in 0-day code from being abused by the invokeWithVirtual method:
+
+         case "findConstructor":
+         case "findVirtual":
+           return defc == java.lang.invoke.MethodHandles.Lookup.class;
+
+The quick patch was applied to the MethodHandleNatives.java file that
+is available inside the jdk1.7.0_10 installation directory (src.zip
+archive with source code).
+
+The patched code was compiled into the following two class files:
+- MethodHandleNatives.class
+- MethodHandleNatives$Constants.class
+
+They had been put into rt.jar file of the JRE lib directory replacing
+the original classes.
+
+We have later conducted an attempt to run the following code fragment
+being part of the 0-day code spotted in the wild:
+
+      Class 
+lookup_class=Class.forName("java.lang.invoke.MethodHandles$Lookup");
+      MethodHandle 
+findconstructor_mh=lookup.findVirtual(lookup_class,"findConstructor",desc);
+
+      System.out.println("findconstructor_mh: 
+"+findconstructor_mh.getClass());
+
+      desc=MethodType.methodType(Void.TYPE);
+
+      MethodHandle 
+constructor_mh=(MethodHandle)findconstructor_mh.invokeWithArguments(lookup,context_class,desc);
+
+On JRE version 1.7.0_10-b18 this produced the following result:
+
+Security manager = sun.plugin2.applet.AWTAppletSecurityManager@...96f
+findconstructor_mh: class java.lang.invoke.AdapterMethodHandle
+java.security.AccessControlException: access denied 
+("java.lang.RuntimePermission" 
+"accessClassInPackage.sun.org.mozilla.javascript.internal")
+	at 
+java.security.AccessControlContext.checkPermission(AccessControlContext.java:366)
+	at 
+java.security.AccessController.checkPermission(AccessController.java:560)
+	at java.lang.SecurityManager.checkPermission(SecurityManager.java:549)
+	at java.lang.SecurityManager.checkPackageAccess(SecurityManager.java:1529)
+	at 
+sun.plugin2.applet.SecurityManagerHelper.checkPackageAccessHelper(Unknown Source)
+	at 
+sun.plugin2.applet.AWTAppletSecurityManager.checkPackageAccess(Unknown 
+Source)
+	at 
+java.lang.invoke.MethodHandles$Lookup.checkSecurityManager(MethodHandles.java:1125)
+	at 
+java.lang.invoke.MethodHandles$Lookup.findConstructor(MethodHandles.java:685)
+	at 
+java.lang.invoke.MethodHandleImpl$BindCaller$T/8717058.invoke_V(MethodHandleImpl.java:1422)
+	at java.lang.invoke.MethodHandle.invokeWithArguments(MethodHandle.java:566)
+	at BlackBox.<init>(BlackBox.java:132)
+
+The above indicates a couple of things:
+- obtained findconstructor_mh MethodHandle is an instance of the class
+   AdapterMethodHandle, this indicated that the handle is "bound" as
+   potentially vulnerable to abuse by invokeWithArguments method call
+- there is an additional class on the stack frame put immediately before
+   the target findConstructor call, this is MethodHandleImpl$BindCaller$T
+   class (dummy trampline class separating trusted caller from a security
+   sensitive method),
+- checkSecurityManager routine now detects that the caller class is not
+   compatible with both the lookup and target classes (their CL namespaces),
+   thus a call to checkPackageAccess is made,
+- Issue 32 and exploit code are both blocked.
+
+In case of no patch, same code fragment above produces the following
+output:
+
+Security manager = sun.plugin2.applet.AWTAppletSecurityManager@...9101
+findconstructor_mh: class java.lang.invoke.DirectMethodHandle
+Security manager = null
+
+This output indicated the lack of protection for findconstructor_mh,
+which makes it vulnerable to the abuse abuse by invokeWithArguments
+method call (a trusted MethodHandle class is seen as a caller by
+the security check routine).
+
+We hope the above analysis clears all doubts regarding our claims and
+the correspondence of Issue 32 to the recent 0-day. We also hope that
+the subtle technical pecularities regarding Issue 32 and Reflection
+API are more clear now to all interested parties.
+
+Thank you.
+
+Best Regards
+Adam Gowdiak
+
+---------------------------------------------
+Security Explorations
+http://www.security-explorations.com
+"We bring security research to the new level"
+---------------------------------------------
+
+References:
+
+[1] Malware don't need Coffee: 0 day 1.7u10 spotted in the Wild - 
+Disable Java Plugin NOW !
+ 
+http://malware.dontneedcoffee.com/2013/01/0-day-17u10-spotted-in-while-disable.html
+[2] [SE-2012-01] New security issue affecting Java SE 7 Update 7
+     http://seclists.org/fulldisclosure/2012/Aug/388
+[3] Immunity Inc
+     http://www.immunityinc.com/
+[4] Esteban Guillardoy "Java MBeanInstantiator.findClass 0Day Analysis"
+ 
+https://partners.immunityinc.com/idocs/Java%20MBeanInstantiator.findClass%200day%20Analysis.pdf
+[5] [SE-2012-01] 'Fix' for Issue 32 exploited by new Java 0-day code
+     http://seclists.org/fulldisclosure/2013/Jan/66
+[6] Zero-Day Season is Not Over Yet
+ 
+http://blog.fireeye.com/research/2012/08/zero-day-season-is-not-over-yet.html#more
+[7] "Security Vulnerabilities in Java SE", technical report
+     http://www.security-explorations.com/materials/se-2012-01-report.pdf
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

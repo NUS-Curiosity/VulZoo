@@ -1,0 +1,191 @@
+
+Date: Fri, 12 Aug 2016 11:20:19 +0200
+From: Hanz Jenson <xnq25hla@...il.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] RCE in Teamspeak 3 server
+
+While auditing the Teamspeak 3 server I've discovered several 0-day
+vulnerabilities which I'll describe in detail in this advisory. They exist in
+the newest version of the server, version 3.0.13.
+
+I found 10 vulnerabilities. Some of these are critical and allow remote code
+execution. For the average user, that means that these vulnerabilities can be
+exploited by a malicious attacker in order to take over any Teamspeak server,
+not only becoming serveradmin, but getting a shell on the affected machine.
+
+Here's the output of an exploit which uses two of the vulnerabilities:
+
+	$ python exploit_teamspeak.py
+	leaking distinct stack pointers
+	 '\xa2'  '\x9a'  '\x8a' . '_' .. '\xa0'
+	got a ptr: 0x7fa29a8a5fa0
+	 '\xa2'  '\x9a'  '\x9a'  'o' ... '\xa0'
+	got a ptr: 0x7fa29a9a6fa0
+	 '\xa2'  '\x9a'  '\xaa' . '\x7f'  '\xa0'
+	got a ptr: 0x7fa29aaa7fa0
+	stack ptr: 0x7fa29a8a5fa0
+	assumed stack base: 0x7fa29a5a5000
+	sleeping a bit to avoid flood detection.......
+	initializing stack sprayers............
+	spraying the stacks............
+	doing some magic.....
+
+	Got a shell from ('127.0.0.1', 38416)
+	ts3@ts3:/home/ts3/teamspeak3-server$
+
+
+I won't release the exploit anytime soon, but I will note that writing one is
+a great learning experience.
+
+
+Next I'll describe my findings. I'll be referring to function names. The
+Teamspeak developers strip their binaries of symbols, but they messed up once
+and forgot to do so.
+
+If you want to follow along at home, I'm sure your favorite search engine can
+help you find the non-stripped server binary.
+
+Now on to the vulns!
+
+
+--- vuln 1: race condition leading to use-after-free ---
+
+The ts3 server is threaded. When accessing objects like a Client or a Channel,
+which can be shared among threads, it's necessary to hold a mutex. However the
+function VirtualServerBase::sendCommandLowPacket drops its mutex before
+accessing a Client object. Here's the vulnerable code:
+
+	0x49d26d:
+	call    _pthread_mutex_unlock
+	mov     rdi, client
+
+	; this will mov rax, [rdi+0F0h]
+	call    Client::getTransmissionReceiveBase(void)
+
+	mov     rcx, [rax]
+	mov     rdx, [rbx+VirtualServer.vsb.vserv_id]
+	mov     rdi, rax
+	mov     rsi, r14
+	call    qword ptr [rcx+58h]
+
+As we can see, the mutex is unlocked and then a TransmissionReceiveBase struct
+is taken out of the Client. Then its vtable is used for a call. Looking at
+the kernel source we see that, at least on Linux, _pthread_mutex_unlock will
+swap out the current thread if there's another thread blocked waiting for the
+mutex.
+
+This other thread could then free the Client and place controlled data on top
+of the freed block. When the first thread runs again, we control the
+TransmissionReceiveBase object completely. The indirect call through its
+vtable allows us to get $pc.
+
+This is one of the vulnerabilities used in the exploit above.
+
+
+--- vuln 2: disclosure of a partially uninitialized stack buffer ---
+
+When a client first connects to the server, it sends over an IV. The IV is
+base64-encoded. The server decodes it in VirtualServerBase::clientInitIV.
+However the server ignores the return value of Crypt::decodeBase64 which is
+the decoded length. Instead it assumes that the length is always 10 bytes.
+
+If the client only encodes e.g. 9 bytes and sends them over, one byte of the
+IV will be uninitialized. The client can guess this byte. Only a correct guess
+will prevent later cryptographic operations from failing. Thus the client can
+deduce the byte. It can repeat the process, sending over only 8 bytes, etc.
+This lets us do a byte-at-a-time leak from the stack.
+
+Specifically it lets us leak a stack pointer, beating ASLR. This was used in
+the exploit above.
+
+
+--- vuln 3: disclosure of heap memory ---
+
+The ts3 server compresses command packets with the "qlz" library. However a
+known vulnerability resides in one of the older versions of this library.
+This was already fixed in the newest qlz release (a beta release). However the
+ts3 server uses an older version of this library.
+
+The vulnerability is described here:
+
+	http://blog.frama-c.com/index.php?post/2011/04/05/QuickLZ-1
+
+But it's straightforward to find for anyone looking at qlz's source code. You
+don't need any fancy "software analyzer" to find it, like in that silly blog
+post.
+
+The vulnerability is qlz-specific and essentially allows you to "decompress"
+data, but much of the decompressed data is actually uninitialized.
+
+Why is this a problem for the ts3 server? Because we can send a short
+compressed command packet over which starts with "some_command return_code=".
+When we use this vuln and the packet is decompressed, the following bytes will
+be included in the packet. So the packet that ts3 sees is "some_command
+return_code=<bytes from the heap>".
+
+Since the return_code parameter is reflected back to us, this lets us leak
+data from the heap.
+
+
+-----
+
+Those three vulnerabilities were the critical ones. Below I'll briefly
+describe some minor ones, resulting in DoS or more interesting things.
+
+
+
+
+--- vuln 4: check if any file exists on the server ---
+
+The function VirtualServer::getpermission_fileTransferInitDownload accepts a
+path from the client and gives different error messages depending on whether
+the file exists or not.
+
+For example using "/../../../etc/passwd" gives "bad path" while
+"/../../../etc/passwz" gives "no such file". This can be used to determine the
+remote OS and installed software, enumerate open fds, etc.
+
+
+--- vulns 5, 6, 7, 8: race conditions galore ---
+
+The function PermissionManager::getChannelGroupInherited looks up and uses a
+Channel struct without holding any mutex. The channel is only used to look up
+a channelid, so this is an infoleak/DoS at best.
+
+In the function VirtualServer::sendRemoteDebuggingInfo we look up a Client
+struct, then drop the mutex, and then we proceed to use the Client to look up
+its uuid. Again this is an infoleak/DoS at best.
+
+In ServerParser::cmd_permget we look up a Client without holding any mutex.
+
+In ServerParser::cmd_clientsetserverquerylogin we do the same.
+
+
+--- vuln 9: ParameterParser index-out-of-bounds DoS ---
+
+In PacketHandler::inINITPacket_SolvePuzzle we initialize a ParameterParser. It
+keeps a vector of parameters. Later, in ServerParser::inPacket, we call
+ParameterParser::getParam to get the parameter at index 0. However it's
+possible to send just the string " " which will result in the ParameterParser
+vector having zero entries. Then this zero-indexing will go out of bounds.
+
+This is unfortunately a DoS at best since the retrieved parameter is just
+compared against "clientinitiv", which isn't terribly useful.
+
+
+--- vuln 10: double clientinit DoS ---
+
+If we run the "clientinit" command twice, the server crashes with a failed
+assertion.
+
+
+
+Advisory by:
+ff214370685e536b9ee021c7ff6b7680bfbe6008bc29f87511b6b90256043536
+
+Original advisory at: pastebin.com/raw/MGsWnTd0
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

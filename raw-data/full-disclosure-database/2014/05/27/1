@@ -1,0 +1,591 @@
+
+Date: Mon, 26 May 2014 20:43:37 -0300
+From: Felipe Daragon <felipe@...unt.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Lua Web Application Security Vulnerabilities
+
+LUA WEB APPLICATION SECURITY VULNERABILITIES
+
+Auditing and Defending Lua-Based Web Applications
+By Felipe Daragon - May 26, 2014
+
+This paper intends to highlight the risk of unvalidated input in
+Lua-based web applications.
+
+Some time ago I wrote about how to detect NoSQL and server-side
+JavaScript (SSJS) injection vulnerabilities using time-based techniques.
+JavaScript is still rising and becoming more popular as a platform for
+server-side code 
+(http://www.techworld.com.au/article/536950/rise_rise_javascript/).
+
+This time I want to cover security aspects of another language/framework
+that is being increasingly adopted for web development and that has a
+lot of potential: Lua.
+
+Lua is a powerful language useful for experienced programmers but
+considered easy for inexperienced programmers at the same time. While
+Lua has been mostly used for game development, there exists a growing
+ecosystem of Lua web applications and frameworks. Mature web servers,
+like Apache & Nginx, are the prefered choice for many that are creating
+or thinking about creating their first Lua-based web applications -
+together they account for over 70% of the world's web servers and are
+solid choices to start. Alternative, pioneer Lua web programming tools
+like CGILua have been around for a while. CGILua runs on top of Apache
+or any CGI-enabled web server.
+
+At Syhunt, we've been using Lua for quite some time as part of our web
+application security tools and a primary scripting language, and
+recently we started using internally the Lua modules for the Apache and
+Nginx web servers, known as mod_lua and ngx_lua respectively. I decided
+to check myself how insecurely coded Lua web applications could be
+targeted and how easily the servers in question could be compromised.
+To perform the tests, I created a small collection of insecure web
+applications with input validations issues tailored to each web server
+software.
+
+THE RESULTS
+
+My simulations covered File System Attacks, Cross-Site Scripting (XSS),
+Local File Inclusion (LFI), OS Command Injection, SQL Injection, Lua
+Code Injection, CRLF Injection and other top vulnerability classes. I
+found no way to perform Remote File Inclusion attacks like in PHP, but
+Lua (at the current state) fails to thwart some attacks that are only
+possible in older PHP versions. When Lua Pages was available, Log
+Poisoning was successfully used to upgrade a LFI vulnerability to remote
+command execution. Time-based techniques were used to spot Lua Code
+Injection vulnerabilities, and SQL Injection vulnerabilities, which then
+were used to upload a Lua web shell (backdoor) to the web servers
+hosting the vulnerable web applications.
+
+Coding securely is hard, even for experienced programmers, no matter the
+programming language you use. If you are a web developer working with
+Lua, it is highly recommended that you learn about the coding mistakes
+that impact security and give rise to these vulnerabilities. This paper
+will go through the most common and important ones. If, instead, you are
+a pen-tester tasked with securing a website that is using Lua, this
+paper may be equally useful to you.
+
+This paper demonstrates that skilled and even unskilled attackers can
+take deep advantage of the weaknesses listed above, and quickly uncover
+the flaws using automated methods. At the end you will also find some
+tips for hardening the web server configuration.
+
+CROSS-SITE SCRIPTING (XSS)
+
+One of the most common vulnerabilities in today's web applications, XSS
+attacks (CWE-79) can be used to hijack user sessions, conduct phishing
+attacks, execute malicious code in the context of the user's session,
+spread malware and more. There are different types of XSS, such as
+reflected (shown in the examples above) and stored on the server (eg in
+a database). To prevent XSS attacks, escape user-supplied data on output
+or validate user input.
+
+Print functions
+mod_lua: r:puts(), r:write()
+ngx_lua: ngx.say(), ngx.print()
+CGILua: cgilua.put(), cgilua.print(), <?=somevar?>
+
+Vulnerable code examples:
+
+     -- /vulnerable.lua?name=<script>alert('XSS');</script>
+     -- Apache & mod_lua
+     function handle(r)
+      local name = r:parseargs().name or ""
+      r:puts(name)
+     end
+
+     -- Nginx & ngx_lua
+     local name = ngx.req.get_uri_args().name or ""
+     ngx.header.content_type = "text/html"
+     ngx.say(name)
+
+     -- CGILua
+     local name = cgilua.QUERY.name or ""
+     cgilua.htmlheader()
+     cgilua.put(name)
+
+Solution
+
+     local name = ngx.req.get_uri_args().name or ""
+     name = htmlescape(name) -- see an example at the end of this paper
+     ngx.header.content_type = "text/html"
+     ngx.say(name)
+
+SQL INJECTION
+
+SQL Injection attacks (CWE-89) are used by bad guys to steal information,
+add or change information in a database, shut down access to a web
+application, bypass authentication, execute arbitrary commands, among
+other things. SQL Injection attacks can be effectively mitigated by
+using strong input validation.
+
+In Lua, the LuaSQL library allows web applications to connect to Oracle,
+MySQL, SQLite, PostgreSQL and other databases and execute SQL
+statements. mod_lua comes with it's own built-in database API for
+running commands on MySQL, PostgreSQL, SQLite, Oracle and other
+databases. Whichever option you choose for running SQL commands, be
+careful with user supplied input and use input validation.
+
+The mod_lua documentation recommends the use of prepared statements
+whenever possible as a way to minimize the risk of SQL injection
+attacks. See the notes about precautions when working with databases at:
+http://www.modlua.org/api/database#database_caveat
+
+SQL execution functions
+LuaSQL's conn:execute()
+mod_lua's DB API: db:query(), ... (see http://www.modlua.org/api/database)
+
+Vulnerable code example:
+
+
+     -- mod_lua DB API
+     function handle(r)
+         r.content_type = "text/html"
+         local username = r:parseargs().username or ""
+         local database, err = r:dbacquire("mysql", 
+"host=localhost,user=user,pass=,dbname=dbname")
+         if not err then
+            local sl = 'SELECT * FROM users WHERE username="'..username..'"'
+            local results, err = database:query(r,sl)
+            -- (...)
+            database:close()
+         else
+            r:puts("Could not connect to the database: " .. err)
+         end
+     end
+
+     -- CGILua & LuaSQL
+     -- /vulnerable.lua?name=John');SQLBELOW
+     -- /shell.lp?cmd=dir
+     cgilua.htmlheader()
+     local sqlite3 = require "luasql.sqlite3"
+     local name = cgilua.QUERY.name
+     local env  = sqlite3.sqlite3()
+     local conn = env:connect('mydb.sqlite')
+     local sql = [[
+     CREATE TABLE sample ('id' INTEGER, 'name' TEXT);
+     INSERT INTO sample values('1','%s')
+     ]]
+     sql = string.format(sql, name)
+     for l in string.gmatch(sql, "[^;]+") do
+         conn:execute(l)
+     end
+     -- (...)
+     conn:close()
+     env:close()
+
+     -- SQLLite shell upload example for CGILua
+     -- ATTACH DATABASE 'shell.lp' AS shell;
+     -- CREATE TABLE shell.demo (data TEXT);
+     -- INSERT INTO shell.demo (data) VALUES ('<? 
+os.execute(cgilua.QUERY.cmd) ?>
+
+The example above works with mod_lua and ngx_lua with some minor changes
+if a LP preprocessor extension is enabled, but this is not exclusive of
+SQLLite. All SQL engines can be target of similar attacks. Most commonly
+targeted is MySQL:
+http://www.greensql.com/article/protect-yourself-sqli-attacks-create-backdoor-web-server-using-mysql
+
+FILESYSTEM ATTACKS
+
+In some environments, Lua filesystem functions accept parameters
+containing null bytes (%00), but do not handle them correctly, treating
+the null byte character as string terminator and ignoring all following
+characters. The reason is that Lua itself, like PHP, is programmed in C
+and relies on the operating system's filesystem functions (see PHP Null
+Byte Poisoning http://www.madirish.net/?article=436 and
+http://www.php.net/manual/en/security.filesystem.nullbytes.php).
+
+Keep this in mind when dealing with user input, especially when passing
+it to filesystem functions.
+
+File system functions
+
+Lua's io library: io.open(), ...
+LuaFileSystem (lfs) library functions - 
+http://keplerproject.github.io/luafilesystem/manual.html
+mod_lua: r:mkdir(), r:mkrdir(), r:rmdir(), r:sendfile(), r:touch(), etc
+
+Vulnerable example:
+
+     -- Nginx & ngx_lua
+     -- /vulnerable.lua?file=/etc/passwd%00
+     -- /vulnerable.lua?file=c:\boot.ini%00
+     ngx.header.content_type = "text/html"
+     local file = ngx.req.get_uri_args().file or ""
+     local f = io.open(file..".txt")
+     local result = f:read("*a")
+     f:close()
+     ngx.say(result)
+
+An effective solution to thwart these kinds of attacks is to avoid
+passing user submitted input to any filesystem API.
+
+LOCAL FILE INCLUSION (LFI)
+
+Regularly underestimated both by penetration testers and developers,
+Local File Inclusion vulnerabilities are commonly exploited by attackers
+to cause source code disclosure or to gain command execution through log
+poisoning and other methods.
+
+Include and similar functions
+
+Lua's require(), dofile()
+CGILua: cgilua.handlelp(), cgilua.lp.include(), cgilua.doif(), 
+cgilua.doscript()
+
+Vulnerable examples:
+
+     -- CGILua
+     -- /vulnerable.lua?prod=/var/log/apache/access_log%00
+     -- after sending request with user-agent "<? 
+os.execute(cgilua.QUERY.cmd) ?>"
+     local prod = cgilua.QUERY.prod or ""
+     cgilua.htmlheader()
+     cgilua.lp.include(prod..".lp")
+
+     -- CGILua (2)
+     -- /vulnerable.lua?prod=/var/log/apache/access_log%00
+     local prod = cgilua.QUERY.prod or ""
+     cgilua.handlelp(prod..".lp")
+
+     -- CGILua (3)
+     -- /vulnerable.lua?prod=somefile.lua%00
+     local prod = cgilua.QUERY.prod or ""
+     cgilua.htmlheader()
+     cgilua.doif(prod..".lua")
+
+LUA CODE INJECTION
+
+This type of vulnerability (known as CWE-94) occurs when a developer
+uses the Lua loadstring() function and passes it untrusted data that an
+attacker can modify. The loadstring() function will compile the code and
+return a function that when called has the same effect as executing the
+string. Attackers can use this to inject arbitraty Lua code that is then
+executed by the web application.
+
+Time-based detection methods
+
+Using Lua code:
+     /vulnerable.lua?name=John")%20c%3Dos.clock t%3Dc() while c()- 
+t<%3D3 do end%20x%3D("`
+
+Using LuaSocket:
+/vulnerable.lua?name=John")%20require"socket".select(nil,nil,3)%20x%3D("
+
+Using the sleep function (ngx_lua only):
+     /vulnerable.lua?name=John")%20ngx.sleep(10)%20x%3D("
+
+Using LuaJIT's FFI:
+     /vulnerable.lua?name=John")%20
+ffi%3Drequire"ffi"%20ffi.cdef%20"unsigned%20int%20sleep(unsigned%20int 
+seconds);
+     "%20ffi.C.sleep(10)%20x%3D("
+
+Vulnerable code examples:
+
+     -- ngx_lua
+     -- /vulnerable.lua?name=John")%20os.execute("notepad.exe
+     local name = ngx.req.get_uri_args().name or ""
+     ngx.header.content_type = "text/html"
+     local html = string.format([[
+      ngx.say("Hello, %s")
+      ngx.say("Today is "..os.date())
+     ]], name)
+     loadstring(html)()
+
+     -- CGILua
+     -- /vulnerable.lua?name=<? os.execute('ls -la') ?>
+     -- /vulnerable.lua?name=<? os.execute('dir') ?>
+     -- Print the source of the vulnerable script:
+     -- /vulnerable.lua?name=<? 
+cgilua.put(io.open(cgilua.script_path):read('*a')) ?>
+     local name = cgilua.QUERY.name or ""
+     cgilua.htmlheader()
+     local html = string.format([[
+     <html>
+     <body>
+     Hello, %s!
+     Today is <?=os.date()?>
+     </body>
+     </html>
+     ]], name)
+     html = cgilua.lp.translate(html)
+     loadstring(html)()
+
+SESSION MANAGEMENT ISSUES
+
+This is another area that web developers often overlook. When not
+properly implemented can lead to attackers hijacking active sessions.
+This is an aspect that CGILua for example has gotten wrong - it
+generates 9-digit session IDs based on OS time and older releases
+generate sequential, non-random IDs. In our attack simulations against a
+vulnerable CGILua-based web application, we were able to guess valid
+session IDs extremely quickly through brute-force attacks. I wrote more
+about this vulnerability at:
+http://www.syhunt.com/?n=Advisories.Cgilua-weaksessionid
+
+When performing a code review or penetration test, a special attention
+must be given to how session identifiers are generated and handled, and
+to the methods used for changing user credentials. Some tools, like the
+Burp Sequencer, can highlight anomalies in the generation of session
+IDs.
+
+If you are cooking up your own session library, you should use the
+standard methods that already exist, instead of making your own.
+Consider using the luuid library, which generates 128-bit random IDs
+(using /dev/urandom), or any other Lua library that can generate unique
+IDs based on high-quality randomness. You can also ask in the mod_lua or
+ngx_lua forums - take this email as an example:
+https://groups.google.com/forum/#!topic/openresty/iGdgYxd6A64
+
+Chances are that the Lua module developers or someone is already using a
+secure session ID generator.
+
+openssl_random_pseudo_bytes() is also available through lua-openssl
+(https://github.com/zhaozg/lua-openssl). Because of the recent OpenSSL
+security issues, you might prefer to stay away from it, or not. See this
+pre-Heartbleed post by timoh6 to understand why:
+http://timoh6.github.io/2013/11/05/Secure-random-numbers-for-PHP-developers.html
+
+The Lua's math.random(), like PHP's rand() function, uses the underlying
+C library's rand function and is a truly weak random number generator.
+Because it is cryptographically insecure (see
+http://en.wikipedia.org/wiki/Cryptographically_secure_pseudorandom_number_generator),
+it isn't suitable for token generation.
+
+The OWASP has a very good article about best practices for session
+management, which I recommend reading:
+https://www.owasp.org/index.php/Session_Management_Cheat_Sheet#Session_ID_Length
+
+For a deeper dive on this subject, see also:
+http://phpsecurity.readthedocs.org/en/latest/Insufficient-Entropy-For-Random-Values.html
+
+INSECURE PASSWORD HASHING
+
+When hashing the passwords, use salt and avoid the MD5 and SHA1
+functions that come with the Lua modules. MD5 and SHA1 are vulnerable to
+collision attack, and are too fast to compute and prevent brute force
+(even SHA512 is too fast). Consider slow hashing such as PBKDF2, bcrypt
+or scrypt.
+
+Here are two excellent articles about hashing issues by CodingHorror:
+http://blog.codinghorror.com/speed-hashing/
+http://blog.codinghorror.com/rainbow-hash-cracking/
+
+OS COMMAND INJECTION
+
+OS command injection flaws (CWE-78) allow attackers to run arbitrary
+commands on the remote server. Because a command injection vulnerability
+may lead to compromise of the server hosting the web application, it is
+often considered a very serious flaw. In Lua, this kind of vulnerability
+occurs, for example, when a developer uses unvalidated user data to run
+operating system commands via the os.execute() or io.popen() Lua
+functions.
+
+Vulnerable code examples:
+
+     -- /vulnerable.lua?user=demo%20|%20dir%20c:\
+     -- mod_lua
+     function handle(r)
+      local user = r:parseargs().user or ""
+      local handle = io.popen("dir "..user)
+      local result = handle:read("*a")
+      handle:close()
+      r:puts(result)
+     end
+     -- mod_lua (2)
+     function handle(r)
+      local user = r:parseargs().user or ""
+      os.execute("ls -l /home/"..user)
+     end
+
+     -- ngx_lua
+     ngx.header.content_type = "text/plain"
+     local user = ngx.req.get_uri_args().user or ""
+     local handle = io.popen("ls -l /home/"..user)
+     local result = handle:read("*a")
+     handle:close()
+     ngx.say(result)
+
+CRLF INJECTION
+
+CRLF injection (CWE-93) is a technique that allows attackers to control
+HTTP response headers. It is fairly simple, but extremely powerful and
+may allow an attacker to perform a myriad of attacks including XSS. Once
+again, sanitizing user input before using it in headers prevents a
+successful attack.
+
+Note: Apache HTTPd/mod_lua 2.4.10 (TBA) adds protection against this
+attack. For more details, see
+http://www.mail-archive.com/dev@httpd.apache.org/msg59607.html
+
+I also contacted the ngx_lua developer, who is considering adding the
+same kind of enhancement in future ngx_lua releases.
+
+Header and redirect functions/tables
+
+mod_lua: r.headers_out[]
+ngx_lua: ngx.redirect(), ngx.header[]
+CGILua: cgilua.redirect(), cgilua.header()
+
+Vulnerable code examples:
+
+     -- mod_lua
+     -- /vulnerable.lua?user=demo%0d%0aNew-Header:SomeValue
+     -- /vulnerable.lua?user=%0d%0a%0d%0a<script>alert('XSS')</script>
+     function handle(r)
+      local user = r:parseargs().user or ""
+      r.content_type = "text/html"
+      r.headers_out['X-Test'] = user
+      r:puts('Some text')
+      return apache2.OK
+     end
+
+     -- ngx_lua
+     -- /vulnerable.lua?name=%0d%0aNewHeader:Value
+     local name = ngx.req.get_uri_args().name or ""
+     ngx.header.content_type = "text/html"
+     ngx.redirect("http://www.somehost.com/"..name)
+
+     -- ngx_lua (2)
+     -- /vulnerable.lua?user=test%0d%0aNewHeader:Value
+     local user = ngx.req.get_uri_args().user or ""
+     ngx.header['X-Test'] = user
+     ngx.say('Some text')
+
+     -- CGILua
+     -- /vulnerable.lua?url=http://someurl%0d%0aNew-Header:SomeValue
+     local url = cgilua.QUERY.url or ""
+     cgilua.redirect(url)
+
+     -- CGILua (2)
+     -- /vulnerable.lua?demo=test%0d%0aLocation:http://www.somehost.com
+     local demo = cgilua.QUERY.demo or ""
+     cgilua.header('X-Test',demo)
+     cgilua.htmlheader()
+
+MAN IN THE MIDDLE (MITM)
+
+Man In The Middle attacks are an evolving threat and happen when an
+attacker manages to put himself into your traffic stream, where he can
+alter or intercept data.
+
+If you wish to protect users from man-in-the-middle attack scenarios:
+
+Deploy HTTPS and set the HTTP Strict Transport Security Header
+(http://dev.chromium.org/sts), and the secure flag on all cookies to
+reduce this risk.
+
+Adopt a TLS/SSL ciphersuite that supports Forward Secrecy - more about
+this at:
+https://community.qualys.com/blogs/securitylabs/2013/08/05/configuring-apache-nginx-and-openssl-for-forward-secrecy)
+
+This will make compromised private keys unable to decrypt past
+communications.
+
+Keep your server software and Lua libraries up-to-date with the latest
+security fixes.
+
+Installing Lua Libraries Over HTTPS
+
+I discussed with the LuaRocks developer about the possibility of an
+attacker injecting malicious Lua code in the legit Lua packages using
+MITM. LuaRocks and its alternatives have not been designed to defend
+against MITM attacks. When installing or updating Lua modules through
+these systems, in case you worry about this possibility, you can try to
+use the GitHub mirror to download the Lua modules over SSL. To
+achievethis, you can invoke the luarocks command using, for example, the
+following parameters:
+
+     luarocks install 
+--only-server=https://raw.github.com/keplerproject/rocks/master/ luasocket
+
+Because most rockspec files point to URLs beginning with https, this
+method will greatly minimize this risk.
+
+VALIDATING USER INPUT
+
+SQL Injection, Code Injection, Command Injection and XSS can be
+effectively mitigated by using strong input validation. Most user input
+will come from:
+
+mod_lua: r:parseargs(), r:parsebody()
+ngx_lua: ngx.req.get_uri_args(), ngx.req.get_post_args()
+CGILua: cgilua.POST, cgilua.QUERY
+
+In Lua, like in other programming languages, validation bypass is likely
+going to happen because of weak patterns used in pattern-matching
+functions, such as string.match(). In ngx_lua, there is ngx.re.gmatch(),
+and ngx.re.match(), which allows to work with PCRE expressions. With
+mod_lua, expression parsing functions like r:strcmp_match(), r:expr()
+and r:regex() can also be used. Developers should pay special attention
+when crafting patterns to match strings, because otherwise they may be
+bypassed by experienced attackers. A simple validation bypass example:
+
+     -- /vulnerable.lua?email=john@...edomain.com
+     -- /vulnerable.lua?email=<script>alert('john@...edomain.com 
+XSS')</script>
+     local email = ngx.req.get_uri_args().email or ""
+     ngx.header.content_type = "text/html"
+     if email:match("[A-Za-z0-9%.%%%+%-]+@[A-Za-z0-9%.%%%+%-]+%.%w%w+") then
+        ngx.say(email)
+     end
+
+HTML Escape example
+
+function htmlescape(text)
+  local special = { ['<']='<', ['>']='>', ['&']='&', ['"']='&quot;' }
+  return text:gsub('[<>&"]', special)
+end
+
+Be sure to check the valua project (https://github.com/Etiene/valua), a
+recently released library for performing input validation, and
+http://sputnik.freewisdom.org/lib/xssfilter/ (I still have to check it
+thoroughly)
+
+HARDENING THE SERVER CONFIGURATION
+
+In Apache/mod_lua, make sure you limit the scope of the SetHandler
+directive by using the FilesMatch directive:
+
+     <FilesMatch "\.lua$">
+       SetHandler lua-script
+     </FilesMatch>
+
+This will prevent "test.lua.foo" to execute as a Lua script.
+Tighten your security by making sure you have PCRE strings that
+perfectly match the Lua extensions. Example:
+
+     LuaMapHandler "\.lp$"
+     versus
+     LuaMapHandler .lp$
+
+The first regular expression example will match .lp, while the second
+example will match ulp, xlp, .lp, !lp etc, making your configuration
+less secure and restrictive.
+
+ASK IN THE FORUMS
+
+Behind the Lua modules are experienced programmers - mod_lua is
+maintained by Daniel Gruno (member of the Apache Software Foundation),
+and ngx_lua maintained by Yichun Zhang (CloudFlare). They have been
+putting a lot of energy into enhancing the core of the Lua modules,
+their performance and stability, and adding new features, and are very
+much open to questions, bug reports, and contributions of all kinds.
+
+------------------------------------------------------------------------
+
+Copyright © 2014 Syhunt Security
+
+Disclaimer: The information in this advisory is provided "as is" without
+warranty of any kind. Details provided are strictly for educational and
+defensive purposes.
+
+Syhunt is not liable for any damages caused by direct or indirect use of
+the information provided by this paper.
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+http://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

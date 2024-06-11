@@ -135,6 +135,10 @@ def download_messages(msg_links, interval=5, print_result=sys.stdout):
             for date, msg_num in msg_links[year][month]:
                 print(f"[*] Fetching message for {year}/{month}/{date}", file=sys.stderr)
                 for i in range(1, msg_num+1):
+                    # check whether the message is already downloaded
+                    if os.path.exists(f"{dest_dir}/{year}/{month}/{date}/{i}"):
+                        print(f"[+] Message {year}/{month}/{date}/{i} already exists", file=sys.stderr)
+                        continue
                     url = f"{full_disclosure_url}/{year}/{month}/{date}/{i}"
                     msg = fetch_msg(url)
                     if msg:
@@ -223,25 +227,29 @@ if __name__ == '__main__':
         # check whether the link index file exists
         # if it does, load the links from the file and calculate the delta
         # otherwise, fetch the links from the website
-        if os.path.exists(link_index):
+        if os.path.exists(link_index):                
             print(f"[*] {link_index} found, loading links from the file", file=sys.stderr)
             with open(link_index, 'r') as f:
                 msg_links = json.load(f)
-            print(f"[*] Calculating the delta between local and online full-disclosure database", file=sys.stderr)
-            delta, lly, llm, lld = get_delta(msg_links, full_disclosure_url, interval=1)
-            # update the msg_links and save it to the file
-            if delta:
-                print(f"[!] {link_index} is outdated, updating the link index", file=sys.stderr)
-                update_index_with_delta(msg_links, delta, lly, llm, lld)
+            if len(sys.argv) > 1 and sys.argv[1] == '--reuse-index':
+                print("[+] Reusing the link index", file=sys.stderr)
+                delta = msg_links
+            else:
+                print(f"[*] Calculating the delta between local and online full-disclosure database", file=sys.stderr)
+                delta, lly, llm, lld = get_delta(msg_links, full_disclosure_url, interval=1)
+                # update the msg_links and save it to the file
+                if delta:
+                    print(f"[!] {link_index} is outdated, updating the link index", file=sys.stderr)
+                    update_index_with_delta(msg_links, delta, lly, llm, lld)
         else:
             print(f"[!] {link_index} not found, fetching links from the website", file=sys.stderr)
             with open(link_index, 'w') as f:
-                msg_links = fetch_msg_links(full_disclosure_url, interval=5, print_result=sys.stdout)
+                msg_links = fetch_msg_links(full_disclosure_url, interval=3, print_result=sys.stdout)
                 f.write(json.dumps(msg_links))
             delta = msg_links
         # downloading the messages
         if delta:
-            download_messages(delta, interval=5, print_result=sys.stdout)
+            download_messages(delta, interval=3, print_result=sys.stdout)
         else:
             print("[+] full-disclosure database is up-to-date", file=sys.stderr)
     except KeyboardInterrupt:

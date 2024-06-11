@@ -1,0 +1,373 @@
+
+Date: Mon, 21 Oct 2013 02:08:35 +0900
+From: x90c <geinblues@...il.com>
+To: full-disclosure@...ts.grok.org.uk
+Subject: [Article] The Internal of Reloc .text
+
+  The Internal of Reloc .text
+
+                                    ___    ___
+                                   / _ \  / _ \
+                            __  __| (_) || | | |  ___
+                            \ \/ / \__. || | | | / __|
+                             >  <    / / | |_| || (__
+                            /_/\_\  /_/   \___/  \___|
+
+
+
+[toc]
+
+        ----[ 1. Intro
+
+        ----[ 2. The Relocation Start
+
+        --------[ 2.1 Call path of the _dl_relocate_object()
+
+        --------[ 2.2 The Process of .text reloc
+
+        ------------[ 2.2.1 The start of the _dl_relocate_object()
+
+        ------------[ 2.2.2 The .text section relocation start
+
+        ------------[ 2.2.3 The real reloc start
+
+        ------------[ 2.2.4 After complete reloc
+
+        ----[ 3. Underground Hacker Scene of south korea In 2013
+
+        ----[ 4. Conclusion
+
+        ----[ 5. References
+
+        ----[ 6. Greets
+
+
+----[ 1. Intro
+
+The article explains the process of .text section's
+relocation after passing the link_map object. The
+_dl_relocate_object() In elf/dl-reloc.c, Internal
+function did it.
+
+The link_map object is used for teh relocation
+of the rtld. It's related with dynamic linking
+of the shared objects. dynamic linked objects's
+Informations on link_map objects.
+
+
+----[ 2. The Relocation Start
+
+
+----[ 2.1 Call path of the _dl_relocate_object()
+
+First of all, see the _dl_relocate_object's
+call path and calling codes. The main function
+of rtld, dl_main() called relocate_doit() and
+the function will called elf/dl-reloc.c::_dl
+_relocate_object() that external function of
+elf/rtld.c.
+
+As you can see In The mayhem's article[1] the
+call path to enter rtld main function of
+dl_main related with the linux kernel.
+The linux kernel called rtld.
+
+
+First, See the codes.
+
+The codes In elf/rtld.c:
+
+----snip----snip----snip----snip----snip----snip----snip----snip----
+
+static void relocate_doit (void *a)
+{
+  struct relocate_args *args = (struct relocate_args *) a;
+
+  // (2) do relocation! (third argument passed lazy bind option)
+  _dl_relocate_object (args->l, args->l->l_scope, args->lazy, 0);
+}
+
+...
+
+static void
+dl_main (const ElfW(Phdr) *phdr,	// rtld's main function.
+	 ElfW(Word) phnum,
+	 ElfW(Addr) *user_entry)
+{
+
+...
+
+  // (1) relocate_doit() called!
+  _dl_receive_error (print_unresolved, relocate_doit, &args);
+
+...
+
+}
+
+----snip----snip----snip----snip----snip----snip----snip----snip----
+
+
+Before mentioned, fs/binfmt_elf.c::load_elf_binary()
+binary handler function In the linux kernel tree
+called _dl_start() entry point In elf/rtld.c. In
+other words the linux kernel called _dl_start
+on from the kernelland to enter the rtld on the
+userland.
+
+
+The next, See the call path of to _dl_relocate_object().
+
+
+The _dl_relocate_object()'s call path:
+----
+
++linux kernel/fs/binfmt_elf.c::load_elf_binary() // from linux kernel.
+
+ +-> sysdeps/i386/dl-machine.h::RTLD_START(%esp)
+
+  -> elf/rtld.c::_dl_start(void *arg) <- to Entry Point.(not RTLD_START)
+
+   -> elf/rtld.c::_dl_start_final(void *arg)
+
+    -> elf/dl-sysdep.c::_dl_sysdep_start(arg, &dl_main)
+
+     -> elf/rtld.c::dl_main(phdr, phnum, &user_entry)
+      |
+      +-> elf/rtld.c::relocate_doit(void *a)
+
+         -> elf/dl-reloc.c::_dl_relocate_object() // <- do relocation!
+
+----
+
+
+----[ 2.2 The Process of .text reloc
+
+I explains the process of relocation of .text section
+with the text relocs, .text_rel section. .text section
+is the same with the code segment in The ELF. _start
+main functions on it.
+
+The Relocation needed for the shared objects as like
+the shared libraries that Dynamic Linking.
+
+
+----[ 2.2.1 The start of the _dl_relocate_object()
+
+
+  (1) Profiling enabled?
+     ----
+     consider_profiling |= GLRO(dl_audit) != NULL;	
+     ----
+
+     GLRO(dl_audit) flag added consider_profiling
+     variable. The dl_audit variable for profiling
+     flag.
+
+  (2) Already relocated object?
+    ----
+    if (l->l_relocated)
+        return;
+    ----
+
+    l->l_relocated(already relocated?) is 1
+    return with no return value.
+
+  (3) Disable lazy binding?
+      lazy binding control with $LD_BIND_NOW environment.
+    ----
+    if (!consider_profiling &&
+    __builtin_expect (l->l_info[DT_BIND_NOW] != NULL, 0))
+    lazy = 0; // to use runtime bind.
+    ----
+
+    consider_profiling == 0(no profiling), If $LD_BIND_NOW
+    environment value exists caused l->l_info[DT_BIND_NOW]
+    exists. Set lazy variable as 0 to disable "Lazy Binding".
+
+
+----[ 2.2.2 The .text section relocation start
+
+If .text_rel relocation section loaded on the
+rtld from an ELF object, the dynamic linker
+entered the process of relocation of .text
+section. and If no .text_rel sets l->l_relocated
+as 1 that means the object relocated. In other
+words, no .text section In ELF object can be
+run on the rtld.
+
+First, Prepared process get a new textrels struct
+and the next will be started real reloc process.
+
+
+Get a new textrels struct:
+
+  (4) .text section no PF_W? Malloc'd textrels struct!
+    ----
+    if (__builtin_expect (l->l_info[DT_TEXTREL] != NULL, 0))
+    {
+    ...
+      const ElfW(Phdr) *ph;
+
+      /*
+	 scan ph = l->l_phdr(link_map's program header)
+       */
+      for (ph = l->l_phdr; ph < &l->l_phdr[l->l_phnum]; ++ph)
+	{
+    ...
+     if (ph->p_type == PT_LOAD && (ph->p_flags & PF_W) == 0)
+     {
+        struct textrels *newp; // struct textrels.
+
+        // malloc'd.
+	newp = (struct textrels *) alloca (sizeof (*newp));
+    ----
+
+    - l->l_info[DT_TEXTREL] exists.
+    - lookup .text section via scanning program
+      header table, the ph->p_type==PT_LOAD.
+      It's the .text segment's type and validation
+      checking of no PF_W on the .text section.
+      * code segment shouldn't have write flag.
+    - If above validation check is success, malloc'd
+      to textrels struct and store Informations of
+      .text section.
+
+  (5) Change the protection on .text section segment to
+    PROT_READ&PROT_WRITE for reloation.
+    ----
+    if (__mprotect (newp->start, newp->len, PROT_READ|PROT_WRITE) < 0)
+    ----
+
+  (6) Set ph->p_flags to textrel struct's ->prot member variable.
+
+In summary the prepared process of .text
+reloc, after 1) .text PF_W validation checking
+and malloc'd `struct textrel', 2) change the
+.text section's protection to PROT_READ&PROT
+_WRITE and finally, 3) fill the value of
+ph->pflags from the ELF object to the malloc
+'d textrel's ->prot member variable.
+
+
+----[ 2.2.3 The real reloc start
+
+See the.text section's Real Relocation start.
+
+   (7) Get .strtab section's relative addr.
+   ----
+   strtab = D_PTR(l, l_info[DT_STRTAB]);
+   ----
+
+   (8) Doing Actual Reloation
+   - called elf/dynamic-link.h!ELF_DYNAMIC_RELOCATE() macro.
+
+   The call path of the Actual Relocation macro as follows:
+   ----
+
+   +dl-reloc.c!_dl_relocate_object
+     |
+     +->dynamic-link.h!ELF_DYNAMIC_RELOCATE()
+       |
+       +-> sysdeps/generic/dl-machine.h!elf_machine_runtime_setup()
+       |
+       +-> dynamic-link.h!ELF_DYNAMIC_DO_REL()
+       |
+       +-> dynamic-link.h!ELF_DYNAMIC_DO_RELA()
+
+   ----
+
+   In Actual Relocation time, PLT and GOT used.
+   I doesn't explain the actual relocation because
+   the subject.
+
+   (9) No PROF macro and profiling enabled?
+       rtld compiled with no profiling
+       and not defined PROF macro and
+       consider_profiling == 1(enable profiling)
+       - malloc'd l->reloc_result and process.
+
+
+  !!!!! The End of .text Relocation !!!!!
+
+
+  (10) Set l->l_relocated as 1.
+  ----
+  // the flag for relocation completed.
+  l->l_relocated = 1;
+  ----
+  - If no .text section on the ELF object
+    the ->l_relocated flag will be set.
+    * the l object is the link_map object.
+
+  (11) Restore .text section's original PROT.
+       - While actual relocation PROT_READ|
+         PROT_WRITE needed and after reloca
+         tion, PROT_READ|PROT_EXEC.
+
+
+In summary the process of Real Relocation start
+1) get the address of .strtab section and 2) doing
+actual relocation of .text section by calling
+dynamic-link.h!ELF_DYNAMIC_RELOCATE() macro and
+after complete the reloc, 3) set 1 to l->l_relocated
+for the flag. and finally Restore .text section's
+original PROTs.
+
+
+----[ 2.2.4 After complete reloc
+
+  (12) Set PROT_READ prot to .rel_ro.
+       If l->l_relro_size exists called _dl_
+       protect_relro(l) to change .rel.ro
+       section'S PROT to PROT_READ using
+       __mprotect().
+       * .rel_ro is read-only section gots
+         reloc entries.
+
+
+----[ 3. Underground Hacker Scene of south korea In 2013
+
+In the region south korea, korean hacker community
+'korean underground' kidz Is there. The korean
+underground opened three global hacker conferences.
+x90c is THE L33T In 2004~2013 who not In the korean
+underground. Except The l33t, all hackers In south
+-korea was/are In the korean underground.
+Check it out http://www.x90c.org/profile.txt.
+
+
+----[ 4. Conclusion
+
+In the article, I explained the process of relocation
+.text section doing by _dl_relocate_object().
+
+The Identified Security features are profiling
+enabling and lazy bind control. It's less relation
+with the security.
+
+An ELF object with no .text section also linked
+dynamically by rtld. It's wierd. and no code
+segment section doesn't run properly.
+
+
+----[ 5. References
+
+[1] mayhem, 2001, Understanding Linux ELF RTLD internals
+  - http://s.eresi-project.org/inc/articles/elf-rtld.txt
+
+
+----[ 6. Greets
+Greets to
+#phrack of efnet
+#social of overthewire
+
+EOF
+
+Content of type "text/html" skipped
+
+View attachment "internal_reloc_text.txt" of type "text/plain" (9804 bytes)
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

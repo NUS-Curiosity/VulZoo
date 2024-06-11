@@ -1,0 +1,160 @@
+
+Date: Tue, 21 Mar 2017 19:09:11 +0100
+From: "Stefan Kanthak" <stefan.kanthak@...go.de>
+To: <bugtraq@...urityfocus.com>
+Cc: fulldisclosure@...lists.org
+Subject: [FD] Defense in depth -- the Microsoft way (part 47): "AppLocker
+	bypasses are not serviced via monthly security roll-ups"
+
+Hi @ll,
+
+Windows 8 and newer versions (Windows 7 and Windows Server 2008 R2
+with KB2532445 or KB3125574 installed too) don't allow unprivileged
+callers to circumvent AppLocker and SAFER rules via
+
+LoadLibraryEx(TEXT("<arbitrary DLL>"), NULL, LOAD_IGNORE_CODE_AUTHZ_LEVEL);
+
+See <https://msdn.microsoft.com/en-us/library/ms684179.aspx>
+and <https://support.microsoft.com/kb/2532445>
+
+| LOAD_IGNORE_CODE_AUTHZ_LEVEL        0x00000010
+|
+| If this value is used, the system does not check AppLocker rules
+| or apply Software Restriction Policies for the DLL. This action
+| applies only to the DLL being loaded and not to its dependencies.
+| This value is recommended for use in setup programs that must
+| run extracted DLLs during installation.
+|
+| Windows Server 2008 R2 and Windows 7:
+| On systems with KB2532445 installed, the caller must be running
+| as "LocalSystem" or "TrustedInstaller"; otherwise the system
+| ignores this flag.
+
+
+Unprivileged users can but bypass AppLocker or SAFER alias Software
+Restriction Policies via
+
+STARTUPINFO si = {sizeof(STARTUPINFO)};
+PROCESS_INFORMATION pi = {0};
+CreateProcess(TEXT("<arbitrary exe>"), NULL, NULL, NULL, FALSE,
+              CREATE_PRESERVE_CODE_AUTHZ_LEVEL, NULL, NULL, &si, &pi);
+
+on ALL versions from Windows XP to Windows 10!
+
+See <https://msdn.microsoft.com/en-us/library/ms684863.aspx>
+
+| CREATE_PRESERVE_CODE_AUTHZ_LEVEL    0x02000000
+|
+| Allows the caller to execute a child process that bypasses the
+| process restrictions that would normally be applied automatically
+| to the process.
+
+
+Mitigation:
+~~~~~~~~~~~
+
+Create an "AppCert.Dll" that exports CreateProcessNotify and
+set the following registry entry
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls]
+"AppCert.Dll"="<path>\AppCert.Dll"
+...
+
+Note: AppCertDlls are loaded at the first call of one of the
+      CreateProcess*() functions. Process creation is denied
+      if one of them returns STATUS_UNSUCCESSFUL from its
+      CreateProcessNotify() routine when called with the flag
+      PROCESS_CREATION_QUERY.
+
+--- APPCERT.C ---
+#pragma comment(linker, "/DLL")
+#ifdef _WIN64
+#pragma comment(linker, "/EXPORT:CreateProcessNotify,PRIVATE")
+#else
+#pragma comment(linker, "/EXPORT:CreateProcessNotify=_CreateProcessNotify@8,PRIVATE")
+#endif
+#pragma comment(linker, "/NOENTRY")
+
+#include <windows.h>
+
+#define PROCESS_CREATION_QUERY   1L
+#define PROCESS_CREATION_ALLOWED 2L
+#define PROCESS_CREATION_DENIED  3L
+
+NTSTATUS NTAPI CreateProcessNotify(LPCWSTR lpApplicationName, ULONG ulReason)
+{
+    NTSTATUS ntStatus = STATUS_SUCCESS;
+
+    switch (ulReason)
+    {
+    case PROCESS_CREATION_QUERY:
+        // called once for each process that is to be created
+        // return STATUS_SUCCESS to allow process creation or
+        // return STATUS_UNSUCCESSFUL to deny process creation
+
+        if (forbidden(lpApplicationName))
+            ntStatus = STATUS_UNSUCCESSFUL;
+
+        break;
+
+    case PROCESS_CREATION_ALLOWED:
+        // called once for each process that is allowed creation
+
+        ...
+
+        break;
+
+    case PROCESS_CREATION_DENIED:
+        // called once for each process that is denied creation
+
+        ...
+
+        break;
+
+    default:
+        ;
+    }
+
+    // the return value is only used for PROCESS_CREATION_QUERY,
+    // all other conditions are ignored
+
+    return ntStatus;
+}
+--- EOF ---
+
+
+stay tuned
+Stefan Kanthak
+
+
+Timeline:
+~~~~~~~~~
+
+2017-03-10    sent vulnerability report to vendor
+
+2017-03-10    reply from vendor: MSRC case 37727 opened
+
+2017-03-13    reply from vendor: product team is working on case
+
+2017-03-21    reply from vendor:
+              "The product team has finished their investigation and
+               determined this will be serviced in a future version
+               of Windows. AppLocker bypasses are not serviced via
+               monthly security roll-ups; only major version updates."
+
+2017-03-21    <https://support.microsoft.com/kb/2532445> but serviced
+              a bypass with a hotfix which was incorporated in later
+              security updates and is included in the "convenience"
+              rollup <https://support.microsoft.com/en-us/kb/3125574>
+
+2017-03-21    reply from vendor:
+              "If you want this fixed immediately and are an
+               enterprise customer you'll need to work with your
+               Account Manager to open a support case."
+
+2017-03-21    report published
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

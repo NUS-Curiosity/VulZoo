@@ -1,0 +1,1387 @@
+
+Date: Fri, 2 Oct 2015 08:17:08 -0700
+From: Qualys Security Advisory <qsa@...lys.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Qualys Security Advisory - OpenSMTPD Audit Report
+
+(Sorry for the "CVE-2015-ABCD" place-holders in the report, but
+OpenSMTPD's developers were ready with the patches before MITRE was
+ready with the CVE-IDs.)
+
+
+Qualys Security Advisory
+
+OpenSMTPD Audit Report
+
+
+========================================================================
+Contents
+========================================================================
+
+Summary
+Approach
+Local Vulnerabilities
+Remote Vulnerabilities
+Inter-Process Vulnerabilities
+Miscellaneous Bugs
+Acknowledgments
+
+
+========================================================================
+Summary
+========================================================================
+
+For the past few months, one of our background projects has been to
+audit OpenSMTPD, a free implementation of the server-side Simple Mail
+Transfer Protocol (SMTP). OpenSMTPD replaces Sendmail as OpenBSD's
+default Mail Transfer Agent (MTA) since OpenBSD 5.6, released on
+November 1, 2014.
+
+OpenSMTPD was designed to be secure, reliable, performant, and easy to
+configure. Indeed, its codebase lives up to OpenBSD's reputation: it is
+clean, modular, privilege-separated, and made our audit easy and really
+enjoyable. However, the project is pretty much in its infancy (the first
+stable version, 5.3, was released on March 17, 2013), which explains why
+we discovered various vulnerabilities during our security assessment:
+
+- an oversight in the portable version of fgetln() that allows attackers
+  to read and write out-of-bounds memory;
+
+- multiple denial-of-service vulnerabilities that allow local users to
+  kill or hang OpenSMTPD;
+
+- a stack-based buffer overflow that allows local users to crash
+  OpenSMTPD, or execute arbitrary code as the non-chrooted _smtpd user;
+
+- a hardlink attack (or race-conditioned symlink attack) that allows
+  local users to unset the chflags() of arbitrary files;
+
+- a hardlink attack that allows local users to read the first line of
+  arbitrary files (for example, root's hash from /etc/master.passwd);
+
+- a denial-of-service vulnerability that allows remote attackers to fill
+  OpenSMTPD's queue or mailbox hard-disk partition;
+
+- an out-of-bounds memory read that allows remote attackers to crash
+  OpenSMTPD, or leak information and defeat the ASLR protection;
+
+- a use-after-free vulnerability that allows remote attackers to crash
+  OpenSMTPD, or execute arbitrary code as the non-chrooted _smtpd user;
+
+- multiple inter-process vulnerabilities that allow attackers to
+  escalate from one (already-compromised) OpenSMTPD process to another.
+
+
+========================================================================
+Approach
+========================================================================
+
+The OpenSMTPD version that we audited is available at:
+
+https://www.opensmtpd.org/archives/opensmtpd-5.4.4p1.tar.gz
+
+and is installed by default on OpenBSD's latest release (OpenBSD 5.7,
+released on May 1, 2015). Unless otherwise noted, the vulnerabilities
+that we discovered in OpenSMTPD 5.4.4p1 affect OpenSMTPD's latest
+release as well (OpenSMTPD 5.7.1p1, released on June 30, 2015).
+
+The "hybrid approach" that we adopted to review OpenSMTPD is described
+in the bible of code auditing, "The Art of Software Security Assessment"
+(by Mark Dowd, John McDonald, and Justin Schuh):
+
+- We started with a "top-down approach" and reviewed the high-level
+  information that we gathered on OpenSMTPD: READMEs, manual pages, web
+  pages (https://www.opensmtpd.org/presentations/asiabsdcon2013-smtpd/
+  and https://www.poolp.org/).
+
+  This approach allowed us to quickly understand OpenSMTPD's design
+  (seven privilege-separated, long-running, and event-driven processes
+  that communicate through UNIX sockets and the imsg API) and identify
+  its attack surface (local, remote, and inter-process entry points).
+
+- We continued with a "bottom-up approach" and reviewed OpenSMTPD's
+  implementation: the lowest-level code first (openbsd-compat/ and
+  smtpd/mproc.c), followed by the higher-level code.
+
+  This approach allowed us to quickly identify complex vulnerabilities:
+  the remote out-of-bounds memory read and use-after-free are actually a
+  combination of several low-level and high-level bugs.
+
+------------------------------------------------------------------------
+Privilege Separation
+------------------------------------------------------------------------
+
+--[ PROC_PARENT ]-------------------------------------------------------
+
+User: root
+
+Chroot: no
+
+Peers: PROC_CONTROL, PROC_LKA, PROC_QUEUE, PROC_CA, PROC_PONY
+
+PROC_PARENT, the "[priv]" process, spawns the six other long-running
+processes at startup (by calling fork_peers() from main()), and the
+transient Mail Delivery Agent (MDA) processes on demand (by calling
+forkmda() from parent_imsg()).
+
+If any of its long-running children dies, PROC_PARENT calls
+parent_shutdown(), kill()s its remaining children, and exit()s, but does
+not restart automatically: if we try to exploit a memory corruption, we
+have to come up with a one-shot, not a brute-force.
+
+--[ PROC_CONTROL ]------------------------------------------------------
+
+User: _smtpd
+
+Chroot: /var/empty
+
+Peers: PROC_SCHEDULER, PROC_QUEUE, PROC_PARENT, PROC_LKA, PROC_PONY,
+PROC_CA
+
+PROC_CONTROL, the "control" process, handles messages from the control
+socket "/var/run/smtpd.sock" (by calling control_dispatch_ext()), and
+gathers statistics from its peers (by calling control_imsg()).
+
+--[ PROC_PONY ]---------------------------------------------------------
+
+User: _smtpd
+
+Chroot: /var/empty
+
+Peers: PROC_PARENT, PROC_QUEUE, PROC_LKA, PROC_CONTROL, PROC_CA
+
+PROC_PONY, the "pony express" process
+(https://en.wikipedia.org/wiki/Pony_Express), handles the server-side
+SMTP sessions (by calling smtp_imsg()), the client-side MTA sessions (by
+calling mta_imsg()), and the local MDA deliveries (by calling
+mda_imsg()).
+
+--[ PROC_LKA ]----------------------------------------------------------
+
+User: _smtpd
+
+Chroot: no (needs access to /etc/resolv.conf and /etc/ssl/cert.pem)
+
+Peers: PROC_PARENT, PROC_QUEUE, PROC_CONTROL, PROC_PONY
+
+PROC_LKA, the "lookup" process, performs all lookups on behalf of the
+other processes: asynchronous DNS resolution (by calling dns_imsg() and
+libasr), user information and credentials lookup, SSL certificate
+verification, alias expansion (by calling lka_imsg()).
+
+--[ PROC_QUEUE ]--------------------------------------------------------
+
+User: _smtpq (or _smtpd if _smtpq does not exist)
+
+Chroot: /var/spool/smtpd
+
+Peers: PROC_PARENT, PROC_CONTROL, PROC_LKA, PROC_SCHEDULER, PROC_PONY
+
+PROC_QUEUE, the "queue" process, manages the persistent storage of
+messages and envelopes (by calling queue_imsg()). By default, the
+smtpd/queue_fs.c backend is used.
+
+--[ PROC_SCHEDULER ]----------------------------------------------------
+
+User: _smtpd
+
+Chroot: /var/empty
+
+Peers: PROC_CONTROL, PROC_QUEUE
+
+PROC_SCHEDULER, the "scheduler" process, knows about all existing
+messages and envelopes (by calling scheduler_imsg()), and decides when
+to relay or deliver them. By default, the smtpd/scheduler_ramqueue.c
+backend is used.
+
+--[ PROC_CA ]-----------------------------------------------------------
+
+User: _smtpd
+
+Chroot: /var/empty
+
+Peers: PROC_CONTROL, PROC_PARENT, PROC_PONY
+
+PROC_CA, the "klondike" process
+(https://en.wikipedia.org/wiki/Klondike_Gold_Rush), performs
+privilege-separated RSA encryption and decryption on behalf of PROC_PONY
+(by calling ca_imsg()).
+
+------------------------------------------------------------------------
+Attack Surface
+------------------------------------------------------------------------
+
+--[ Local Vectors ]-----------------------------------------------------
+
+----[ .forward
+
+Local users may put a .forward file in their home directory in order to
+control how their incoming email is processed and delivered.
+
+When PROC_PONY receives a CMD_RCPT_TO from one of its SMTP clients, it
+sends an IMSG_SMTP_EXPAND_RCPT to PROC_LKA. If the recipient is a local
+user, the (unprivileged) PROC_LKA sends an IMSG_LKA_OPEN_FORWARD to the
+(privileged) PROC_PARENT. If PROC_PARENT manages to open() the user's
+.forward file, it sends its file descriptor back to PROC_LKA, which
+parses and expands its contents.
+
+----[ Control Socket
+
+PROC_CONTROL calls getpeereid(), or getsockopt(SO_PEERCRED), in order to
+determine the credentials of the clients that connect to its UNIX socket
+"/var/run/smtpd.sock". It processes all the messages received from
+connections initiated by root, but otherwise processes only the
+IMSG_CTL_SMTP_SESSION and forwards it to PROC_PONY.
+
+Clients normally connect to the control socket with the command-line
+program "smtpctl", but we may also connect() to it directly, should we
+ever want to exploit a vulnerability in the imsg API, for example.
+
+----[ Offline Directory
+
+The command-line program "smtpctl" can be used to send email (when
+invoked as "sendmail"): it connects to the control socket, sends an
+IMSG_CTL_SMTP_SESSION to PROC_CONTROL (which forwards it to PROC_PONY),
+and enqueues the email through this local SMTP session (enqueue() in
+smtpd/enqueue.c).
+
+However, if OpenSMTPD is not running, the connection to the control
+socket will fail, and "smtpctl" will simply store the email into the
+"/var/spool/smtpd/offline" directory, which is mode 01777
+(enqueue_offline() in smtpd/enqueue.c).
+
+Later, when OpenSMTPD restarts, it will execvp() "smtpctl" for each
+email stored in the offline directory, exactly as if its owner had just
+submitted it for the first time (offline_enqueue() in smtpd/smtpd.c).
+
+--[ Remote Vectors ]----------------------------------------------------
+
+----[ SMTP Client
+
+By default, OpenSMTPD is configured to accept email from local users,
+and connects to remote SMTP servers in order to relay and deliver it.
+The code for these client-side MTA sessions (smtpd/mta_session.c) is
+reachable remotely (and is also used for bounces) and represents an
+important attack vector.
+
+----[ SMTP Server
+
+OpenSMTPD can be configured to accept email from remote SMTP clients,
+and relay or deliver it to local users. The code for these server-side
+SMTP sessions (smtpd/smtp_session.c) is reachable remotely and
+represents another important attack vector.
+
+----[ DNS Resolver
+
+The libasr, an asynchronous DNS resolver, is used by OpenSMTPD and
+represents yet another remote vector. However, its codebase is pretty
+much independent and therefore beyond the scope of our OpenSMTPD audit.
+The same can be said of OpenSSL and LibreSSL.
+
+--[ Inter-Process Vectors ]---------------------------------------------
+
+If we ever manage to compromise one of OpenSMTPD's processes, a
+vulnerability in the inter-process communication code may allow us to
+escalate from an unprivileged, chrooted process to a privileged,
+non-chrooted process. For example, pivoting from PROC_PONY to
+PROC_PARENT, or even PROC_LKA, would be a good move.
+
+
+========================================================================
+Local Vulnerabilities
+========================================================================
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Portable fgetln() can return a zero length
+------------------------------------------------------------------------
+
+Constructs similar to the following appear several times throughout
+OpenSMTPD's codebase:
+
+        while ((buf = fgetln(fp, &len))) {
+                if (buf[len - 1] == '\n')
+                        buf[len - 1] = '\0';
+
+and:
+
+                        line = fgetln(s->msgfp, &len);
+                        if (line == NULL) break;
+                        line[len - 1] = '\0';
+
+In theory, if fgetln() succeeds (i.e., does not return NULL) but stores
+a 0 length in len, an out-of-bounds memory read and (possibly) write is
+triggered. In practice, this is impossible because OpenBSD's libc
+implementation of fgetln() guarantees what the manpage says:
+
+        The length of the line, including the final newline, is stored
+        in the memory location to which len points and is guaranteed to
+        be greater than 0 upon successful completion.
+
+Unfortunately, the portable implementation of fgetln() in
+openbsd-compat/fgetln.c (which is used on Linux, at least) offers no
+such guarantee:
+
+ 38 char *
+ 39 fgetln(stream, len)
+ 40     FILE *stream;
+ 41     size_t *len;
+ 42 {
+ ..
+ 50     if (fgets(buffer, buflen+1, stream) == NULL)
+ 51         return NULL;
+ 52     *len = strlen(buffer);
+ ..
+ 60     return buffer;
+ 61 }
+
+For example, if fgets() reads the line "\0\n", fgetln() succeeds and
+stores a 0 string-length in len (which should be impossible), and the
+out-of-bounds memory is accessed upon return.
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Local denial-of-service (invalid imsg)
+------------------------------------------------------------------------
+
+The fatalx(NULL) in mproc_dispatch() can be triggered locally by
+connecting directly to the control socket and sending an invalid imsg
+(one that is smaller than IMSG_HEADER_SIZE or larger than MAX_IMSGSIZE).
+imsg_get() will fail, fatalx() will be called, and PROC_CONTROL will
+exit() (and, as mentioned earlier, if one OpenSMTPD process dies, all
+OpenSMTPD processes die):
+
+187                 if ((n = imsg_get(&p->imsgbuf, &imsg)) == -1) {
+188                         log_warn("fatal: %s: error in imsg_get for %s",
+189                             proc_name(smtpd_process),  p->name);
+190                         fatalx(NULL);
+191                 }
+
+This local denial-of-service has been discovered independently by
+OpenSMTPD's developers and fixed in version 5.4.6p1 (released on June
+11, 2015):
+
+188                 if ((n = imsg_get(&p->imsgbuf, &imsg)) == -1) {
+189
+190                         if (smtpd_process == PROC_CONTROL &&
+191                             p->proc == PROC_CLIENT) {
+192                                 log_warnx("warn: client sent invalid imsg "
+193                                     "over control socket");
+194                                 p->handler(p, NULL);
+195                                 return;
+196                         }
+197                         log_warn("fatal: %s: error in imsg_get for %s",
+198                             proc_name(smtpd_process),  p->name);
+199                         fatalx(NULL);
+200                 }
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Local denial-of-service (file-descriptor exhaustion)
+------------------------------------------------------------------------
+
+By connecting locally to the control socket and passing many file
+descriptors (~1024) to PROC_CONTROL (which does not really expect this),
+it is possible to exhaust almost all of its available fds.
+
+- In OpenSMTPD 5.4.4p1, PROC_CONTROL ends up calling fatal("exiting") in
+  mproc_dispatch():
+
+153                 if ((n = imsg_read(&p->imsgbuf)) == -1) {
+154                         log_warn("warn: %s -> %s: imsg_read",
+155                             proc_name(smtpd_process),  p->name);
+156                         fatal("exiting");
+157                 }
+
+- In OpenSMTPD 5.7.1p1, PROC_CONTROL does not call fatal("exiting")
+  (thanks to the EAGAIN check at the beginning of mproc_dispatch()), but
+  it will never again accept new client connections (because of how
+  control_accept() handles file-descriptor exhaustion):
+
+155                 if ((n = imsg_read(&p->imsgbuf)) == -1) {
+156                         log_warn("warn: %s -> %s: imsg_read",
+157                             proc_name(smtpd_process),  p->name);
+158                         if (errno == EAGAIN)
+159                                 return;
+160                         fatal("exiting");
+161                 }
+
+There are actually three different ways to trigger this local
+denial-of-service:
+
+1/ Send one fd per imsg, with the IMSGF_HASFD flag turned on: imsg_get()
+will move the fd from ibuf->fds to imsg->fd, but because PROC_CONTROL
+does not expect a fd to be passed, this fd is leaked forever when
+imsg_free() is called by mproc_dispatch().
+
+2/ Send one fd per imsg, but with the IMSGF_HASFD flag turned off:
+imsg_get() will leave the fd in ibuf->fds, which are supposed to be
+closed when control_close() is called, but this never happens if all fds
+are exhausted first.
+
+3/ Send only one large (>1024) imsg, one byte at a time, with one fd
+attached to every single byte sent: this will accumulate all passed fds
+into ibuf->fds.
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Local denial-of-service (connection-id wrap)
+------------------------------------------------------------------------
+
+In control_accept(), it is possible to trigger the errx() of the
+following tree_xset() call:
+
+348         c = xcalloc(1, sizeof(*c), "control_accept");
+349         if (getpeereid(connfd, &c->euid, &c->egid) == -1)
+350                 fatal("getpeereid");
+351         c->id = ++connid;
+352         c->mproc.proc = PROC_CLIENT;
+353         c->mproc.handler = control_dispatch_ext;
+354         c->mproc.data = c;
+355         mproc_init(&c->mproc, connfd);
+356         mproc_enable(&c->mproc);
+357         tree_xset(&ctl_conns, c->id, c);
+
+If we establish a first connection to the control socket (and keep it
+alive), and then establish (and immediately close) new connections in a
+loop, the "static uint32_t connid" will eventually wrap and collide with
+our (kept-alive) first connection id, and the exclusive tree_xset() will
+fail and terminate PROC_CONTROL with errx().
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Local denial-of-service (WIFSTOPPED() child)
+------------------------------------------------------------------------
+
+In parent_sig_handler(), it is possible to trigger the following
+fatalx() call:
+
+ 366                         pid = waitpid(-1, &status, WNOHANG);
+ 367                         if (pid <= 0)
+ 368                                 continue;
+ ...
+ 371                         if (WIFSIGNALED(status)) {
+ ...
+ 375                         } else if (WIFEXITED(status)) {
+ ...
+ 381                         } else
+ 382                                 fatalx("smtpd: unexpected cause of SIGCHLD");
+
+If the child is ptraced, WIFSIGNALED() and WIFEXITED() can return false,
+but WIFSTOPPED() can return true, even if WUNTRACED was not specified in
+waitpid(). In order to trigger this in the context of OpenSMTPD, a local
+user can add a "|exec /tmp/ptraceme" line to his ~/.forward file, where
+ptraceme is a small program that simply calls ptrace(PT_TRACE_ME) and
+execve() (it does not matter which binary is executed).
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Local denial-of-service (blocking open() call)
+------------------------------------------------------------------------
+
+The open() call in parent_forward_open() can block forever (if the
+~/.forward was created by mkfifo, for example) and this will effectively
+block OpenSMTPD as a whole (PROC_PARENT will not respond to
+IMSG_LKA_OPEN_FORWARD and IMSG_MDA_FORK requests anymore):
+
+1232         if (! bsnprintf(pathname, sizeof (pathname), "%s/.forward",
+1233                 directory))
+1234                 fatal("smtpd: parent_forward_open: snprintf");
+....
+1247         do {
+1248                 fd = open(pathname, O_RDONLY);
+1249         } while (fd == -1 && errno == EINTR);
+
+------------------------------------------------------------------------
+Multiple hardlink attacks in the offline directory
+------------------------------------------------------------------------
+
+In the world-writable "/var/spool/smtpd/offline" directory, local users
+can create hardlinks to files they do not own, and wait until the server
+reboots (or, crash OpenSMTPD with a denial-of-service and wait until the
+administrator restarts it) to carry out assorted attacks.
+
+1/ The following code in offline_enqueue() allows an attacker to
+chflags(0) arbitrary files, by hardlinking them to the offline directory
+(CVE-2015-ABCD):
+
+1117                 if (lstat(path, &sb) == -1) {
+1118                         log_warn("warn: smtpd: lstat: %s", path);
+1119                         _exit(1);
+1120                 }
+1121
+1122 #ifdef HAVE_CHFLAGS
+1123                 if (chflags(path, 0) == -1) {
+1124                         log_warn("warn: smtpd: chflags: %s", path);
+1125                         _exit(1);
+1126                 }
+1127 #endif
+
+2/ The following code in offline_enqueue() allows an attacker to
+execvp() "/usr/sbin/smtpctl" as "sendmail", with a command-line argument
+that is the hardlinked file's first line (CVE-2015-ABCD):
+
+1149                 if ((fp = fopen(path, "r")) == NULL)
+1150                         _exit(1);
+....
+1160                 if ((p = fgetln(fp, &len)) == NULL)
+1161                         _exit(1);
+....
+1167                 addargs(&args, "%s", "sendmail");
+1168
+1169                 while ((tmp = strsep(&p, "|")) != NULL)
+1170                         addargs(&args, "%s", tmp);
+....
+1179                 execvp(PATH_SMTPCTL, args.list);
+1180                 _exit(1);
+
+For example, an attacker can hardlink /etc/master.passwd to the offline
+directory, and retrieve its first line (root's encrypted password) by
+running ps (or a small program that simply calls sysctl() with
+KERN_FILE_BYUID and KERN_PROC_ARGV) in a loop:
+
+In the attacker's terminal:
+
+$ ln /etc/master.passwd /var/spool/smtpd/offline
+$ ./getargs &
+[1] 23460
+
+In the administrator's terminal:
+
+# /etc/rc.d/smtpd restart
+smtpd(ok)
+smtpd(ok)
+
+On the attacker's terminal:
+
+root:$2b$09$pN5WRvGaiPHEXPsrIwSNWe1S0U5iTIvtWqPQgHmd0BAJK02GOYG.W:0:0:daemon:0:0:Charlie &:/root:/bin/ksh
+
+3/ If an attacker controls at least part of another user's file, he can
+hardlink this file to the offline directory, and try to exploit one of
+the vulnerable fgetln() calls in the enqueue code, which runs with the
+privileges of this other user. For example, in offline_enqueue():
+
+1160                 if ((p = fgetln(fp, &len)) == NULL)
+1161                         _exit(1);
+1162
+1163                 if (p[len - 1] != '\n')
+1164                         _exit(1);
+1165                 p[len - 1] = '\0';
+
+And in savedeadletter():
+
+898         while ((buf = fgetln(in, &len))) {
+899                 if (buf[len - 1] == '\n')
+900                         buf[len - 1] = '\0';
+
+However, we did not investigate this vector any further, because on
+OpenBSD (where an attacker is allowed to hardlink another user's file)
+fgetln() is not vulnerable, and on Linux (where fgetln() is vulnerable)
+an attacker is usually not allowed to hardlink another user's file.
+
+4/ If an attacker is able to reach another user's file (i.e., +x on all
+directories that lead to the file) but not read it, he can hardlink the
+file to the offline directory, and wait for savedeadletter() to create a
+world-readable copy of the file in this other user's home directory:
+
+854         (void)snprintf(buffer, sizeof buffer, "%s/dead.letter", pw->pw_dir);
+...
+859         if ((fp = fopen(buffer, "w")) == NULL)
+860                 return 0;
+...
+898         while ((buf = fgetln(in, &len))) {
+...
+909                 fprintf(fp, "%s\n", buf);
+910         }
+
+However, there are three reasons why this particular vector is useless
+in practice:
+
+a) In OpenSMTPD 5.4.4p1, the getlogin() call in enqueue() will always
+return "root", which means that the world-readable "dead.letter" will
+always be created in /root, unreachable by the attacker (drwx------).
+
+b) In OpenSMTPD 5.4.5p2, smtpctl's -S command-line option was added to
+work around the getlogin() problem, but the getopt() string was
+incorrectly modified to "RS:" instead of "R:S".
+
+c) In OpenSMTPD 5.7.1p1, the getopt() string was fixed to "R:S", but the
+savedeadletter() code was removed altogether.
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - .forward stack-based buffer overflow
+------------------------------------------------------------------------
+
+In lka_expand_format(), the exptoklen bytes returned by
+lka_expand_token() are memcpy()ed to ptmp (a pointer into the
+stack-based tmpbuf) without first checking that there is enough space
+left in tmpbuf:
+
+799                 exptoklen = lka_expand_token(exptok, sizeof exptok, token, ep,
+800                     ui);
+801                 if (exptoklen == 0)
+802                         return 0;
+803
+804                 memcpy(ptmp, exptok, exptoklen);
+
+This stack-based buffer overflow can be triggered locally through
+OpenSMTPD's .forward mechanism:
+
+$ whoami
+john
+
+$ python -c 'print "/" * 1014 + "%{sender}"' > ~/.forward
+
+$ python -c 'print "A" * 255 + "@" + "A" * 255'
+AAA...AAA@......AAA
+
+$ telnet 127.0.0.1 25
+EHLO 127.0.0.1
+MAIL FROM:<AAA...AAA@......AAA>
+RCPT TO:<john@...alhost>
+Connection closed by foreign host.
+
+As a result, in the logs:
+
+smtpd[9305]: warn: format string error while expanding for user john
+smtpd: stack overflow in function lka_submit
+
+It does not appear to be exploitable on OpenBSD x86 (beyond a local
+denial-of-service), where even a one-byte overflow ended up smashing the
+stack canary of every smtpd binary we tried. However, it may lead to
+arbitrary code execution on other operating systems or platforms.
+
+
+========================================================================
+Remote Vulnerabilities
+========================================================================
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Remote denial-of-service (disk-space exhaustion)
+------------------------------------------------------------------------
+
+The maximum size of an email, env->sc_maxsize (by default 35 megabytes),
+is enforced in dataline_callback() for the email's body:
+
+ 266         len = strlen(line) + 1;
+ 267
+ 268         if (s->datalen + len > env->sc_maxsize) {
+ 269                 s->msgflags |= MF_ERROR_SIZE;
+ 270                 return;
+ 271         }
+ ...
+ 278         s->datalen += len;
+
+but not in header_default_callback() for the email's headers:
+
+ 243         len = strlen(hdr->name) + 1;
+ ...
+ 248         s->datalen += len;
+ 249
+ 250         TAILQ_FOREACH(l, &hdr->lines, next) {
+ 251                 len = strlen(l->buffer) + 1;
+ ...
+ 256                 s->datalen += len;
+ 257         }
+
+It is therefore possible to send a headers-only email (i.e., no empty
+line between the last header and the DATA-ending ".") that is much
+larger than 35 megabytes, and fill OpenSMTPD's queue or mailbox
+hard-disk partition.
+
+------------------------------------------------------------------------
+Multiple vulnerabilities in IMSG_{SMTP,MTA}_SSL_VERIFY*
+------------------------------------------------------------------------
+
+These IMSG_{SMTP,MTA}_SSL_VERIFY* messages are exchanged between
+PROC_PONY and PROC_LKA:
+
+- after PROC_PONY successfully established an SSL connection with an
+  SMTP client (a client-certificate request is always made, but not
+  necessarily responded to), it calls smtp_verify_certificate() and
+  sends a few IMSG_SMTP_SSL_VERIFY* messages to PROC_LKA, which verifies
+  the client's SSL certificate (if any) on behalf of PROC_PONY.
+
+- after PROC_PONY successfully established an SSL connection with an
+  SMTP server (opportunistic STARTTLS encryption is always attempted,
+  but not necessarily successful), it calls mta_verify_certificate() and
+  sends a few IMSG_MTA_SSL_VERIFY* messages to PROC_LKA, which verifies
+  the server's SSL certificate on behalf of PROC_PONY.
+
+In lka_imsg(), PROC_LKA blindly trusts the contents of the
+req_ca_vrfy_smtp, req_ca_vrfy_mta, and req_ca_vrfy_chain structures that
+it receives from PROC_PONY (although this suggests vulnerabilities that
+are inter-process only, they are also triggerable remotely through two
+other low-level bugs in imsg and mproc, to be described shortly):
+
+struct ca_vrfy_req_msg {
+        uint64_t                reqid;
+        char                    pkiname[SMTPD_MAXHOSTNAMELEN];
+        unsigned char          *cert;
+        off_t                   cert_len;
+        size_t                  n_chain;
+        size_t                  chain_offset;
+        unsigned char         **chain_cert;
+        off_t                  *chain_cert_len;
+};
+
+ 63 static void
+ 64 lka_imsg(struct mproc *p, struct imsg *imsg)
+ 65 {
+ ..
+ 70         static struct ca_vrfy_req_msg   *req_ca_vrfy_smtp = NULL;
+ 71         static struct ca_vrfy_req_msg   *req_ca_vrfy_mta = NULL;
+ 72         struct ca_vrfy_req_msg          *req_ca_vrfy_chain;
+
+- In the IMSG_{SMTP,MTA}_SSL_VERIFY_{CERT,CHAIN} cases, PROC_LKA
+  attempts to read cert_len bytes from imsg->data, but does not check
+  first that PROC_PONY actually sent this amount of data (out-of-bounds
+  memory read, CVE-2015-ABCD):
+
+148                 case IMSG_SMTP_SSL_VERIFY_CERT:
+149                         req_ca_vrfy_smtp = xmemdup(imsg->data, sizeof *req_ca_vrfy_smtp, "lka:ca_vrfy");
+150                         req_ca_vrfy_smtp->cert = xmemdup((char *)imsg->data +
+151                             sizeof *req_ca_vrfy_smtp, req_ca_vrfy_smtp->cert_len, "lka:ca_vrfy");
+
+158                 case IMSG_SMTP_SSL_VERIFY_CHAIN:
+159                         if (req_ca_vrfy_smtp == NULL)
+160                                 fatalx("lka:ca_vrfy: chain without a certificate");
+161                         req_ca_vrfy_chain = imsg->data;
+162                         req_ca_vrfy_smtp->chain_cert[req_ca_vrfy_smtp->chain_offset] = xmemdup((char *)imsg->data +
+163                             sizeof *req_ca_vrfy_chain, req_ca_vrfy_chain->cert_len, "lka:ca_vrfy");
+
+- In the IMSG_{SMTP,MTA}_SSL_VERIFY_CERT case, PROC_LKA does not
+  sanity-check n_chain, the number of certificates in the chain that
+  will be sent by PROC_PONY:
+
+148                 case IMSG_SMTP_SSL_VERIFY_CERT:
+149                         req_ca_vrfy_smtp = xmemdup(imsg->data, sizeof *req_ca_vrfy_smtp, "lka:ca_vrfy");
+150                         req_ca_vrfy_smtp->cert = xmemdup((char *)imsg->data +
+151                             sizeof *req_ca_vrfy_smtp, req_ca_vrfy_smtp->cert_len, "lka:ca_vrfy");
+152                         req_ca_vrfy_smtp->chain_cert = xcalloc(req_ca_vrfy_smtp->n_chain,
+153                             sizeof (unsigned char *), "lka:ca_vrfy");
+154                         req_ca_vrfy_smtp->chain_cert_len = xcalloc(req_ca_vrfy_smtp->n_chain,
+155                             sizeof (off_t), "lka:ca_vrfy");
+156                         return;
+
+- In the IMSG_{SMTP,MTA}_SSL_VERIFY_{CERT,CHAIN} cases, PROC_LKA does
+  not sanity-check chain_offset (out-of-bounds memory write,
+  CVE-2015-ABCD):
+
+  . in the IMSG_{SMTP,MTA}_SSL_VERIFY_CERT case, chain_offset should be
+    initialized to 0, but PROC_LKA trusts PROC_PONY to do so (arbitrary
+    memory write);
+
+  . in the IMSG_{SMTP,MTA}_SSL_VERIFY_CHAIN case, chain_offset should be
+    checked against n_chain, but PROC_LKA trusts PROC_PONY to send no
+    more than n_chain certificates (heap-based buffer overflow):
+
+158                 case IMSG_SMTP_SSL_VERIFY_CHAIN:
+159                         if (req_ca_vrfy_smtp == NULL)
+160                                 fatalx("lka:ca_vrfy: chain without a certificate");
+161                         req_ca_vrfy_chain = imsg->data;
+162                         req_ca_vrfy_smtp->chain_cert[req_ca_vrfy_smtp->chain_offset] = xmemdup((char *)imsg->data +
+163                             sizeof *req_ca_vrfy_chain, req_ca_vrfy_chain->cert_len, "lka:ca_vrfy");
+164                         req_ca_vrfy_smtp->chain_cert_len[req_ca_vrfy_smtp->chain_offset] = req_ca_vrfy_chain->cert_len;
+165                         req_ca_vrfy_smtp->chain_offset++;
+166                         return;
+
+- In the IMSG_{SMTP,MTA}_SSL_VERIFY case, PROC_LKA does not reset the
+  static pointer req_ca_vrfy_{smtp,mta} to NULL after free(), but trusts
+  PROC_PONY to always send an IMSG_{SMTP,MTA}_SSL_VERIFY_CERT (which
+  re-initializes this static pointer) before sending an
+  IMSG_{SMTP,MTA}_SSL_VERIFY{_CHAIN,} (use-after-free, CVE-2015-ABCD):
+
+168                 case IMSG_SMTP_SSL_VERIFY:
+169                         if (req_ca_vrfy_smtp == NULL)
+170                                 fatalx("lka:ca_vrfy: verify without a certificate");
+...
+185                         for (i = 0; i < req_ca_vrfy_smtp->n_chain; ++i)
+186                                 free(req_ca_vrfy_smtp->chain_cert[i]);
+187                         free(req_ca_vrfy_smtp->chain_cert);
+188                         free(req_ca_vrfy_smtp->chain_cert_len);
+189                         free(req_ca_vrfy_smtp->cert);
+190                         free(req_ca_vrfy_smtp);
+191                         return;
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Integer truncation in the imsg API
+------------------------------------------------------------------------
+
+There is a fundamental design flaw in the imsg_create(), imsg_add(), and
+imsg_compose() functions (and imsg_composev(), which calls imsg_create()
+and imsg_add()): their datalen argument is directly an u_int16_t, a fact
+that is easily overlooked by their callers and makes them vulnerable to
+integer truncation.
+
+In OpenSMTPD, the nearly-identical functions smtp_verify_certificate()
+and mta_verify_certificate() are vulnerable to this integer truncation,
+and both are reachable remotely through SSL certificate verification:
+
+2046 static int
+2047 smtp_verify_certificate(struct smtp_session *s)
+2048 {
+....
+2056         x = SSL_get_peer_certificate(s->io.ssl);
+....
+2059         xchain = SSL_get_peer_cert_chain(s->io.ssl);
+....
+2071         /* Send the client certificate */
+2072         memset(&req_ca_vrfy, 0, sizeof req_ca_vrfy);
+....
+2083         req_ca_vrfy.cert_len = i2d_X509(x, &req_ca_vrfy.cert);
+2084         if (xchain)
+2085                 req_ca_vrfy.n_chain = sk_X509_num(xchain);
+2086         iov[0].iov_base = &req_ca_vrfy;
+2087         iov[0].iov_len = sizeof(req_ca_vrfy);
+2088         iov[1].iov_base = req_ca_vrfy.cert;
+2089         iov[1].iov_len = req_ca_vrfy.cert_len;
+2090         m_composev(p_lka, IMSG_SMTP_SSL_VERIFY_CERT, 0, 0, -1,
+2091             iov, nitems(iov));
+....
+2095         if (xchain) {
+2096                 /* Send the chain, one cert at a time */
+2097                 for (i = 0; i < sk_X509_num(xchain); ++i) {
+2098                         memset(&req_ca_vrfy, 0, sizeof req_ca_vrfy);
+....
+2100                         x = sk_X509_value(xchain, i);
+2101                         req_ca_vrfy.cert_len = i2d_X509(x, &req_ca_vrfy.cert);
+2102                         iov[0].iov_base = &req_ca_vrfy;
+2103                         iov[0].iov_len  = sizeof(req_ca_vrfy);
+2104                         iov[1].iov_base = req_ca_vrfy.cert;
+2105                         iov[1].iov_len  = req_ca_vrfy.cert_len;
+2106                         m_composev(p_lka, IMSG_SMTP_SSL_VERIFY_CHAIN, 0, 0, -1,
+2107                             iov, nitems(iov));
+....
+2109                 }
+2110         }
+2111
+2112         /* Tell lookup process that it can start verifying, we're done */
+2113         memset(&req_ca_vrfy, 0, sizeof req_ca_vrfy);
+....
+2115         m_compose(p_lka, IMSG_SMTP_SSL_VERIFY, 0, 0, -1,
+2116             &req_ca_vrfy, sizeof req_ca_vrfy);
+....
+2119 }
+
+If the cert_len returned by i2d_X509() exceeds 64k, integer truncation
+occurs when m_composev() calls imsg_composev(). The following #define
+from OpenSSL and LibreSSL confirms that this is indeed possible:
+
+#define SSL_MAX_CERT_LIST_DEFAULT 1024*100 /* 100k max cert list :-) */
+
+Surprisingly, this integer truncation in PROC_PONY triggers the
+out-of-bounds memory read in PROC_LKA: xmemdup() tries to read cert_len
+bytes (the non-truncated cert_len) from imsg->data, which contains only
+the truncated number of cert_len bytes (i.e., xmemdup() tries to read an
+extra 64k from imsg->data).
+
+Our initial research suggests that this out-of-bounds memory read can be
+transformed into a remote information leak that reveals heap addresses
+and defeats the ASLR protection. Linux is almost certainly exploitable,
+but OpenBSD's heavily randomized and hardened malloc significantly
+raises the bar for successful exploitation.
+
+------------------------------------------------------------------------
+CVE-2015-ABCD - Missing return-value checks in the mproc API
+------------------------------------------------------------------------
+
+The m_forward(), m_compose(), and m_composev() functions do not check
+the return value of imsg_compose() and imsg_composev(): if the message
+to be sent is larger than MAX_IMSGSIZE (16k), these three functions will
+fail to send the message, but they will not report this failure to their
+callers, which have therefore no way of knowing whether the message was
+actually sent or not.
+
+Again, smtp_verify_certificate() and mta_verify_certificate() are
+vulnerable: if the peer's certificate is larger than 16k (but smaller
+than 64k, in order to avoid the integer truncation), PROC_PONY will fail
+to send the IMSG_{SMTP,MTA}_SSL_VERIFY_CERT to PROC_LKA, and the
+subsequent IMSG_{SMTP,MTA}_SSL_VERIFY_CHAIN will trigger the
+use-after-free in PROC_LKA, which in turn will trigger the out-of-bounds
+memory write in PROC_LKA.
+
+Our initial research suggests that this use-after-free (and
+out-of-bounds memory write) can be transformed into remote code
+execution, when combined with the information leak described above.
+Linux is almost certainly exploitable, but again, OpenBSD's heavily
+randomized and hardened malloc significantly raises the bar for
+successful exploitation.
+
+
+========================================================================
+Inter-Process Vulnerabilities
+========================================================================
+
+Although we focused our audit on local and remote vulnerabilities,
+nevertheless we identified four classes of common inter-process
+vulnerabilities in OpenSMTPD:
+
+- Out-of-bounds memory read: one process X receives a specific type of
+  structure (or structured data) from another process Y, but does not
+  check that process Y actually sent enough data; or, checks are
+  performed, but incorrectly (e.g., because of an integer-wrap).
+
+- Indirect information leak: if such an out-of-bounds memory read
+  survives (i.e., X does not segfault), and if the partial structure
+  received by X is sent back to Y as a complete structure, information
+  from the memory of process X is leaked to process Y.
+
+- Direct information leak: a structure sent by one process to another
+  process contains uninitialized fields (e.g., union fields, or large
+  string buffers that are only partially strlcpy()ed to), thus leaking
+  information from the memory of the sending process to the receiving
+  process.
+
+- Out-of-bounds memory write: one process receives data from another
+  process and copies it into a buffer without checking that it actually
+  fits; or, a structure is received and its contents (e.g., size fields)
+  are trusted without checks.
+
+------------------------------------------------------------------------
+
+In parent_imsg(), case IMSG_LKA_OPEN_FORWARD:
+
+ 169 static void
+ 170 parent_imsg(struct mproc *p, struct imsg *imsg)
+ 171 {
+ 172         struct forward_req      *fwreq;
+ ...
+ 185                 case IMSG_LKA_OPEN_FORWARD:
+ 186                         fwreq = imsg->data;
+ ...
+ 196                         m_compose(p, IMSG_LKA_OPEN_FORWARD, 0, 0, fd,
+ 197                             fwreq, sizeof *fwreq);
+
+- Indirect information leak: fwreq.
+
+------------------------------------------------------------------------
+
+In queue_imsg(), case IMSG_SCHED_ENVELOPE_BOUNCE:
+
+ 64 static void
+ 65 queue_imsg(struct mproc *p, struct imsg *imsg)
+ 66 {
+ ..
+ 68         struct bounce_req_msg   *req_bounce;
+ ..
+238                 case IMSG_SCHED_ENVELOPE_BOUNCE:
+239                         req_bounce = imsg->data;
+...
+250                         queue_bounce(&evp, &req_bounce->bounce);
+...
+512 static void
+513 queue_bounce(struct envelope *e, struct delivery_bounce *d)
+514 {
+515         struct envelope b;
+...
+519         b.agent.bounce = *d;
+...
+543                 m_create(p_scheduler, IMSG_QUEUE_ENVELOPE_SUBMIT, 0, 0, -1);
+544                 m_add_envelope(p_scheduler, &b);
+545                 m_close(p_scheduler);
+
+- Indirect information leak: req_bounce->bounce.
+
+------------------------------------------------------------------------
+
+In control_imsg(), cases IMSG_STAT_INCREMENT, IMSG_STAT_DECREMENT,
+IMSG_STAT_SET:
+
+ 82 static void
+ 83 control_imsg(struct mproc *p, struct imsg *imsg)
+ 84 {
+ ..
+ 86         struct stat_value        val;
+ 87         struct msg               m;
+ 88         const char              *key;
+ 89         const void              *data;
+ 90         size_t                   sz;
+ ..
+165         case IMSG_STAT_SET:
+166                 m_msg(&m, imsg);
+167                 m_get_string(&m, &key);
+168                 m_get_data(&m, &data, &sz);
+169                 m_end(&m);
+170                 memmove(&val, data, sz);
+
+- Out-of-bounds memory write (stack-based buffer overflow): in the call
+  to memmove(), the sz returned by m_get_data() is blindly trusted to be
+  equal to the size of the stack-based val structure (CVE-2015-ABCD).
+
+------------------------------------------------------------------------
+
+In mda_imsg(), case IMSG_MDA_LOOKUP_USERINFO:
+
+114 void
+115 mda_imsg(struct mproc *p, struct imsg *imsg)
+116 {
+...
+124         const void              *data;
+...
+127         size_t                   sz;
+...
+134                 case IMSG_MDA_LOOKUP_USERINFO:
+135                         m_msg(&m, imsg);
+136                         m_get_id(&m, &reqid);
+137                         m_get_int(&m, (int *)&status);
+138                         if (status == LKA_OK)
+139                                 m_get_data(&m, &data, &sz);
+140                         m_end(&m);
+...
+144                         if (status == LKA_TEMPFAIL)
+...
+148                         else if (status == LKA_PERMFAIL)
+...
+152                         else {
+153                                 memmove(&u->userinfo, data, sz);
+
+- Out-of-bounds memory write (heap-based buffer overflow): in the call
+  to memmove(), the sz returned by m_get_data() is blindly trusted to be
+  equal to the size of the heap-based u->userinfo structure
+  (CVE-2015-ABCD).
+
+------------------------------------------------------------------------
+
+In mta_start_tls():
+
+1501 static void
+1502 mta_start_tls(struct mta_session *s)
+1503 {
+1504         struct ca_cert_req_msg  req_ca_cert;
+1505         const char             *certname;
+1506
+1507         if (s->relay->pki_name)
+1508                 certname = s->relay->pki_name;
+1509         else
+1510                 certname = s->helo;
+1511
+1512         req_ca_cert.reqid = s->id;
+1513         (void)strlcpy(req_ca_cert.name, certname, sizeof req_ca_cert.name);
+1514         m_compose(p_lka, IMSG_MTA_SSL_INIT, 0, 0, -1,
+1515             &req_ca_cert, sizeof(req_ca_cert));
+
+- Direct information leak: req_ca_cert.name is not fully initialized by
+  strlcpy() (unlike strncpy(), strlcpy() does not fill its destination
+  buffer with additional null-bytes), and therefore still contains
+  sensitive information from the stack.
+
+------------------------------------------------------------------------
+
+In mta_session_imsg(), case IMSG_MTA_SSL_INIT:
+
+ 253         struct ca_cert_resp_msg *resp_ca_cert;
+ ...
+ 314         case IMSG_MTA_SSL_INIT:
+ 315                 resp_ca_cert = imsg->data;
+ ...
+ 336                 resp_ca_cert = xmemdup(imsg->data, sizeof *resp_ca_cert, "mta:ca_cert");
+ 337                 resp_ca_cert->cert = xstrdup((char *)imsg->data +
+ 338                     sizeof *resp_ca_cert, "mta:ca_cert");
+ ...
+ 343                 ssl = ssl_mta_init(pkiname,
+ 344                     resp_ca_cert->cert, resp_ca_cert->cert_len);
+ ...
+ 349                 explicit_bzero(resp_ca_cert->cert, resp_ca_cert->cert_len);
+
+- Out-of-bounds memory read: resp_ca_cert.
+
+- Out-of-bounds memory read: the string passed to xstrdup() is not
+  guaranteed to be null-terminated.
+
+- Out-of-bounds memory read: in the call to ssl_mta_init(),
+  resp_ca_cert->cert_len is blindly trusted to be equal to
+  resp_ca_cert->cert's xstrdup()ed length.
+
+- Out-of-bounds memory write: in the call to explicit_bzero(),
+  resp_ca_cert->cert_len is blindly trusted to be equal to
+  resp_ca_cert->cert's xstrdup()ed length (CVE-2015-ABCD).
+
+------------------------------------------------------------------------
+
+In mta_session_imsg(), case IMSG_MTA_SSL_VERIFY:
+
+ 252         struct ca_vrfy_resp_msg *resp_ca_vrfy;
+ ...
+ 354         case IMSG_MTA_SSL_VERIFY:
+ 355                 resp_ca_vrfy = imsg->data;
+ 356                 s = mta_tree_pop(&wait_ssl_verify, resp_ca_vrfy->reqid);
+ ...
+ 360                 if (resp_ca_vrfy->status == CA_OK)
+
+- Out-of-bounds memory read: resp_ca_vrfy.
+
+------------------------------------------------------------------------
+
+In smtp_session_imsg(), case IMSG_SMTP_SSL_INIT:
+
+ 551         struct ca_cert_resp_msg         *resp_ca_cert;
+ ...
+ 831         case IMSG_SMTP_SSL_INIT:
+ 832                 resp_ca_cert = imsg->data;
+ ...
+ 842                 resp_ca_cert = xmemdup(imsg->data, sizeof *resp_ca_cert, "smtp:ca_cert");
+ ...
+ 845                 resp_ca_cert->cert = xstrdup((char *)imsg->data +
+ 846                     sizeof *resp_ca_cert, "smtp:ca_cert");
+ ...
+ 861                 explicit_bzero(resp_ca_cert->cert, resp_ca_cert->cert_len);
+
+- Out-of-bounds memory read: resp_ca_cert.
+
+- Out-of-bounds memory read: the string passed to xstrdup() is not
+  guaranteed to be null-terminated.
+
+- Out-of-bounds memory write: in the call to explicit_bzero(),
+  resp_ca_cert->cert_len is blindly trusted to be equal to
+  resp_ca_cert->cert's xstrdup()ed length (CVE-2015-ABCD).
+
+------------------------------------------------------------------------
+
+In smtp_session_imsg(), case IMSG_SMTP_SSL_VERIFY:
+
+ 552         struct ca_vrfy_resp_msg         *resp_ca_vrfy;
+ ...
+ 866         case IMSG_SMTP_SSL_VERIFY:
+ 867                 resp_ca_vrfy = imsg->data;
+ 868                 s = tree_xpop(&wait_ssl_verify, resp_ca_vrfy->reqid);
+ 869
+ 870                 if (resp_ca_vrfy->status == CA_OK)
+
+- Out-of-bounds memory read: resp_ca_vrfy.
+
+------------------------------------------------------------------------
+
+In smtp_mfa_response() and smtp_io(), cases IMSG_SMTP_REQ_CONNECT and
+IO_LOWAT, respectively:
+
+ 888 static void
+ 889 smtp_mfa_response(struct smtp_session *s, int msg, int status, uint32_t code,
+ 890     const char *line)
+ 891 {
+ 892         struct ca_cert_req_msg           req_ca_cert;
+ ...
+ 905         case IMSG_SMTP_REQ_CONNECT:
+ ...
+ 915                         if (s->listener->pki_name[0])
+ 916                                 (void)strlcpy(req_ca_cert.name, s->listener->pki_name,
+ 917                                     sizeof req_ca_cert.name);
+ 918                         else
+ 919                                 (void)strlcpy(req_ca_cert.name, s->smtpname,
+ 920                                     sizeof req_ca_cert.name);
+ 921                         m_compose(p_lka, IMSG_SMTP_SSL_INIT, 0, 0, -1,
+ 922                             &req_ca_cert, sizeof(req_ca_cert));
+
+- Direct information leak: req_ca_cert.name is not fully initialized by
+  strlcpy(), and therefore still contains sensitive information from the
+  stack.
+
+------------------------------------------------------------------------
+
+In lka_imsg(), case IMSG_{SMTP,MTA}_SSL_INIT:
+
+struct ca_cert_resp_msg {
+        uint64_t                reqid;
+        enum ca_resp_status     status;
+        char                   *cert;
+        off_t                   cert_len;
+};
+
+ 63 static void
+ 64 lka_imsg(struct mproc *p, struct imsg *imsg)
+ 65 {
+ ..
+ 75         struct ca_cert_resp_msg          resp_ca_cert;
+ ..
+126                 case IMSG_SMTP_SSL_INIT:
+127                         req_ca_cert = imsg->data;
+128                         resp_ca_cert.reqid = req_ca_cert->reqid;
+...
+133                         if (pki == NULL) {
+134                                 resp_ca_cert.status = CA_FAIL;
+135                                 m_compose(p, IMSG_SMTP_SSL_INIT, 0, 0, -1, &resp_ca_cert,
+136                                     sizeof(resp_ca_cert));
+137                                 return;
+138                         }
+
+- Out-of-bounds memory read: req_ca_cert.
+
+- Direct information leak: resp_ca_cert's cert and cert_len fields.
+
+------------------------------------------------------------------------
+
+In ca_imsg(), case IMSG_CA_PRIV{ENC,DEC}:
+
+292                 case IMSG_CA_PRIVENC:
+293                 case IMSG_CA_PRIVDEC:
+294                         m_msg(&m, imsg);
+295                         m_get_id(&m, &id);
+296                         m_get_string(&m, &pkiname);
+297                         m_get_data(&m, &from, &flen);
+298                         m_get_size(&m, &tlen);
+299                         m_get_size(&m, &padding);
+300                         m_end(&m);
+...
+307                         if ((to = calloc(1, tlen)) == NULL)
+308                                 fatalx("ca_imsg: calloc");
+309
+310                         switch (imsg->hdr.type) {
+311                         case IMSG_CA_PRIVENC:
+312                                 ret = RSA_private_encrypt(flen, from, to, rsa,
+313                                     padding);
+314                                 break;
+315                         case IMSG_CA_PRIVDEC:
+316                                 ret = RSA_private_decrypt(flen, from, to, rsa,
+317                                     padding);
+318                                 break;
+319                         }
+
+- Out-of-bounds memory write (heap-based buffer overflow): in the call
+  to RSA_private_{enc,dec}rypt(), the size (tlen) of the destination
+  buffer (to) is blindly trusted to be equal to RSA_size(rsa)
+  (CVE-2015-ABCD).
+
+------------------------------------------------------------------------
+
+In m_get_typed_sized():
+
+493 static inline void
+494 m_get_typed_sized(struct msg *m, uint8_t type, const void **dst, size_t *sz)
+495 {
+496         if (m->pos + 1 + sizeof(*sz) > m->end)
+497                 m_error("msg too short");
+498         if (*m->pos != type)
+499                 m_error("msg bad type");
+500         memmove(sz, m->pos + 1, sizeof(*sz));
+501         m->pos += sizeof(sz) + 1;
+502         if (m->pos + *sz > m->end)
+503                 m_error("msg too short");
+504         *dst = m->pos;
+505         m->pos += *sz;
+506 }
+
+- Out-of-bounds memory read: *sz, the amount of data allegedly received,
+  is read directly from the wire and sanity-checked, but large *sz
+  values can integer-wrap the check.
+
+------------------------------------------------------------------------
+
+In m_get_sockaddr():
+
+705 void
+706 m_get_sockaddr(struct msg *m, struct sockaddr *sa)
+707 {
+708         size_t           s;
+709         const void      *d;
+710
+711         m_get_typed_sized(m, M_SOCKADDR, &d, &s);
+712         memmove(sa, d, s);
+713 }
+
+- Out-of-bounds memory write (buffer overflow): in the call to
+  memmove(), the size s of the data d returned by m_get_typed_sized() is
+  blindly trusted to be equal to the size of the sockaddr structure sa
+  (CVE-2015-ABCD).
+
+
+========================================================================
+Miscellaneous Bugs
+========================================================================
+
+------------------------------------------------------------------------
+
+In mta_imsg(), case IMSG_CTL_RESUME_ROUTE, if u64 is 0 ("resuming all
+routes"), mta_route_unref() may eventually free() route, which is then
+used-after-free by SPLAY_NEXT() in SPLAY_FOREACH() (there is a SAFE
+version of most FOREACH macros, but no SPLAY_FOREACH_SAFE()):
+
+ 419                 case IMSG_CTL_RESUME_ROUTE:
+ 420                         u64 = *((uint64_t *)imsg->data);
+ ...
+ 426                         SPLAY_FOREACH(route, mta_route_tree, &routes) {
+ 427                                 if (u64 && route->id != u64)
+ 428                                         continue;
+ 429
+ 430                                 if (route->flags & ROUTE_DISABLED) {
+ ...
+ 441                                         mta_route_unref(route); /* from mta_route_disable */
+ 442                                 }
+ 443
+ 444                                 if (u64)
+ 445                                         break;
+ 446                         }
+ 447                         return;
+
+------------------------------------------------------------------------
+
+In parent_sig_handler(), the cause pointer should always be initialized
+to NULL before the calls to asprintf(), and the return value of these
+calls should be checked (on OpenBSD, asprintf() will always reset the
+cause pointer to NULL in case of a failure, but this behavior is
+implementation-dependent):
+
+ 351 static void
+ 352 parent_sig_handler(int sig, short event, void *p)
+ 353 {
+ ...
+ 357         char            *cause;
+ ...
+ 365                 do {
+ 366                         pid = waitpid(-1, &status, WNOHANG);
+ ...
+ 371                         if (WIFSIGNALED(status)) {
+ ...
+ 373                                 asprintf(&cause, "terminated; signal %d",
+ 374                                     WTERMSIG(status));
+ 375                         } else if (WIFEXITED(status)) {
+ 376                                 if (WEXITSTATUS(status) != 0) {
+ ...
+ 378                                         asprintf(&cause, "exited abnormally");
+ 379                                 } else
+ 380                                         asprintf(&cause, "exited okay");
+ 381                         } else
+ 382                                 fatalx("smtpd: unexpected cause of SIGCHLD");
+ ...
+ 442                         free(cause);
+ 443                 } while (pid > 0 || (pid == -1 && errno == EINTR));
+
+------------------------------------------------------------------------
+
+Code similar to the following appears several times in OpenSMTPD:
+
+ 979         (void)strlcpy(sfn, "/tmp/smtpd.out.XXXXXXXXXXX", sizeof(sfn));
+ 980         omode = umask(7077);
+ 981         allout = mkstemp(sfn);
+ 982         umask(omode);
+ 983         if (allout < 0) {
+ ...
+ 991                 return;
+ 992         }
+ 993         unlink(sfn);
+
+But 7077 is decimal, not octal; in octal, 7077 is 015645. Luckily, the
+call to mkstemp() that always follows uses mode 0600, which results in
+the final mode 0000 (0600 & ~015645). This is not a security issue,
+because these permissions are even more restrictive than those
+originally intended.
+
+------------------------------------------------------------------------
+
+In do_show_queue(), chdir(".") should rather be chdir("/"), because the
+current working directory may be outside the chroot tree:
+
+ 652                 if (chroot(PATH_SPOOL) == -1 || chdir(".") == -1)
+ 653                         err(1, "%s", PATH_SPOOL);
+
+However, this is not a security issue either: do_show_queue() is an
+smtpctl functionality, only root is allowed to run it, and all
+subsequent filesystem accesses begin with '/' anyway.
+
+
+========================================================================
+Acknowledgments
+========================================================================
+
+We would like to thank OpenSMTPD's developers for their cooperation,
+professional work, and minute attention to every detail in our audit
+report.
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

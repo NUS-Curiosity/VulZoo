@@ -1,0 +1,248 @@
+
+Date: Fri, 1 Jul 2016 10:51:55 -0500
+From: KoreLogic Disclosures <disclosures@...elogic.com>
+To: fulldisclosure@...lists.org, bugtraq@...urityfocus.com
+Subject: [FD] KL-001-2016-003 : SQLite Tempdir Selection Vulnerability
+
+KL-001-2016-003 : SQLite Tempdir Selection Vulnerability
+
+Title: SQLite Tempdir Selection Vulnerability
+Advisory ID: KL-001-2016-003
+Publication Date: 2016.07.01
+Publication URL: https://www.korelogic.com/Resources/Advisories/KL-001-2016-003.txt
+
+
+1. Vulnerability Details
+
+     Affected Vendor: SQLite/Hwaci
+     Affected Product: SQLite
+     Affected Version: All versions prior to 3.13.0
+     Platform: UNIX, GNU/Linux
+     CWE Classification: CWE-379: Creation of Temporary File in Directory
+                         with Incorrect Permissions
+     Impact: Data Leakage
+     Attack vector: Local
+
+2. Vulnerability Description
+
+     Usually processes writing to temporary directories do not need to
+     perform readdir() because they control the filenames they create, so
+     setting /tmp/ , /var/tmp/ , etc. to be mode 1733 is a not uncommon
+     UNIX hardening practice.
+
+     Affected versions of SQLite reject potential tempdir locations if
+     they are not readable, falling back to '.'.  Thus, SQLite will favor
+     e.g. using cwd for tempfiles on such a system, even if cwd is an
+     unsafe location.  Notably, SQLite also checks the permissions of '.',
+     but ignores the results of that check.
+
+     By itself, this is only a POLA (Principle of Least Astonishment)
+     violation that may cause unexpected failures.  However, this might
+     in turn cause software that uses SQLite libraries to behave in
+     unsafe ways, leaking sensitive data, opening up SQLite libraries to
+     attack by deliberately corrupted tempfiles, etc.
+
+
+3. Technical Description
+
+     SQLite creates tempfiles only under certain specific circumstances,
+     and the behavior is tunable in various ways; see
+     https://www.sqlite.org/tempfiles.html for more background.
+     Generally speaking, the below does not apply for rollback journals,
+     master journals, write-ahead log (WAL) files, or shared-memory
+     (-shm) files.  They may apply for various other tempfile types.
+
+     When a tempfile must be created, sanity checks are performed on
+     candidate tempdir locations; these checks are flawed.
+
+     src/os_unix.c (which is merged into sqlite3.c during the
+     release-tarball preparation process) performs these checks when
+     considering candidate temporary directory locations (quoted from
+     commit 0064a8c77b, 2016-02-23):
+
+       /*
+       ** Return the name of a directory in which to put temporary files.
+       ** If no suitable temporary file directory can be found, return NULL.
+       */
+       static const char *unixTempFileDir(void){
+         static const char *azDirs[] = {
+            0,
+            0,
+            "/var/tmp",
+            "/usr/tmp",
+            "/tmp",
+            "."
+         };
+         unsigned int i;
+         struct stat buf;
+         const char *zDir = sqlite3_temp_directory;
+
+         if( !azDirs[0] ) azDirs[0] = getenv("SQLITE_TMPDIR");
+         if( !azDirs[1] ) azDirs[1] = getenv("TMPDIR");
+         for(i=0; i<sizeof(azDirs)/sizeof(azDirs[0]); zDir=azDirs[i++]){
+           if( zDir==0 ) continue;
+           if( osStat(zDir, &buf) ) continue;
+           if( !S_ISDIR(buf.st_mode) ) continue;
+           if( osAccess(zDir, 07) ) continue;
+           break;
+         }
+         return zDir;
+       }
+
+     osAccess is defined elsewhere as a wrapper around the access system
+     call:
+
+         { "access",       (sqlite3_syscall_ptr)access,     0  },
+       #define osAccess    ((int(*)(const char*,int))aSyscall[2].pCurrent)
+
+     So, a candidate directory will be rejected if it does not match mode
+     07; that is to say it must be readable, writable, and executable.
+
+     Furthermore, the comment that "If no suitable temporary file
+     directory can be found, return NULL." is incorrect: in fact, if all
+     directories including "." fail, then "." is returned, because zDir
+     has already been assigned before the checks fail.  (Also,
+     unixGetTempname, which calls unixTempFileDir, does not check if NULL
+     was returned.)
+
+     The specific lines of code embodying this check have subtly changed
+     a dozen times over SQLite's history (and things like the NULL check
+     might have been valid in some past version).  The first time a check
+     for readability was included appears to have been in fossil commit
+     e7b65e37fd, imported from this CVS commit:
+
+       -** @(#) $Id: pager.c,v 1.15 2001/09/13 14:46:10 drh Exp $
+       +** @(#) $Id: pager.c,v 1.16 2001/09/14 03:24:25 drh Exp $
+
+
+          for(i=0; i<sizeof(azDirs)/sizeof(azDirs[0]); i++){
+       -    if( stat(azDirs[i], &buf)==0 && S_ISDIR(buf.st_mode)
+       -         && access(azDirs[i], W_OK) ){
+       -       return azDirs[i];
+       -    }
+       +    if( stat(azDirs[i], &buf) ) continue;
+       +    if( !S_ISDIR(buf.st_mode) ) continue;
+       +    if( access(azDirs[i], 07) ) continue;
+       +    return azDirs[i];
+          }
+
+     As seen here, prior to 2001.09.14 the only permission checked was
+     W_OK, writability.  The commit message for e7b65e37fd does not call
+     out this change; perhaps there was some problem that changing from
+     W_OK to R_OK+W_OK+X_OK was intended to solve at the time.
+
+     As stated above, this by itself is only a POLA violation: a
+     developer or system administrator might not expect a candidate
+     temporary directory to be rejected if it is not readable.  This
+     would result in SQLITE_TMPDIR , TMPDIR , /var/tmp , /tmp , etc.
+     being rejected by the above if they are mode 1733 or similar, and
+     also cause sqlite to fail at runtime if cwd is not writable.
+
+     SQLite does the right things when creating its tempfile, once the
+     tempdir is chosen.  It randomly generates the filename (although
+     weirdly, using a home-grown implementation instead of mkstemp,
+     possibly for cross-platform purposes), uses file mode 600, with good
+     file-open flags (O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC), etc.  If
+     possible (such as for 'TEMP' databases), the file is unlinked
+     immediately.
+
+     However, this could lead to insecure behavior by some application
+     using SQLite under these conditions.  As a contrived example, a
+     program which writes sensitive data to an sqlite database, and
+     during execution chdir()'s to a directory in which it is not safe to
+     write sensitive data even temporarily, such as an NFS or SMB network
+     share (allowing network capture), or a removable device which will
+     later leave the user's physical control (leaving on-disk residue,
+     possibly mitigated by SQLite's SECURE_DELETE settings).
+
+     It is also possible that the failure of unixTempFileDir to return
+     NULL, and of unixGetTempname to check for that NULL, may lead to
+     abrupt crashes or otherwise unexpected or undefined behavior by the
+     calling program when "." is also not writable.
+
+4. Mitigation and Remediation Recommendation
+
+     The vendor released version 3.13.0 on 2016.05.18 in which the reported
+     vulnerability was patched. Release notes available at:
+     https://www.sqlite.org/releaselog/3_13_0.html
+
+5. Credit
+
+     This vulnerability was discovered by Hank Leininger of KoreLogic, Inc.
+
+6. Disclosure Timeline
+
+     2016.03.24 - KoreLogic sends vulnerability report and PoC to SQLite.
+     2016.03.24 - SQLite acknowledges receipt of vulnerability report.
+     2016.04.21 - KoreLogic asks for an update on the remediation effort.
+     2016.04.21 - SQLite responds that the vulnerability has been patched
+                  and will be public in the next update.
+     2016.05.18 - SQLite 3.13.0 released.
+     2016.07.01 - Public disclosure.
+
+7. Proof of Concept
+
+     ########################################################################
+     #
+     # Copyright 2016 KoreLogic Inc., All Rights Reserved.
+     #
+     # This proof of concept, having been partly or wholly developed
+     # and/or sponsored by KoreLogic, Inc., is hereby released under
+     # the terms and conditions set forth in the Creative Commons
+     # Attribution Share-Alike 4.0 (United States) License:
+     #
+     #   http://creativecommons.org/licenses/by-sa/4.0/
+     #
+     #######################################################################*
+
+     Reproduction using the sqlite3 binary (but an application linked
+     against libsqlite would behave similarly):
+
+patsy@foo ~/sqlite-test $ ls -la
+total 16
+drwxr-xr-x  4 root  root  4096 Feb 23 22:45 .
+drwxr-xr-x 19 patsy root  4096 Feb 23 23:04 ..
+drwx-wx-wt  2 root  patsy 4096 Feb 23 22:41 tmp
+drwxrwxrwx  2 patsy patsy 4096 Feb 23 22:45 unsafe
+
+patsy@foo ~/sqlite-test $ export TMPDIR=~/sqlite-test/tmp
+patsy@foo ~/sqlite-test $ cd unsafe
+patsy@foo ~/sqlite-test/unsafe $ sqlite3
+SQLite version 3.10.2 2016-01-20 15:27:19
+Enter ".help" for usage hints.
+Connected to a transient in-memory database.
+Use ".open FILENAME" to reopen on a persistent database.
+sqlite> CREATE TEMP TABLE testtemp(text);
+sqlite>
+
+foo ~ # ls -l /proc/$(pidof sqlite3)/fd/ | egrep /patsy/
+lrwx------ 1 patsy patsy 64 Feb 23 23:04 3 ->
+/home/patsy/sqlite-test/unsafe/etilqs_1974c47b45a40cc9 (deleted)
+lrwx------ 1 patsy patsy 64 Feb 23 23:04 4 ->
+/home/patsy/sqlite-test/unsafe/etilqs_81d3a73a2307205a (deleted)
+
+The contents of this advisory are copyright(c) 2016
+KoreLogic, Inc. and are licensed under a Creative Commons
+Attribution Share-Alike 4.0 (United States) License:
+http://creativecommons.org/licenses/by-sa/4.0/
+
+KoreLogic, Inc. is a founder-owned and operated company with a
+proven track record of providing security services to entities
+ranging from Fortune 500 to small and mid-sized companies. We
+are a highly skilled team of senior security consultants doing
+by-hand security assessments for the most important networks in
+the U.S. and around the world. We are also developers of various
+tools and resources aimed at helping the security community.
+https://www.korelogic.com/about-korelogic.html
+
+Our public vulnerability disclosure policy is available at:
+https://www.korelogic.com/KoreLogic-Public-Vulnerability-Disclosure-Policy.v2.2.txt
+
+
+Download attachment "signature.asc" of type "application/pgp-signature" (474 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

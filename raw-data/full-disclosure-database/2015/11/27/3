@@ -1,0 +1,229 @@
+
+Date: Wed, 25 Nov 2015 16:47:01 +0100
+From: "Stefan Kanthak" <stefan.kanthak@...go.de>
+To: <bugtraq@...urityfocus.com>
+Cc: fulldisclosure@...lists.org
+Subject: [FD] Mitigations for "carpet bombing" alias "directory poisoning"
+	attacks against executable installers
+
+Hi @ll,
+
+almost all executable installers (and self-extractors as well
+as "portable" applications too) for Windows have a well-known
+(trivial, trivial to detect and trivial to exploit) vulnerability:
+they load system DLLs from their "application directory" (or a
+temporary directory they extract their payload to) instead of
+"%SystemRoot%\System32\".
+
+See <https://capec.mitre.org/data/definitions/471.html>,
+<https://technet.microsoft.com/en-us/library/2269637.aspx>,
+<https://msdn.microsoft.com/en-us/library/ff919712.aspx>,
+<https://msdn.microsoft.com/en-us/library/ms682586.aspx> and
+<http://blogs.technet.com/b/srd/archive/2014/05/13/load-library-safely.aspx>:
+
+| To ensure secure loading of libraries
+| * Use proper DLL search order.
+| * Always specify the fully qualified path when the library location
+    ~~~~~~
+|   is constant.
+| * Load as data file when required.
+| * Make use of code signing infrastructure or AppLocker.
+
+
+This vulnerability is typically attacked via "carpet bombing"
+alias "directory poisoning", for example conducted per "drive-by"
+downloads: see <http://seclists.org/fulldisclosure/2012/Aug/134>
+<http://blog.acrossecurity.com/2012/02/downloads-folder-binary-planting.html>
+<https://insights.sei.cmu.edu/cert/2008/09/carpet-bombing-and-directory-poisoning.html>
+
+Unsuspecting users who run vulnerable executable installers or
+self-extractors (and of course "portable" applications too) from
+their "Downloads" directory are the typical victims.
+
+To make things worse: executable installers (and all DLLs they load)
+are typically run with administrative privileges, either due to
+their application manifest (specifying "requireAdministrator") or
+the "installer detection" of Windows' "user account control" (see
+<https://technet.microsoft.com/en-us/library/dd835540.aspx#BKMK_InstDet>):
+"protected" administrators are prompted for consent, unprivileged
+standard users are prompted for an administrator password.
+
+
+Mitigations for developers and vendors:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+0. DON'T BUILD EXECUTABLE INSTALLERS AND SELF-EXTRACTORS!
+
+   Use the platform's native package format, either .MSI or .INF
+   (plus .CAB) instead to distribute your software/files!
+
+1. ALWAYS use fully qualified (absolute) paths in ALL references
+   to executables and DLLs!
+
+2. Call SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)
+   (see <https://msdn.microsoft.com/en-us/library/hh310515.aspx>)
+   to remove the application directory from the DLL search path!
+
+   Create a load-time dependency (i.e. use a static import) for
+   this function: this lets your installers and self-extractors
+   fail on systems older than Windows 8 when the optional update
+   <https://support.microsoft.com/en-us/kb/2533623> (which
+   backports this function to Windows Vista, Windows 7 and Windows
+   Server 2008 [R2]) is missing there: better be safe than sorry!
+
+   CAVEAT: this fixes the vulnerability for runtime dependencies
+           only, but not for load-time dependencies!
+
+   NOTE: the load-time dependency to SetDefaultDllDirectories()
+         is safe: KERNEL32.DLL is one of the "Known DLLs"
+         (see <https://support.microsoft.com/en-us/kb/164501>)!
+
+3. Test your installers:
+
+   a) Create a UAC-enabled "protected" administrator test account;
+
+   b) Create an empty file "C:\Windows\Debug\SAFER.Log" and grant
+      your test account at least "append" permission; remove all
+      permissions for all other accounts;
+
+   c) Enable Software Restriction Policies, without restrictions,
+      with advanced logging, for all users and all executables:
+
+      --- LOG_ONLY.REG ---
+      REGEDIT4
+
+      [HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers]
+      "AuthentiCodeEnabled"=dword:00000000
+      "DefaultLevel"=dword:00040000       ; 'Unrestricted'
+      "LogFileName"="C:\\Windows\\Debug\\SAFER.Log"
+      "PolicyScope"=dword:00000000        ; Users & Administrators
+      "TransparentEnabled"=dword:00000002 ; All executables and DLLs
+      --- EOF ---
+
+   d) Logon with your test account;
+
+   e) Create an empty directory (or use the "Downloads" directory);
+
+
+      NOTE: on Windows XP (Windows Embedded POSReady 2009 is in
+            extended support until April 2019) use the existing
+            "%SystemRoot%\System32\DLLCache\" instead and skip the
+            following step.
+
+   f) Open a command prompt in the choosen empty directory and run
+      the following command line to create hardlinks to all system
+      DLLs (more precise: all DLLs found in the PATH) there:
+
+      For %! In ("%PATH:;=" "%") Do For %? In ("%~!\*.dll" "%~!\*.ax" "%~!\*.acm" "%~!\*.drv" "%~!\*.ocx" "%~!\*.tsp"
+"%~!\*.ime""%~!\*.iec") Do MkLink /H "%~nx?" "%?"
+
+      NOTE: if "MkLink /H" fails, use "Copy" (with switched arguments)
+            instead.
+
+      NOTE: on x64 systems this "copies" the 64-bit DLLs.
+            Almost all installers are but 32-bit, so use the 32-bit
+            CMD.EXE to run this command line there!
+
+   g) Copy your installers into this directory and execute them per
+      double-click;
+
+   h) Determine the DLLs your installers loaded from the "application
+      directory" by running the following command line in the still
+      open command prompt:
+
+      FIND.EXE /I "%CD%\" "C:\Windows\Debug\SAFER.Log"
+
+   i) Fix the vulnerable installers and retest them.
+
+
+Mitigations for (end) users and (their) administrators:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+0. Don't run executables from the "Downloads" directory or a "%TEMP%"
+   directory!
+   NEVER!
+
+1. DON'T USE EXECUTABLE INSTALLERS OR SELF-EXTRACTORS!
+
+   If your favourite applications are not distributed in the native
+   installer package format of the resp. target platform: ask^WURGE
+   their vendors/developers to provide native installation packages.
+   If they don't: dump these applications, stay away from such cruft!
+
+2. Deny execution (at least) in the "Downloads" directory and all
+   "%TEMP%" directories and their subdirectories:
+
+   * Add the NTFS ACE "(D;OIIO;WP;;;WD)" meaning "deny execution of
+     files in this directory for everyone, inheritable to all files
+     in all subdirectories" (use CACLS.EXE /S:<SDDL> for example);
+
+   * Use "software restriction policies" resp. AppLocker.
+
+   Consider to apply either/both to every "%USERPROFILE%" as well as
+   "%ALLUSERSPROFILE%" alias %ProgramData%" and "%PUBLIC%": Windows
+   doesn't place executables in these directories and beyond.
+
+   See <http://home.arcor.de/skanthak/SAFER.html> as well as
+   <http://mechbgon.com/srp/> plus
+   <http://csrc.nist.gov/itsec/SP800-68r1.pdf>,
+   <https://www.nsa.gov/ia/_files/os/win2k/application_whitelisting_using_srp.pdf>
+   or <https://books.google.de/books?isbn=1437914926> and finally
+   <http://www.asd.gov.au/infosec/top35mitigationstrategies.htm>!
+
+3. Install the optional update
+   <https://support.microsoft.com/en-us/kb/2264107>
+   (available via Windows Update) and create the registry entry
+
+   [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager]
+   "CWDIllegalInDLLSearch"=dword:ffffffff
+
+   to remove the current working directory from the DLL search path.
+
+4. On Windows Vista, Windows 7 and Windows Server 2008 [R2] install
+   the optional update <https://support.microsoft.com/en-us/kb/2533623>
+   (available via Windows Update).
+
+5. Disable UAC's privilege elevation for standard users and installer
+   detection for all users:
+
+   [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System]
+   "ConsentPromptBehaviorUser"=dword:00000000 ; Automatically deny elevation requests
+   "EnableInstallerDetection"=dword:00000000
+
+   See <https://technet.microsoft.com/en-us/library/dd835564.aspx#BKMK_RegistryKeys>
+
+6. Remove the user accounts created during Windows setup from the
+   "Administrators" group and place them in the "Users" group, i.e.
+   demote these accounts from "Administrator" to "Standard user".
+
+   Start->Run "CONTROL.EXE UserPasswords2" alias
+   "RUNDLL32.EXE NETPLWIZ.DLL,UsersRunDll" allows this operation!
+
+   Cf. <http://windows.microsoft.com/en-us/windows/user-accounts-faq>
+
+   | There are three types of accounts. Each type gives you a different
+   | level of control over the PC:
+   | * Administrator accounts provide the most control over a PC, and
+   |   should be used sparingly. You probably created this type of
+   |   account when you first started using your PC.
+   | * Standard accounts are for everyday use. If you're setting up
+   |   accounts for other people on your PC, it's a good idea to give
+   |   them standard accounts.
+
+   JFTR: don't forget to enable the builtin "Administrator" account.
+
+         NET.EXE User Administrator /Active:Yes
+
+
+stay tuned
+Stefan Kanthak
+
+
+PS: see <https://gpg4win.de/news-20151125.html> and the fixes provided
+    by them for a widely used executable installer.
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/
