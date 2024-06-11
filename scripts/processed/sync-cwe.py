@@ -19,7 +19,7 @@ processed_data_file = "../../processed/cwe-database/cwec.json"
 with open(raw_data_file, "r") as f:
     data = f.read()
 
-data_dict = xmltodict.parse(data, postprocessor=attr_to_key)
+data_dict = xmltodict.parse(data)
 json_content = json.dumps(data_dict, indent=4)
 
 with open(processed_data_file, "w") as f:

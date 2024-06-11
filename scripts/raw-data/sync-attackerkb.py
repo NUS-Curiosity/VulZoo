@@ -9,7 +9,7 @@ import os
 import json
 
 
-dest_dir = "../../raw-data/attackerkb-database"
+dest_dir = "../../processed/attackerkb-database"
 topic_dir = f"{dest_dir}/topics"
 assessment_dir = f"{dest_dir}/assessments"
 
