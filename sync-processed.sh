@@ -14,8 +14,9 @@ processed_DIR=processed
 # oss-security, cwe
 print_green "[*][$processed_DIR] Updating OSS-Security, CWE"
 cd scripts/processed/
-python sync-inter-oss-security.py
-python sync-inter-cwe.py
+python sync-oss-security.py
+python sync-cwe.py
+python sync-capec.py
 cd -
 
 echo "processed/ update | ts: `date '+%s'`" >> CHANGELOG

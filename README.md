@@ -11,7 +11,7 @@ Related tasks: vulnerability detection, assessment, and prioritization.
 This dataset is divided into two parts: raw data and processed data.
 
 - `raw-data/`: contains the raw data from different sources.
-- `processed`: contains the intermediate data that is processed or filtered.
+- `processed/`: contains the intermediate data that is processed or filtered.
 
 ## How to Use
 

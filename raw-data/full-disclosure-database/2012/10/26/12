@@ -1,0 +1,98 @@
+
+Date: Wed, 24 Oct 2012 12:10:23 +0000
+From: pr <pr@...ecurity.com>
+To: "full-disclosure@...ts.grok.org.uk" <full-disclosure@...ts.grok.org.uk>
+Subject: RANDOM NUMBER SECURITY IN PYTHON
+
+RANDOM NUMBER SECURITY IN PYTHON
+
+Introduction
+This is the second article devoted to the vulnerabilities of pseudorandom number generators (PRNG).
+A series of publications describing the PRNG vulnerabilities from the basic ones ([1]) to vulnerabilities in various programming languages implemented in CMS and other software ([2],[3],[4]) have appeared recently.
+These publications are popular because PRNG is the basis of web application security. Pseudorandom numbers/character sequences are used in web application security for:
+- Generation of different tokens (CSRF, password reset tokens, and etc.)
+- Generation of random passwords
+- Generation of a text in CAPTCHA
+- Generation of session identifiers
+The previous article (http://blog.ptsecurity.com/2012/08/not-so-random-numbers-take-two.html), relying on the research of George Argyros and Aggelos Kiayias ([3]), explained how to guess random numbers in PHP using PHPSESSID and taught various methods to reduce pseudorandom number entropy.
+Now we are going to consider PRNG in web applications written in the Python language.
+
+
+Specific Features of Python PRNG
+Python-е includes 3 modules intended for generation of random/pseudorandom numbers - random, urandom, and _random:
+ - _random implements the Mersenne Twister algorithm (MT) ([6],[7]) with few changes in the C language
+- urandom uses external entropy resources (CryptGenRandom uses Windows encryption provider) in the C language
+- random is a shell for the _random module in Python-е, including both libraries and having two main functions for pseudorandom number generation - random() and SystemRandom().
+Random()
+The first uses the MT algorithm (_random), but first of all it tries to initiate it with SEED taken from urandom, which converts PRNG to RNG (random number generator). If you fail to call urandom (say, /dev/urandom is missing or a necessary function is not called from the library advapi32.dll), then int(time.time() * 256) will be used as SEED (which, as you already know, ensures weak entropy).
+SystemRandom()
+SystemRandom() calls urandom, which uses external resources for random data generation.
+The MT algorithm change means that instead of a number based on one of 624 numbers from the current PRNG state (state) two numbers are used:
+random_random()
+{
+    unsigned long a=genrand_int32(self)>>5, b=genrand_int32(self)>>6;
+    return PyFloat_FromDouble((a*67108864.0+b)*(1.0/9007199254740992.0));
+}
+As opposed to PHP, the generator can be initiated not only with the long variable, but with any byte sequence (init_by_array() is called), this exactly happens when the random module is imported with the help of an external entropy resource (32 bytes taken from urandom), and in case it fails, time() is used:
+                if a is None: try:
+                a = int.from_bytes(_urandom(32), 'big')
+            except NotImplementedError:
+                import time
+a = int(time.time() * 256)
+
+
+Protection
+It would seem the data of the change, as opposed to PHP, provides sufficient generator entropy even if random.random() is called. That's not so bad.
+Python frameworks are distinguished from PHP by the fact that Python is started once together with a web server. It means that the state is initialized by default only once when the import random command is executed or when random.seed() is forced (it is very rare in web applications), which allows attacking the MT state in accordance with the following algorithm:
+- Find a script displaying the value random.random() (for instance, error logger does this in Plone (SiteErrorLog.py), it leads to a page "error with number *** is detected", where a random number is displayed).
+- Make consequently a series of requests and fix random numbers in them. Request numbers are 1,2,199,200,511,625.
+- Perform an easy-to-guess action with the 313th request (for example, generate a link to reset a password).
+- Relying on requests 1,199, define the states state_1[1], state_1[2], state_1[397].
+- Relying on requests 2,200, define the states state_1[3], state_1[398].
+- Relying on request 511 - state_2[397].
+- Relying on request 625 - state_3[1].
+Accurate state determination depends on a state element index (i): for i mod 2=0 entropy is 2^6, for i mod 2 = 1 - 2^5.
+Requests 1,2,199,200 help determine the states state_1[1], state_1[2], state_1[3], state_1[397], state_1[398], on the basis of which state_2[1] and state_2[2] are generated, from which random request number No. 313 is resulted. However, this number entropy is 2^24 (16M). The entropy is reduced with requests 511 and 625. These requests help calculate state_2[397], state_3[1]. It reduces the number of state options up to 2^8. It means that there are only 256 options of a "random" number used in request No. 313.
+
+For the attack to be performed, it is necessary to prevent anybody from interfering with the requesting process and changing the PRNG state (in other words, to define state indexes correctly). It is also necessary to ensure request No. 1 to use PRNG state elements with indexes not higher than 224, otherwise request No. 200 will use another generator state, which will corrupt the algorithm functioning. It is 36% possible.
+That is why an additional task of request No. 625 is to determine that all previous requests have been made in the necessary states and nobody has interfered with the requesting process.
+
+In addition, here is a script<http://www.ptsecurity.ru/download/brute.py>, which receives random numbers of 6 requests at the input. All possible random numbers of request No. 313 are generated at exit.
+
+
+Practical Application
+We analyzed several frameworks and web applications in the Python language (including Plone and Django). Unfortunately (but maybe fortunately), we couldn't find vulnerable ones among them.
+The most anticipated target is Plone as random numbers can be displayed in it (SiteErrorLog.py), but the attack problem is the following:
+Plone functions under Python 2.7.*, which cuts the last 5 numbers when float is converted to str(). It sufficiently broadens the number of options (including local bruteforce and external requests to the server).
+Python of the third branch does not cut float in the st()r function, which makes its applications the most vulnerable to attacks.
+Here is a script<http://www.ptsecurity.ru/download/brute.py>, which receives 6 random numbers at input (initiated by the state with necessary indexes, for instance, from the test script vuln.py), and generates possible options of this random number at exit. It takes about an hour on an "average" computer.
+Note: this script does not take into account the error of element state determination for (i mod 2 = 1), that is why the script efficiency reduces from 36% to 18%.
+
+Conclusion
+The specific features of the framework code execution (web server side) allow an attacker to conduct attacks impossible or hardly implemented in the PHP language. It is required to follow simple rules to protect PRNG:
+- Use the urandom module or the random.SystemRandom() function.
+- Initiate with the help of random.seed() prior to each random.random() call with sufficient SEED entropy (if it is impossible to use urandom, you can use, for example, the value of the function md5(time.time()*(int)salt1+str(salt2)) as SEED, where salt1 and salt2 are initiated in the course of web application installation).
+- Restrict random number displaying in your web application (you only need to use such hash functions as md5).
+
+
+Links
+[1] http://blog.ptsecurity.com/2012/08/not-so-random-numbers-take-two.html
+[2] http://jazzy.id.au/default/2010/09/20/cracking_random_number_generators_part_1.html
+[3] http://crypto.di.uoa.gr/CRYPTO.SEC/Randomness_Attacks_files/paper.pdf
+[4] http://www.slideshare.net/d0znpp/dcg7812-cryptographyinwebapps-14052863
+[5] http://media.blackhat.com/bh-us-10/presentations/Kamkar/BlackHat-USA-2010-Kamkar-How-I-Met-Your-Girlfriend-slides.pdf
+[6] http://en.wikipedia.org/wiki/Mersenne_twister
+[7] http://jazzy.id.au/default/2010/09/22/cracking_random_number_generators_part_3.html
+
+
+Timur Yunusov,
+Positive Technologies<http://www.ptsecurity.com/>
+
+
+
+Content of type "text/html" skipped
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
