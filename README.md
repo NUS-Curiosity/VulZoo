@@ -8,11 +8,10 @@ VulZoo is a large-scale vulnerability intelligence dataset that integrates vario
 
 Related tasks: vulnerability detection, assessment, and prioritization.
 
-This dataset is divided into three parts: 
+This dataset is divided into two parts: raw data and processed data.
 
 - `raw-data/`: contains the raw data from different sources.
-- `intermediate/`: contains the intermediate data that is preliminarily processed or filtered.
-- `vulzoo/`: contains the processed data that is more structured and easier to use.
+- `processed`: contains the intermediate data that is processed or filtered.
 
 ## How to Use
 
@@ -39,16 +38,10 @@ You can run the `sync-raw-data.sh` script to incrementally update the local raw 
 ./sync-raw-data.sh
 ```
 
-Then, you can run the `sync-intermediate.sh` script to process the raw data and synchronize the intermediate data with the latest raw data:
+Then, you can run the `sync-processed.sh` script to process the raw data and synchronize the processed data with the latest raw data:
 
 ```bash
-./sync-intermediate.sh
-```
-
-Finally, you can run the `sync-vulzoo.sh` script to generate the processed data:
-
-```bash
-./sync-vulzoo.sh
+./sync-processed.sh
 ```
 
 ## Data Sources
