@@ -44,6 +44,8 @@ Then, you can run the `sync-processed.sh` script to process the raw data and syn
 ./sync-processed.sh
 ```
 
+P.S. You can run `scripts/sync-statistics.sh` to get the statistics of the VulZoo dataset.
+
 ## Data Sources
 
 ### Structural
