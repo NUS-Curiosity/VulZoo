@@ -18,8 +18,7 @@ This dataset is divided into two parts: raw data and processed data.
 Pre-requisites:
 
 - Python 3.6+
-- jq (Linux command-line JSON processor)
-- Disk space: 30GB+
+- Disk space: 25GB+
 
 VulZoo is composed of both git-based and non-git-based sources. The git-based sources are from upstream repositories and organized as git submodules in this repository. The non-git-based sources are crawled and maintained in this repository. To get started, clone the repository with the following command:
 
@@ -45,7 +44,9 @@ Then, you can run the `sync-processed.sh` script to process the raw data and syn
 ./sync-processed.sh
 ```
 
-P.S. You can run `scripts/sync-statistics.py` to get the statistics of the VulZoo dataset.
+P.S. 
+
+- You can run `scripts/processed/print-statistics.py` to get the statistics of the processed data.
 
 ## Data Sources
 
