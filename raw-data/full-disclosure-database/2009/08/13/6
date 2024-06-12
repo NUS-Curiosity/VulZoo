@@ -1,0 +1,120 @@
+
+Date: Thu, 13 Aug 2009 20:57:53 +0200
+From: Tavis Ormandy <taviso@....lonestar.org>
+To: full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com
+Subject: Linux NULL pointer dereference due to incorrect
+	proto_ops initializations
+
+Linux NULL pointer dereference due to incorrect proto_ops initializations
+-------------------------------------------------------------------------
+
+In the Linux kernel, each socket has an associated struct of operations
+called proto_ops which contain pointers to functions implementing various
+features, such as accept, bind, shutdown, and so on.
+
+If an operation on a particular socket is unimplemented, they are expected
+to point the associated function pointer to predefined stubs, for example if
+the "accept" operation is undefined it would point to sock_no_accept(). However,
+we have found that this is not always the case and some of these pointers are
+left uninitialized.
+
+This is not always a security issue, as the kernel validates the pointers at
+the call site, such as this example from sock_splice_read:
+
+static ssize_t sock_splice_read(struct file *file, loff_t *ppos,
+                    struct pipe_inode_info *pipe, size_t len,
+                unsigned int flags)
+{
+    struct socket *sock = file->private_data;
+
+    if (unlikely(!sock->ops->splice_read))
+        return -EINVAL;
+
+    return sock->ops->splice_read(sock, ppos, pipe, len, flags);
+}
+
+But we have found an example where this is not the case; the sock_sendpage()
+routine does not validate the function pointer is valid before dereferencing
+it, and therefore relies on the correct initialization of the proto_ops
+structure.
+
+We have identified several examples where the initialization is incomplete:
+
+- The SOCKOPS_WRAP macro defined in include/linux/net.h, which appears correct
+  at first glance, was actually affected. This includes PF_APPLETALK, PF_IPX,
+  PF_IRDA, PF_X25 and PF_AX25 families.
+
+- Initializations were missing in other protocols, including PF_BLUETOOTH,
+  PF_IUCV, PF_INET6 (with IPPROTO_SCTP), PF_PPPOX and PF_ISDN.
+
+--------------------
+Affected Software
+------------------------
+
+All Linux 2.4/2.6 versions since May 2001 are believed to be affected:
+
+- Linux 2.4, from 2.4.4 up to and including 2.4.37.4
+- Linux 2.6, from 2.6.0 up to and including 2.6.30.4
+
+--------------------
+Consequences
+-----------------------
+
+This issue is easily exploitable for local privilege escalation. In order to
+exploit this, an attacker would create a mapping at address zero containing
+code to be executed with privileges of the kernel, and then trigger a
+vulnerable operation using a sequence like this:
+
+/* ... */
+    int fdin = mkstemp(template);
+    int fdout = socket(PF_PPPOX, SOCK_DGRAM, 0);
+
+    unlink(template);
+
+    ftruncate(fdin, PAGE_SIZE);
+
+    sendfile(fdout, fdin, NULL, PAGE_SIZE);
+/* ... */
+
+Please note, sendfile() is just one of many ways to cause a sendpage
+operation on a socket.
+
+Successful exploitation will lead to complete attacker control of the system.
+
+-------------------
+Mitigation
+-----------------------
+
+Recent kernels with mmap_min_addr support may prevent exploitation if
+the sysctl vm.mmap_min_addr is set above zero. However, administrators
+should be aware that LSM based mandatory access control systems, such
+as SELinux, may alter this functionality.
+
+It should also be noted that all kernels up to 2.6.30.2 are vulnerable to
+published attacks against mmap_min_addr.
+
+-------------------
+Solution
+-----------------------
+
+Linus committed a patch correcting this issue on 13th August 2009.
+
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commit;h=e694958388c50148389b0e9b9e9e8945cf0f1b98
+
+-------------------
+Credit
+-----------------------
+
+This bug was discovered by Tavis Ormandy and Julien Tinnes of the Google
+Security Team.
+
+
+-- 
+-------------------------------------
+taviso@....lonestar.org | finger me for my gpg key.
+-------------------------------------------------------
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

@@ -1,0 +1,277 @@
+
+Date: Wed, 11 Feb 2009 23:22:51 +1300
+From: Andrew Miller <sec.432@...l.com>
+To: full-disclosure@...ts.grok.org.uk
+Subject: Local vulnerability in suexec + FastCGI + PHP
+	configurations
+
+DISCLAIMER: THIS SECURITY ADVISORY IS PROVIDED AS-IS, AND WITHOUT ANY
+GUARANTEE OF ANY KIND THAT THE INFORMATION IS ACCURATE, OR THAT THE
+WORKAROUND, SOLUTIONS, OR PATCHES PROVIDED WILL PROTECT SYSTEMS, OR THAT
+THEY WILL NOT CREATE NEW PROBLEMS. THE AUTHOR ACCEPTS NO LIABILITY OF
+ANY FORM FOR THE INFORMATION CONTAINED WITHIN OR THE CONSEQUENCES OF ITS
+USE OR MISUSE.
+
+Synopsis:
+  Most current installations of PHP set up to run via FastCGI with
+suexec are vulnerable to a local exploit, where anyone with the ability
+to run code as the user the webserver runs as can gain access as any
+user with an account set up to run PHP. It is anticipated that this
+issue will especially affect shared web hosts who use FastCGI + suexec
+thinking it will give them additional security.
+
+Conditions for exploitation:
+  => PHP needs to be used via CGI or FastCGI.
+  => The system must be set up to use suexec (rather than, say, having
+PHP run as an external FastCGI server).
+  => The attacker must be able to run code as the same user that the
+webserver runs as. This is unlikely to be a problem for many local
+attackers, because there are a multitude of possible attack vectors,
+such as SSI, non-suexec CGI scripts, non-suexec PHP (if mod_php is also
+installed), and likely numerous other options.
+  => Depending on the configuration, setting an open_basedir might
+protect an installation. However, this only applies if open_basedir is
+set, php-cgi is not installed directly into the web space, but is
+instead called from a script which doesn't pass any parameters from the
+script command line.
+
+Affected PHP versions:
+  => All versions of PHP (including PHP 5.2.8 and latest CVS) in
+existence at the date of this advisory are believed to be affected.
+
+Vendor notification:
+  security@....net has been informed of this issue. Antony Dovegal
+replied to say:
+     "It's been agreed that we won't implement any more security hacks
+in PHP itself since such things should be done by the OS, so no more
+magic INI settings."
+  As such, it appears that the PHP developers do not intend to add any
+technical measures against this vulnerability. It should be noted that
+while this is a vulnerability in a way of installing PHP, it appears
+that there is no way to securely set up a suexec + FastCGI + PHP
+installation using an unpatched version of PHP and so it is hoped that
+the PHP developers will reconsider in time.
+
+Work-arounds:
+  A proposed patch is provided later which can be applied to PHP to
+protect against this vulnerability (when coupled with an appropriate
+configuration). This patch has been briefly tested to ensure it works,
+but requires more testing and review before it should be used in
+production. No guarantees are made about it.
+
+  Using a permanently running external FastCGI process per user is an
+alternative solution if the cost of these extra processes is tolerable.
+
+  Setting open_basedir from within php.ini may be a possible workaround
+(but only if nowhere in open_basedir is writable to the attacker), but
+only if PHP is called from a script which also sets SERVER_SOFTWARE and
+doesn't pass through the command line arguments. For example:
+#!/bin/bash
+export SERVER_SOFTWARE=blah
+/usr/bin/php-cgi -c /home/myuser/php.ini
+
+Technical details of attack:
+  PHP does not place any restrictions on what it will run, even when
+called from suexec. This means that by manipulating the environment
+variables passed in to php-cgi when calling via suexec, an attacker can
+execute arbitrary PHP scripts with the user of the owner of the PHP
+script (and if SERVER_SOFTWARE is not set, can also pass in PHP code to
+be executed via stdin).
+
+The filtering of environment variables by suexec does not protect
+against this attack, because the environment variables needed to perform
+the attack are passed through suexec. Likewise, setting doc_root and
+user_dir in php.ini (as recommended in the security section of the PHP
+manual) provides no protection, as the attacker has full control of
+environments indicating the base directory.
+
+Example of exploitation:
+  Suppose that suexec php is set up as follows:
+In /home/wwjargon/public_html/php.fcgi we have:
+#!/bin/bash
+/usr/bin/php-cgi -c /home/wwjargon/php.ini
+
+In .htaccess we have:
+Action php-fcgi /php.fcgi
+AddHandler php-fcgi .php
+
+This is a fairly common set up. It can be exploited as follows (www-data
+is the username the webserver runs as):
+
+$ whoami
+www-data
+$ cat >/tmp/exploit.php
+<?php system("whoami");
+$ cd /home/wwjargon/public_html/
+$ SCRIPT_FILENAME=/tmp/exploit.php SERVER_SOFTWARE=blah
+/usr/lib/apache2/suexec "~wwjargon" wwjargon php.fcgi
+X-Powered-By: PHP/5.2.6-2ubuntu4
+Content-type: text/html
+
+wwjargon
+
+Patch for PHP to provide protection:
+  This patch has been briefly tested to ensure it works, but requires
+more testing and review before it should be used in production. No
+guarantees are made about it.
+
+diff -rbud ./php-5.2.8-orig/sapi/cgi/cgi_main.c
+./php-5.2.8/sapi/cgi/cgi_main.c
+--- ./php-5.2.8-orig/sapi/cgi/cgi_main.c    2009-02-10
+21:37:09.000000000 +1300
++++ ./php-5.2.8/sapi/cgi/cgi_main.c    2009-02-11 00:07:51.000000000 +1300
+@@ -67,6 +67,9 @@
+#include <fcntl.h>
+#include "win32/php_registry.h"
+#endif
++#ifdef HAVE_PWD_H
++#include <pwd.h>
++#endif
+
+#ifdef __riscos__
+#include <unixlib/local.h>
+@@ -170,6 +173,10 @@
+     zend_bool impersonate;
+# endif
+#endif
++#ifdef HAVE_PWD_H
++    char* suexec_base_dir;
++    char* suexec_user_dir;
++#endif
+} php_cgi_globals_struct;
+
+#ifdef ZTS
+@@ -1232,6 +1239,10 @@
+     STD_PHP_INI_ENTRY("fastcgi.impersonate",     "0",  PHP_INI_SYSTEM,
+OnUpdateBool,   impersonate, php_cgi_globals_struct, php_cgi_globals)
+# endif
+#endif
++#ifdef HAVE_PWD_H
++    STD_PHP_INI_ENTRY("cgi.suexec_base_dir",     NULL, PHP_INI_SYSTEM,
+OnUpdateString, suexec_base_dir, php_cgi_globals_struct, php_cgi_globals)
++    STD_PHP_INI_ENTRY("cgi.suexec_user_dir",     NULL, PHP_INI_SYSTEM,
+OnUpdateString, suexec_user_dir, php_cgi_globals_struct, php_cgi_globals)
++#endif
+PHP_INI_END()
+
+/* {{{ php_cgi_globals_ctor
+@@ -1254,6 +1265,10 @@
+     php_cgi_globals->impersonate = 0;
+# endif
+#endif
++#ifdef HAVE_PWD_H
++    php_cgi_globals->suexec_base_dir = NULL;
++    php_cgi_globals->suexec_user_dir = NULL;
++#endif
+}
+/* }}} */
+
+@@ -1708,6 +1723,10 @@
+#if PHP_FASTCGI
+             && !fastcgi
+#endif
++#ifdef HAVE_PWD_H
++            && CGIG(suexec_base_dir) == NULL
++            && CGIG(suexec_user_dir) == NULL
++#endif
+         ) {
+             while ((c = php_getopt(argc, argv, OPTIONS, &php_optarg,
+&php_optind, 0)) != -1) {
+                 switch (c) {
+@@ -1884,6 +1903,10 @@
+#if PHP_FASTCGI
+             || fastcgi
+#endif
++#ifdef HAVE_PWD_H
++            || CGIG(suexec_base_dir) != NULL
++            || CGIG(suexec_user_dir) != NULL
++#endif
+         )
+         {
+             file_handle.type = ZEND_HANDLE_FILENAME;
+@@ -1922,9 +1945,49 @@
+         */
+         retval = FAILURE;
+         if (cgi || SG(request_info).path_translated) {
++#ifdef HAVE_PWD_H
++            zend_bool path_ok = !(CGIG(suexec_base_dir) ||
++                                  CGIG(suexec_user_dir));
++            if (!path_ok && SG(request_info).path_translated)
++            {
++                struct stat statbuf;
++                char *real_path =
+tsrm_realpath(SG(request_info).path_translated, NULL TSRMLS_CC);
++
++                virtual_stat(SG(request_info).path_translated, &statbuf
+TSRMLS_CC);
++                /* Only execute if the script is owned by the current user,
++                 * the user execute bit is set, and it is not group or
+world
++                 * writable.
++                 */
++                if (statbuf.st_uid == geteuid() &&
++                    (statbuf.st_mode & 0100) == 0100 &&
++                    (statbuf.st_mode & 022) == 0) {
++                    if (CGIG(suexec_base_dir) && !strncmp(real_path,
+CGIG(suexec_base_dir), strlen(CGIG(suexec_base_dir)))) {
++                        path_ok = 1;
++                    }
++                    if (!path_ok && CGIG(suexec_user_dir)) {
++                        struct passwd* pw = getpwuid(geteuid());
++                        size_t len = strlen(pw->pw_dir) + 1 +
+strlen(CGIG(suexec_user_dir)) + 2;
++                        char * user_dir = malloc(len);
++                        strcpy(user_dir, pw->pw_dir);
++                        strlcat(user_dir, "/", len);
++                        strlcat(user_dir, CGIG(suexec_user_dir), len);
++                        strlcat(user_dir, "/", len);
++                        if (!strncmp(real_path, user_dir, len - 1))
++                            path_ok = 1;
++                        free(user_dir);
++                    }
++                    free(real_path);
++                }
++            }
++
++            if (path_ok) {
++#endif
+             if
+(!php_check_open_basedir(SG(request_info).path_translated TSRMLS_CC)) {
+                 retval = php_fopen_primary_script(&file_handle TSRMLS_CC);
+             }
++#ifdef HAVE_PWD_H
++            }
++#endif
+         }
+         /*
+             if we are unable to open path_translated and we are not
+
+Usage of the patch:
+  => Apply to PHP 5.2.8 and rebuild and install php-cgi.
+  => Replace the scripts in the web directory with a script like:
+#!/bin/bash
+/usr/bin/php-cgi -c /etc/php.ini
+
+  Then in php.ini, you have two new configuration options:
+cgi.suexec_base_dir
+cgi.suexec_user_dir
+
+  If either of these directives are set, extra security checks are
+enabled. If both are set, the security checks for one or the other of
+the directives must pass.
+
+  cgi.suexec_base_dir restricts script execution to paths starting with
+the directive (include a trailing slash if you don't want it to be used
+as a prefix).
+
+  cgi.suexec_user_dir gives a path relative to the users home directory
+where PHP will execute code from.
+
+  In addition, any PHP scripts to be executed must be owned by the same
+user, have the execute bit set, and not be group or world writable.
+
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

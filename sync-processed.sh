@@ -25,6 +25,8 @@ print_green "[*][$processed_DIR] Updating D3FEND"
 python sync-d3fend.py
 print_green "[*][$processed_DIR] Updating Linux Vulns"
 python sync-linux-vulns.py
+print_green "[*][$processed_DIR] Updating Patches"
+python sync-patch.py
 cd - &> /dev/null
 
 print_green "[*][$processed_DIR] Updating MITRE CVE"
@@ -41,9 +43,8 @@ print_green "[*][$processed_DIR] Updating NVD"
 mkdir -p $processed_DIR/nvd-database
 cp -r $raw_data_DIR/nvd-database/CVE-*/ $processed_DIR/nvd-database/
 
-print_green "[*][$processed_DIR] Updating GitHub Advisories"
+print_green "[*][$processed_DIR] Updating GitHub Security Advisories"
 mkdir -p $processed_DIR/github-advisory-database
 cp -r $raw_data_DIR/github-advisory-database/advisories/github-reviewed/* $processed_DIR/github-advisory-database/
-
 
 echo "processed/ update | ts: `date '+%s'`" >> CHANGELOG

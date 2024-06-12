@@ -4,10 +4,10 @@
 tempfile=$(mktemp)
 
 # Calculate the hash values of all files in the directory and store the results in the temporary file
-find ../../intermediate/ -type f -exec sha256sum {} \; > "$tempfile"
+find $1 -type f -exec sha256sum {} \; > "$tempfile"
 
 # Find and display duplicate files
-echo "[*] Finding duplicate files in the intermediate directory"
+echo "[*] Finding duplicate files in $1"
 echo "[+] The following are identical files:"
 sort "$tempfile" | awk '{
     hash=$1

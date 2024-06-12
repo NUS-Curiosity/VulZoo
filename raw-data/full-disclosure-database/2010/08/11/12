@@ -1,0 +1,261 @@
+
+Date: Wed, 11 Aug 2010 14:16:05 +0200
+From: Florian Zumbiehl <florz@...rz.de>
+To: full-disclosure@...ts.grok.org.uk
+Subject: Collisions in PDF signatures
+
+
+(Note: This advisory can also be found at http://pdfsig-collision.florz.de/)
+
+= Summary =
+
+The specification of the Portable Document Format (PDF) from version
+1.3 onward, including ISO 19005-1:2005 (PDF/A-1) and ISO 32000-1:2008
+(equivalent to PDF 1.7), ostensibly defines a mechanism for digitally
+signing a document's contents so as to integrate cryptographic
+authentication of a document's contents into the existing container
+format. A common use of this mechanism is for the creation of supposedly
+non-repudiable signatures on legal documents, including scenarios where
+digital signatures are mandated by law.
+
+This advisory shows how a signed PDF document can be constructed in such a
+way that its appearance can be changed without necessarily invalidating the
+signature.
+
+It is not entirely clear whether the files provided as a demonstration of
+the vulnerability can actually be considered (syntactically valid) PDF
+documents or not--I haven't found a cleaner way so far. Also, the
+demonstration documents do not work with all implementations in the same
+way--however, I would argue that the mere fact that implementations
+(and in at least one case even two different interfaces to what seems to
+be the same implementation) don't agree on how to interpret a document
+and its signing status while not being in conflict with the specification
+in any obvious way is sufficient evidence that at the very least the
+specification is lacking.
+
+That said, my opinion is that the mechanism is fundamentally flawed and
+ought to be replaced. Also, the main point of this advisory is not the
+practical demonstration (even though it takes up most of the space),
+but rather the theoretical deficiency of the specification, which is
+only shown by the demonstration to not be purely theoretical in nature.
+
+
+= The Problem =
+
+The PDF specification does not itself specify any of the cryptographic
+operations to be performed for signing or for the verification of
+signatures, but instead limits itself to providing a framework that any
+signature mechanism can be plugged into.
+
+The specification defines how the document is to be serialized into the
+sequence of bytes that is fed into the signature mechanism, it defines the
+way the resulting signature blob along with possible mechanism-specific
+signature meta data is to be stored within the file, and it specifies
+a marker that is used to distinguish between signature mechanisms.
+
+Practically, PKCS#7 seems to be the prevalent signature mechanism in use,
+thus building on proven, well-documented, and well-understood technology
+for the core cryptographic operations.
+
+The problem lies in the serialization step: The transformation that
+creates the byte sequence that is fed into the signature mechanism is
+non-injective, and, of course, not collision resistant, thus allowing
+for the construction of colliding documents.
+
+
+= How PDF Signatures (Don't) Work =
+
+Note: In the following, it is assumed that you are familiar with the
+structure of PDF files. If you are not, you can find a short introduction
+below that covers everything that you need to know in order to understand
+the attack.
+
+The data structure at the heart of the digital signature framework is
+a "signature dictionary" like this one (defined under 12.8.1 in
+ISO 32000-1:2008):
+
+<<
+	/Type /Sig
+	/Filter /Adobe.PPKMS
+	/SubFilter /adbe.pkcs7.detached
+	/Contents <12[lots of hex digits ...]ef>
+	/ByteRange [0 123 456 789]
+>>
+
+The SubFilter field indicates the signature mechanism used, the Contents
+field stores the signature blob produced by the signature mechanism as
+a hexadecimal string, and the ByteRange field specifies the regions
+of the file that are covered by the signature (it's a list of pairs,
+where each pair specifies a start offset and the number of bytes to
+include starting at that offset--it should, as per the specification,
+cover the whole file, excluding only exactly the value of the Contents
+field of the signature dictionary).
+
+The serialization of the document that's fed into the signature mechanism
+is exactly bit-identical to the serialization in the final (signed) file
+(including the cross-reference table), with the only difference that
+the range of bytes that is occupied by the value of the Contents field
+in the final file is left out--or, to put it another way: It is the
+concatenation of those byte ranges of the final file that are specified
+by the ByteRange field.
+
+To simplify the reasoning about the attack, a model of a "byte sequence
+with a gap of a defined size" will be used in the following--the "gap"
+being an object that occupies address space in the sequence but doesn't
+have any properties besides that.
+
+Using this model, one can describe the process of the creation of a
+signed PDF file as follows:
+
+First, the document is serialized into such a byte sequence with a
+gap of appropriate size inserted in the location where the value of
+the signature dictionary's Contents field would belong in the final
+file. This is called the "preliminary serialization" in the following.
+
+The preliminary serialization then is transformed into the byte sequence
+that is fed into the signature mechanism by simply dropping the gap from
+the sequence. This is called the "signing serialization" in the following.
+
+Finally, the final, signed file is created by replacing the gap in the
+preliminary serialization with the signature blob that has been created
+by the signature mechanism.
+
+
+= The Attack in Detail =
+
+Using the model described above, if we assume the values of the bytes in
+the sequence to be opaque to us, it is obvious that the transformation
+from the preliminary to the signing serialization is not injective, as
+there is no way for reconstructing the gap from the signing serialization.
+
+If we do allow for the contents of the sequence to be used for the
+reconstruction of the gap, at first glance it may seem as if the
+ByteRange field provided the needed information (position and size of
+the gap)--however, in order to locate the signature dictionary with
+the ByteRange field in it, one first would have to reconstruct the gap,
+as the offsets of the indirect objects one has to traverse in order to
+find the signature dictionary (such as the document catalog) may depend
+on the size of the gap (depending on the object's position relative to
+the gap). This circular dependency can not be broken in the general case,
+as is demonstrated by the following example.
+
+So, the idea of the attack is to create a pair of preliminary
+serializations that differ only in the position of the gap (thus
+resulting in colliding signing serializations) with two alternative
+document catalogs in between the two possible gap locations, so that
+depending on which of the two locations the signature blob is injected at,
+either one or the other of the two catalogs will be moved to the offset
+that the cross-reference table entry for the document catalog points to.
+
+Schematically, the two preliminary serializations look like this:
+
+1. <contents><sigdict 1<gap>><catalog 1><catalog 2><sigdict 2><xreftable>
+2. <contents><sigdict 1><catalog 1><catalog 2><sigdict 2<gap>><xreftable>
+
+Both get transformed into this signing serialization:
+
+<contents><sigdict 1><catalog 1><catalog 2><sigdict 2><xreftable>
+
+Thus a signature that is valid for one of them will be valid for the other
+as well. After injecting the signature, the two documents look like this:
+
+                                   +-- offset of the document catalog --+
+                                   v                                    |
+1. <contents><sigdict 1<signature>><catalog 1><catalog 2><sigdict 2><xreftable>
+2. <contents><sigdict 1><catalog 1><catalog 2><sigdict 2<signature>><xreftable>
+
+As all contents of the document are accessed by traversing the document
+catalog, this allows for all aspects of the document's appearance to be
+changed depending on the injection point of the signature blob.
+
+
+= Demonstration =
+
+These two demonstration documents contain exactly the same signature:
+
+- http://pdfsig-collision.florz.de/letter_of_rec.pdf
+- http://pdfsig-collision.florz.de/order.pdf
+
+The root certificate of the CA used for signing the documents:
+
+- http://pdfsig-collision.florz.de/rootca.pem
+
+All three files in one gzip compressed tar archive:
+
+- http://pdfsig-collision.florz.de/pdfsig-collision.tar.gz
+
+Please note that I don't make any guarantees regarding the security of
+the CA used for signing the demonstration documents--so make sure you
+remove the CA from your trusted list after you have tested what you
+wanted to test.
+
+The contents of the two documents were shamelessly copied from postscript
+documents created by Magnus Daum and Stefan Lucks as a demonstration of
+a practical attack using MD5 collisions which can be found at
+http://th.informatik.uni-mannheim.de/people/lucks/HashCollisions/.
+
+
+= How To Fix =
+
+As noted in the summary, it is unclear whether the file provided as
+a demonstration of the vulnerability can actually be considered a
+(syntactically valid) PDF document.
+
+Possibly the specification could be clarified in such a way that it could
+be proven that the vulnerability could not ever occur in a syntactically
+valid PDF document. If the verification of signatures then was made
+to include an exact validation of the document's syntax, that possibly
+could fix the problem.
+
+Given that it's crucial for this type of application that the code is
+bug-free, the complexity inherent in such an approach seems undesirable,
+in particular in the light of the simplicity of a robust solution.
+
+An obvious simple and robust solution would be to extend the current
+signing serialization by concatenating it with a copy of the ByteRange
+array, assigning new designations for variants of existing signature
+mechanisms that use this new signing serialization.
+
+
+= Appendix: A Short Introduction to PDF =
+
+This is just trying to sketch out as much of the format as is needed for
+understanding the attack, without much attention to formal ambiguity.
+The full and much less ambiguous specification of the format is freely
+available on the web:
+
+http://www.adobe.com/devnet/acrobat/pdfs/PDF32000_2008.pdf
+
+Essentially, a PDF file is a concatenation of variable length objects of
+various kinds representing the document's structure, contents, meta data,
+etc. Each object is identified by a number (each "indirect object",
+to be precise--objects also can appear nested inside other objects,
+those don't have numbers) that's used for references among the objects
+(actually there are even two numbers per indirect object, but that's
+mostly syntactic sugar).
+
+At the end of the file, there is an index that maps the object numbers
+to byte offsets within the file, called the "cross-reference table".
+When reading a PDF file, one starts from the end where one first finds
+the byte offset of the start of the cross-reference table and the object
+number of the "document catalog", which is basically the root object
+of the document's structure. In order to retrieve a specific piece
+of the document, one follows references to other objects, starting
+at the document catalog, each time locating the object through the
+cross-reference table.
+
+Many objects in PDF are represented as so-called dictionaries--collections
+of key-value pairs--which take roughly this form:
+
+<<
+	/Key <12a56e>
+	/OtherKey 123.5
+	/YetAnotherKey /NamesCanBeValuesToo
+	/Child 1 0 R % this is a reference to the object with number "1 0"
+	/And (so on)
+>>
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

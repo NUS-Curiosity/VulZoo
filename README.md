@@ -46,7 +46,7 @@ Then, you can run the `sync-processed.sh` script to process the raw data and syn
 
 P.S. 
 
-- You can run `scripts/processed/print-statistics.py` to get the statistics of the processed data.
+- You can run `print-statistics.py` to get the statistics of the processed data.
 
 ## Data Sources
 
