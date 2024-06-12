@@ -1,0 +1,82 @@
+
+Date: Thu, 08 Oct 2009 17:04:11 +0200
+From: Przemyslaw Frasunek <venglin@...ebsd.lublin.pl>
+To: full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com
+Subject: FreeBSD 7.2 VFS/devfs race condition exploit
+
+FreeBSD 7.2 and below (including 6.4) are vulnerable to race condition in VFS
+and devfs code, resulting in NULL pointer dereference. In contrast to pipe race
+condition, this vulnerability is actually much harder to exploit.
+
+Due to uninitalised value in devfs_open(), following function is called with
+fp->f_vnode = 0:
+
+static int
+devfs_fp_check(struct file *fp, struct cdev **devp, struct cdevsw **dswp)
+{
+
+        *dswp = devvn_refthread(fp->f_vnode, devp);
+        if (*devp != fp->f_data) {
+                if (*dswp != NULL)
+[6]                        dev_relthread(*devp);
+                return (ENXIO);
+        }
+        KASSERT((*devp)->si_refcount > 0,
+            ("devfs: un-referenced struct cdev *(%s)", devtoname(*devp)));
+        if (*dswp == NULL)
+                return (ENXIO);
+        curthread->td_fpop = fp;
+        return (0);
+}
+
+
+struct cdevsw *
+devvn_refthread(struct vnode *vp, struct cdev **devp)
+{
+        struct cdevsw *csw;
+        struct cdev_priv *cdp;
+
+        mtx_assert(&devmtx, MA_NOTOWNED);
+        csw = NULL;
+        dev_lock();
+[1]        *devp = vp->v_rdev;
+        if (*devp != NULL) {
+[2]                cdp = (*devp)->si_priv;
+[3]                if ((cdp->cdp_flags & CDP_SCHED_DTR) == 0) {
+[4]                        csw = (*devp)->si_devsw;
+                        if (csw != NULL)
+[5]                                (*devp)->si_threadcount++;
+                }
+        }
+        dev_unlock();
+        return (csw);
+}
+
+In [1] vp is dereferenced, resulting in user-controllable *devp pointer (loaded
+from *0x1c). If values dereferenced in [2], [3] and [4] are reachable, at [5] we
+have memory write at user-controllable address. Unfortunately, the value is
+decremented in [6].
+
+In my exploit, I use si_threadcount incrementation to modify kernel code in
+devfs_fp_check(). Opcode at 0xc076c64b is "je" (0x74). After incrementation it
+changes to 0x75, which is "jne". Such modification results in not calling
+dev_relthread() at [6] and eventually leads to function pointer call in
+devfs_kqfilter_f().
+
+The following exploit code works only on default 7.2 kernel, due to hardcoded
+addresses:
+
+http://www.frasunek.com/devfs.txt
+
+This bug was fixed a week ago and official advisory was issued:
+
+http://security.freebsd.org/advisories/FreeBSD-SA-09:14.devfs.asc
+
+-- 
+* Fido: 2:480/124 ** WWW: http://www.frasunek.com ** NICHDL: PMF9-RIPE *
+* Jabber ID: venglin@...by.pl ** PGP ID: 2578FCAD ** HAM-RADIO: SQ5JIV *
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

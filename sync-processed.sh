@@ -27,6 +27,8 @@ print_green "[*][$processed_DIR] Updating Linux Vulns"
 python sync-linux-vulns.py
 print_green "[*][$processed_DIR] Updating Patches"
 python sync-patch.py
+print_green "[*][$processed_DIR] Updating Exploit-DB"
+python sync-exploit-db.py
 cd - &> /dev/null
 
 print_green "[*][$processed_DIR] Updating MITRE CVE"
