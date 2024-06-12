@@ -11,13 +11,14 @@ Related tasks: vulnerability detection, assessment, and prioritization.
 This dataset is divided into two parts: raw data and processed data.
 
 - `raw-data/`: contains the raw data from different sources.
-- `processed/`: contains the intermediate data that is processed or filtered.
+- `processed/`: contains the processed data that is extracted or converted from the raw data.
 
 ## How to Use
 
 Pre-requisites:
 
 - Python 3.6+
+- jq (Linux command-line JSON processor)
 - Disk space: 30GB+
 
 VulZoo is composed of both git-based and non-git-based sources. The git-based sources are from upstream repositories and organized as git submodules in this repository. The non-git-based sources are crawled and maintained in this repository. To get started, clone the repository with the following command:

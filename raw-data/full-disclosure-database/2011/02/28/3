@@ -1,0 +1,182 @@
+
+Date: Mon, 28 Feb 2011 12:10:49 -0500
+From: Dan Rosenberg <dan.j.rosenberg@...il.com>
+To: full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com
+Cc: product-security@...le.com, secteam@...ebsd.org
+Subject: FreeBSD crontab information leakage
+
+====================================
+FreeBSD crontab information leakage
+====================================
+
+For its implementation of the standard UNIX cron daemon, FreeBSD uses a version
+based off vixie-cron.  This package is installed by default, and includes a
+setuid-root crontab binary to allow unprivileged users to list and modify their
+own cronjobs.
+
+I recently audited this code [1], and found a few interesting race conditions
+and symlink attacks that allow for very minor information leakage.  I thought
+I'd share my findings because I enjoyed exploiting these issues and they don't
+pose any significant risk to live systems - in other words, this advisory is
+intended for system administrators and developers of FreeBSD-based systems;
+journalists, end users and other non-technical readers do not need to be
+concerned. :p
+
+OpenBSD and NetBSD are not affected.  Nor is Debian/Ubuntu cron, which is based
+on vixie-cron 3.0, or Red Hat/Fedora cronie, which is a fork off ISC Cron (aka
+vixie-cron 4.1).  It seems the vulnerable code was specially inserted into the
+FreeBSD codebase as additional security checks that introduced new issues of
+their own.  Perhaps it was inserted as a government-sponsored backdoor.  Only
+kidding.  Because of its heavy reliance on FreeBSD source code, Mac OS X is
+also affected [2], except for the realpath() case, which is conveniently
+#ifdef'd out.
+
+=====================================================
+Leakage of file/directory existence via stat() calls
+=====================================================
+
+At two points (lines 366 and 436 in crontab.c), crontab makes calls to stat()
+on a user-owned temporary file while retaining an euid of 0.  Since stat()
+follows symbolic links and returns ENOENT when called on a symbolic link
+pointing to a non-existent resource, this can be used to determine the existence of
+files or directories in ways that violate directory search permissions.
+
+The first of these instances, on line 436, is trivially exploitable.  First,
+invoke crontab with the -e flag to edit an existing cronjob.  This will result
+in crontab opening a text editor to edit the cronjob.  While this editor is
+open, simply remove the temporary file created by crontab (of the form
+"/tmp/crontab.XXXXXXXXXX") and replace it with a symlink to a file whose
+existence you wish to verify.  On exiting the editor, crontab will print a
+warning if the call to stat() on this symlink fails, confirming the
+non-existence of the target file.  Likewise, if the file exists, a different
+error will be generated ("temp file must be edited in place").
+
+The second of these instances, on line 366, doesn't have the luxury of an
+editor holding everything up, and so requires exploitation of a race condition.
+The temporary file is created on line 338.  It can't be removed at this time,
+since it's created with euid 0 in a presumably sticky-bit /tmp directory, but
+shortly after it's fchown()'d to the user's id.  At this point, if it's deleted
+and replaced with a symlink to the file whose existence is to be confirmed, the
+call to stat() on line 366 will perform identically to the first case.
+
+==============================================
+Leakage of directory existence via realpath()
+==============================================
+
+When crontab is run with a file argument, it makes a call to realpath() with
+euid 0 to canonicalize the provided argument:
+
+	--snip--
+	} else if (realpath(Filename, resolved_path) != NULL &&
+		   !strcmp(resolved_path, SYSCRONTAB)) {
+			err(ERROR_EXIT, SYSCRONTAB " must be edited manually");
+	}
+	--snip--
+
+SYSCRONTAB is defined as /etc/crontab.  Because realpath() resolves each member
+of the requested path individually, in this case with euid 0, it's possible to
+reveal the existence of directories regardless of search permissions, again
+violating DAC.  For example, consider the following request:
+
+crontab /my/secret/directory/../../../../etc/crontab
+
+If /my/secret/directory exists, realpath() will return a non-NULL value and the
+resolved path will still be equal to SYSCRONTAB.  If not, the above error
+message will be displayed, because realpath() will return an error if any
+directories in the search path do not exist.
+
+====================================
+MD5 comparisons for arbitrary files
+====================================
+
+FreeBSD's crontab calculates the MD5 sum of the previous and new cronjob to
+determine if any changes have been made before copying the new version in.
+This seems entirely superfluous to me, but maybe there's a good explanation.
+In particular, it uses the MD5File() function, which takes a pathname as an
+argument, and is again called with euid 0.  The following relevant steps are
+performed by crontab:
+
+	1. Create the temporary file (of the form "/tmp/crontab.XXXXXXXXXX")
+
+	2. chown() this file to the user's id
+
+	3. Open the existing cronjob and copy it into the temp file
+
+	4. Call fstat() on the file descriptor to the temp file
+
+	5. Call stat() on the temp file's name
+
+	6. Compare the inode and device numbers returned by stat() and fstat(),
+	   and abort if not equal
+
+	7. Call MD5File() on the temp file's name
+
+	8. Perform the edits by launching an editor
+
+	9. Call stat() again on the temp file's name
+
+	10. Again compare the inode and device numbers from the first fstat()
+	    call and most recent stat() call, aborting on mismatch
+
+	11. Call MD5File() on the temp file's name
+
+	12. Abort if the two MD5 sums are equal
+
+The race created here is difficult, but entirely possible.  Exploitation looks
+like this:
+
+	1. Once the temp file is created, create a hard link to it (for example
+	   at /tmp/link)
+
+	2. After the stat() call but before the MD5File() call, remove the temp
+	   file and replace it with a symlink to the first target file
+
+	3. While the editor is open, remove the symlink and replace it with the
+	   original file, re-created by making a hard link to your previously
+	   created hard link
+
+	4. After the second stat() call but before the second MD5File() call,
+	   remove the temp file and replace it with a symlink to the second
+	   target file
+
+	5. The results of the MD5 sum comparison will tell you if the two
+	   targets you chose have the same MD5 sum
+
+In practice, this is more easily achieved by creating the hard link
+immediately, removing the temp file, and rapidly toggling a symlink to
+alternately point to the newly created hard link and the target file.  Of
+course, this is a ridiculous amount of work for such little gain, but hey, it's
+still fun.
+
+============
+Conclusions
+============
+
+I think there are a few lessons to be learned here.  First, any library calls
+that rely on user-controlled paths (or paths pointing to user-controlled
+resources) rather than file descriptors should be performed with reduced
+privileges if possible.  Second, even heavily audited code can still have
+interesting bugs, especially if new functionality is introduced.  Finally, it's
+about time that UNIX-based operating systems moved towards a more restrictive
+symlink and hard link policy that prevents these kinds of attacks.  One
+solution, originally found in Openwall Linux, followed by grsecurity, and most
+recently as the Yama LSM enabled by default in Ubuntu Maverick, prevents all
+users from following symlinks created by other users in sticky-bit directories.
+This simple restriction successfully prevents exploitation of a majority of
+these types of attacks.
+
+Greets to $1$kk1q85Xp$Id.gAcJOg7uelf36VQwJQ/ and #busticati.
+
+Happy hacking,
+Dan Rosenberg
+
+@djrbliss on twitter
+
+[1] http://svn.freebsd.org/viewvc/base/head/usr.sbin/cron/crontab/crontab.c?view=markup
+[2] http://opensource.apple.com/source/cron/cron-35/crontab/crontab.c
+
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

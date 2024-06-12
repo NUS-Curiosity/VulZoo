@@ -34,7 +34,7 @@ for file in cwec*.xml; do
     break
   fi
 done
-cd -
+cd - &> /dev/null
 
 # capec
 print_green "[*][$RAW_DATA_DIR] Updating CAPEC"
@@ -56,7 +56,7 @@ for file in capec*.xml; do
     break
   fi
 done
-cd -
+cd - &> /dev/null
 
 # d3fend
 print_green "[*][$RAW_DATA_DIR] Updating D3FEND"
@@ -67,7 +67,7 @@ wget https://d3fend.mitre.org/ontologies/d3fend.csv -O $RAW_DATA_DIR/d3fend-data
 print_green "[*][$RAW_DATA_DIR] Updating OSS-Security"
 cd scripts/raw-data/
 python3 sync-oss-security.py
-cd -
+cd - &> /dev/null
 
 
 echo "raw-data/ update | ts: `date '+%s'`" >> CHANGELOG

@@ -1,0 +1,178 @@
+
+Date: Sat, 3 Dec 2011 08:49:37 -0800
+From: Nam Nguyen <namn@...emoon.com.vn>
+To: full-disclosure@...ts.grok.org.uk
+Subject: Indexed blind SQL injection
+
+===========================
+Indexed blind SQL injection
+===========================
+
+:Author: gamma95 <gamma95 [at] gmail> and his minions
+:Date: December 03, 2011
+
+
+Time based blind SQL attack suffers from low bit/request ratio. Each request produces only one valuable bit of information. This paper describes a tweak that produces higher yield at the expense of longer runtime. Along the way, some issues and notes of applicability are also discussed.
+
+
+Background
+++++++++++
+
+Time based blind SQL injection attack is probably the most well-known technique in the planet. The method works by analyzing the time difference in various queries. Because query execution time is a side effect of a query, no visible output is required for this method to succeed. For example, a query could request that the DBMS to sleep for 10 seconds if the first character of the username is ``A``.
+
+Usually, time based technique go hand in hand with binary search. Instead of asking if the first character is ``1``, then ``2``, then ``3``, it could partition the possible values into two ranges (say from ``0`` to ``4`` and ``5`` to ``9``) and ask if the first character is less than ``5``. Depending on the result, it picks out the more likely range and repeats the process until there is only one possible value. This effectively puts a logarithmic bound on number of requests to the DBMS.
+
+In other words, each request gives us one bit of information.
+
+
+Increasing the usable bit/request ratio
++++++++++++++++++++++++++++++++++++++++
+
+Due to low bit/request ratio, an attack attempt usually leaves behind too many requests in access log. This is undesirable.
+
+A better approach could be to encode the correct value into query execution time itself. For example, if we know the value is a number from 0 to 9, we could ask DBMS to sleep for that many seconds straight. In this case, one request carries more than 3 bits of usable information.
+
+This is the principal idea behind our tweak.
+
+
+Indexed time based attack
++++++++++++++++++++++++++
+
+To encode more bits into the execution time, we must work with variable numeric delay values. Therefore, we need two things:
+
+    + A measurable delay interval. Too short the interval and network latency could negatively affect our measurement. Too long the delay will also waste our time.
+
+    + And its mapping to target values. A delay of one second could mean character ``A`` or it could also mean some other value, depending on the possible domain.
+ 
+These necessitate an array-like index search. Say, if our domain is ten (character) values from ``0`` to ``9``, then we can easily combine them into an array like shown below.
+
+::
+
+       1   2   3   4   5   6   7   8   9  10   (index)
+       |   |   |   |   |   |   |   |   |   |
+       v   v   v   v   v   v   v   v   v   v
+     +---+---+---+---+---+---+---+---+---+---+
+     | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | (value)
+     +---+---+---+---+---+---+---+---+---+---+
+
+Given a random character, we can tell in one request if it is in this set, and if it is, what specific character it actually is. The way to do that is by delaying query time by the index of the character. If the input character is not in the set, there will be no delay. If it is, its index is determinable from the sleep time.
+
+
+An example
+++++++++++
+
+Suppose we are trying to grab version information from a **MySQL** server. Possible characters include 0-9 and period. Observe the execution time.
+
+::
+
+    select sleep(find_in_set(mid(@@version, 1, 1), '0,1,2,3,4,5,6,7,8,9,.')); 
+    1 row in set (6.04 sec)
+    # index 6, value '5'
+
+    select sleep(find_in_set(mid(@@version, 2, 1), '0,1,2,3,4,5,6,7,8,9,.')); 
+    1 row in set (11.00 sec)
+    # index 11, value '.'
+
+    select sleep(find_in_set(mid(@@version, 3, 1), '0,1,2,3,4,5,6,7,8,9,.')); 
+    1 row in set (2.00 sec)
+    # index 2, value '1'
+
+    ...
+
+Each request gives us exactly one character (not bit).
+
+
+Notes of applicability
+++++++++++++++++++++++
+
+Adjusting sleep time
+====================
+
+Faster sleep time is easily achievable by multiplying the index with some factor smaller than 1. For example, we can sleep half the time as before::
+
+    select sleep(0.5 * find_in_set(mid(@@version, 1, 1), '0,1,2,3,4,5,6,7,8,9,.')); 
+    1 row in set (3.00 sec)
+    # index 6, value '5'
+
+Similarly, longer sleep time can use factors greater than 1.
+
+Guarding against network latency
+================================
+
+Time based attack generally works best in a fast and reliable networked environment. Small jitters in latency could skew the measurements and affect end result. However, this technique we are describing here could be modified to support network latency.
+
+The idea is that since sleeping time is a calculated number, we could add to it a fixed amount of time for latency, or prepend some invalid characters (such as ``a`` when the domain is 0-9) in the domain set.
+
+::
+
+    select sleep(find_in_set(mid(@@version, 1, 1), 'a,a,a,a,0,1,2,3,4,5,6,7,8,9,.'));
+    1 row in set (10.00 sec)
+    # index 10, value '5'
+
+We can also sprinkle invalid characters in between valid characters to manually adjust amount of sleeping time.
+
+Picking an acceptable domain
+============================
+
+The set of possible values should be carefully picked to match the value that one expects. Wide domain (more values) has a better chance of catching the input, but it requires a longer sleep time on average. Narrow domain (less values) has slimmer chance to catch the input, but it generally finishes faster on average.
+
+Some web frameworks enforce a maximum execution time. A query that takes more than, say, 30 seconds will be prime target for an early termination (and possibly logging). Therefore, picking out an acceptable domain is not only an optimization but sometimes a necessity.
+
+Using other functions
+=====================
+
+``find_in_set`` is only one of the string search functions that MySQL supports. One can also use other functions such as ``instr``, ``locate``, and ``position``.
+
+Sleeping in ``WHERE`` clause
+============================
+
+Most of the time, the injection point is in a ``WHERE`` clause. Because the ``WHERE`` clause is tested against all candidate rows, we better make sure that there is only **one** candidate. We can do that by making sure the table scan produces one row. Otherwise, our sleep measure will be multiplied up by the number of candidates.
+
+::
+
+    create table test (a int primary key, b char(16));
+    insert into test values(1, 'abcd');
+    insert into test values(2, 'zyxw');
+
+    select count(*) from test;
+    +----------+
+    | count(*) |
+    +----------+
+    |        2 |
+    +----------+
+    # we have 2 rows in table test
+
+    select * from test where sleep(locate(mid(@@version, 1, 1), '0123456789.'));
+    Empty set (12.00 sec)
+    # here we sleep for 12 seconds because all (2) rows are tested
+
+    select * from test where a=1 and sleep(locate(mid(@@version, 1, 1), '0123456789.'));
+    Empty set (6.00 sec)
+    # here we sleep for 6 seconds because only one row is tested
+
+
+Conclusion
+++++++++++
+
+This paper described a small tweak to the well-known time based SQL injection technique. The principle behind the increase in bit/request ratio is encoding more information in the query execution time. This is done with index based array search functions such as ``find_in_set``. The desirably smaller number of requests comes at the expense of generally longer execution time.
+
+This paper also discussed about some technical concerns that one must pay close attention to when employing the technique. Minute aspects such as table scan, applicable value domain, network latency, and amount of sleep time are at the top list to watch out for.
+
+
+Acknowledgement
++++++++++++++++
+
+Thanks go to Nam Nguyen for his early review and support.
+
+-- 
+Nam Nguyen, CISA, CISSP, CSSLP
+Blue Moon Consulting Co., Ltd
+http://www.bluemoon.com.vn
+
+
+Content of type "application/pgp-signature" skipped
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

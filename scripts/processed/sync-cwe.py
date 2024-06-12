@@ -25,4 +25,4 @@ json_content = json.dumps(data_dict, indent=4)
 with open(processed_data_file, "w") as f:
     f.write(json_content)
 
-print(f"{GREEN}[*] CWE data has been converted to JSON format at {processed_data_file}{RESET}")
+# print(f"{GREEN}[*] CWE data has been converted to JSON format at {processed_data_file}{RESET}")

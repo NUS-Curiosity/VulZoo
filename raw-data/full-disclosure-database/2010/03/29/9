@@ -1,0 +1,354 @@
+
+Date: Mon, 29 Mar 2010 19:50:07 +0200
+From: Andreas Bogk <andreas@...reas.org>
+To: "full-disclosure@...ts.grok.org.uk" <full-disclosure@...ts.grok.org.uk>
+Subject: Advisory: Weak RNG in PHP session ID generation
+ leads to session hijacking
+
+PHP session ID generation uses RNG with weak properties
+=======================================================
+
+Advisory (c) 2010 Andreas Bogk <andreas@...reas.org>
+
+Product: PHP
+Version: 5.3.2 and before
+Type of vulnerability: Cryptographic weakness, session hijacking
+Severity: Medium
+
+
+Summary
+=======
+
+PHP utilizes a cryptographically weak random number generator to
+produce session ID information.  Additionally, not enough entropy is
+used for the initial seeding of the RNG, and some of the entropy can
+leak by careless use of the uniqid() PHP function.  Under certain
+circumstances, these individual weaknesses interact and reduce the
+number of possible values of a PHP session ID so much that exhaustive
+search for a valid session ID against the web server becomes feasible.
+
+
+Prerequisites
+=============
+
+A PHP site becomes vulnerable to the attack described below if it
+meets the follogin requirements:
+
+ * It uses the standard PHP session mechanism
+ * It provides access to the output of the uniqid() function, with
+   'more_entropy' set to 'true'.
+ * It uses some mechanism to persist the PHP interpreter, such as FCGI.
+ * It discloses login status and remote address of users
+
+
+Attack description
+==================
+
+The goal of the attack is guessing a valid session ID value of some
+user, in order to impersonate this user and take over the session.
+The standard PHP mechanism we're focusing on here provides an
+interface for PHP code to access the session ID via the session_id()
+function.  The session ID is passed on the HTTP layer under the name
+of PHPSESSID or PHPSESSIONID, either as a cookie or as a parameter in
+the request URL.
+
+To understand where this session ID is coming form, let's take a look
+at the code which generates it:
+
+---- ext/session/session.c, php_session_create_id() -----
+        spprintf(&buf, 0, "%.15s%ld%ld%0.8F",
+                 remote_addr ? remote_addr : "",
+                 tv.tv_sec,
+                 (long int)tv.tv_usec,
+                 php_combined_lcg(TSRMLS_C) * 10);
+
+        switch (PS(hash_func)) {
+                case PS_HASH_FUNC_MD5:
+                        PHP_MD5Init(&md5_context);
+                        PHP_MD5Update(&md5_context,
+                                      (unsigned char *) buf,
+                                      strlen(buf));
+                        digest_len = 16;
+                        break;
+---------------------------------------------------------
+
+"remote_addr" is the remote address of the user as passed in the CGI
+environment or equivalent (IPv4 address as string in dotted notation),
+"tv" is a struct timeval as returned by the gettimeofday() function upon
+ID creation.  php_combined_lcg() is the random generator, we will look
+into this further below.  To summarize, PHP passes the remote address
+of the user, the current server time to microsecond precision and a
+pseudo-random value through MD5 to produce the session ID.
+
+In order for an attacker to generate a valid session ID, she needs to
+know all the parameters that go into its creation.  Or more precisely,
+she needs to limit down the number of possible values for the
+parameters so that exhaustively trying all of them becomes feasible.
+Let's look at them in order.
+
+remote address
+--------------
+
+Ignoring the trivial case of a configuration where the remote address
+is not known to PHP (note the ' : ""'), success of this attack depends
+on knowledge of the IP address.  In some cases, anonymous Wikipedia
+users come to mind, the PHP application simply displays this address
+publicly.  Rather more realistic is that the attacker induces the
+victim to access an URL on a server under her control. e.g. by placing
+an image link that the victim is bound to see on the attacked site.
+If all else fails, the attacker might use knowledge about the victim
+such as city of residence and ISP, or place of work and typically used
+web proxy, to pin down as much of the address as he can, although the
+attack effort grows with the number of possible addresses.
+
+A special case is the usage of IPv6.  Note that only the first 15
+characters of the remote address end up in the buffer.  For an IPv6
+address in printed representation, this would be the first 6 octets.
+Those usually don't vary between different customers of an ISP, and
+current IPv6 address space utilization is sparse enough simply trying
+all valid prefixes from BGP is within the reach.
+
+time stamp
+----------
+
+Quite a number of bits before MD5 processing come from the call to
+gettimeofday() during session ID creation.  However, in the days of
+ubiquitous NTP on all servers, an attacker can get quite a good
+estimate of the server time simply by looking at his own clock.  Also,
+most HTTP servers return the server time with a second precision.
+
+If the PHP site under attack features a status indication that shows
+whether a victim is online or not, the attacker can get an estimate on
+the value of the time stamp at the moment of ID generation.  The
+resolution of the gettimeofday() value is microseconds, so in theory
+we have one possible value to try for every microsecond that passes
+between each polling of the online status, plus the epsilon that our
+estimate of the system time might be off.  In practice, there are some
+platforms where gettimeofday() only runs with a precision of 1ms or
+even 10ms, severely limiting the number of guesses we have to take.
+
+Still, correctly predicting the timestamp is the major obstacle in
+actually generating valid session IDs.  The uniqid(), which we will
+discuss in the context of RNG prediction, is of great help here to get
+a precise correlation between the attackers clock and the clock on the
+server.
+
+random number generator value
+-----------------------------
+
+The final ingredient in a PHP session ID is a value produced by
+php_combined_lcg().  This function implements a combnation of two
+linear congruential generators, both with a state of 32 bits.  As Samy
+Kamkar[1] has pointed out, this is not a cryptographically sound RNG,
+and given the internal state of the generator function, all previous and
+future values can be predicted.  That's not a surprising result,
+academic publications on the weaknesses of LCGs have been appearing
+since 1977.
+
+However, we do not get access to the internal state.  Let's have a
+look at the php_combined_lcg() function:
+
+---- ext/standard/lcg.c ----
+PHPAPI double php_combined_lcg(TSRMLS_D)
+{
+        php_int32 q;
+        php_int32 z;
+
+        if (!LCG(seeded)) {
+                lcg_seed(TSRMLS_C);
+        }
+
+        MODMULT(53668, 40014, 12211, 2147483563L, LCG(s1));
+        MODMULT(52774, 40692, 3791, 2147483399L, LCG(s2));
+
+        z = LCG(s1) - LCG(s2);
+        if (z < 1) {
+                z += 2147483562;
+        }
+
+        return z * 4.656613e-10;
+}
+----------------------------
+
+We're only getting 2^31 different possible values out of the function
+here.  Still, this is a lot of entropy we're getting here.  If we can
+guess 35 bits of the state, one output should be sufficient to brute
+force the other bits.
+
+So let us consider lcg_seed() next:
+
+---- ext/standard/lcg.c ----
+static void lcg_seed(TSRMLS_D) /* {{{ */
+{
+        struct timeval tv;
+
+        if (gettimeofday(&tv, NULL) == 0) {
+                LCG(s1) = tv.tv_sec ^ (tv.tv_usec<<11);
+        } else {
+                LCG(s1) = 1;
+        }
+#ifdef ZTS
+        LCG(s2) = (long) tsrm_thread_id();
+#else
+        LCG(s2) = (long) getpid();
+#endif
+
+        /* Add entropy to s2 by calling gettimeofday() again */
+        if (gettimeofday(&tv, NULL) == 0) {
+                LCG(s2) ^= (tv.tv_usec<<11);
+        }
+
+        LCG(seeded) = 1;
+}
+----------------------------
+
+That's btw. the code that's supposed to fix Samy's attack from PHP
+5.3.2.  The second call to gettimeofday is new, in the old code, the
+getpid() call was the only source of entropy in the LCG named s2
+about, and Samy's code quite cleverly used that property to build a
+time/memory tradeoff attack.
+
+But let's look at the latest version, as shown above.  What we
+immediately notice is the lack of non-predictable entropy sources in
+the initial seeding.  The sources used here are the process ID and the
+gettimeofday() value.  As already noted, the higher bits of the
+current time are predictable by the attacker, only the lower bits of
+the microsecond part offer some kind of real entropy.  Also, the
+process ID tends to be predictable after system reboot.
+
+We assume the attacker has a way to look at the result of
+php_combined_lcg() (and we will come to that really soon now).  Then all
+she has to do is wait for a system reboot, e.g. by constantly sending
+ICMP Echo Requests to the target system and waiting for it to stop
+answering and then coming back.  All she has to do now is fetching
+some random value from the system, putting in good estimates for PID
+and timeval, and start brute-forcing the bits considered random until
+her own output matches the output from the target site.
+
+How long will it take her to run the brute force attack?  To estimate
+this, first observe that the second call to gettimeofday() will return
+the very same data as the first call, plus the time that has passed in
+between.  Chances are good that no preemptive scheduling happens, so
+the time difference will be in the order of single digit microseconds,
+giving a few meager bits of extra entropy.
+
+Assuming we're able to pin down the server time of RNG seeding with
+precision of one second, that's 20 bits of entropy for the
+microseconds and 15 bits for the PID.  One round of LCG generation
+requires one division and three multiplications, or, since there are
+two LCGs combined, 8 float ops.  A modern GPU crunches through
+1TFLOP/s, and thus exhausts that space in less than a second.
+
+So, the final pice of the puzzle: where does the attacker get the lcg
+values to brute force against from?  And the answer is: she hopes for
+the server to call the PHP function uniqid() and hand her back the
+value.  Let's look at code again:
+
+---- ext/standard/uniqid.c, PHP_FUNCTION(uniqid) ----
+        gettimeofday((struct timeval *) &tv, (struct timezone *) NULL);
+        sec = (int) tv.tv_sec;
+        usec = (int) (tv.tv_usec % 0x100000);
+
+        if (more_entropy) {
+                spprintf(&uniqid, 0, "%s%08x%05x%.8F", prefix, sec,
+                usec, php_combined_lcg(TSRMLS_C) * 10);
+        } else {
+                spprintf(&uniqid, 0, "%s%08x%05x", prefix, sec, usec);
+        }
+-----------------------------------------------------
+
+Do you see it?  Not only does this function hand us back a precise
+server timestamp on a silver platter, it also adds in LCG output if we
+request "more entropy".  Yeah, baby, give me more of your entropy, so
+I can brute force your session IDs!!
+
+Ahem, sorry.  Let me direct your attention to the fact that when I am
+the first one to get to call php_combined_lcg through uniqid(), the
+timestamp I'm getting back is almost identical to the one used to seed
+the LCG, because they're both called right next to each other in
+program flow.  This reduces the entropy unknown to me to the PID and
+some microseconds.
+
+Keep watching out for data in the format "xxxxxxxxxxxxx.dddddddd",
+where x are hex digits and d decimal digits, in PHP applications.
+Might be part of URLs, might be cookies, might be the autogenerated
+filename for your file upload.  That's where it leaks entropy.
+
+Note that you can substitute raw computing power for access to
+uniqid() output.  The attacker knows her remote address and time of
+login, and she has access to her own session ID.  As described above,
+the LCG output has 31 bits of entropy.  Add 20 for the uncertainty in
+the microseconds, for a total of 2^51 MD5 operations to try and brute
+force the lcg value out of the attacker's cookie.  A modern GPU can
+handle about 2^30 MD5 ops per second, so we're looking into 2^21 GPU
+seconds.  This is within the reach of big organizations.
+
+Summary
+=======
+
+Here's a summary of the attack steps outlined above:
+
+ * wait for the server to reboot
+ * fetch a uniqid value
+ * brute force the RNG seed from this
+ * poll the online status to wait for target to appear
+ * interleave status polls with uniqid polls to keep track of current
+   server time and RNG value
+ * brute force session ID against server using the time and RNG value
+   interval established in polling
+
+
+Limits
+======
+
+The attack requires a combination of properties of the system under
+attack in order to be successful, as outlined above.  It also puts a
+lot of stress on the system under attack.  However, the uniqid() leak
+can be substituted by reasonable computing power, and some of the
+other information can be gathered on other ways, making the attack
+slightly flexible.
+
+
+Recommendations for PHP authors
+===============================
+
+ * Make sure to use real entropy in your session IDs.  Usage of the
+   Suhosin[2] patch in version 0.9.31 or later will do that for you
+   automatically.
+
+ * Never use the value of uniqid() directly, always hash the result.
+   This is orthogonal to the recommendation above, especially if you
+   depend on the uniqid() values to be unguessable.
+
+
+Recommendations for PHP maintainers
+===================================
+
+ * Make sure the user has no way to generate insecure session IDs.
+   There's no modern platform out there *not* supporting some real
+   source of randomness.  Use this for seeding.  Use a construction
+   like a chained hash or cipher for RNG instead of a LCG.
+
+ * Change the definition of uniqid() so it always uses a hash.
+
+ * While you're at it, replace MD5 and SHA with SHA-384 everywhere.
+
+ * Read Schneier.
+
+
+Acknowledgements
+================
+
+Thanks go out to Zamy Kamkar for inspiring this research, and to
+Stefan Esser for providing feedback.  Also props to Jarno Huuskonen
+for pointing out this very issue as much as 9 years back.
+
+
+[1] http://samy.pl/phpwn/
+[2] http://www.hardened-php.net/suhosin/
+[3] http://seclists.org/vuln-dev/2001/Jul/33
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
