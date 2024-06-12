@@ -68,6 +68,8 @@ P.S.
 - [Exploit-DB](https://gitlab.com/exploit-database/exploitdb)
 - [oss-security mailing list](https://www.openwall.com/lists/oss-security)
 - [bugtraq mailing list](https://lists.openwall.net/bugtraq/)
+- [GitHub](https://github.com)
+- [git.kernel.org](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git)
 
 ### Hybrid
 
