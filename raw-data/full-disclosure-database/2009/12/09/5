@@ -1,0 +1,249 @@
+
+Date: Wed, 09 Dec 2009 09:15:49 +0100
+From: Stefan Esser <stefan.esser@...tioneins.de>
+To: full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com
+Subject: Advisory 02/2009: PHPIDS Unserialize()
+	Vulnerability
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+
+                         SektionEins GmbH
+                        www.sektioneins.de
+
+                     -= Security  Advisory =-
+
+     Advisory: PHPIDS Unserialize() Vulnerability
+ Release Date: 2009/12/09
+Last Modified: 2009/12/09
+       Author: Stefan Esser [stefan.esser[at]sektioneins.de]
+
+  Application: PHPIDS <= 0.6.2
+     Severity: PHPIDS unserializes() user input which allows an attacker
+               to send a carefully crafted cookie that when unserialized
+               can utilize existing classes which e.g. can lead to
+               upload of arbitrary files or execution of arbitrary PHP
+               code in Zend Framework Applications
+         Risk: Critical
+Vendor Status: PHPIDS 0.6.3.1 was released which fixes this vulnerability
+    Reference:
+http://www.sektioneins.com/en/advisories/advisory-022009-phpids-unserialize-vulnerability/
+              
+http://www.suspekt.org/downloads/RSS09-WebApplicationFirewallBypassesAndPHPExploits.pdf
+              
+http://www.suspekt.org/downloads/POC2009-ShockingNewsInPHPExploitation.pdf         
+ 
+ 
+ 
+
+Overview:
+
+  Quote from http://www.php-ids.org
+  "PHPIDS (PHP-Intrusion Detection System) is a simple to use, well
+   structured, fast and state-of-the-art security layer for your PHP
+   based web application. The IDS neither strips, sanitizes nor
+   filters any malicious input, it simply recognizes when an attacker
+   tries to break your site and reacts in exactly the way you want it
+   to. Based on a set of approved and heavily tested filter rules any
+   attack is given a numerical impact rating which makes it easy to
+   decide what kind of action should follow the hacking attempt. This
+   could range from simple logging to sending out an emergency mail
+   to the development team, displaying a warning message for the
+   attacker or even ending the user’s session."
+
+  During our research in unserialize() vulnerabilities it was discovered
+  that PHPIDS's centrifuge detection unserializes every piece of user
+  input that looks like being serialized. This allows an attacker to
+  crash the PHP interpreter or to utilize existing classes for attacks.
+ 
+  In combination with the classes available in the Zend Framework this
+  results in file upload and PHP code execution vulnerabilities. Taken
+  in consideration the research in interruption vulnerability exploits
+  that was demonstrated by SektionEins at Syscan and Blackhat this
+  vulnerability has to be considered an arbitrary code execution
+  vulnerability.
+
+Details:
+
+  SektionEins recently demonstrated how it is sometimes possible
+  to execute arbitrary PHP code in an application using unserialize()
+  on user supplied data. In detail various exploits were shown that
+  work against all Zend Framework based applications that unserialize()
+  user input. Part of this research was to find popular PHP open
+  source applications that are vulnerable to this.
+ 
+  During our search it was discovered that PHPIDS did unserialize()
+  every piece of user input that looked like being seríalized.
+ 
+  public static function runCentrifuge($value, IDS_Monitor $monitor =
+null)
+  {
+      $threshold = 3.49;
+      $unserialized = false;
+      if(preg_match('/^\w:\d+:\{/', $value)) {
+          $unserialized = @unserialize($value);
+      }
+ 
+  This will unserialize() any user input supplied to an application
+  using PHPIDS. Therefore an exploit against applications using the
+  Zend Framework is pretty straight forward.
+ 
+  When trying to exploit an unserialize() vulnerability in a PHP
+  application the first step is to enumerate the objects that contain
+  __wakeup() or __destruct() methods and read their code to analyze if
+  these methods are doing something interesting.
+ 
+  When looking at the Zend Framework one particular class can be
+  found that can be used in an code execution attack. This class is
+  called Zend_Log and contains the following code.  
+ 
+  public function __destruct()
+  {
+    foreach($this->_writers as $writer) {
+      $writer->shutdown();
+    }
+  }
+ 
+  The Zend_Log destructor iterates through an array which it expects
+  inside the _writers property. Each element of this array is then
+  expected to have a method called shutdown() which is then executed.
+  The next step in creating an exploit is to find classes that contain
+  a shutdown method. The best fitting class is the Zend_Log_Writer_Mail
+ 
+  public function shutdown()
+  {
+    // If there are events to mail, use them as message body.  Otherwise,
+    // there is no mail to be sent.
+    if (empty($this->_eventsToMail)) {
+      return;
+    }
+
+    if ($this->_subjectPrependText !== null) {
+      // Tack on the summary of entries per-priority to the subject
+      // line and set it on the Zend_Mail object.
+      $numEntries = $this->_getFormattedNumEntriesPerPriority();
+      $this->_mail->setSubject(
+      "{$this->_subjectPrependText} ({$numEntries})");
+    }
+
+
+    // Always provide events to mail as plaintext.
+    $this->_mail->setBodyText(implode('', $this->_eventsToMail));
+
+    // If a Zend_Layout instance is being used, set its "events"
+    // value to the lines formatted for use with the layout.
+    if ($this->_layout) {
+      // Set the required "messages" value for the layout.  Here we
+      // are assuming that the layout is for use with HTML.
+      $this->_layout->events = implode('', $this->_layoutEventsToMail);
+
+      // If an exception occurs during rendering, convert it to a notice
+      // so we can avoid an exception thrown without a stack frame.
+      try {
+        $this->_mail->setBodyHtml($this->_layout->render());
+      } catch (Exception $e) {
+        ...
+      }
+
+      // Finally, send the mail.  If an exception occurs, convert ...
+      // warning-level message so we can avoid an exception thrown ...
+      // stack frame.
+      try {
+          $this->_mail->send();
+      } catch (Exception $e) {
+          ...
+      }
+  }
+ 
+  This shutdown method will check if there are events not yet mailed
+  and if there are, it will mail them to the address specified in the
+  Zend_Mail object which has to be within the _mail property. This
+  allows anyone to send out arbitrary spam to arbitrary mail addresses.
+  However there is a more interesting exploitation path hidden that
+  utilizes the HTML rendering. Therefore an attacker has to find a
+  class that contains a render method. The most promising class
+  is Zend_Layout which comes with a render method.
+ 
+  public function render($name = null)
+  {
+      if (null === $name) {
+          $name = $this->getLayout();
+      }
+
+      if ($this->inflectorEnabled() && (null !== ($inflector =
+$this->getInflector())))
+      {
+          $name = $this->_inflector->filter(array('script' => $name));
+      }
+
+      ...
+  }  
+
+  The code snippet above does not do much aside from calling the filter
+  method of an object in the _inflector property. Usually this would be
+  an inflector object. However to achieve arbitrary code execution a
+  different object type is used. The best candidate for this is
+  Zend_Filter_PregReplace that can be used to execute arbitrary PHP
+  code with the help of the /e modifier.
+ 
+  public function filter($value)
+  {
+      if ($this->_matchPattern == null) {
+          require_once 'Zend/Filter/Exception.php';
+          throw new Zend_Filter_Exception(get_class($this) . ' does
+not have a valid MatchPattern set.');
+      }
+
+      return preg_replace($this->_matchPattern, $this->_replacement,
+$value);
+  }
+    
+  So to summarize the attack: By sending a single serialized string to
+  any application based on the Zend Framework using PHPIDS it is
+  possible to utilize Zend Frameworks's own objects and execute
+  arbitrary PHP code by supplying the arguments to a preg_replace()
+  function call.
+
+Proof of Concept:
+
+  SektionEins GmbH is not going to release a proof of concept
+  exploit for this vulnerability.
+
+Disclosure Timeline:
+
+  19. October  2009 - Notified PHPIDS vendor
+  22. October  2009 - PHPIDS developers released PHPIDS 0.6.3.1
+  09. December 2009 - Public Disclosure
+
+Recommendation:
+
+  It is recommended to upgrade to the latest version of PHPIDS.
+
+  Grab your copy at:
+  http://php-ids.org/files/phpids-0.6.3.1.tar.bz2
+
+CVE Information:
+
+  The Common Vulnerabilities and Exposures project (cve.mitre.org) has
+  not assigned a name to this vulnerability.
+
+GPG-Key:
+
+  pub  1024D/15ABDA78 2004-10-17 Stefan Esser
+  Key fingerprint = 7806 58C8 CFA8 CE4A 1C2C  57DD 4AE1 795E 15AB DA78
+
+Copyright 2009 SektionEins GmbH. All rights reserved.
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.8 (Darwin)
+Comment: Using GnuPG with Mozilla - http://enigmail.mozdev.org/
+
+iEYEARECAAYFAksfXLUACgkQSuF5XhWr2niOtQCffLwnaOfmfnar7xKfnYpa15sm
+JJYAn2J6aUP9/QXMOvXvuTQYyk8HvI04
+=25Bs
+-----END PGP SIGNATURE-----
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

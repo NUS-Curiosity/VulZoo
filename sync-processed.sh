@@ -12,6 +12,10 @@ function print_yellow {
 raw_data_DIR=raw-data
 processed_DIR=processed
 
+print_green "[*][$processed_DIR] Updating NVD"
+mkdir -p $processed_DIR/nvd-database
+cp -r $raw_data_DIR/nvd-database/CVE-*/ $processed_DIR/nvd-database/
+
 cd scripts/processed/
 print_green "[*][$processed_DIR] Updating OSS-Security"
 python sync-oss-security.py
@@ -40,10 +44,6 @@ cp -r $raw_data_DIR/cve-database/2*/ $processed_DIR/cve-database/
 print_green "[*][$processed_DIR] Updating ZDI Advisories"
 mkdir -p $processed_DIR/zdi-advisory-database
 cp -r $raw_data_DIR/zdi-advisory-database/advisories/* $processed_DIR/zdi-advisory-database/
-
-print_green "[*][$processed_DIR] Updating NVD"
-mkdir -p $processed_DIR/nvd-database
-cp -r $raw_data_DIR/nvd-database/CVE-*/ $processed_DIR/nvd-database/
 
 print_green "[*][$processed_DIR] Updating GitHub Security Advisories"
 mkdir -p $processed_DIR/github-advisory-database

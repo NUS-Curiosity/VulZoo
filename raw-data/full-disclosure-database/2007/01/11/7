@@ -1,0 +1,154 @@
+
+Date: Thu, 11 Jan 2007 12:00:24 +0100
+From: Pierre Habouzit <madcoder@...ian.org>
+To: full-disclosure@...ts.grok.org.uk
+Subject:  Re: new class of printf issue: int overflow
+
+On Thu, Jan 11, 2007 at 02:00:53AM +0100, Felix von Leitner wrote:
+> This is about two issues.  First: abs within vasprintf.
+> 
+> I just read some gnupg source code and stumbled upon their
+> vasprintf implementation.  Basically they make one pass over the format
+> string to find out how much memory to malloc, and then they call sprintf
+> on the malloced buffer.
+> 
+> Here is an excerpt:
+> 
+>               if (*p == '*')
+>                 {
+>                   ++p;
+>                   total_width += abs (va_arg (ap, int));
+>                 }
+> 
+> I noticed this code because it calls abs on an int.  A little known fact
+> about abs is that it can return negative values.  If the int is
+> 0x80000000, for example, abs() will also return 0x80000000.  So, I
+> thought, mhh, if someone can control this value but not the format
+> string, he can cause total_width to be very small but then write lots of
+> stuff to it.
+
+  That's indeed a bug, and that should be fixed. MIN_INT is a value that
+should generate an error IMHO, that's not reasonable to use printf to
+write 2Go of data anyway, but YMMV.
+
+
+> But that got me thinking.  *printf return an int, and it's supposed to
+> be the number of chars written.  So a typical idiom is
+> 
+>   size_t memory_needed=snprintf(NULL,0,format_string,...);
+>   char* ptr=malloc(memory_needed+1);
+>   sprintf(ptr,format_string,...);
+
+  that's not the sole braindead idiom that generate errors. In my
+software I use an xmalloc that returns NULL if its argument is <= 0, and
+as you're supposed to check if malloc returns NULL (theorically) then
+the idiom is:
+
+  size_t needed;
+  char *buf;
+ 
+  needed  = snprintf(NULL, 0, fmt, ...);
+  buf     = xmalloc(needed + 1);
+  if (!buf) {
+      // somehow barf here about beeing OOM
+  }
+  sprintf(ptr, format_string, ...);
+
+  The error message will be inaccurate, but there is no security flaw.
+
+[...]
+> The question is: do we want to do something about it?  What should
+> printf do if it detects an int overflow?  Return -1?  Is there a good
+> solution to this?  Solaris apparently returns -1.
+
+  like said for your aprintf case, IMHO, MIN_INT for a '*' width
+specifier has to be taken as an erroneous value. At least, it really
+feels sensible.
+
+> PS: Does anyone understand why sprintf does not count the \0 at the end?
+> I think that's pretty brain-dead.
+
+  That's everything but braindead. It allows you to point _on_ the final
+NUL rather than after it.  Every string function should speak of the
+string length that it produces, because that's what the programmer needs
+most of the time. In fact, I really believe snprintf is the good API:
+  - it returns the _length_ of the string that could have been written
+    if enough space exist in the buffer ;
+  - it takes the buffer and the buffer _size_ (opposed to the string
+    length it contains) as an argument.
+
+  Then you can _safely_ write things like:
+
+  char buf[SOME_SIZE];
+  int pos = 0;
+
+  pos += snprintf(buf + pos, sizeof(buf) - pos, fmt, ...);
+  pos += snprintf(buf + pos, sizeof(buf) - pos, fmt, ...);
+  pos += snprintf(buf + pos, sizeof(buf) - pos, fmt, ...);
+  pos += snprintf(buf + pos, sizeof(buf) - pos, fmt, ...);
+
+  without needing to check for overflows (I obviously suppose that the
+size can be negative, I use a wrapper around snprintf that takes a
+ssize_t rather than a size_t for this very reason).
+
+  if snprintf returned the size of the buffer rather than the length,
+that would have been pretty akward to write, because you'd have to write
+sth like:
+
+  pos += snprintf(buf + pos, sizeof(buf) - pos, fmt, ...) - 1;
+
+  and if you forget the -1, then you don't really concatenate strings
+correctly. In fact, what is good with such an API is that you can create
+new functions that follow the very same API using bricks that use it,
+like that:
+
+    ssize_t my_strfunc(char *dst, ssize_t dlen, ...)
+    {
+	ssize_t pos = 0;
+
+        pos += my_strotherfunc(dst + pos, dlen - pos, ...);
+        pos += my_strotherfunc2(dst + pos, dlen - pos, ...);
+
+        return pos;
+    }
+
+  With that you inherit from the security from the functions you call,
+without needing any more checks. It generates very safe code, _and_
+readable code too. Once again, if you return the size, the previous code
+would be:
+
+    ssize_t my_strfunc(char *dst, ssize_t dlen, ...)
+    {
+	ssize_t pos = 0;
+
+	pos += my_strotherfunc(dst + pos, dlen - pos, ...) - 1;
+        pos += my_strotherfunc2(dst + pos, dlen - pos, ...) - 1;
+
+        return pos + 1;
+    }
+
+  or worse:
+
+    ssize_t my_strfunc(char *dst, ssize_t dlen, ...)
+    {
+	ssize_t pos = 0;
+
+	pos += my_strotherfunc(dst + pos - 1, dlen - pos + 1, ...);
+	pos += my_strotherfunc2(dst + pos - 1, dlen - pos + 1, ...);
+
+        return pos;
+    }
+
+  it's way too error prone IMHO.
+
+-- 
+·O·  Pierre Habouzit
+··O                                                madcoder@...ian.org
+OOO                                                http://www.madism.org
+
+Content of type "application/pgp-signature" skipped
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

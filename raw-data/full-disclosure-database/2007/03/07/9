@@ -1,0 +1,193 @@
+
+Date: Thu, 8 Mar 2007 00:40:10 +0100
+From: Luigi Auriemma <aluigi@...istici.org>
+To: bugtraq@...urityfocus.com, bugs@...uritytracker.com,
+	news@...uriteam.com, full-disclosure@...ts.grok.org.uk, vuln@...unia.com,
+	packet@...ketstormsecurity.org
+Subject: Buffer-overflow in Conquest client 8.2a (svn 691)
+
+
+#######################################################################
+
+                             Luigi Auriemma
+
+Application:  Conquest
+              http://www.radscan.com/conquest.html
+Versions:     <= 8.2a (svn 691)
+Platforms:    *nix and Windows
+Bugs:         A] buffer-overflow in metaGetServerList()
+              B] memory corruption through SP_CLIENTSTAT
+Exploitation: local and remote, versus the client
+Date:         07 Mar 2007
+Author:       Luigi Auriemma
+              e-mail: aluigi@...istici.org
+              web:    aluigi.org
+
+
+#######################################################################
+
+
+1) Introduction
+2) Bugs
+3) The Code
+4) Fix
+
+
+#######################################################################
+
+===============
+1) Introduction
+===============
+
+
+Conquest is a multi-player game which can be defined the predecessor of
+Netrek (http://www.netrek.org).
+Note that on some distros (like Debian) the conquest's binaries are
+marked setgid for the conquest group.
+
+
+#######################################################################
+
+=======
+2) Bugs
+=======
+
+-----------------------------------------
+A] buffer-overflow in metaGetServerList()
+-----------------------------------------
+
+The Conquest client has an option (-m) for the querying of the
+metaserver conquest.radscan.com on which are listed the servers
+currently online but the program allows the usage of alternative
+metaservers too.
+
+The function which reads the data received from the metaserver is
+affected by a stack based buffer-overflow which happens during the
+storing of the line containing the server's entry in a buffer (buf) of
+1024 bytes.
+
+The best exploitation of this bug is for local users who want to
+escalate their privileges gaining the conquest group.
+
+At the same time exists also another buffer-overflow which affects the
+static servers buffer limited to 1000 (META_MAXSERVERS) max servers,
+anyway doesn't seem possible to fully exploit this second bug for code
+execution.
+
+from meta.c:
+
+int metaGetServerList(char *remotehost, metaSRec_t **srvlist)
+{
+  static metaSRec_t servers[META_MAXSERVERS];
+  ...
+  char buf[1024];               /* server buffer */
+  ...
+  off = 0;
+  while (read(s, &c, 1) > 0)
+    {
+      if (c != '\n')
+        {
+          buf[off++] = c;
+        }
+      else
+        {                       /* we got one */
+          buf[off] = 0;
+
+          /* convert to a metaSRec_t */
+          if (str2srec(&servers[nums], buf))
+            nums++;
+            ...
+
+
+------------------------------------------
+B] memory corruption through SP_CLIENTSTAT
+------------------------------------------
+
+SP_CLIENTSTAT is a type of packet used by the server for sending some
+informations about the ships and the users.
+
+In this packet are located two numbers which are not correctly
+sanitized by the client:
+- unum: 16 bit, used for the Users structure
+- snum:  8 bit, used for the Ships structure
+
+Both the structures are placed in the cBasePtr buffer allocated at
+runtime with 262144 (SIZEOF_COMMONBLOCK) bytes of memory: Users at
+offset 388 where each element has a size of 264 bytes (total 132000)
+and Ships at offset 141040 with 1124 bytes per element (total 23604).
+
+In both the cases is possible to write one or more bytes in some zones
+of the memory outside the original structures and the cBasePtr buffer,
+but I think that code execution is practically impossible...
+
+The following are the instructions used for handling the SP_CLIENTSTAT
+packet and where is easily visible the writing of the scstat->team
+value sent by the server:
+
+    case SP_CLIENTSTAT:
+      scstat = (spClientStat_t *)buf;
+      Context.snum = scstat->snum;
+      Context.unum = (int)ntohs(scstat->unum);
+      Ships[Context.snum].team = scstat->team;
+      clientFlags = scstat->flags;
+      break;
+
+
+#######################################################################
+
+===========
+3) The Code
+===========
+
+
+A]
+- launch a fake metaserver which sends more than 1024 chars:
+  perl -e 'print "a"x1200' | nc -l -p 1700 -v -v -n
+
+- launch the client specifying the alternate metaserver:
+  conquest -m -M 127.0.0.1
+
+- interrupt the fake metaserver, conquest should have been crashed
+  trying to executing the code at offset 0x61616161
+
+
+B]
+- get the source code of the server, modify the scstat.snum or
+  scstat.unum value in the sendClientStat function located in server.c
+  giving them values like 0xff (for snum) or htons(0xffff) (for unum)
+  depending by what of the two bugs you want to test:
+
+  scstat.type = SP_CLIENTSTAT;
+  scstat.flags = flags;
+- scstat.snum = snum;
++ scstat.snum = 0xff;
+  scstat.team = team;
+  scstat.unum = htons(unum);
+  scstat.esystem = esystem;
+
+- compile the new server, launch it and join with a client which will
+  crash after the login
+
+
+#######################################################################
+
+======
+4) Fix
+======
+
+
+SVN 693
+
+
+#######################################################################
+
+
+--- 
+Luigi Auriemma
+http://aluigi.org
+http://mirror.aluigi.org
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

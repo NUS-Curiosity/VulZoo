@@ -1,0 +1,204 @@
+
+Date: Wed, 9 Jul 2008 17:13:55 +1200
+From: "Brett Moore" <brett.moore@...omniasec.com>
+To: <full-disclosure@...ts.grok.org.uk>
+Subject: Insomnia : ISVA-080709.1 - Microsoft SQL Server -
+	Corrupt Backup File Heap Overflow
+
+__________________________________________________________________
+
+ Insomnia Security Vulnerability Advisory: ISVA-080709.1
+___________________________________________________________________
+
+ Name: Microsoft SQL Server - Corrupt Backup File Heap Overflow
+ Released: 09 July 2008
+  
+ Vendor Link: 
+    http://www.microsoft.com/sql/default.mspx
+  
+ Affected Products:
+    MS SQL Server 2005, possibly previous versions
+ 
+ Original Advisory: 
+    http://www.insomniasec.com/advisories/ISVA-080709.1.htm
+ 
+ Researcher: 
+    Brett Moore, Insomnia Security
+    http://www.insomniasec.com
+___________________________________________________________________
+
+_______________
+
+ Description
+_______________
+
+Microsoft SQL Server contains a buffer overflow that can be reached
+by causing the server to attempt a database restore from a corrupt
+back file.
+
+This can be triggered by a user with PUBLIC access through the 
+RESTORE TSQL statement, available through the console as well as
+through a vulnerable SQL statement on a web server (sql injection) 
+
+By default the service runs under the NETWORK SERVICE account but
+has the ability to impersonate through tokens, and therefore
+can gain full LOCAL SYSTEM account access.
+
+_______________
+
+ Details
+_______________
+
+The following TSQL statement can be called by any user with PUBLIC
+access.
+
+	RESTORE FILELISTONLY FROM DISK = 'path to file'
+
+By hosting a corrupt SQL database backup on a remote file share
+it is possible to force the target server to open the file, parse
+it, and corrupt the internal heap.
+
+Obviously the target SQL server must have egress availability to 
+connect out through SMB or webdav functionality.
+
+The SQL backup format consists of multiple chunks of data which 
+follow a basic structure of
+  
+  struct backupChunk {
+        unsigned long nametag;
+        unsigned long size;
+   }
+
+The nametag describes the type of tag (ex.SCIN, SFGI, MQCI, etc).
+The size corresponds to the size of the complete chunk size which 
+includes the 8byte chunk header.
+
+The parsing function goes through  file using the backupChunk->size 
+field to point to the next valid chunk.
+
+-------------------------------------------------------------------
+022E5FE2 PUSH EAX
+022E5FE3 MOV EAX, [ESP+18h]
+022E5FE7 PUSH EAX
+022E5FE8 PUSH ESI
+022E5FE9 CALL EDX	;	<-- This loads the 8byte header of the block
+022E5FEB PUSH EBX
+022E5FEC MOV ECX,ESI
+-------------------------------------------------------------------
+
+If the size field is larger than the current buffer, a check 
+prevents the application from overflowing.
+
+-------------------------------------------------------------------
+Size Check
+022E6063 MOV EAX,DWORD PTR DS:[EDX+4]  ;<- Load Size	
+022E6066 MOV ECX,DWORD PTR SS:[ESP+14] ;<- Load Buffer Size
+022E606A SUB ECX,EAX
+022E606C JS SHORT sqlservr.022E6076
+022E606E CMP EAX,DWORD PTR DS:[EBX+C8] ;<- Compare against 0x2000
+022E6074 JBE SHORT sqlservr.022E60DC   ;<- Jump to continuation
+-------------------------------------------------------------------
+
+After this size comparison, the size is adjusted to subtract the
+size of the 8byte structure header.
+
+-------------------------------------------------------------------
+The size decrease
+022E60DC MOV ECX,DWORD PTR SS:[ESP+10]
+022E60E0 MOV EDI,DWORD PTR DS:[ECX+4]
+022E60E3 SUB EDI,8                    ; <- Subtract 8 bytes
+022E60E6 CMP DWORD PTR DS:[EBX+40],0
+022E60EA JA SHORT sqlservr.022E6107
+-------------------------------------------------------------------
+
+If the structure size was a value between 0 and 7 then an Integer 
+Underflow/Overflow/Wraparound/Whatever will occur, and the 
+'negative' large value is passed directly into the StartRead
+function.
+
+-------------------------------------------------------------------
+The write
+022E6115 MOV EDX,DWORD PTR DS:[EDX+60]
+022E6118 PUSH EDI                ; <- Push the new 'negative' size
+022E6119 PUSH EAX
+022E611A MOV EAX,DWORD PTR SS:[ESP+18]
+022E611E ADD EAX,8
+022E6121 PUSH EAX
+022E6122 PUSH ESI
+022E6123 CALL EDX                ;  call StartRead
+022E6125 PUSH EBX
+-------------------------------------------------------------------
+
+StartRead, among other things, uses the size value in a call to 
+_memcpy, that will read the available data from the file 
+overflowing the buffer and overwriting heap memory.
+
+-------------------------------------------------------------------
+022D44BC MOV EBX,[EBP+arg_4]
+022D44BF PUSH ESI              ; <- The 'negative' size
+022D44C0 PUSH EAX              ; void *
+022D44C1 PUSH EBX              ; void *
+022D44C2 CALL _MEMCPY          ; <- Call to memcpy
+-------------------------------------------------------------------
+
+The result of exploitation is that heap memory is overflowed. 
+
+We have had successful exploitable 'exceptions' in the following 
+places;
+
+-------------------------------------------------------------------
+A 'write 4'
+0116D35A JE sqlservr.011C6BCE
+0116D360 MOV EAX,DWORD PTR DS:[EAX+C]
+0116D363 MOV ECX,DWORD PTR SS:[EBP-10]
+0116D366 MOV EDX,DWORD PTR DS:[ECX+C0]
+0116D36C MOV DWORD PTR DS:[EDX],EAX   ; <- Control of EDX and EAX
+-------------------------------------------------------------------
+
+-------------------------------------------------------------------
+Function Call
+014AEA5F MOV EAX,DWORD PTR DS:[EDX+C] ; <- Control EDX
+014AEA62 CALL EAX
+014AEA64 TEST EAX,EAX
+014AEA66 JE SHORT sqlservr.014AEA70
+-------------------------------------------------------------------
+
+-------------------------------------------------------------------
+Function Call
+011F9D08 MOV EAX,DWORD PTR DS:[EDX+58] ; <- Control EDX
+011F9D0B CALL EAX
+011F9D0D MOV ECX,DWORD PTR DS:[ESI+10]
+-------------------------------------------------------------------
+
+SQL server appears to use its own dynamic heap management, which 
+makes exploitation different from a standard heap overflow. Using
+a custom heap management routines means that the standard heap
+protections mechanisms are not in place. 
+
+_______________
+
+ Solution
+_______________
+
+Microsoft have released a security update to address this issue;
+http://www.microsoft.com/technet/security/bulletin/ms08-040.mspx
+
+_______________
+
+ Legals
+_______________
+
+The information is provided for research and educational purposes
+only. Insomnia Security accepts no liability in any form whatsoever
+for any direct or indirect damages associated with the use of this
+information.
+
+___________________________________________________________________
+ 
+ Insomnia Security Vulnerability Advisory: ISVA-080709.1
+___________________________________________________________________
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

@@ -1,0 +1,422 @@
+
+Date: Wed, 09 Dec 2009 09:18:56 +0100
+From: Stefan Esser <stefan.esser@...tioneins.de>
+To: full-disclosure@...ts.grok.org.uk, bugtraq@...urityfocus.com
+Subject: Advisory 03/2009: Piwik Cookie unserialize()
+	Vulnerability
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+
+                         SektionEins GmbH
+                        www.sektioneins.de
+
+                     -= Security  Advisory =-
+
+     Advisory: Piwik Cookie Unserialize() Vulnerability
+ Release Date: 2009/12/09
+Last Modified: 2009/12/09
+       Author: Stefan Esser [stefan.esser[at]sektioneins.de]
+
+  Application: Piwik <= 0.4.5
+     Severity: Piwik unserializes() user input which allows an attacker
+               to send a carefully crafted cookie that when unserialized
+               utilizes Piwik's classes to upload arbitrary files or
+               execute arbitrary PHP code
+         Risk: Critical
+Vendor Status: Piwik 0.5.0 was released which fixes this vulnerability
+    Reference:
+http://www.sektioneins.com/en/advisories/advisory-032009-piwik-cookie-unserialize-vulnerability/
+              
+http://www.suspekt.org/downloads/RSS09-WebApplicationFirewallBypassesAndPHPExploits.pdf
+              
+http://www.suspekt.org/downloads/POC2009-ShockingNewsInPHPExploitation.pdf        
+ 
+ 
+ 
+
+
+Overview:
+
+  Quote from http://www.piwik.org
+  "Piwik is a downloadable, open source (GPL licensed) web analytics
+   software program. It provides you with detailed real time reports
+   on your website visitors: the search engines and keywords they
+   used, the language they speak, your popular pages… and so much more.
+ 
+   Piwik aims to be an open source alternative to Google Analytics."
+
+  Piwik recently became sourceforge project of the month and won the
+  Infoworld Bossie Award for best open source enterprise software which
+  made it quite popular. Therefore Piwik is nowadays installed on many
+  high profile websites like: banking websites, political party websites,
+  gaming websites, blogs and even security company websites.
+
+  During our research in unserialize() vulnerabilities it was discovered
+  that Piwik unserializes data from the user supplied cookie. By
+  unserializing some of Piwik's objects it is possible to write
+  arbitrary files to writable locations on the webserver which
+  can be used to upload e.g. PHP files to writable directories
+  within the webserver's document root which usually exist in a
+  standard Piwik installation. In newer versions of Piwik it is
+  also possible to execute arbitrary PHP code directly.
+
+  Combined with the interruption vulnerability exploits demonstrated
+  by SektionEins at Syscan and Blackhat it is possible to disable
+  all internal PHP security protections and execute arbitrary code
+  e.g. local kernel exploits to become root.
+
+Details:
+
+  SektionEins recently demonstrated how it is sometimes possible
+  to execute arbitrary PHP code in an application using unserialize()
+  on user supplied data. In detail various exploits were shown that
+  work against all Zend Framework based applications that unserialize()
+  user input. Part of this research was to find popular PHP open
+  source applications that are vulnerable to this.
+ 
+  During our search it was discovered that Piwik does unserialize()
+  data from the cookie and uses parts of the Zend Framework:
+ 
+  protected function loadContentFromCookie()
+  {
+    $cookieStr = $_COOKIE[$this->name];
+    $values = explode( self::VALUE_SEPARATOR, $cookieStr);
+    foreach($values as $nameValue)
+    {
+      $equalPos = strpos($nameValue, '=');
+      $varName = substr($nameValue,0,$equalPos);
+      $varValue = substr($nameValue,$equalPos+1);
+           
+      // no numeric value are base64 encoded so we need to decode them
+      if(!is_numeric($varValue))
+      {
+        $varValue = base64_decode($varValue);
+
+        // some of the values may be serialized array so we try to...
+        if( ($arrayValue = @unserialize($varValue)) !== false
+            // we set the unserialized version only for arrays...
+            && is_array($arrayValue)
+            )
+        {
+          $varValue = $arrayValue;
+        }
+      }
+      $this->set($varName, $varValue);
+    }
+  }
+ 
+  While this allows to unserialize() user input the previously
+  demonstrated exploits will not work on Piwik because only parts of
+  the Zend Framework are shipped with the Piwik source code. Because
+  of this we had to evaluate if Piwik's own classes can be utilized
+  in exploits.
+ 
+  When trying to exploit an unserialize() vulnerability in a PHP
+  application the first step is to enumerate the objects that contain
+  __wakeup() or __destruct() methods and read their code to analyze if
+  these methods are doing something interesting.
+ 
+  When looking at the Piwik source code one particular class can be
+  found that allows writing arbitrary configuration files to the
+  webserver. This class is called Piwik_Config and contains the
+  following code.
+ 
+  function __destruct()
+  {
+    if($this->configFileUpdated === true
+        && $this->doWriteFileWhenUpdated === true)
+    {
+      $configFile = "; <?php exit; ?> DO NOT REMOVE THIS LINE\n";
+      $configFile .= "; file automatically generated or modified by "
+                     "Piwik; you can manually override the default "
+                     "values in global.ini.php by redefining them "
+                     "in this file.\n";
+           
+      foreach($this->userConfig as $section => $arraySection)
+      {
+        $arraySection = $arraySection->toArray();
+        $configFile .= "[$section]\n";
+        foreach($arraySection as $name => $value)
+        {
+          ...
+          $configFile .= $name.' = '.$value."\n";                    
+          ...
+        }
+        $configFile .= "\n";
+      }
+      chdir($this->correctCwd);
+      file_put_contents($this->pathIniFileUserConfig, $configFile );
+    }
+  }
+ 
+  It should be obvious that when unserializing a Piwik_Config object
+  it is possible to write arbitrary configurations to arbitrary
+  locations by just setting the properties of the object correctly.
+  However it should also be obvious that executing arbitrary PHP code
+  is not that simple because the authors of Piwik add a show stopper
+  to the beginning of every configuration file "; <?php exit; ...".
+  Because of this it is not possible to just write PHP code into a
+  file and execute it.
+
+  There is however a lesser known and nearly never used feature of PHP5
+  that allows exploiting this situation. By using the PHP5 filter
+  stream wrapper through the php://filter URI scheme it is possible to
+  write arbitrary files to the server. By crafting a configuration
+  filename like
+  php://filter/write=convert.base64-decode/resource=/var/www/x.php it
+  is possible to channel all writes to the file through a base64
+  decoder. Because PHP does ignore invalid characters during base64
+  decoding it is possible to destroy the show stopper by a single
+  base64 decoding. By calculating how many base64 compatible characters
+  are contained in the show stopper it is possible to find out how
+  many padding bytes are necessary so that base64 injected PHP payload
+  ends up correctly decoded in the written configuration file.
+ 
+  Because the filter wrapper can be stacked several times before data
+  is written to the actual file it is possible to construct payloads
+  that do not only destroy the show stopper but also get rid of all the
+  bytes. In current Piwik versions 5 times base64 decode is required
+  for this. In earlier versions of Piwik there have been 3 different
+  show stoppers strings. Therefore in order to exploit older Piwik
+  versions different exploits are required.
+ 
+  In order to execute arbitrary code it is possible to overwrite one
+  of Piwik cache files and triggering a tracking event. Alternatively
+  it is possible to first write a .htaccess file to one of the
+  directories within Piwik's tmp directory that allows accessing its
+  content and then dropping a PHP file in there.
+ 
+  In the most recent Piwik version the Zend Framework components were
+  upgraded which allows executing arbitrary PHP code directly. To
+  achieve this the Zend_Log destructor is utilized.
+ 
+  public function __destruct()
+  {
+    foreach($this->_writers as $writer) {
+      $writer->shutdown();
+    }
+  }
+ 
+  The Zend_Log destructor iterates through an array which it expects
+  inside the _writers property. Each element of this array is then
+  expected to have a method called shutdown() which is then executed.
+  The next step in creating an exploit is to find classes that contain
+  a shutdown() method. The best fitting class is Zend_Log_Writer_Mail.
+  It is the same class that is also utilized in the generic Zend
+  Framework exploit.
+ 
+  public function shutdown()
+  {
+    // If there are events to mail, use them as message body.  Otherwise,
+    // there is no mail to be sent.
+    if (empty($this->_eventsToMail)) {
+      return;
+    }
+
+    if ($this->_subjectPrependText !== null) {
+      // Tack on the summary of entries per-priority to the subject
+      // line and set it on the Zend_Mail object.
+      $numEntries = $this->_getFormattedNumEntriesPerPriority();
+      $this->_mail->setSubject(
+      "{$this->_subjectPrependText} ({$numEntries})");
+    }
+
+
+    // Always provide events to mail as plaintext.
+    $this->_mail->setBodyText(implode('', $this->_eventsToMail));
+
+    // If a Zend_Layout instance is being used, set its "events"
+    // value to the lines formatted for use with the layout.
+    if ($this->_layout) {
+      // Set the required "messages" value for the layout.  Here we
+      // are assuming that the layout is for use with HTML.
+      $this->_layout->events = implode('', $this->_layoutEventsToMail);
+
+      // If an exception occurs during rendering, convert it to a notice
+      // so we can avoid an exception thrown without a stack frame.
+      try {
+        $this->_mail->setBodyHtml($this->_layout->render());
+      } catch (Exception $e) {
+        ...
+      }
+
+      // Finally, send the mail.  If an exception occurs, convert ...
+      // warning-level message so we can avoid an exception thrown ...
+      // stack frame.
+      try {
+          $this->_mail->send();
+      } catch (Exception $e) {
+          ...
+      }
+  }
+ 
+  This shutdown method will check if there are events not yet mailed
+  and if there are, it will mail them to the address specified in the
+  Zend_Mail object which has to be within the _mail property. This
+  allows anyone to send out arbitrary spam to arbitrary mail addresses.
+  However there is a more interesting exploiting path hidden here that
+  once again utilizes the HTML rendering. Therefore an attacker has to
+  find a class that contains a render method. The most promising class
+  in case of Piwik is Piwik_View. Its render method will do a lot of
+  things that can be ignored and finally call smarty to render the
+  template.
+ 
+  public function render()
+  {
+    try {
+      ...
+    } catch(Exception $e) {
+      // can fail, for example at installation (no plugin loaded yet)    
+    }
+   
+    ...
+
+    @header('Content-Type: text/html; charset=utf-8');
+    @header("Pragma: ");
+    @header("Cache-Control: no-store, must-revalidate");
+
+    return $this->smarty->fetch($this->template);
+  }
+ 
+  Because most of the code in the render method is within a try and
+  catch block it can be ignored. The only interesting part of the
+  method is the fetch method called on the smarty property. Because
+  smarty templates can execute PHP code the smarty class is the first
+  one should look at and indeed smarty can be used to execute PHP
+  code.
+ 
+  function fetch($resource_name, $cache_id = null, ...)
+  {
+    ...
+    if ($display && !$this->caching &&
+count($this->_plugins['outputfilter']) == 0) {
+      if ($this->_is_compiled($resource_name, $_smarty_compile_path)
+          || $this->_compile_resource($resource_name,
+$_smarty_compile_path))
+      {
+        include($_smarty_compile_path);
+      }
+    } else {
+    ...
+ 
+  The supplied template name is then given to the _compile_resource
+  method to compile the resource.
+ 
+  function _compile_resource($resource_name, $compile_path)
+  {
+
+    $_params = array('resource_name' => $resource_name);
+    if (!$this->_fetch_resource_info($_params)) {
+      return false;
+    }
+    ...
+ 
+  Before the resource is being compiled the _fetch_resource_info
+  method is called to determine more information about the resource.
+ 
+  function _fetch_resource_info(&$params)
+  {
+    ...
+    $_params = array('resource_name' => $params['resource_name']) ;
+    ...
+   
+    if ($this->_parse_resource_name($_params)) {
+      $_resource_type = $_params['resource_type'];
+      $_resource_name = $_params['resource_name'];
+      switch ($_resource_type) {
+        case 'file':
+          ...
+          break;
+
+        default:
+          // call resource functions to fetch the template source and
+timestamp
+          if ($params['get_source']) {
+            $_source_return =
+isset($this->_plugins['resource'][$_resource_type]) &&
+           
+call_user_func_array($this->_plugins['resource'][$_resource_type][0][0],
+             array($_resource_name, &$params['source_content'], &$this));
+          } else {
+            $_source_return = true;
+          }
+          ...
+        }
+
+  The _fetch_resource_info method first calls _parse_resource_name to
+  determine the type and name of resource. The expected format is
+  resource_type:resource_name. For non file resources a function will
+  be determined by a lookup in the _plugins[resource] lookup table
+  that will be called to retrieve the resource data. Because all
+  properties are attacker supplied an exploit can freely choose what
+  function should be called.
+ 
+  Because the called function is called with three parameters and only
+  the first one is user supplied it gets a bit tricky to execute
+  arbitrary PHP code. Calling eval() is not possible because it is a
+  language construct and not a function and calling assert() instead
+  will also fail, because it only accepts one parameter. The trick
+  here is to use one of the methods inside the smarty class which is
+  a wrapper around eval().
+ 
+  function _eval($code, $params=null)
+  {
+    return eval($code);
+  }
+ 
+  While this function does only define two parameters in its signature
+  it is possible to call this function with more than two parameters.
+  The reason for this is that unlike internal functions that usually
+  bail out when too many parameters are supplied internal functions
+  will not do this because otherwise it would not be possible to have
+  functions with an arbitrary number of parameters.
+
+  So to summarize the attack: By carefully crafting a user supplied
+  cookie it is possible to utilize Piwik's own objects and execute
+  arbitrary PHP code by supplying the argument to an eval() statement.
+
+Proof of Concept:
+
+  SektionEins GmbH is not going to release a proof of concept
+  exploit for this vulnerability.
+
+Disclosure Timeline:
+
+  28. November 2009 - Notified hello@...ik.org
+  09. December 2009 - Piwik developers released Piwik 0.5.0
+  09. December 2009 - Public Disclosure
+
+Recommendation:
+
+  It is recommended to upgrade to the latest version of Piwik.
+
+  Grab your copy at:
+  http://piwik.org/latest.zip
+
+CVE Information:
+
+  The Common Vulnerabilities and Exposures project (cve.mitre.org) has
+  not assigned a name to this vulnerability.
+
+GPG-Key:
+
+  pub  1024D/15ABDA78 2004-10-17 Stefan Esser
+  Key fingerprint = 7806 58C8 CFA8 CE4A 1C2C  57DD 4AE1 795E 15AB DA78
+
+Copyright 2009 SektionEins GmbH. All rights reserved.
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.8 (Darwin)
+Comment: Using GnuPG with Mozilla - http://enigmail.mozdev.org/
+
+iEYEARECAAYFAksfXXAACgkQSuF5XhWr2ngSawCfVzsl15InklBsG89ru5TmYZDd
+S0sAmwTr4R9wkQi0cdYUyyKi3XQ3yxPg
+=0UDg
+-----END PGP SIGNATURE-----
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
