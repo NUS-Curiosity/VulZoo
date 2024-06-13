@@ -1,0 +1,128 @@
+
+Date: Wed, 16 Sep 2009 18:58:17 +0200
+From: Julien TINNES <julien@....org>
+To: full-disclosure@...ts.grok.org.uk
+Cc: taviso@....lonestar.org
+Subject: Iret #GP on pre-commit handling failure: the
+	NetBSD case (CVE-2009-2793)
+
+Iret #GP on pre-commit handling failure: the NetBSD case (CVE-2009-2793)
+------------------------------------------------------------------------
+
+On the Intel architecture, once an operating system kernel has completed
+servicing an interrupt or exception, it will generally return to user
+mode using iret. The iret instruction will restore the context required
+to continue execution, such as code segment, instruction pointer, flags
+and so on.
+
+iret is a complex instruction whose pseudocode alone spans several pages
+of the software developers manual. Interestingly, in protected mode it
+is executed in two distinct stages, a pre-commit stage (before privilege
+level is changed) and a post-commit stage (after privilege level is
+changed). You can see the commit point in the pseudocode below (taken
+from Intel manual, comment is ours)
+
+IF new mode != 64-Bit Mode
+  THEN
+    IF tempEIP is not within code segment limits
+      THEN #GP(0); FI;
+    EIP <- tempEIP;
+  ELSE (* new mode = 64-bit mode *)
+    IF tempRIP is non-canonical
+      THEN #GP(0); FI;
+    RIP <- tempRIP;
+FI;
+CS <- tempCS;  // This is the commit point (privilege switch)
+EFLAGS (CF, PF, AF, ZF, SF, TF, DF, OF, NT) <- tempEFLAGS;
+
+When the processor handles an exception, two cases can arise:
+- the handler procedure is executed at the same level of privilege
+  as the interrupted procedure, no stack switch occurs
+- the handler procedure is executed at a different privilege level,
+  therefore a stack switch occurs
+
+The generated stack frame will be different if a stack switch occurs,
+because the processor needs to save the interrupted procedure's stack.
+
+When iret returns to a different privilege level, its behaviour on
+failure will depend on which stage of the operation it is currently
+executing.  A pre-commit failure will induce no stack-switching while a
+post-commit failure will induce a stack switching and therefore generate
+a different size trap frame.
+
+--------------------
+Affected Software
+------------------------
+
+It's easy to overlook this distinction and we have found multiple cases
+where this has had direct security consequences or made other issues
+exploitable.
+
+For instance, the NetBSD kernel on x86 does not handle pre-commit failures
+properly.
+
+We can easily make iret fail pre-commit by having tempEIP outside the
+code segment limits.
+
+- The canonical way to do this is to set-up a LDT entry with a code segment
+  limited to 0x1FFF. mmap memory at 0x1000 and then put some shellcode with
+  an int 0x80 at the very end of this page, so that when the kernel iret,
+  tempEIP is past the code segment limits.
+
+- Interestingly, because of the lazy handling of non executable stack
+  emulation on x86, this bug could be triggered by a non malicious
+  program:
+
+/* ... */
+int main(int argc, char **argv)
+{
+  jmp_buf env;
+
+  void handlesig(int n) {
+        longjmp(env, 1);
+
+  }
+  signal(SIGSEGV, handlesig);
+
+  if (setjmp(env) == 0) {
+        ( (void(*)(void)) NULL) ();
+  }
+
+  return 0;
+}
+
+/* ... */
+int main(int argc, char **argv)
+{
+       char baguette;
+       signal(SIGABRT, (void (*)(int))&baguette);
+       abort();
+}
+
+--------------------
+Consequences
+-----------------------
+
+In the NetBSD case, the kernel stack will get desynchronized. This might
+allow an attacker to elevate privileges.
+
+-------------------
+Solution
+-----------------------
+
+We reported this to NetBSD developpers in May. Obviously, the fix is
+non trivial, and after much discussion, we agreed to release this
+information to open this issue to the wider NetBSD developement
+community.
+
+-------------------
+Credit
+-----------------------
+
+This bug was discovered by Tavis Ormandy and Julien Tinnes of the Google
+Security Team.
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

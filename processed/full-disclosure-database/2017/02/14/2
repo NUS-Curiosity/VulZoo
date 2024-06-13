@@ -1,0 +1,240 @@
+
+Date: Mon, 13 Feb 2017 10:15:29 +0100
+From: Sydream Labs <labs@...dream.com>
+To: cve@...re.org, fulldisclosure@...lists.org, bugtraq@...urityfocus.com
+Subject: [FD] CVE-2017-5670 : Riverbed RiOS insecure cryptographic storage
+
+# Riverbed RiOS insecure cryptographic storage (CVE-2017-5670)
+
+## Description
+
+Riverbed Steelhead hardware appliances are used to optimize and
+accelerate network traffic.
+There can be implemented as TLS endpoints, so they have a secure vault
+aimed to store private TLS certificates for servers.
+The secure vault has FIPS mode support.
+
+## Improper encryption implementation
+
+The secure vault used on the Steelhead appliance (and potentially other
+that we could not test) is not efficient in its default form, because of
+the lack of boot loader security.
+
+**Threat**
+
+An adversary can boot an appliance and recover all private keys of the
+server certificates that are configured on it. It may happen in various
+situation (subcontractors, hardware decommissioning, etc.).
+
+**Expectation**
+
+With proper encryption (FDE) and sanitization procedures, certificates
+should be unrecoverable, as quoted from the documentation:
+
+> Since the information is only in memory, when an appliance is rebooted
+or powered off, the information is no longer available".
+
+**CVE ID**: CVE-2017-5670
+
+**Access Vector**: local
+
+**Security Risk**: medium
+
+**Vulnerability**: CWE-310, CWE-321
+
+**CVSS Base Score**: 7.1
+
+**CVSS Vector**: CVSS:3.0/AV:P/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:L
+
+### Defeating system encryption with anonymous console access
+
+We followed the steps below to take over the appliance and recover
+private keys from the file system, with zero knowledge of the appliance
+and its configuration :
+
+**1/** Connect to the appliance in RS232.
+
+**2/** Turn on the appliance and edit the Grub line to boot in `single` mode
+
+**3/** Proceed with the boot to get the root shell. But at this stage,
+vault decryption has not happened yet.
+
+**4/** Reset the *admin* password, which can be achieved with the
+`/sbin/resetpw.sh` script.
+
+**5/** Modify the firmware to replace `/opt/tms/bin/cli` with `bash` :
+
+```
+# mount / -o remount, rw
+# cd /opt/tms/bin/
+# mv cli cli.bask
+# cp /bin/bash cli
+# reboot
+```
+
+**5/** Reboot to now get a full admin access with a `bash` shell.
+
+**6/** Use the `mount` command to confirm that decryption has happened:
+
+```
+# mount
+encfs on /var/opt/rbt/decrypted type fuse.encfs
+(rw,nosuid,nodev,relatime,user_id=0)
+# ls /var/opt/rbt/decrypted
+available framework notes ssl tmp
+```
+
+**7/** Now insert an USB key and retrieve the whole vault. Note that
+non-exportable certificates can be extracted without any issue (from
+`./decrypted/server_certs/names/NOExportableCA/`).
+The exportation is only based on a local file that acts as a flag:
+
+```
+# cat /var/opt/rbt/decrypted/server_certs/names/NOExportableCA/exportable
+false
+```
+
+**8/** Note that encryption is made by the `/sbin/secure_vault.sh`
+script, which makes EncFS encryption based on fixed and hard-coded keys:
+
+```
+[...]
+MAGIC_STRING='This ********* motorcycle'
+[...]
+PASSWORD="${MAGIC_STRING}_{SERIAL_NUM}
+[...]
+```
+
+So the passphrase is basically a concatenation of a constant magic
+string and the appliance serial number, two pieces of information that
+an attacker can easily retrieve.
+
+> With this knowledge, it is trivial to reproduce the decryption on any
+Linux computer with EncFS. Thus, it is actually not necessary anymore to
+root the appliance to decrypt data, the disk content could be copied
+offline.
+
+Several weaknesses lead to the certificate exposure:
+
+- The boot loading chain is not password protected (starting with Grub)
+and there is no integrity control, so it is trivial to "root" the appliance.
+- File-system level encryption is inefficient for protecting local
+storage, especially when the system lacks of integrity protection : the
+disk can be accessed and the data can be retrieved while it is decrypted.
+- A fixed and hard-coded value is used by the system as an encryption
+key. It even makes offline decryption easy.
+- Do not claim to encrypt with PBKDF-2 in the documentation. The user
+password is used with no derivation.
+
+### A look at the user password mode
+
+In an improved vault encryption mode, the appliance allows the user to
+encrypt with its own key.
+The documentation advertises that the key is based on PBKDF-2, so we
+expect that the encryption to be a hash.
+
+We set this mode and tracked system calls while unlocking a certificate
+in the Web interface :
+
+```
+# strace -e write -o /tmp/out /opt/tms/bin/mgmtd & 1 > /dev/null 2>&1
+[...]
+write(19, "Pass123_EC6R*****0\n", 22) = 22
+[...]
+```
+
+So we found the password that we set for the vault, appended with the
+appliance serial number. With this information, we succeeded in
+decrypting the vault offline, from another Linux box.
+
+Riverbed advertises that the use of PBKDF-2 makes the password stronger
+to prevent brute force attacks (as it is used in EncFS).
+However, a poorly chosen pass phrase (in the absence of password policy
+enforcement) and a physically readable salt (the serial number on the
+appliance) would yet defeat the benefits of EncFS encryption.
+
+
+## Insecure secure vault deletion
+
+Two scripts are used at different times to delete the secure vault:
+`/sbin/secure_vault_clear.sh` and `/sbin/scrub.sh`.
+
+They simply use the `rm` system command to delete the files, as follows:
+
+```
+[...]
+umount /var/opt/rbt/decrypted
+rm -rf /var/opt/rbt/decrypted
+rm -rf /var/opt/rbt/encrypted
+rm -f /var/opt/rbt/ssl
+[...]
+```
+
+A better practice would be to use `shred` or `srm` utilities to wipe
+files securely.
+
+## Affected versions
+
+RiOS versions prior to 9.0.1 regarding the single boot mode.
+
+Potentially all version regarding secure vault weak encryption and wiping.
+
+### Solution
+
+Sysdream considers that the encryption scheme needs a complete
+re-factoring in relevance with the secrets it protects. We believe that
+full disk encryption should be implemented, with better boot loader
+security features. Default security and clarifications should be
+mandatory for this kind of appliance.
+
+As of now, Riverbed advises:
+
+> 1) Ensure physical access is protected
+> 2) Keep your software up-to-date
+> 3) Set a bootloader password
+> 4) Set a BIOS password
+> 5) Change the default secure-vault password
+> 6) Take proper steps when decommissioning including erasing hard-disk data
+
+We could not verify that all these items can be implemented (for
+instance, on our model and RiOS version, no setting allowed to set a
+Grub and BIOS password, and the user guide did not mention anything).
+So, please refer to your documentation (deployment guide) or support to
+check how you can implement these security settings.
+
+## Timeline (dd/mm/yyyy)
+
+* 7/12/2016 Initial discovery
+* 11/12/2016    First e-mail contact
+* 17/12/2016    Sent all details to Riverbed contact
+* 26/01/2017    After several requests to the support, got contact with
+the security team. Riverbed position is that customers should put proper
+physical protections in place in any case. Also, version 9.0.1 removed
+single mode boot.
+* 11/02/2017	Disclosure
+
+## Credits
+
+* Jean-Christophe Baptiste, aka phocean, Sysdream (jc.baptiste -at-
+sysdream -dot- com)
+
+
+-- 
+SYSDREAM Labs <labs@...dream.com>
+
+GPG :
+47D1 E124 C43E F992 2A2E
+1551 8EB4 8CD9 D5B2 59A1
+
+* Website: https://sysdream.com/
+* Twitter: @sysdream
+
+
+
+Download attachment "signature.asc" of type "application/pgp-signature" (848 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

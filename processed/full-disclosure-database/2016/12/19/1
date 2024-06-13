@@ -1,0 +1,154 @@
+
+Date: Mon, 19 Dec 2016 11:47:07 +0100
+From: Berend-Jan Wever <berendj@...ver.nl>
+To: fulldisclosure@...lists.org, Bugtraq <bugtraq@...urityfocus.com>
+Subject: [FD] CVE-2013-6627: Chrome Chrome HTTP 1xx
+ base::StringTokenizerT<...>::QuickGetNext OOBR
+
+Since November I have been releasing details on all vulnerabilities I
+found that I have not released before. This is the 35th entry in the
+series. This information is available in more detail on my blog at
+http://blog.skylined.nl/20161219001.html. There you can find a repro
+that triggered this issue in addition to the information below, it also
+provides code snippets for the affected code, and a diagram that
+attempts to explain the memory layout.
+
+This advisory contains a lot more information about the root cause and
+how to exploit it, as Google Bug Bounties reward high quality
+bug-reports to a point where it is worth investigating a bug in detail.
+
+If you find these releases useful, and would like to help me make time
+to continue releasing this kind of information, you can make a donation
+in bitcoin to 183yyxa9s1s1f7JBp­PHPmz­Q346y91Rx5DX.
+
+Follow me on http://twitter.com/berendjanwever for daily browser bugs.
+
+Chrome HTTP 1xx base::StringTokenizerT<...>::QuickGetNext OOBR
+==============================================================
+(CVE-2013-6627)
+
+Synopsis
+--------
+A specially crafted HTTP response can allow a malicious web-page to
+trigger a out-of-bounds read vulnerability in Google Chrome. The data is
+read from the main process' memory.
+
+Known affected software, attack vectors and potential mitigations
+-----------------------------------------------------------------
+* Google Chrome up to, but not including, 31.0.1650.48
+
+  An attacker would need to get a target user to open a specially
+  crafted web-page. Disabling JavaScript does not prevent an attacker
+  from triggering the vulnerable code path, but may prevent
+  exfiltration of information.
+
+  Since the affected code has not been changed since 2009, I assume this
+  affects all versions of Chrome released in the last few years.
+
+Details
+-------
+The `HttpStreamParser` class is used to send HTTP requests and receive
+HTTP responses. Its `read_buf_` member is a buffer used to store HTTP
+response data received from the server. Parts of the code are written
+under the assumption that the response currently being parsed is always
+stored at the start of this buffer (as returned by
+`read_buf_->StartOfBuffer()`), other parts take into account that this
+may not be the case (`read_buf_->StartOfBuffer() +
+read_buf_unused_offset_`). In most cases, responses are removed from the
+buffer once they have been parsed and any superfluous data is moved to
+the beginning of the buffer, to be treated as part of the next response.
+However, the code special cases `HTTP 1xx` replies and returns a result
+without removing the request from the buffer. This means that the
+response to the next request will not be stored at the start of the
+buffer, but after this `HTTP 1xx` response and `read_buf_unused_offset_`
+should be used to find where it starts.
+
+A look through the code has revealed one location where this can lead to
+a security issue (also in `DoReadHeadersComplete`). The code uses an
+offset from the start of the buffer (rather than the start of the
+current responses) to pass as an argument to a `DoParseResponseHeaders`.
+`DoParseResponseHeaders` passes the argument unchanged to
+`HttpUtil::AssembleRawHeaders`. The `HttpUtil::AssembleRawHeaders`
+method takes two arguments: a pointer to a buffer, and the length of the
+buffer. The pointer is calculated correctly (in
+`DoParseResponseHeaders`) and points to the
+start of the current response. The length is the offset that was
+calculated incorrectly in `DoReadHeadersComplete`. If the current
+response is preceded by a `HTTP 1xx` response in the buffer, this length
+is larger than it should be: the calculated value will be the correct
+length plus the size of the previous `HTTP 1xx` response
+(`read_buf_unused_offset_`).
+
+The code will continue to rely on this incorrect value to try to create
+a copy of the headers, inadvertently making a copy of data that is not
+part of this response and may not even be part of the `read_buf_`
+buffer. This could cause the code to copy data from memory that is
+stored immediately after `read_buf_` into a string that represents the
+response headers. This string is passed to the renderer process that
+made the request, allowing a web-page inside the sandbox to read memory
+from the main process' heap.
+
+Exploit
+-------
+The impact depends on what happens to be stored on the heap immediately
+following the buffer. Since a web-page can influence the activities of
+the main process (e.g. it can ask it to make other HTTP requests), a
+certain amount of control over the heap layout is possible. An attacker
+could attempt to create a "heap feng shui"-like attack where careful
+manipulation of the main process' activities allow reading of various
+types of information from the main process' heap. The most obvious
+targets that come to mind are http request/response data for different
+domains, such as log-in cookies, or session keys and function pointers
+that can be used to bypass ASLR/DEP. There are undoubtedly many other
+forms of interesting information that can be revealed in this way.
+
+There are little limits to the number of times an attacker can exploit
+this vulnerability, assuming the attacker can avoid triggering an access
+violation: if the buffer happens to be stored at the end of the heap,
+attempts to exploit this vulnerability could trigger an access
+violation/segmentation fault when the code attempts to read beyond the
+buffer from unallocated memory addresses.
+
+Fix
+---
+I identified and tested two approaches to fixing this bug:
++ Fix the code where it relies on the response being stored at the
+  start of the buffer.
+  This addresses the incorrect addressing of memory that causes this
+  vulnerability in various parts of the code. The design to keep HTTP
+  1xx responses in the buffer remains unchanged.
+
++ Remove HTTP 1xx responses from the buffer.
+  There was inline documentation in the source that explained why HTTP
+  1xx responses were handled in a special way, but it didn't make much
+  sense to me. This fix changes the design to no longer keep the HTTP
+  1xx response in the buffer. There is an added benefit to this fix in
+  that it removes a potential DoS attack, where a server responds with
+  many large HTTP 1xx replies, all of which are kept in memory and
+  eventually cause an OOM crash in the main process.
+
+The later fix was eventually implemented.
+
+Time-line
+---------
+* 27 September 2013: This vulnerability and two patches were submitted
+  to the Chromium bugtracker.
+* 2 October 2013: A patch for this vulnerability was submitted by
+  Google.
+* 12 November 2013: This vulnerability was address in version
+  31.0.1650.48.
+* 19 December 2016: Details of this vulnerability are released.
+
+Cheers,
+
+SkyLined
+
+Download attachment "0x2557C5AA.asc" of type "application/pgp-keys" (2036 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (820 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

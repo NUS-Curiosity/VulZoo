@@ -1,0 +1,222 @@
+
+Date: Tue, 30 Apr 2019 22:35:58 -0400
+From: Nightwatch Cybersecurity Research <research@...htwatchcybersecurity.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] RCE in CGI Servlet – Apache Tomcat on Windows – CVE-2019-0232
+
+[Original post:
+https://wwws.nightwatchcybersecurity.com/2019/04/30/remote-code-execution-rce-in-cgi-servlet-apache-tomcat-on-windows-cve-2019-0232/]
+
+SUMMARY
+
+Apache Tomcat has a vulnerability in the CGI Servlet which can be
+exploited to achieve remote code execution (RCE). This is only
+exploitable when running on Windows in a non-default configuration in
+conjunction with batch files. The vendor released a fix in Tomcat
+versions 7.0.94, 8.5.40 and 9.0.19. Users are encouraged to upgrade as
+soon as possible. CVE-2019-0232 has been assigned to track this issue.
+
+VULNERABILITY DETAILS
+
+Common Gateway Interface (CGI) is a standard protocol to allow web
+servers to execute command line programs / scripts via web requests.
+This protocol also allows passing of command line arguments to the
+script or program being executed via URL parameters. The protocol
+itself is defined in RFC 3875.
+
+Apache Tomcat supports execution of CGI scripts / programs in a
+non-default configuration via a special CGI servlet. This servlet also
+parses URL parameters and translates them into command line arguments.
+The actual execution of the CGI scripts happens via Java Runtime
+Environment (JRE)’s java.lang.Runtime class, exec() function.
+
+When CGI support is enabled in Apache Tomcat in Windows, and command
+line argument passing is enabled, it is possible to cause command
+injection via parameter interpolation when calling a batch file (*.bat
+/ *.cmd). This happens because “cmd.exe” performs interpolation on
+some special characters before execution which can cause other shell
+commands to be called. Neither Apache Tomcat or the Windows JRE
+perform any kind of input validation for these special characters.
+
+STEPS TO REPLICATE
+1. Install a Java Runtime Environment (JRE) in Windows.
+2. Download a vulnerable version of Tomcat and extract.
+3. Modify the conf\context.xml file on line 19, to enable privileged context:
+<Context privileged="true">
+
+4. Modify conf\web.xml to enable the CGI Servlet by removing the
+comments around line 387 as follows and adding the following
+parameters (enableCmdLineArguments is only needed for Tomcat 9):
+<servlet>
+<servlet-name>cgi</servlet-name>
+<servlet-class>org.apache.catalina.servlets.CGIServlet</servlet-class>
+<init-param>
+  <param-name>cgiPathPrefix</param-name>
+  <param-value>WEB-INF/cgi</param-value>
+</init-param>
+<init-param>
+  <param-name>executable</param-name>
+  <param-value></param-value>
+</init-param>
+<init-param>
+  <param-name>enableCmdLineArguments</param-name>
+  <param-value>true</param-value>
+</init-param>
+<load-on-startup>5</load-on-startup>
+</servlet>
+
+5. Enable the CGI servlet by removing comments around this – you also
+need to change the URL pattern to match the one in the previous step
+(“cgi”):
+<servlet-mapping>
+<servlet-name>cgi</servlet-name>
+<url-pattern>/cgi/*</url-pattern>
+</servlet-mapping>
+
+6. Create a folder for the CGI files:
+mkdir webapps\ROOT\WEB-INF\cgi
+
+7. Place the following text into a batch file located in
+“webapps\ROOT\WEB-INF\cgi\test.bat”
+@echo off
+echo Content-Type: text/plain
+echo.
+echo Hello, World!
+
+8. Run Tomcat via the following command:
+cd bin
+catalina run
+
+9. Trigger the following URLs and observe the dir command being run:
+http://localhost:8080/cgi/test.bat?&dir
+
+ADDITIONAL NOTES – ENVIRONMENT VARIABLES AND PATH
+
+By default, Tomcat doesn’t pass all of the environment variables from
+the parent process that runs Tomcat itself. That means that if you run
+“set”, you will not see any environment variables other than those set
+by Tomcat itself. This also means that you would need to spell out the
+directory path of the command you are trying to run. However, if the
+“passShellEnvironment” parameter is set to true, the variables from
+the parent process will be passed through and you can call any command
+in PATH as well as view those variables. If the command cannot be
+found, there will be a error in the console log “XXXX is not
+recognized as an internal or external command”.
+
+ADDITIONAL NOTES – MEMORY LEAKS / DENIAL OF SERVICE
+
+If the command being executed is a long running command, it maybe
+possible to cause a denial of service or a memory leak. This happens
+because Tomcat waits for the OS process to complete.
+
+ADDITIONAL NOTES – OTHER COMMANDS AND STDERR
+
+The “executable” parameter indicates which executable should be used
+to run the script. By default, this is set to “perl” with the
+expectation that the files being executed are Perl scripts. If this is
+set to empty, then it is possible to execute batch files since those
+are executed by “cmd.exe”. HOWEVER, it seems that the command
+interpolation only happens with batch files – if this is set to real
+program, then command interpolation doesn’t necessary occur and this
+vulnerability may be not exploitable.
+
+Also, if the command being triggered outputs to STDERR instead of
+STDOUT, that output doesn’t get piped back to the web request –
+instead it goes to the Tomcat console log.
+
+VENDOR RESPONSE
+
+This issue was responsibly reported to the vendor via the EU FOSSA
+bounty program operated by Intigriti. Vendor analysis indicated that
+the core cause for this issue has to do with the way the Java Runtime
+Environment (JRE) interprets command arguments in Windows specifically
+and doesn’t impact Apache Tomcat when used with other operating
+systems. The vendor assigned CVE-2019-0232 to track this issue and
+provided a fix.
+
+The vendor fix consists of two parts:
+* Disabling command line arguments from being passed to the CGI
+servlet in the default configuration (“enableCmdLineArguments” set to
+“false“) for Tomcat 7 and 8  – this was already disabled by default in
+Tomcat 9.
+* Adding a new configuration parameter (“cmdLineArgumentsDecoded“) to
+the default CGI configuration that will be used for input validation
+if passing of command line arguments is enabled and will be set to the
+following regular expression (OS specific). Note that if the user
+changes this parameter, they may become vulnerable again.
+*** Windows - [[a-zA-Z0-9\Q-_.\\/:\E]+]
+*** Other operating systems - [.*]
+
+AFFECTED VERSIONS AND MITIGATION
+
+Apache Tomcat is only vulnerable to this issue if the following
+conditions are met:
+* Running on Windows
+* CGI support is enabled either via the web.xml for a specific web
+application or the server as whole (see documentation). This is
+disabled by default.
+* The “privileged” setting is set to “true” in the Context element.
+This is “false” by default.
+* Tomcat 9 only – enableCmdLineArguments is set to “true” (enabled by
+default in Tomcat 7 and 8)
+* The “executable” parameter is empty, and the the CGI scripts being
+executed are batch files (either .bat or .cmd). It is not clear if
+other commands that use “cmd.exe” are vulnerable as well.
+
+The vendor indicated that the following versions are vulnerable (no
+information is available on earlier versions):
+* Tomcat 9 – versions 9.0.0.M1 through 9.0.17 (9.0.18 is not affected)
+* Tomcat 8 – versions 8.5.0 to 8.5.39
+* Tomcat 7 – versions 7.0.0 to 7.0.93
+
+Users are encouraged to upgrade to the following fixed versions or later:
+* Tomcat 9 – version 9.0.19 – details and code commit
+* Tomcat 8 – version 8.5.40 – details and code commit
+* Tomcat 7 – version 7.0.94 – details and code commit
+
+IMPORTANT NOTE: even when running a fixed version, you SHOULD NOT
+change the “cmdLineArgumentsDecoded” configuration parameter to a
+different value. If you do, your installation may become vulnerable.
+
+If an upgrade is not possible, users can apply one of the following mitigations:
+* Disable CGI support (it is disabled by default)
+* Or set the “enableCmdLineArguments” parameter to “false”. This
+setting will disable command line arguments from being passed via the
+CGI servlet.
+
+BOUNTY INFORMATION
+
+This report satisfied the requirement of the EU FOSSA bounty program
+and a bounty has been paid.
+
+REFERENCES
+
+Blog post on JRE behavior: see here (Markus Wulftange)
+[https://codewhitesec.blogspot.com/2016/02/java-and-command-line-injections-in-windows.html]
+CGI Standard: RFC 3875 [https://tools.ietf.org/html/rfc3875]
+CVE-ID: CVE-2019-0232
+CVSS v2.0 Score: 9.3 – (AV:N/AC:M/Au:N/C:C/I:C/A:C)
+CVSS v3.0 Score: 8.1 – (AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H)
+Tomcat CGI Servlet source code: see GitHub
+[https://github.com/apache/tomcat/blob/master/java/org/apache/catalina/servlets/CGIServlet.java]
+Vendor advisory: see here
+[http://mail-archives.us.apache.org/mod_mbox/www-announce/201904.mbox/%3C13d878ec-5d49-c348-48d4-25a6c81b9605%40apache.org%3E]
+
+CREDITS
+
+Text of the advisory written by Yakov Shafranovich.
+
+TIMELINE
+
+2019-02-14: Initial report submitted to the platform
+2019-02-17: Initial report validated by the platform
+2019-03-03: Report acknowledged by the vendor
+2019-03-14: Interim evaluation received from the vendor
+2019-03-22: Communication with the vendor
+2019-04-10: Public advisory issued by the vendor
+2019-04-30: Public disclosure by reporter
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

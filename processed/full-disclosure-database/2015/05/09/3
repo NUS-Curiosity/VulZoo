@@ -1,0 +1,203 @@
+
+Date: Thu, 07 May 2015 13:38:37 +0200
+From: Balint Varga-Perke <vpbalint@...entsignal.hu>
+To: fulldisclosure@...lists.org
+Subject: [FD] CVE-2014-3440 - Symantec Critical System Protection RCE
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Silent Signal Security Advisory
+===============================
+
+Title: Symantec Critical System Protection Remote Code Execution
+CVE: CVE-2014-3440
+CVSSv2: 9.0 (AV:N/AC:L/Au:S/C:C/I:C/A:C)
+Status: Public
+Date: 2015-05-05
+
+## Software description
+
+According to the vendor Symantec Critical System Protection provides
+policy-based behavior control and detection for server and desktop
+computers. Symantec Critical System Protection includes management
+console and server components, and agent components that enforce
+policies on computers.
+
+## Vulnerability Description
+
+The agent control interface of the SCSP Server (sis-agent) is affected
+by a remote unauthenticated code execution vulnerability. This interface
+is used by the IDS/IPS agents to communicate with the SCSP server:
+register themselves, fetch policy updates, report events, etc. Since all
+the protected hosts need to communicate with the SCSP Server we can
+expect that this interface will be exposed to wide network ranges.
+The problem is caused by the fact that SCSP doesn't properly validate
+bulk log file uploads allowing connecting parties (Agents and attackers
+acting like Agents) to place arbitrary files on the client system. By
+placing JSP files under one of the several web application root
+directories of the Apache Tomcat server included in the Server package
+an attacker can open an interactive command shell.
+
+The vulnerable code resides in the BulklogHandler class of the sis-agent
+application. The sis-agent application uses a custom HTTP(S)-wrapped
+protocol that is similar to the standard multipart POST requests. In
+this protocol the body of the HTTP request is divided into multiple
+parts. Each part starts with a simple header that describes the type
+(plaintext, xml, binary) and size (in bytes, without the header) of the
+part. Each part can contain application Properties. In case of plaintext
+data-type, Properties are simple key-value pairs. The body of each
+request (and response) is ended with a line containing the "EOF_FLAG"
+string. The lines of the request body are ended with ASCII 0x0A. An
+example request body looks like this:
+
+```
+Data-Format=text/plain
+Data-Type=properties
+Data-Length=410
+
+agent.name=TEST12345678
+agent.hostname=TEST12345678
+agent.version=5.2.9.37
+agent.initial.group=
+agent.config.initial.group=
+config.initial.group=
+ids.policy.initial.group=Windows
+ids.config.initial.group=
+agent.ostype=windows
+agent.osversion=7 Service Pack 1
+agent.osdescription=
+agent.charset=UTF-8
+agent.features=PD
+agent.domain.name=
+polling.interval=300
+tcp.enabled=true
+tcp.port=2222
+agent.timezone=+120
+
+EOF_FLAG
+```
+
+The agent interface relies on the Java Servlet technology. User requests
+are routed through several classes which parse the incoming properties.
+The main logic of the Agent communication interface is implemented in
+multiple Handler classes. In case of the BulklogHandler class the users
+request first gets handled by the handleRequest() method that
+immediately calls the logFile() method for every "properties" part of
+the request:
+
+```
+// JAD decompiled code snippet
+private void logFile(Properties prop, byte data[], boolean repeat)
+throws Exception{
+    String filename;
+    File file;
+    FileOutputStream fout;
+    filename = prop.getProperty("file.name");
+    file = getBulkLogFile(filename);
+    fout = null;
+    fout = new FileOutputStream(file);
+    fout.write(data);
+    fout.flush();
+    // ...
+
+```
+
+The first method parameter holds the parsed properties from the request.
+The second parameter holds the corresponding binary part (the contents
+of the file to be uploaded). The method immediately calls the
+getBulLogFile() method in order to get the appropriate file descriptor
+object:
+
+```
+// JAD decompiled code snippet
+    private File getBulkLogFile(String filename)
+    {
+        File file;
+        String agentName = null;
+        int index = filename.indexOf('.', 24);
+        if(index > 0)
+            agentName = filename.substring(24, index);
+        else
+            agentName = filename.substring(24);
+        String date = mFormat.format(mParser.parse(filename.substring(0,
+8)));
+        String parentFolder = (new
+StringBuilder()).append(SisProperties.getBulkLogDir()).append(FILE_SEP).append(agentName).append(FILE_SEP).append(date).toString();
+        File parent = new File(parentFolder);
+        if(!parent.isDirectory())
+            parent.delete();
+        parent.mkdirs();
+        file = new File(parentFolder, filename);
+        return file;
+        Throwable th;
+        th;
+        throw new IllegalArgumentException((new
+StringBuilder()).append("Corrupted bulk log filename
+[").append(filename).append("]!!").toString(), th);
+    }
+```
+
+This method first tries to determine the name of the agent, taking the
+substring of the file name from the 24th character to the first dot
+after that. It then parses the first 8 characters of the given filename
+as a date. The uploaded files will be placed into their own directories
+(parent path), the directory structure looks like
+LOG_ROOT/AGENT_NAME/FORMATTED_DATE. This structure is created with the
+parent.mkdirs() call. The final path of the file descriptor is then
+created basically by concatenating the original file name to the parent
+path.
+
+Based on this, arbitrary file write can be achieved as follows:
+
+*  Register an agent using the /register interface and retreive the
+agent GUID that should be used as a session identifier in the later steps.
+*  Initiate a file upload with an agent name in the form of
+YYYY-MM-DD/YYYYMMDD where YYYYMMDD and YYYY-MM-DD are the same valid
+dates. The file upload will fail, but the directory structure will be
+created. This way we can create a path that we will need for the next step.
+*  Initiate another file upload with a filename formatted in the
+following way to achieve arbitrary file write inside the directory of
+the servlet container: YYYYMMDD/../../../././././PATH_FROM_TOMCAT . The
+most obvious way to use this opportunity is to upload a JSP shell to the
+sis-agent interface.
+
+SCSP Server runs with NT_AUTHORITY\SYSTEM privileges by default. A
+separate user account can be provided at install time. Running SCSP with
+fewer privileges can reduce the potential impact of this vulnerability.
+
+## Vulnerable / Tested versions
+
+Symantec Critical System Protection Server 5.2.9 (Windows 7 (32-bit))
+
+## References
+
+https://www.symantec.com/security_response/securityupdates/detail.jsp?fid=security_advisory&pvid=security_advisory&year=2015&suid=20150119_00
+https://web.nvd.nist.gov/view/vuln/detail?vulnId=CVE-2014-3440
+http://blog.silentsignal.eu/2015/05/07/cve-2014-3440-symantec-critical-system-protection-remote-code-execution/
+
+## Credit
+
+This vulnerability was discovered by Silent Signal.
+
+## Contact
+
+Name: Balint Varga-Perke
+E-mail: vpbalint@...entsignal.hu
+PGP: 3E54 69E9 9BE9 0EE7 4B55 5C4B 8D84 5457 179D E644
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.11 (GNU/Linux)
+
+iQEcBAEBAgAGBQJVSy8OAAoJEI2EVFcXneZE3EkH/im0A6rKHu+D6CSt7urrwac6
+GlNBc2funnwdvTgKCDNOdySNZA2gS8AxzmegOovevzfM9NKjs75kp3BQDL2uygnA
+DS21A2uP+gBVRXLn3cJ22i1lNecW8GJ5csIS/2RluUOvGfFtHMP19/VeLhIYIFfm
+ViFVpEJrim0wr7BylDOrgrm0rw39uY1eLlbxOBPhUwwBBOlDz6aO8apQQSZwNd4E
+kAu8rVT03nb6UKq+2jj1C9DeuFdiJzU2kb99hKu/uFQOK7Gu8RL8c6NAXBL5zjOa
+yHaePbbV9hvBCCmyd9oKTo4Rlq2q4i3MoLbvRFqssZA/NARu/q/scETn3ge+Opg=
+=POR5
+-----END PGP SIGNATURE-----
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

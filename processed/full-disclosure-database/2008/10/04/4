@@ -1,0 +1,479 @@
+
+Date: Fri, 3 Oct 2008 22:18:53 -0500
+From: ds.adv.pub@...il.com
+To: full-disclosure@...ts.grok.org.uk
+Subject: VMware Emulation Flaw x64 Guest Privilege
+	Escalation (1/2)
+
+VMware Emulation Flaw x64 Guest Privilege Escalation (1/2)
+
+Derek Soeder
+ds.adv.pub@...il.com
+
+Discovered: January 18, 2008
+Reported:   June 26, 2008
+Published:  October 3, 2008
+
+
+AFFECTED VENDOR
+---------------
+VMware
+
+
+AFFECTED SOFTWARE
+-----------------
+(for a complete list, see:
+ http://www.vmware.com/security/advisories/VMSA-2008-0016.html or
+ http://lists.vmware.com/pipermail/security-announce/2008/000037.html)
+VMware Player 2.0.4-Build 93057
+VMware Server 1.0.6 Build-91891
+VMware Workstation 6.0.4 Build-93057
+
+
+PATCHED SOFTWARE
+---------------------
+VMware Player 2.0.5-Build 109488
+VMware Server 1.0.7-Build 108231
+VMware Workstation 6.0.5-Build 109488
+(some fixes were silently released with VMSA-2008-0014, see:
+ http://www.vmware.com/security/advisories/VMSA-2008-0014.html)
+
+
+UNAFFECTED SOFTWARE
+-------------------
+VMware Player 2.5
+VMware Server 2.0
+VMware Workstation 6.5
+
+
+IMPACT
+------
+By exploiting the VMware flaw described in this document, user-mode
+code executing in a virtual machine may gain kernel privileges within
+the virtual machine, dependent upon the guest operating system.  The
+flaw has been proven exploitable on x64 versions of Windows, and it
+has produced potentially exploitable crashes on x64 versions of *BSD.
+The Linux kernel does not allow exploitation of the flaws on x64
+versions of Linux.
+
+
+VULNERABILITY DETAILS
+---------------------
+This document describes the first of two x64 instruction emulation
+flaws, discovered by the author in the aforementioned versions of
+VMware products, which allow user-mode code to cause an illegitimate
+kernel-mode exception inside the virtual machine.  If the guest
+operating system kernel is not written to safely handle such an
+exception, it may be possible for user-mode code to interfere with
+kernel execution in a way that allows elevation of privileges.
+
+Currently, the only scenario which the author knows to be exploitable
+is when the unexpected kernel exception occurs during the very
+beginning or very end of a kernel-mode service routine (a generic term
+referring to interrupt handlers and system call handlers), on certain
+x64 operating systems.  Exploitability in such a case depends on the
+operating system's use of the x64 SWAPGS instruction as the sole
+mechanism for switching the GS base address between user-mode and
+kernel-mode system data structures, and it requires that the operating
+system act on the data at GS: in an exploitable way, without any
+preclusive safety checks.  (For more information on SWAPGS and the GS:
+segment override in the x64 architecture, see "AMD64 Architecture
+Programmer's Manual" Volumes 2 and 3, "24593.pdf" and "24594.pdf".)
+
+The following pseudo-assembly snippet provides a brief illustration of
+a typical x64-specific interrupt handler that permits exploitation of
+the VMware emulation flaw:
+
+  ISR_Entry_Point:
+
+    ; For a long-mode (64-bit) ISR, RSP points to the following QWORDs:
+    ;
+    ;   [<error code>]
+    ;   <return RIP> <return CS> <return RFLAGS>
+    ;   [<return RSP> <return SS>]
+    ;
+    ; The first act of typical ISR prologue code is to build a standard
+    ; "trap frame" on the stack -- saving registers, etc.
+
+     ...                                        ; GS -> user or kernel
+
+    ; If the CPL at the time of the fault (recorded in the two least
+    ; significant bits of <return CS>) was zero, then the fault occurred
+    ; in kernel mode; some OSes then assume that kernel GS is already
+    ; active, and will therefore skip the SWAPGS instruction.
+
+    TEST    [return CS], (1, 2, or 3)           ; GS -> user or kernel
+    JZ      Skip_Swap                           ; GS -> user or kernel
+
+    ; If the previous mode was user mode, then it is assumed that the
+    ; user GS base address is loaded, so SWAPGS will exchange the
+    ; value in the KernelGSbase MSR (MSR C000_0102h) with the base
+    ; address in the GS shadow descriptor, in effect switching from
+    ; user GS to kernel GS.
+
+    SWAPGS                      ; before: GS -> user; after: GS -> kernel
+
+  Skip_Swap:
+
+    ; Now it's (supposedly) safe to use GS: to access GS-relative kernel
+    ; data structures.
+
+     ...                                        ; GS -> kernel
+
+    ; At this point, the ISR switches back to user GS if returning to
+    ; user mode; if returning to kernel mode, it leaves kernel GS loaded
+    ; and therefore doesn't need to do SWAPGS.
+
+    TEST    [return CS], (1, 2, or 3)           ; GS -> kernel
+    JZ      Skip_Swap_Back                      ; GS -> kernel
+
+    SWAPGS                      ; before: GS -> kernel; after: GS -> user
+
+  Skip_Swap_Back:
+
+    IRETQ                                       ; GS -> user or kernel
+
+If any exception occurs during execution of a kernel-mode service
+routine's prologue prior to the initial SWAPGS instruction, or in the
+epilogue after the final SWAPGS instruction, then the fault handler
+will be invoked with a "return CS" indicating kernel mode, but with a
+GS base not guaranteed to be kernel GS, because the interrupted
+prologue code did not yet have a chance to execute the SWAPGS
+instruction.  In other words, the interrupt handler for the exception
+could execute with user GS still active, and yet it will not use
+SWAPGS to switch to kernel GS because the previous mode was kernel
+mode, meaning the handler could then act upon user-controlled data as
+though it were trusted kernel data.
+
+The robustness of the SWAPGS model illustrated above is contingent
+upon the kernel's ability to prevent exceptions from happening in
+kernel-mode code where user GS may still be in effect.  Although the
+design is not inherently vulnerable, it potentially permits privilege
+escalation if user-mode code can force an exception to occur in one of
+these delicate regions of kernel code.  If the kernel can be tricked
+by user-mode code into causing such an exception, then that is a
+vulnerability in the operating system.  If the CPU provides an
+undocumented or unintended means of generating one of these dangerous
+exceptions, that is a flaw in the CPU.  The VMware emulation flaw
+described in the following paragraphs is essentially a defect in the
+VMware "virtual CPU" -- it is VMware's responsibility, but operating
+system vendors could treat the flaw like a processor erratum and
+update their kernels with an appropriate workaround.
+
+The remainder of this section is devoted to a detailed discussion of
+how to reproduce this VMware emulation flaw.
+
+Flaw #1: Interrupt Can Occur at Non-Canonical RIP After Indirect Jump
+(CVE-2008-4279)
+
+Current x64 architectures define a "canonical" address as a 64-bit
+address in which the 16 most significant bits each equal bit 47, or in
+other words, a 48-bit address properly sign-extended to 64 bits.  Any
+other address is non-canonical.
+
+If an indirect jump ("JMP mem") attempts to transfer execution to a
+non-canonical RIP, a proper CPU will raise a general protection fault
+(#GP) at the address of the JMP instruction, before executing the
+instruction.  Affected versions of VMware, on the other hand, will
+improperly execute the instruction, which assigns a non-canonical
+address to RIP, and will then raise a #GP fault because RIP is
+non-canonical.  Therefore, when the #GP handler is invoked, it will
+have a non-canonical address on the stack as its "return RIP" -- this
+is an invalid state that will cause the handler to experience a
+separate #GP fault if it tries to IRETQ back to the non-canonical RIP.
+ As depicted in the earlier pseudo-assembly, the IRETQ instruction may
+be returning to user mode or to kernel mode, and therefore it may
+execute with user GS active.  If this IRETQ faults when user GS is
+active, an exploitable situation results.
+
+In fact, the #GP fault handler on x64 Windows will not IRETQ back to
+user mode at the non-canonical RIP; instead, it invokes the exception
+dispatching mechanism, which transfers execution to user mode at a
+static canonical address inside NTDLL.  However, if an indirect jump
+to a non-canonical address is performed repeatedly, a hardware
+interrupt will eventually (after a few seconds) occur while execution
+is at the non-canonical RIP, meaning the hardware interrupt handler
+will receive an invalid stack frame that will cause it to fault at its
+IRETQ instruction.  The #GP handler will then execute with user GS
+active but a return CS indicating kernel mode, yielding the
+exploitable scenario described above.
+
+When executed in a loop, the following x64 assembly instructions will
+produce a proof-of-concept crash that manifests as a triple fault
+(reboot) in affected versions of VMware:
+
+    MOV     RAX, 0x8000000000000000
+    PUSH    RAX
+    JMP     QWORD PTR [RSP]
+
+Equivalently, in AT&T syntax:
+
+    movq    $0x8000000000000000, %rax
+    pushq   %rax
+    jmp     *(%rsp)
+
+This emulation flaw does not appear to be reproducible if the "Disable
+acceleration" advanced option is selected for the virtual machine.
+
+As an aside, when a similar VMware emulation flaw was disclosed by the
+author in September 2006
+(http://eeyeresearch.typepad.com/blog/2006/09/another_vmware_.html), a
+VMware engineer responded to the effect that the flaw was not
+important and would not be fixed because the VMware VMM depends on it
+internally (http://x86vmm.blogspot.com/2006/09/yes-virginia-we-deliver-gps-on-control.html).
+ Nevertheless, the flaw and all known variations have been fixed in
+the unaffected versions of VMware software listed above.
+
+Flaw #2:
+(details withheld pending release of a patch)
+
+
+EXPLOITATION
+------------
+This section gives a detailed account of how this emulation flaw can
+be exploited on Windows XP x64 and Windows Server 2003 x64.
+Exploitation on x64 versions of *BSD is also believed to be possible,
+but has not yet been proven, so a brief discussion of the BSD x64
+kernel and also the Linux x64 kernel (which is believed to prevent
+exploitation) is presented first.
+
+BSD x64
+
+The assembly language entry points for BSD's x64 interrupt handlers
+are contained in "src/sys/arch/amd64/amd64/vector.S", and chiefly
+consist of the following "INTRENTRY" macro defined in
+"src/sys/arch/amd64/include/frameasm.h":  (The identifier "SEL_UPL"
+that appears below is defined in "segments.h" as the value 3.)
+
+    #define INTRENTRY \
+            subq    $32,%rsp                ; \
+            testq   $SEL_UPL,56(%rsp)       ; \
+            je      98f                     ; \
+            swapgs                          ; \
+            movw    %gs,0(%rsp)             ; \
+            movw    %fs,8(%rsp)             ; \
+            movw    %es,16(%rsp)            ; \
+            movw    %ds,24(%rsp)            ; \
+    98:     INTR_SAVE_GPRS
+
+This prologue is simple and lacks any safeguards that prevent
+exploitation of the VMware emulation flaw, and in fact, executing the
+three AT&T-syntax assembly instructions provided to demonstrate the
+first flaw will reboot the system.  Exploitability then solely depends
+on how GS: is used throughout the rest of the exception handling code.
+ The "INTRFASTEXIT" macro, also defined in "frameasm.h", similarly
+exhibits the simplest possible GS-swapping logic, with no safety
+checks:
+
+    #define INTRFASTEXIT \
+            INTR_RESTORE_GPRS               ; \
+            testq   $SEL_UPL,56(%rsp)       ; \
+            je      99f                     ; \
+            cli                             ; \
+            swapgs                          ; \
+            movw    0(%rsp),%gs             ; \
+            movw    8(%rsp),%fs             ; \
+            movw    16(%rsp),%es            ; \
+            movw    24(%rsp),%ds            ; \
+    99:     addq    $48,%rsp                ; \
+            iretq
+
+Exploitation of these VMware flaws on BSD is very likely to be
+identical to exploitation of FreeBSD kernel vulnerability
+CVE-2008-3890 discovered by Nate Eldredge, although this has not been
+confirmed.
+
+Linux x64
+
+The Linux kernel is much more careful in its exception handlers, and
+although the safeguards do not seem to have been designed with
+knowledge of any specific CPU flaws in mind, they nonetheless offer a
+general robustness that prevents exploitation of the VMware emulation
+flaw discussed in this document.  The relevant Linux kernel source
+resides in "arch/x86/entry_64.S".
+
+Most fault handlers are based on either the "errorentry" or
+"zeroentry" macro, both of which are defined as code that sets up an
+exception frame on the stack, then transfers control to the
+"error_entry" routine.  The following excerpt illustrates the major
+safety check that thwarts exploitation:  (Note that capital "CS" and
+"RIP" correspond to the stack offsets at which the return CS and
+return RIP are stored.  Two definitions of "retint_kernel" are
+possible, but both lead to "retint_restore_args".)
+
+    KPROBE_ENTRY(error_entry)
+             ...
+            xorl %ebx,%ebx
+            testl $3,CS(%rsp)
+            je  error_kernelspace
+    error_swapgs:
+            swapgs
+    error_sti:
+             ...
+            call *%rax
+             ...
+            /* ebx: no swapgs flag (1: don't need swapgs, 0: need it) */
+    error_exit:
+            movl %ebx,%eax
+             ...
+            testl %eax,%eax
+            jne  retint_kernel
+             ...
+            andl %edi,%edx
+            jnz  retint_careful
+            jmp retint_swapgs
+
+    error_kernelspace:
+            incl %ebx
+           /* There are two places in the kernel that can potentially fault with
+              usergs. Handle them here. The exception handlers after
+               iret run with kernel gs again, so don't set the user space flag.
+             ... */
+            leaq iret_label(%rip),%rbp
+            cmpq %rbp,RIP(%rsp)
+            je   error_swapgs
+             ...
+            jmp  error_sti
+    KPROBE_END(error_entry)
+
+    retint_swapgs:          /* return to user space */
+             ...
+            swapgs
+            jmp restore_args
+
+    retint_restore_args:    /* return to kernel space */
+             ...
+    restore_args:
+             ...
+    iret_label:
+            iretq
+
+Although this code uses SWAPGS in the same way as exploitable kernels,
+the code was written to survive kernel exceptions when user GS is
+still active, as the block comment suggests.  If a fault occurs at the
+IRETQ instruction ("iret_label"), the code near "error_kernelspace"
+will recognize this and force a GS swap, which keeps the first
+emulation flaw from producing a condition where a fault on IRETQ will
+lead the exception handler to improperly operate on user GS.
+(Interrupt handlers, constructed using the "interrupt" macro, also
+flow to the same, shared IRETQ instruction at "iret_label".)
+
+In short, the Linux x64 kernel appears immune to attempts to exploit
+the VMware emulation flaw.
+
+Windows XP x64 and Windows Server 2003 x64
+
+Reliable exploitation of this VMware emulation flaw has been achieved
+on Windows XP x64 and Windows Server 2003 x64, allowing an
+unprivileged user to execute arbitrary code with kernel privileges.
+
+The emulation flaw discussed in this document can be used to cause an
+unexpected kernel exception with user GS active -- specifically, a #GP
+fault on the IRETQ of a hardware interrupt handler (typically
+NT!KiInterruptDispatchNoLock).  When the #GP fault handler
+(NT!KiGeneralProtectionFault) is invoked with user GS and kernel mode
+indicated as previous mode, it ends up calling NT!KiExceptionDispatch,
+from which point GS: will be accessed a number of times and its
+contents treated as trusted kernel data.
+
+Since exploitability hinges entirely on user control of GS during the
+execution of GS-dependent kernel code, GS-relative memory accesses in
+the code path starting with the interrupt handler are of the most
+interest.  NT!KiGeneralProtectionFault includes the "LDMXCSR DWORD PTR
+GS:[0x180]" instruction, which will raise an undesirable #GP fault if
+that DWORD contains invalid set flags, so GS:[0x180] (here referring
+to user GS, which will be treated like kernel GS during exploitation)
+should be assigned a value of zero.
+
+The next important GS-relative access occurs in
+NT!KiDispatchException, which is called by NT!KiExceptionDispatch.
+Early in the function, the sequence "MOV RAX, GS:[0x20] / INC DWORD
+PTR [RAX+0x22A0]" is executed.  (GS:[0x20] is the "KPCR.CurrentPrcb"
+pointer, and the field at offset 0x22A0 from there is
+"KPRCB.KeExceptionDispatchCount".  On Vista x64, the increment is
+simply "INC DWORD PTR GS:[0x34FC]", and therefore cannot be used to
+modify arbitrary kernel memory.)  Although other, subsequent
+GS-relative accesses are performed, controlling this increment alone
+is sufficient for exploitation.
+
+After the increment, NT!KiDispatchException calls
+NT!KeContextFromKframes and then NT!KiPreprocessFault, neither of
+which makes notable use of GS.  The next "CALL" instruction, "CALL
+QWORD PTR [NT!KiDebugRoutine]", reads a function pointer global
+variable that points to NT!KdpStub if the kernel is not being
+debugged, or NT!KdpTrap if a kernel debugger is attached to the
+system.  (This exploitation technique has only been made successful
+for cases where the kernel is not being debugged, which is basically
+assumed to be the only real-world attack scenario.)
+
+The NT!KiDebugRoutine function pointer is writable and can therefore
+be the target of the user-controllable increment.  By pointing
+GS:[0x20] to &NT!KiDebugRoutine - 0x22A0 before exploiting the
+emulation flaw, NT!KiDebugRoutine will be incremented, and then its
+modified contents (NT!KdpStub + 1) will be called.  The first
+instruction of NT!KdpStub is "SUB RSP, 0x58", which in machine code is
+"48/83/EC/58".  Therefore, the instruction that gets executed at
+NT!KdpStub + 1 is "83/EC/58", or in assembly, "SUB ESP, 0x58".  On the
+x64 architecture, instructions that perform a 32-bit write to a
+register implicitly zero the upper 32 bits of that register, so in
+this case, "SUB ESP, 0x58" subtracts 0x58 from RSP, then clears bits
+63..32, resulting in an RSP that points into user-land.
+
+If the kernel stack pointer can be leaked, or even guessed to within a
+reasonable range, then memory can be allocated that covers the address
+of the DWORD-truncated kernel stack pointer, meaning that the kernel
+stack -- and therefore kernel execution -- can be controlled once
+NT!KdpStub returns.  Because user GS will remain active until the
+exploit payload has a chance to execute, any hardware interrupts
+(interrupts are enabled before NT!KiExceptionDispatch is called) or
+page faults that occur before execution reaches the payload will cause
+a cascade of exceptions that culminates in a triple fault (reboot).
+Fortunately, the critical window is small, and the exploit can take
+steps to reduce these risks, and even relatively reckless exploitation
+has proven to be reliable.
+
+Windows Vista x64
+
+As mentioned above, incrementing arbitrary kernel memory is not
+possible on Windows Vista x64, because the "INC" instruction of
+interest modifies a GS-relative DWORD directly (and therefore can only
+increment a DWORD in user GS), rather than dereferencing a pointer
+retrieved from a GS-relative field.  By carefully crafting user GS
+data, it may be possible to allow kernel execution to continue without
+disruption until some other exploitable operation is reached (perhaps
+RtlCaptureContext as called by KeBugCheckEx), but as of this writing,
+no such technique has been attempted.
+
+
+CONCLUSION
+----------
+This document discloses details of the first of two VMware emulation
+flaws that have been proven exploitable on Windows XP x64 and Windows
+Server 2003 x64 for gaining kernel privileges.  Excerpts from the *BSD
+and Linux x64 kernel source are examined for the sake of illustrating
+their presumed exploitability or resilience.  Techniques are also
+presented for exploiting the "GS mismatch" condition caused by
+inducing unexpected kernel exceptions on x64 operating systems; such
+techniques are not specific to these VMware flaws, and may be applied
+in any case where a GS mismatch arises.  Very specific implementation
+details of exploitation are omitted.
+
+Other specific means of causing an operating system to experience an
+unsafely-handled kernel exception are not considered, as they would
+constitute new operating system vulnerabilities.  To researchers and
+developers interested in finding such vulnerabilities, the author
+recommends first examining any kernel code that constructs or modifies
+an IRETQ stack frame, since returning to a non-canonical RIP, or
+returning to 32-bit mode with RIP >= 4GB, is the most straightforward
+way to experience a kernel fault with user GS active.
+
+
+GREETINGS
+---------
+www.fourteenforty.jp
+www.digitrustgroup.com
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
