@@ -1,0 +1,135 @@
+
+Date: Wed, 20 Jun 2007 01:50:36 +0200 (CEST)
+From: Blazej Miga <bla@....poznan.pl>
+To: bugtraq@...urityfocus.com
+Cc: full-disclosure@...ts.grok.org.uk
+Subject: Apache Prefork MPM vulnerabilities - Report
+
+
+-----
+Apache Prefork MPM vulnerabilities
+----------------------------------
+
+
+PSNC Security Team
+
+http://security.psnc.pl/files/apache_report.pdf
+
+
+1. Introduction
+
+This small case study is a result of source code analysis of Apache httpd server MPM modules. The main goal of this document is to show, what may be done by an attacker who has the possibility of running arbitrary code in the context of the worker process (WP).
+
+2. Research scope
+
+Our work has been concentrated on verifying whether (and to which extent) it is secure to run an external code in the worker process context. Such code may be provided through appropriate functions of script languages attached as a module (like dl(), dlopen()) or as a result of running an exploit of one of vulnerabilities found in Apache modules (e.g. Integer Overflow in chunk_split() function). In order to simulate running an external code in the WP context we use dl() function from mod_php module.
+
+3. Prefork MPM
+
+Prefork MPM is the default Apache httpd server process management module for *nix systems. A server based upon this architecture runs 1 master process (MP) and n worker processes (WP). The MP running with root credentials, controls the amount of WPs. WPs acting with nobody user credentials handle the users requests.
+
+(...)
+
+4. Additional information useful for vulnerability analysis
+a. Running arbitrary code in the worker process
+
+For demonstration purposes we will use mod_php module. This module allows to run PHP scripts in the context of WP process. In order to run the code we will use dl() function that allows to load a custom PHP module. The dl() function loads a library (dlopen) and looks for appropriate symbols in order to check whether the library being loaded is a PHP module. Putting arbitrary code in the init section of this library causes running that code during loading this library by the WP.
+
+b. Finding process_score and worker_score arrays
+
+In our examples we use vulnerabilities associated with modifying process_score and worker_score structures arrays. These arrays are located in scoreboard array that is put into a shared memory segment.
+The first task to do is to find the shared memory segment address. In order to find that address we find the /dev/zero (Apache 2.x) or //SYS. (Apache 1.3) memory in /proc/self/maps file.
+
+Example 1
+
+
+(...)
+
+
+As we know how to run arbitrary code in the WP process context and where the two arrays are located, let.s have some fun modifying the arrays.
+
+5. Bugs, weaknesses, features 
+PoC #1: httpd DoS
+
+(..)
+
+In the process_score array we put a random PID > 0 and we set its status in the worker_score array as 1. Additionally we send a SIGKILL signal to all other WPs. After both arrays are modified, we finish the WP activity.
+
+The MP will no longer create new WPs, because . according to the information taken from the worker_score array, there are WPs able to handle incoming requests.
+
+PoC #2 DoS  (Apache 1.3.x, 2.x)
+
+As we look at the function responsible for creating new WPs, we can see that it uses for that purpose the information taken from the process_score and worker_score structures. The procedure of verifying the new processes amount is run after one of the WPs finishes its activity (ap_wait_or_timeout(&exitwhy, &status, &pid, pconf);). An exemplary code that forces the MP to create an unlimited amount of new WPs looks like shown below:
+
+Example 3
+while(1) {
+int pid1;
+usleep(1000);
+for(i=0;i<(wsk_global_score->server_limit);i++)
+ 	{
+ 	if((wsk_process_score+i)->pid && (wsk_process_score+i)->pid!=mypid) pid1=(wsk_process_score+i)->pid;
+ 	(wsk_process_score+i)->pid=0;
+ 	(wsk_worker_score+i)->my_access_count=0;
+ 	(wsk_worker_score+i)->access_count=0;
+ 	(wsk_worker_score+i)->status=0;
+ 	}
+ 	if(pid1) kill(pid1,9);
+}
+
+The function above clears worker_score and process_score arrays. The MP, after having reviewed empty worker_score and process_score arrays finds that there is an insufficient amount of free WP processes. However, the function kills some of remaining WPs, because of which the MP continues its activity stopped at the ap_wait_or_timeout(&exitwhy, &status, &pid, pconf); function and creates another 5 new processes.
+The function shown above forces creating an unlimited amount of WP processes by the MP process, which in turn causes consuming all server resources.
+
+PoC #3 SIGUSR1 killer #1 (Apache 2.x)
+
+(...)
+
+
+PoC #4 SIGUSR1 killer #2 (Apache 1.3)
+
+The MP process is able to remove unnecessary processes. If there are too many WP processes with IDLE status, the MP sends SIGUSR1 signal to the appropriate process taken from the process_score array. During sending the signal the MP process does not verify whether the PID put into the process_score array is really a PID that belongs to the appropriate WP process. Therefore a specific modification of worker_score and process_score arrays allows to send SIGUSR1 signal to arbitrary process in the system by the MP process.
+
+Example 3
+
+(...)
+
+
+The function, after it checks that there is too many free WP processes, sends a SIGUSR1 signal to one of them.
+
+
+The weaknesses mentioned below are rather features that result from the server architecture, than security vulnerabilities. However, they are worth mentioning just to exhaust the subject of Apache security.
+
+PoC #5 Stealing the sensitive data (Apache 1.3.x, 2.x)
+
+The Apache server architecture (1 MP managing the child processes and n WPs that respond to client requests) assumes that any WP is able to serve a request that is directed to any virtual host. Therefore each of the WPs has got a complete information on the whole server configuration.
+
+(...)
+
+PoC #6 Spoofing  (Apache 1.3.x, 2.x)
+
+
+The Apache Web server architecture makes it possible for the modules to attach their own functions to appropriate hooks. The information on hooks is stored in an apr_global_hook_pool structure that is located in the heap memory of each WP. The pool is configured during the start of the system. The pool contents is not verified by the WP during handling consecutive requests from the clients. The modification of entries put into hook chains will be visible during every further request being handled by the same WP. A specific modification of the pool (adding own functions to appropriate hooks) gives the possibility of generating arbitrary content for any virtual host configured within the same instance of Apache Web server.
+
+The source code of an example that is able to exploit this vulnerability is too extensive to be put within this report. An exemplary tool that modifies the content of apr_global_hook_pool pool may be downloaded from the PSNC Security Team webpage.
+
+
+6. Summary . A secure installation
+
+The vulnerabilities mentioned above may be exploited in some specific situations (e.g. an attacker must be able to run the code in the WP context). The analysis shows that the server is secure only if the administrator does not allow to run a dangerous code. Therefore the question arises . how to secure a hosting system?
+An administrator who secures his or her server should follow the guidelines below:
+.	All content generators (php, perl etc.) must be run by separate processes. The languages should be attached to the Web server as cgi/fcgi!
+.	Beware of the mod_ssi extension. The extension allows to run external applications with daemon/apache credentials <--#exec cmd=.. -->
+.	For each virtual host a separate user within the system should be created, whose credentials will be used for generating content.
+.	Virtual hosts should be created only for trusted domains. For the users that do not trust each other, a separate instance of the Web server should be rather applied.
+
+(...)
+
+
+
+All report is now available online - http://security.psnc.pl/files/apache_report.pdf
+
+PSNC Security Team
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
