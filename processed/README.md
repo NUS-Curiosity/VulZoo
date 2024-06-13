@@ -22,6 +22,9 @@ Total AttackerKB topics with assessments: 1314
 Total Exploit-DB exploits: 46540
 Total CVEs with Exploit-DB exploits: 24587
 Total CAPEC attack patterns: 615
+Total MITRE ATT&CK (Enterprise) attack patterns: 780
+Total MITRE ATT&CK (ICS) attack patterns: 95
+Total MITRE ATT&CK (Mobile) attack patterns: 187
 Total CWE weaknesses: 963
 Total CWE weaknesses (Level: Variant): 299
 Total CWE weaknesses (Level: Base): 535

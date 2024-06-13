@@ -107,6 +107,30 @@ res["mitre-attack"] = {
     "ics": 0,
     "mobile": 0,
 }
+with open(f"{processed_dir}/attack-database/enterprise-attack/enterprise-attack.json") as f:
+    enterprise_attack = json.load(f)
+    for obj in enterprise_attack["objects"]:
+        if obj["type"] == "x-mitre-collection":
+            for content in obj["x_mitre_contents"]:
+                if content['object_ref'].startswith("attack-pattern--"):
+                    res["mitre-attack"]["enterprise"] += 1
+            break
+with open(f"{processed_dir}/attack-database/ics-attack/ics-attack.json") as f:
+    ics_attack = json.load(f)
+    for obj in ics_attack["objects"]:
+        if obj["type"] == "x-mitre-collection":
+            for content in obj["x_mitre_contents"]:
+                if content['object_ref'].startswith("attack-pattern--"):
+                    res["mitre-attack"]["ics"] += 1
+            break
+with open(f"{processed_dir}/attack-database/mobile-attack/mobile-attack.json") as f:
+    mobile_attack = json.load(f)
+    for obj in mobile_attack["objects"]:
+        if obj["type"] == "x-mitre-collection":
+            for content in obj["x_mitre_contents"]:
+                if content['object_ref'].startswith("attack-pattern--"):
+                    res["mitre-attack"]["mobile"] += 1
+            break
 
 
 # CVE
@@ -248,6 +272,9 @@ print(f"Total AttackerKB topics with assessments: {res['attackerkb']['topic_with
 print(f"Total Exploit-DB exploits: {res['exploit-db']['exploit_count']}")
 print(f"Total CVEs with Exploit-DB exploits: {res['exploit-db']['cve_with_exploit_count']}")
 print(f"Total CAPEC attack patterns: {res['capec']['count']}")
+print(f"Total MITRE ATT&CK (Enterprise) attack patterns: {res['mitre-attack']['enterprise']}")
+print(f"Total MITRE ATT&CK (ICS) attack patterns: {res['mitre-attack']['ics']}")
+print(f"Total MITRE ATT&CK (Mobile) attack patterns: {res['mitre-attack']['mobile']}")
 print(f"Total CWE weaknesses: {res['cwe']['count']}")
 res["cwe"].pop("count")
 for abstract, count in res["cwe"].items():
