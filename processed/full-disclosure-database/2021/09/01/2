@@ -1,0 +1,381 @@
+
+Date: Wed, 1 Sep 2021 13:20:46 -0500
+From: KoreLogic Disclosures via Fulldisclosure <fulldisclosure@...lists.org>
+To: fulldisclosure@...lists.org
+Subject: [FD] KL-001-2021-008: CyberArk Credential File Insufficient
+ Effective Key Space
+
+KL-001-2021-008: CyberArk Credential File Insufficient Effective Key Space
+
+Title: CyberArk Credential File Insufficient Effective Key Space
+Advisory ID: KL-001-2021-008
+Publication Date: 2021.09.01
+Publication URL: https://korelogic.com/Resources/Advisories/KL-001-2021-008.txt
+
+
+1. Vulnerability Details
+
+     Affected Vendor: CyberArk
+     Affected Product: Application Access Manager/Credential Provider
+     Affected Version: Prior to 12.1
+     Platform: Linux/Windows/zOS
+     CWE Classification: CWE-326: Inadequate Encryption Strength
+     CVE ID: CVE-2021-31796
+
+
+2. Vulnerability Description
+
+     CyberArk Credential Providers and possibly other Vault
+     components use credential files to store usernames and encrypted
+     passwords. Under certain conditions, the effective key space
+     used to encrypt the passwords is significantly reduced. For
+     an attacker who understands the key derivation scheme and
+     encryption mechanics, full access to the information used to
+     derive the encryption key is sufficient to reduce effective key
+     space to one. With partial access, the effective key space can
+     vary depending on the information available, and a number of
+     those variations are unlikely to withstand brute force attacks.
+
+
+3. Technical Description
+
+     The password(s) stored in CyberArk version 2 credential (.cred)
+     files are protected against inadvertent disclosure through
+     the use of a proprietary key derivation scheme and Advanced
+     Encryption Standard (AES) encryption. More specifically, each
+     password along with some additional information is encrypted
+     using the AES cipher in Cipher Block Chaining (CBC) mode,
+     a 256-bit key, and a 128-bit Initialization Vector (IV).
+
+     Per online documentation, the encryption key is derived from a
+     random 160-bit salt and the following environmental information:
+     Client ID (10 characters), OS user, IP address, and Application
+     [1].
+
+     Based on analysis and observations, the following credential
+     file fields are involved in the key derivation process:
+
+       - ClientApp             (conditionally required)
+       - AppPath               (conditionally required)
+       - ClientIP              (conditionally required)
+       - OSUser                (conditionally required)
+       - AdditionalInformation (              required)
+       - ClientHostname        (conditionally required)
+
+     where
+
+       - ClientApp identifies the allowed application type
+       - AppPath is a path that points to an allowed system executable
+       - ClientIP identifies the allowed system IP address
+       - OSUser identifies the allowed system user
+       - AdditionalInformation is a 160-bit random salt
+       - ClientHostname identifies the allowed system hostname
+
+     Whether or not the conditionally required fields noted above are
+     required (i.e., used in the key derivation process) depends on
+     the value of the VerificationsFlag field, which is implemented
+     as a bit mask having the undocumented mappings shown in the
+     table below.
+
+     +-----------------------+------------+-----+
+     | Field                 | Mask Value | Bit |
+     +-----------------------+------------+-----+
+     | ClientApp             |     0x0001 |  0  |
+     | AppPath               |     0x0002 |  1  |
+     | ClientIP              |     0x0004 |  2  |
+     | OSUser                |     0x0008 |  3  |
+     | AdditionalInformation |     0x0010 |  4  |
+     | ClientHostname        |     0x0020 |  5  |
+     +-----------------------+------------+-----+
+
+     For a specific VerificationsFlag value, a given field is
+     required if its bit is set in the aggregate mask for that
+     value. For example, an aggregate mask of 17 (0x0011) indicates
+     that the AdditionalInformation (bit 4) and ClientApp (bit 0)
+     fields are required since those mask values (i.e., 0x0010 and
+     0x0001) yield an aggregate mask of 0x0011 when ORed together in
+     a bitwise operation. Similarly, an aggregate mask of 63 (0x003f)
+     indicates that all fields in the table above are required.
+
+     Below is a table derived from online documentation [1]. It
+     identifies all currently known application types. For the
+     purposes of key derivation, this list constitutes the set
+     of valid choices for the ClientApp field. If the bit for
+     this field is set in the aggregate mask, the corresponding
+     value undergoes several transformations prior to being folded
+     into the key derivation process. First, it is converted to
+     a lowercase string. Next, the lowercase string is hashed
+     using SHA1. Finally, the resultant hash (in binary form)
+     is encoded as a Base64 string. In the sections that follow,
+     this transformed value will be referred to as ClientAppXForm.
+
+     +---------------------------------------------+----------------+
+     | Application Type                            | ID             |
+     +---------------------------------------------+----------------+
+     | Central Policy Manager                      | CPM            |
+     | Password Vault Web Access                   | PVWA           |
+     | Password Vault Web Access application user  | PVWAApp        |
+     | OPM and Credential Provider                 | AppPrv         |
+     | Privileged Session Manager application user | PSMApp         |
+     | CyberArk Replicator/Restore/Prebackup       | CABACKUP       |
+     | Disaster Recovery Vault                     | DR             |
+     | Event Notification Engine                   | ENE            |
+     | PrivateArk Client                           | WINCLIENT, GUI |
+     | CyberArk CLI                                | PACLI          |
+     | CyberArk ActiveX API                        | XAPI           |
+     | CyberArk .Net API                           | NAPI           |
+     | Export Vault Data                           | EVD            |
+     | CyberArk Encryption Utility                 | CACrypt        |
+     +---------------------------------------------+----------------+
+
+     Embedded in the key derivation code are two undocumented,
+     hard-coded byte sequences (henceforth referred to as Suffix1
+     and Suffix2).
+
+     Given the above, the key derivation process can be summarized
+     as follows:
+
+       - start a pair of SHA1 hashes (Hash1 and Hash2)
+       - update each hash with required field values in the following
+         order: ClientAppXForm, AppPath, ClientIP, ClientHostname,
+         OSUser, and AdditionalInformation
+       - update Hash1 with Suffix1
+       - update Hash2 with Suffix2
+       - finalize hashes
+       - construct encryption key using Hash1[0:20] and Hash2[0:12]
+
+     Unfortunately, the effective key space can be substantially
+     less than the total key space, which is 2^256. This is due to
+     a lack of entropy in the field values used. The table below
+     provides a qualified best case estimate for each field value
+     than can be used.
+
+     +-----------------------+-----------------+--------------------------------------------------------+
+     | Best Case Estimates                                                                              |
+     +-----------------------+-----------------+--------------------------------------------------------+
+     | Field                 | Possible Values | Basis for Estimate                                     |
+     +-----------------------+-----------------+--------------------------------------------------------+
+     | ClientAppXForm        | =15             | actual number of documented application types          |
+     | AppPath               | <=1000000       | reasonable number of distinct files on a Linux system  |
+     | ClientIP              | <=2^24          | confined to a single class A network                   |
+     | ClientHostname        | <=63^63         | confined to 63 characters drawn from [0-9A-Za-z-]      |
+     | OSUser                | <=1000          | reasonable number of distinct users on a Linux system  |
+     | AdditionalInformation | =16^40          | actual size of value                                   |
+     +-----------------------+-----------------+--------------------------------------------------------+
+
+     If all fields are used, the effective key space would be:
+
+       15 * 1000000 * 2^24 * 63^63 * 1000 * 16^40
+
+     or approximately 2^595. This is certainly better than 2^256,
+     but it's not realistic because additional context will
+     be available in the typical attack scenario: a credential
+     file is found/accessed within the system/network for which
+     it was originally created/deployed. With this scenario, an
+     attacker will likely be able to significantly narrow the set
+     of possible values for the AppPath, ClientIP, ClientHostname,
+     and OSUser fields. The table below provides a more realistic
+     set of estimates.
+
+     +-----------------------+-----------------+--------------------------------------------------------+
+     | Realistic Estimates                                                                              |
+     +-----------------------+-----------------+--------------------------------------------------------+
+     | Field                 | Possible Values | Basis for Estimate                                     |
+     +-----------------------+-----------------+--------------------------------------------------------+
+     | ClientAppXForm        | =15             | actual number of documented application types          |
+     | AppPath               | <=256           | limited to CyberArk components actually installed/used |
+     | ClientIP              | <=256           | if no direct lookup, likely to be class C or less      |
+     | ClientHostname        | <=256           | if no direct lookup, follow site naming conventions    |
+     | OSUser                | <=256           | reasonable number of likely users on a Linux system    |
+     | AdditionalInformation | =1              | value specified in credential file                     |
+     +-----------------------+-----------------+--------------------------------------------------------+
+
+     If all fields are used, the effective key space would be:
+
+       15 * 256 * 256 * 256 * 256 * 1
+
+     or approximately 2^36. Note that the work factor associated
+     with this key space is well within the reach of even modest
+     compute power.
+
+     In the case where an attacker has access to all the information
+     used to derive the encryption key, the effective key space is
+     reduced to one. To illustrate this point, consider the example
+     credential file created using the CyberArk "createcredfile"
+     utility, shown below.
+
+       $ createcredfile example_0x003f.cred Password -Username ca_user -Password ca_pass -ExternalAuth no -AppType
+AppPrv -ExePath /opt/CARKaim/sdk/clipasswordsdk -IPAddress -Hostname -OSUsername os_user -DisplayRestrictions
+       --- example_0x003f.cred ---
+       CredFileType=Password
+       CredFileVersion=2
+       Username=ca_user
+       VerificationsFlag=63
+       Password=A9125EA93F77E5DEABB00FB822169AEAC0E5AC6EEA08FF4F90EC0361E43992B27077B73242916AE401081ACD6842D89A
+       ExternalAuthentication=no
+       AdditionalInformation=27653F765AE71F605833AF1A3EC96048477F133F
+       ClientApp=AppPrv
+       AppPath=/opt/CARKaim/sdk/clipasswordsdk
+       ClientIP=192.168.1.6
+       ClientHostname=krom
+       OSUser=os_user
+       --- example_0x003f.cred ---
+
+     When SUFFIX1 and SUFFIX2 are assigned the proper values, the
+     decryption utility provided in the Proof-of-Concept section
+     below will decrypt example_0x003f.cred as demonstrated here:
+
+       $ decrypt-cyberark-credfile.py ${SUFFIX1} ${SUFFIX2} example_0x003f.cred
+       --- output ---
+       SUPPLIED_VERIFICATION_FLAGS='0x003f' (63)
+       REQUIRED_VERIFICATION_FLAGS='0x003f' (63)
+       TARGET='Password'
+         KEY='0E145BE620B42749F077294ED222C6799A2A31C88BB7528C2863AC90D5DE4A52'
+         IV='A9125EA93F77E5DEABB00FB822169AEA'
+         ACTUAL_PLAINTEXT_HASH='1D2BABAF7564A7291782DBC1258E5E62D8D7CBF8'
+         TARGET_PLAINTEXT_HASH='1D2BABAF7564A7291782DBC1258E5E62D8D7CBF8'
+         DECRYPTION_STATUS='pass'
+         PASSWORD='ca_pass'
+       --- output ---
+
+     Note that it's not uncommon to encounter credential files
+     with a VerificationsFlag value of 16 (i.e., 0x0010). This
+     means that the effective key space is automatically one. The
+     example below demonstrates that scenario.
+
+       $ createcredfile example_0x0010.cred Password -Username ca_user -Password ca_pass
+       --- example_0x0010.cred ---
+       CredFileType=Password
+       CredFileVersion=2
+       Username=ca_user
+       VerificationsFlag=16
+       Password=E948B686F881DE616B2E00672B0ED39982977250CF9AD473A5C445FE240268DBC27E686B40AA5B6D204B14D6CCD56801
+       ExternalAuthentication=No
+       AdditionalInformation=6CF3132ECA8BD1A9F550DB18F69176EFCF8823DD
+       --- example_0x0010.cred ---
+
+       $ decrypt-cyberark-credfile.py ${SUFFIX1} ${SUFFIX2} example_0x0010.cred
+       --- output ---
+       SUPPLIED_VERIFICATION_FLAGS='0x0010' (16)
+       REQUIRED_VERIFICATION_FLAGS='0x0010' (16)
+       TARGET='Password'
+         KEY='6BE15C6BFFF6F234E74CE46F8D510F76490778658E9B903D693A92150D64A715'
+         IV='E948B686F881DE616B2E00672B0ED399'
+         ACTUAL_PLAINTEXT_HASH='1D2BABAF7564A7291782DBC1258E5E62D8D7CBF8'
+         TARGET_PLAINTEXT_HASH='1D2BABAF7564A7291782DBC1258E5E62D8D7CBF8'
+         DECRYPTION_STATUS='pass'
+         PASSWORD='ca_pass'
+       --- output ---
+
+     In cases where security restrictions (i.e.,
+     '-DisplayRestrictions') have been enabled or certain fields
+     are not represented in a given credential file, the decryption
+     utility would need to be modified to brute force missing values,
+     but that is relatively easy to do.
+
+     [1] https://docs.cyberark.com/Product-Doc/OnlineHelp/PAS/Latest/en/Content/PASIMP/CreateCredFile-Utility.htm
+
+
+4. Mitigation and Remediation Recommendation
+
+     The vendor has released an updated version (v12.1) which
+     remediates the described vulnerability. Release notes are
+     available at:
+
+    
+https://docs.cyberark.com/Product-Doc/OnlineHelp/PAS/Latest/en/Content/Release%20Notes/RN-WhatsNew12-1-CPs.htm?tocpath=Get%20Started%7CWhat%E2%80%99s%20New%7CRelease%20Notes%7C_____4
+
+
+5. Credit
+
+     This vulnerability was discovered by Klayton Monroe of
+     KoreLogic, Inc.
+
+
+6. Disclosure Timeline
+
+     2020.11.04 - KoreLogic submits vulnerability details to
+                  CyberArk.
+     2020.11.05 - CyberArk acknowledges receipt and the intention
+                  to investigate.
+     2020.11.16 - KoreLogic and CyberArk meet to discuss the
+                  details of this and other reported
+                  vulnerabilities. Both parties agree that the
+                  remediation timeline will extend significantly
+                  longer than the standard 45 business days specified
+                  in the KoreLogic Public Disclosure Policy.
+     2021.01.14 - 45 business days have elapsed since the
+                  vulnerability was reported to CyberArk.
+     2021.01.21 - KoreLogic and CyberArk meet to discuss proposed
+                  remediation efforts for this and other reported
+                  vulnerabilities.
+     2021.03.24 - 90 business days have elapsed since the
+                  vulnerability was reported to CyberArk.
+     2021.04.22 - CyberArk notifies KoreLogic that the reported
+                  vulnerability will be mitigated in a version
+                  scheduled for release in late May, 2021.
+     2021.05.10 - 120 business days have elapsed since the
+                  vulnerability was reported to CyberArk.
+     2021.05.10 - CyberArk provides KoreLogic with the CVE for this
+                  vulnerability. Vendor requests KoreLogic delay
+                  public disclosure until the end of June, 2021.
+     2021.06.08 - KoreLogic and CyberArk meet to discuss the details
+                  of the product release and revisit timeline for
+                  public disclosure. CyberArk informs KoreLogic that
+                  the Linux/Windows version of the Credential
+                  Provider will be released at the end of June, 2021.
+                  A Credential Provider for the zOS platform will be
+                  released at the end of July, 2021. KoreLogic agrees
+                  to delay public disclosure of this and other
+                  reported vulnerabilities until 2021.08.15.
+     2021.06.23 - CyberArk releases Credential Provider v12.1 for
+                  Linux/Windows platforms.
+     2021.08.05 - 180 business days have elapsed since the
+                  vulnerability was reported to CyberArk.
+     2021.08.10 - CyberArk informs KoreLogic that the zOS Credential
+                  Provider update has been released to their
+                  customers. Requests that KoreLogic forgo
+                  publication of the Proof of Concept code as an
+                  unforseen issue prevents some customers from
+                  updating in the near term.
+     2021.08.27 - KoreLogic suggests delaying the release of the
+                  Proof of Concept until a to-be-determined future
+                  date.
+     2021.08.30 - CyberArk tenders 2022.01.01 release date for the
+                  Proof of Concept.
+     2021.09.01 - KoreLogic public disclosure.
+
+
+7. Proof of Concept
+
+     At the vendor's request, KoreLogic has agreed to delay
+     publication of the Proof of Concept while customers continue
+     to deploy the updated versions of the product.
+
+
+
+The contents of this advisory are copyright(c) 2021
+KoreLogic, Inc. and are licensed under a Creative Commons
+Attribution Share-Alike 4.0 (United States) License:
+http://creativecommons.org/licenses/by-sa/4.0/
+
+KoreLogic, Inc. is a founder-owned and operated company with a
+proven track record of providing security services to entities
+ranging from Fortune 500 to small and mid-sized companies. We
+are a highly skilled team of senior security consultants doing
+by-hand security assessments for the most important networks in
+the U.S. and around the world. We are also developers of various
+tools and resources aimed at helping the security community.
+https://www.korelogic.com/about-korelogic.html
+
+Our public vulnerability disclosure policy is available at:
+https://korelogic.com/KoreLogic-Public-Vulnerability-Disclosure-Policy.v2.3.txt
+
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

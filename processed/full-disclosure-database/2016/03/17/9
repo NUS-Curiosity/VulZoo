@@ -1,0 +1,150 @@
+
+Date: Wed, 16 Mar 2016 01:31:47 +0100
+From: Laël Cellier <lael.cellier@...oste.net>
+To: bugtraq@...urityfocus.com, fulldisclosure@...lists.org,
+ security-basics@...urityfocus.com, full-disclosure@...ts.grok.org.uk
+Subject: [FD] server and client side remote code execution through a buffer overflow in all git versions before 2.7.1 (unpublished ᴄᴠᴇ-2016-2324 and ᴄᴠᴇ‑2016‑2315)
+
+Hello, original report describing the first overflow full details is 
+here http://pastebin.com/UX2P2jjg or at the attachment
+The aim is to push a crafted tree object if the target is a server or 
+make a client cloning a crafted repository.
+
+On 11/02/2016 16:50, Jeff King wrote this on the git security mailing list:
+> On Thu, Feb 11, 2016 at 02:31:49PM +0100, 'Laël Cellier' via Git 
+> Security wrote:
+>> Ok the bug works by pushing or cloning a repository with a large
+>> filename or a large number of nested trees.
+>> [...]
+>> The point is affected versions are still shipped as part of many
+>> distributions as part of their stable branch, so I think it’s
+>> important to get a ᴄᴠᴇ for public awareness.
+> Yes, I do think versions below v2.7.0 have a heap overflow, as you
+> mentioned. But I don't think that is the only problem with path_name(),
+> even in the current version.
+>
+> I'll repeat the code here (the version you posted was indented badly,
+> and I had trouble reading it):
+>
+> -- >8 --
+> char *path_name(const struct name_path *path, const char *name)
+> {
+>          const struct name_path *p;
+>          char *n, *m;
+>          int nlen = strlen(name);
+>          int len = nlen + 1;
+>
+>          for (p = path; p; p = p->up) {
+>                  if (p->elem_len)
+>                          len += p->elem_len + 1;
+>          }
+>          n = xmalloc(len);
+>          m = n + len - (nlen + 1);
+>          memcpy(m, name, nlen + 1);
+>          for (p = path; p; p = p->up) {
+>                  if (p->elem_len) {
+>                          m -= p->elem_len + 1;
+>                          memcpy(m, p->elem, p->elem_len);
+>                          m[p->elem_len] = '/';
+>                  }
+>          }
+>          return n;
+> }
+> -- 8< --
+>
+> The problem you describe is one where the size of the allocation does
+> not match what strcpy would write. And that's kind-of fixed by moving to
+> memcpy() in 34fa79a6, because at least now the initial value of "len"
+> matches the number of bytes we write (so that number might be totally
+> bogus, but we don't write more than we allocate).
+>
+> But "len" can also change after the fact, due to the loop. If you have a
+> sequence of path components, each less than 2^31, they can sum to a much
+> smaller positive value due to integer overflow (e.g., A/B/C with lengths
+> A=2^31-5, B=2^31-5, C=20 would yield len=10). Then the buffer is too
+> small to fit C, let alone all of the extra components we insert in the
+> second loop.
+>
+> The fix I came up with for this is to convert all of the "int" variables
+> here to "size_t". That doesn't actually _fix_ the problem at all, but
+> does mean on a 64-bit system that you need a 2^64-long path to trigger
+> it, which is impractical. But that doesn't help 32-bit systems (though
+> in practice, I wouldn't be surprised if we barf long before that, as we
+> would be unable to hold the "struct name_path" list in memory).
+>
+> Note that there is also a similar problem in tree-diff.c's
+> path_appendnew().  There we build up the full pathname in a strbuf,
+> which checks for overflow. But we then pass that length as an int and
+> allocate a FLEX_ARRAY struct with it, which can end up too-small. This
+> one is the more interesting of the two, I think, as it triggers via
+> git-log, whereas the path_name() happens only during a repack (so it
+> will hit you _eventually_, but probably not as soon as you've cloned).
+>
+> My solution there was similar: use size_t, which at least means you'd
+> have to allocate petabytes on a 64-bit system to trigger it (much less
+> on a 32-bit system, but _probably_ you'd be saved by malloc failing
+> first).
+>
+> And that's why I dragged my feet on sending those fixes upstream; I
+> don't think they're complete. The complete fix would be to use size_t
+> consistently to store return values for strlen(), and to do integer
+> overflow checks whenever we do computations on size_t.
+>
+> Those of you on this list may recall I posted a series for the latter
+> last year, but it was somewhat invasive. It may be worth resurrecting.
+>
+> I think we could also get rid of path_name() entirely. The sole purpose
+> at this point is to compute the name-hash for pack-objects, which could
+> be done by walking the name_path list rather than re-constructing the
+> whole thing in memory.
+>
+> -Peff
+Of course everything Peff talked about above is now fixed in git 2.7.1 
+with the removal of path_name() and the size_t/overflow check in 
+tree-diff.c. It was even fixed earlier for users of github enterprise.
+However, several months after the last message on this thread, I’m not 
+aware of any Linux distribution that issued a fix for their stable 
+branch. Last week I could contact wikimedia so they could fix their 
+gerrit‑gc server. Bitbucket, GitLab still suffer from that issue (they 
+even use a git version before 
+git/commit/34fa79a6cde56d6d428ab0d3160cb094ebad3305 which is the easiest 
+one to trigger because of strcpy() instead of memcpy() ).
+Users of gerrit are also affected due to gerrit‑gc (so even probably 
+google’s servers). But as the frontend is Jgit, the installed git 
+version number is hidden (so the only way is to exploit remote code 
+execution).
+While it seems normal the ᴄᴠᴇ details are still unpublished, I 
+definitely can’t deal with every major provider. Their probably many 
+popular git services which are still impacted, I just can’t check for 
+everyone of them (for example I didn’t checked sourceware.org the site 
+that allow to download glibc)
+
+People surely remember 
+https://www.google.com/search?tbm=nws&q=CVE-2014-9390 breaking the news 
+about a similar issue in that software (which allowed most distros to 
+fix it quikcly). It seems while this threat is more widespread, it 
+definitely lacks advertisement. I reported it to cert in December but 
+didn’t got any response except the automated acknowledgement.
+So some peoples suggested me to post about it at security mailing lists.
+
+Those buffer overflows are reported simply as memory corruptions. While 
+I’m sure affected variables aren’t at the end of allocated heap, I 
+definitely lack the required skills to produce a proof for remote code 
+execution http://security.stackexchange.com/q/117394/36301 (I know how 
+to put arbitrary data in paths but I don’t know how to exploit a heap 
+overflow even without aslr and dep). Being too lazy, I didn’t get the 
+required mark to go at the university which could have taught it (I had 
+to go at an another one). So I won’t write it.
+So if someone is interested in producing such proof … Please do it …
+
+
+But the primary concern is how to solve that advertisement problem ? Any 
+ideas ?
+
+View attachment "cve-2016-2315.txt" of type "text/plain" (1697 bytes)
+
+
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: http://seclists.org/fulldisclosure/

@@ -69,6 +69,11 @@ cd scripts/raw-data/
 python3 sync-oss-security.py
 cd - &> /dev/null
 
+# full-disclosure
+print_green "[*][$RAW_DATA_DIR] Updating Full-Disclosure"
+cd scripts/raw-data/
+python3 sync-full-disclosure.py
+cd - &> /dev/null
 
 echo "raw-data/ update | ts: `date '+%s'`" >> CHANGELOG
 

