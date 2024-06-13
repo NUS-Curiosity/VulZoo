@@ -1,0 +1,1996 @@
+
+Date: Fri, 25 May 2007 09:45:27 -0400
+From: <auto294156@...hmail.com>
+To: <full-disclosure@...ts.grok.org.uk>
+Cc: 
+Subject: PHRACK 64: AUTOMATED VULNERABILITY AUDITING IN
+	MACHINE CODE
+
+		  Automated vulnerability auditing in machine code
+
+             		Tyler Durden <tyler@...ack.org> 
+
+		              Phrack Magazine #64
+                  		
+		             Version of May 21 2007
+
+					
+
+I. Introduction
+   a/ On the need of auditing automatically
+   b/ What are exploitation frameworks
+   c/ Why this is not an exploitation framework
+   d/ Why this is not fuzzing
+   e/ Machine code auditing : really harder than sources ? 
+
+II. Preparation
+   a/ A first intuition 
+   b/ Static analysis vs dynamic analysis
+   c/ Dependences & predicates
+       - Controlflow analysis
+       - Dataflow analysis
+   d/ Translation to intermediate forms
+   e/ Induction variables (variables in loops)     
+
+III. Analysis
+   a/ What is a vulnerability ?
+   b/ Buffer overflows and numerical intervals
+	- Flow-insensitive
+	- Flow-sensitive
+	- Accelerating the analysis by widening
+   c/ Type-state checking
+	- Memory leaks
+	- Heap corruptions	
+   d/ More problems
+	- Predicate analysis
+	- Alias analysis and naive solutions
+	- Hints on detecting race conditions
+
+IV. Chevarista: an analyzer of binary programs
+   a/ Project modelization
+   b/ Program transformation
+   c/ Vulnerability checking
+   d/ Vulnerable paths extraction
+   e/ Future work : Refinement
+
+V. Related Work
+   a/ Model Checking
+   b/ Abstract Interpretation
+
+VI. Conclusion
+VII. Greetings
+VIII. References
+IX. The code
+      
+
+	.::###########################################################::.
+
+
+Software have bugs. That is quite a known fact.
+
+
+
+----------------------[ I. Introduction
+
+
+
+In this article, we will discuss the design of an engine for 
+automated 
+vulnerability analysis of binary programs. The source code of the 
+Chevarista static analyzer is given at the end of this document.
+
+The purpose of this paper is not to disclose 0day vulnerability, but
+to understand how it is possible to find them without (or with
+restricted) human intervention. However, we will not friendly print
+the result of our automated auditing on predefined binaries : 
+instead
+we will always take generic examples of the most common 
+difficulties 
+encountered when auditing such programs. Our goal is to enlight the 
+underground community about writing your own static analyzer and not
+to be profitful for security companies or any profit oriented 
+organization.
+
+Instead of going straight to the results of the proposed 
+implementation, 
+we may introduce the domain of program analysis, without going 
+deeply
+in the theory (which can go very formal), but taking the perspective
+of a hacker who is tired of focusing on a specific exploit problem
+and want to investigate until which automatic extend it is possible
+to find vulnerabilities and generate an exploit code for it without
+human intervention.
+
+Chevarista hasnt reached its goal of being this completely automated
+tool, however it shows the path to implement incrementally such tool
+with a genericity that makes it capable of finding any definable 
+kind 
+of vulnerability.
+
+Detecting all the vulnerabilities of a given program can be
+untractable, and this for many reasons. The first reason is that
+we cannot predict that a program running forever will ever have
+a bug or not. The second reason is that if this program ever stop,
+the number of states (as in "memory contexts") it reached and passed
+through before stopping is very big, and testing all of of possible
+concrete program paths would either take your whole life, or a 
+dedicated 
+big cluster of machine working on this for you during ages.
+
+As we need more automated systems to find bugs for us, and we do not
+have such computational power, we need to be clever on what has to 
+be 
+analysed, how generic can we reason about programs, so a single 
+small 
+analyzer can reason about a lot of different kinds of bugs. After 
+all, 
+if the effort is not worth the genericity, its probably better to 
+audit 
+code manually which would be more productive. However, automated 
+systems
+are not limited to vulnerability findings, but because of their 
+tight 
+relation with the analyzed program, they can find the exact 
+conditions 
+in which that bug happens, and what is the context to reach for 
+triggering it.
+
+But someone could interject me : "But is not Fuzzing supposed to do
+that already ?". My answer would be : Yes. But static analysis is
+the intelligence inside Fuzzing. Fuzzy testing programs give very
+good results but any good fuzzer need to be designed with major 
+static
+analysis orientations. This article also applies somewhat to fuzzing
+but the proposed implementation of the Chevarista analyzer is not 
+a fuzzer. The first reason is that Chevarista does not execute the
+program for analyzing it. Instead, it acts like a (de)compiler but 
+perform analysis instead of translating (back) to assembly (or 
+source) code.
+It is thus much more performant than fuzzing but require a lot of
+development and litterature review for managing to have a complete
+automatic tool that every hacker dream to maintain.
+
+Another lost guy will support : "Your stuff looks more or less like 
+an
+exploitation framework, its not so new". Exploitation frameworks
+are indeed not very new stuffs. None of them analyze for 
+vulnerabilities,
+and actually only works if the builtin exploits are good enough. 
+When
+the framework aims at letting you trigger exploits manually, then it
+is not an automated framework anymore. This is why Chevarista is not
+CORE-Impact or Metasploit : its an analyzer that find bugs in 
+programs
+and tell you where they are.
+
+One more fat guy in the end of the room will be threatening: "It is 
+simply
+not possible to find vulnerabilities in code without the source .." 
+and
+then a lot of people will stand up and declare this as a prophety, 
+because its already sufficiently hard to do it on source code 
+anyway.
+I would simply measure this judgement by several remarks: for some
+peoples, assembly code -is- source code, thus having the assembly is
+like having the source, without a certain number of information. 
+That
+is this amount of lost information that we need to recover when 
+writing
+a decompiler. 
+
+First, we do not have the name of variables, but naming variables 
+in a different
+way does not affect the result of a vulnerability analysis. Second, 
+we do not have
+the types, but data types in compiled C programs do not really 
+enforce properties 
+about the variables values (because of C casts or a compiler 
+lacking strong type 
+checking). The only real information that is enforced is about 
+variable size in
+memory, which is recoverable from an assembly program most of the 
+time. This
+is not as true for C++ programs (or other programs written in 
+higher level
+objects-oriented or functional languages), but in this article we 
+will 
+mostly focuss on compiled C programs.
+
+A widely spread opinion about program analysis is that its harder 
+to 
+acheive on a low-level (imperative) language rather than a high-
+level 
+(imperative) language. This is true and false, we need to bring 
+more 
+precision about this statement. Specifically, we want to compare the
+analysis of C code and the analysis of assembly code:
+
+
+ -------------------------------------------------------------------
+--
+| Available information   |      C code         |    Assembly code  
+  |
+|-------------------------------------------------------------------
+--|
+| Original variables names|    Yes (explicit)   |         No        
+  |
+|-------------------------------------------------------------------
+--|
+|   Original types names  |    Yes (explicit)   |         No        
+  |
+|-------------------------------------------------------------------
+--|
+|  Control Sequentiality  |    Yes (explicit)   |    Yes (explicit) 
+  |
+|-------------------------------------------------------------------
+--|
+|  Structured control     |    Yes (explicit)   |    Yes 
+(recoverable)|
+|-------------------------------------------------------------------
+--|
+|    Data dependencies    |    Yes (implicit)   |    Yes (implicit) 
+  |
+|-------------------------------------------------------------------
+--|
+|    Data Types           |    Yes (explicit)   |    Yes 
+(recoverable)|
+|-------------------------------------------------------------------
+--|
+|    Register transfers   |    No               |    Yes (explicit) 
+  |
+|-------------------------------------------------------------------
+--|
+|  Selected instructions  |    No               |    Yes (explicit) 
+  |
+ -------------------------------------------------------------------
+--
+
+Lets discuss those points more in details:
+
+ - The control sequentiality is obviously kept in the assembly, else
+the processor would not know how to execute the binary program.
+
+ - However the binary program does not contain a clearly structured
+tree of execution. Conditionals, but especially, Loops, do not 
+appear
+as such in the executable code. We need a preliminary analysis for
+structuring the control flow graph. This was done already on source
+and binary code using different algorithms that we do not present
+in this article.
+
+- Data dependencies are not explicit even in the source program, 
+however
+we can compute it precisely both in the source code and the binary 
+code.
+The dataflow analysis in the binary code however is slightly 
+different,
+because it contains every single load and store between registers 
+and
+the memory, not only at the level of variables, as done in the 
+source
+program. Because of this, the assembly programs contains more 
+instructions
+than source programs contain statements. This is an advantage and a
+disadvantage at the same time. It is an advantage because we can 
+track
+the flow in a much more fine-grained fashion at the machine level, 
+and
+that is what is necessary especially for all kind of optimizations, 
+or machine-specific bugs that relies on a certain variable being 
+either
+in the memory or in a register, etc. This is a disadvantage because 
+we 
+need more memory to analyse such bigger program listings.
+
+- Data types are explicit in the source program. Probably the 
+recovery
+of types is the hardest information to recover from a binary code. 
+However this has been done already and the approach we present in 
+this
+paper is definitely compatible with existing work on type-based
+decompilation. Data types are much harder to recover when dealing 
+with
+real objects (like classes in compiled C++ programs). We will not 
+deal
+with the problem of recovering object classes in this article, as 
+we 
+focuss on memory related vulnerabilities.
+
+- Register level anomalies can happen [see dvorak select bug lkml], 
+which
+can be useful for a hacker to determine how to create a context of 
+registers or memory when writing exploits. Binary-level code 
+analysis has
+this advantage that it provides a tighter approach to exploit 
+generation
+on real world existing targets.
+
+- Instruction level information is interested again to make sure we 
+dont
+miss bugs from the compiler itself. Its very academically well 
+respected
+to code in parallel a certified compiler but for the hacker point 
+of view,
+it does not mean so much. Concrete use in the wild means concrete 
+code,
+means assembly. Additionally, it is more rare but it has been 
+constated
+already some irregularities in the processor's execution of specific
+patterns of instructions, so an instruction level analyzer can deal 
+with
+those, but a source level analyzer cannot. A last reason I would 
+mention
+is that the source code of a project is very verbose. If a code 
+analyzer
+is embedded into some important device, either the source code of 
+the
+software inside the device will not be available, or the device 
+will lack
+storage or communication bandwidth to keep an accessible copy of 
+the source
+code. Binary code analyzer do not have this dependencie on source 
+code and
+can thus be used in a wider scope.
+
+
+Indeed there is a lot of information recovery work before starting 
+to
+perform the source-like level analysis. However, the only 
+information
+that is not available after recovery is not mandatory for analysing
+code. Indeed, the name of types and variables is not affecting the 
+execution of a program, so we can abstract those away from our 
+analysis
+already, and use our own naming scheme, as presented in the next
+chapter of this article.
+
+
+
+
+-------------[ II. Preparation
+
+
+
+
+We have to go on the first wishes and try to understand better what
+vulnerabilities are, how we can detect them automatically, are we
+really capable to generate exploits from analyzing a program that we
+do not even execute ? The answer is yes and no and we need to make 
+things clear about this. The answer is yes, because if you know 
+exactly
+how to caracterize a bug, and if this bug is detectable by any 
+algorithm, then we can code a program that will reason only about
+those known-in-advance vulnerability specificities and convert the 
+raw assembly (or source) code into an intermediate form that will 
+make
+clear where the specificities happens, so that the "signature" of 
+the
+vulnerability can be found if it is present in the program. The 
+answer
+is no, because giving an unknown vulnerability, we do not know in
+advance about its specificities that caracterize its signature. It
+means that we somewhat have to take an approximative signature and 
+check the program, but the result might be an over-approximation (a
+lot of false positives) or an under-approximation (finds nothing or
+few but vulnerabilities exist without being detected).
+
+As fuzzing and black-box testing are dynamic analysis, the core of 
+our analyzer is not as such, but it can find an interest to run the 
+program for a different purpose than a fuzzer. Those try their 
+chance on a randomly crafted input. Fuzzer does not have a *inner*
+knowledge of the program they analyze. This is a major issue because
+the dynamic analyzer that is a fuzzer cannot optimize or refine
+its inputs depending on what are unobservable events for him. A 
+fuzzer
+can as well be coupled with a debugger, so that fuzzing is guided 
+by 
+the debugger knowledge about internal memory states and variable 
+values
+during the execution of the program.
+
+Nevertheless, the real concept of a code analysis tool must be an 
+integrated 
+solution, to avoid losing even more performance when using an 
+external 
+debugger (like gdb which is awfully slow when using ptrace). Our 
+technique of analysis is capable of taking decisions depending on 
+internal states of a program even without executing them. However, 
+our 
+representation of a state is abstract : we do not compute the whole 
+content of the real memory state at each step of execution, but 
+consider
+only the meaningful information about the behavior of the program 
+by automatically 
+annotating its code with qualifiers such as : "The next instruction 
+of the 
+will perform a memory allocation" or "Register R or memory cell M 
+will 
+contain a pointer on a dynamically allocated memory region". We 
+will explain
+in more details heap related properties checking in the type-state 
+analysis
+paragraph of Part III.
+
+In this part of the paper, we will describe a family of 
+intermediate forms
+which bridge the gap between code analysis on a structured code, 
+and code
+analysis on an unstructured (assembly) code. Conversion to those 
+intermediate
+forms can be done from binary code (like in an analyzing 
+decompiler) or from
+source code (like in an analyzing compiler). In this article, we 
+will
+transform binary code into a program written in an intermediate 
+form, and then
+perform all the analysis on this intermediate form. All the studies 
+properties
+will be related to dataflow analysis. No structured control flow is 
+necessary
+to perform those, a simple control flow graph (or even list of 
+basic blocks
+with xrefs) can be the starting point of such analysis.
+
+Lets be more  concrete a illustrate how we can analyze the internal 
+states of
+a program without executing it. We start with a very basic piece of 
+code:
+
+	
+Stub 1:
+-------
+			 o			o  : internal state
+ if (a)		        / \		
+   b++;		->     o   o			/\ : control-flow splitting 
+ else		        \ /			\/ : control-flow merging
+   c--;	               	 o
+-------                        
+
+
+In this simplistic example, we represent the program as a graph 
+whoose
+nodes are states and edges are control flow dependencies. What is 
+an internal
+state ? If we want to use all the information of each line of code,	
+we need to make it an object remembering which variables are used 
+and modified 
+(including status flags of the processors). Then, each of those 
+control state
+perform certains operations before jumping on another part of the 
+code (represented
+by the internal state for the if() or else() code stubs). Once the 
+if/else 
+code is finished, both paths merge into a unique state, which is 
+the state after
+having executed the conditional statement.
+
+Once must differentiate control-flow (like in the previous 
+example), and dataflow.
+
+Imagine this piece of code:
+
+
+Stub 2:
+-------
+
+Code			Control-flow		  Data-flow with predicates
+
+                                                           a
+						        ---o--- 
+                                                       /    \  \
+                                                      /      \  \
+						     /  c     \  \
+c = 21;			    o		            |   o    b o  \
+b = a;			    |			    |  / \    /    \ 
+a = 42;			    o			     \/   ------   /
+if (b != c)		   / \		             /\  |b != c| /  
+  a++;			  o   o  		    /  \  ------ /
+else			   \ /                     /    \ /   \ /
+  a--;                      o                     |    a o   a o
+c += a;                     |                      \     |    /
+-------                     o                       \    |   /
+			                             \   |  /
+						      \	 | / 
+                                                       c o 	
+                                                         |
+						       (...)
+                            
+
+In a dataflow  graph, the nodes are the variables, and the arrow 
+are the
+dependences between variables. The control-flow and data-flow 
+graphs are
+actually complementary informations. One only cares about the 
+sequentiality
+in the graph, the other one care about the dependences between the 
+variables
+without apparently enforcing any order of evaluation. Adding 
+predicates
+to a dataflow graph helps at determining which nodes are involved 
+in a
+condition and which instance of the successors data nodes (in our 
+case, 
+variable a in the if() or the else()) should be considered for our 
+analysis.
+
+As you can see, even a simple data-flow graph with only few 
+variables
+starts to get messy already. To clarify the reprensentation of the 
+program we are working on, we need some kind of intermediate 
+representation
+that keep the sequentiality of the control-flow graph, but also 
+provide the
+dependences of the data-flow graph, so we can reason on both of them
+using a single structure. We can use some kind of "program 
+dependence graph"
+that would sum it up both in a single graph. That is the graph we 
+will consider
+for the next examples of the article.
+
+Some intermediate forms introduces special nodes in the data-flow 
+graph, and
+give a well-recognizable types to those nodes. This is the case of 
+Phi() and
+Sigma() nodes in the Static Single Assignment (SSA) and Static 
+Single 
+Information (SSI) intermediate forms and that facilitates indeed 
+the reasoning
+on the data-flow graph. Additionally, decomposing a single variable 
+into
+multiple "single assignments" (and single use in SSI), that is 
+naming uniquely 
+each apparition of a given variable, help at desambiguizing which 
+instance of 
+the variable we are talking about at a given point of the program:
+
+
+Stub 2 in SSA form	Stub 2 in SSI form	Data-flow graph in SSI form
+------------------	------------------	--------------------------
+
+c1 = 21;		c1 = 21;			              o a1
+b1 = a1;		b1 = a1;			             / \
+if (b1 != c1)		(a3, a4) = Sigma(a2);  (a3, a4) = Sigma(a2) o   o b1
+  a2 = a1 + 1;		if (b1 != c1)                              /|
+else			  a3 = a2 + 1;                            / |
+                                                                 /  
+| 
+                                                                /   
+|    
+                                                               /    
+|    o c1
+  a3 = a1 - 1;		else                                   |    |    |
+a4 = Phi(a2, a3)	  a4 = a2 - 1;                      a3 o    o a4 |
+c2 = c1 + a4;		a5 = Phi(a3, a4);                       \   |    |
+			c2 = c1 + a5;                            \  |    |
+----------------        -------------------                       \ 
+|    |
+                                                                   
+\|    |
+                                                  a5 = Phi(a3, a4)  
+o    |
+                                                                    
+ \  /
+                                                                    
+  o c2
+                                                                    
+  .
+                                                                    
+  .
+                                                                    
+  .
+
+      
+Note that we have not put the predicates (condition test) in that 
+graph. In
+practice, its more convenient to have additional links in the 
+graph, for 
+predicates (that ease the testing of the predicate when walking on 
+the graph),
+but we have removed it just for clarifying what is SSA/SSI about.
+
+Those "symbolic-choice functions" Phi() and Sigma() might sound a 
+little bit
+abstract. Indeed, they dont change the meaning of a program, but 
+they capture
+the information that a given data node has multiple successors 
+(Sigma) or
+ancestors (Phi). This is especially relevant when analyzing code 
+with loops, 
+like this one:
+
+
+		Stub 3 C code		Stub 3 in Labelled SSI form        
+		-------------           ---------------------------       
+
+		int a = 42;	        int a1 = 42;
+		int i = 0;              int i1 = 0;
+
+					P1 = [i1 < a1]
+                        		(<i4:Loop>, <i9:End>) = Sigma(P1,i2);
+					(<a4:Loop>, <a9:End>) = Sigma(P1,a2);
+			
+		while (i < a)           
+		{                 =>    Loop:
+                       			 a3 = Phi(<BLoop:a1>, <BEnd:a5>);
+					 i3 = Phi(<BLoop:i1>, <BEnd:i5>);
+  		  a--;                   a5 = a4 - 1;
+  		  i++;                   i5 = i4 + 1;
+					 P2 = [i5 < a5]
+					 (<a4:Loop>, <a9:End>) = Sigma(P2,a6);
+		        		 (<i4:Loop>, <i9:End>) = Sigma(P2,i6);
+		} 
+                        		End:
+                        		 a8 = Phi(<BLoop:a1>, <Bend:a5>);
+                        		 i8 = Phi(<BLoop:i1>, <Bend:i5>);
+		a += i;                  a10 = a9 + i9;
+		-----------             ---------------------------------
+
+
+
+By trying to synthetize this form a bit more (grouping the variables
+under a unique Phi() or Sigma() at merge or split points of the 
+control
+flow graph), we obtain a smaller program:
+
+
+		Stub 3 in Factored & Labelled SSI form        
+		--------------------------------------
+
+		int a1 = 42;
+		int i1 = 0;
+
+		P1 = [i1 < a1]
+
+		(<i4:Loop>, <i9:End>)            (i2)
+		(		    ) = Sigma(P1,(  ));
+		(<a4:Loop>, <a9:End>)            (a2)
+	   
+			
+		Loop:
+
+		(a3)      (<BLoop:a1>, <BEnd:a5>)
+		(  ) = Phi(                     );
+		(i3)      (<BLoop:i1>, <BEnd:i5>)
+
+		a5 = a4 - 1;
+		i5 = i4 + 1;
+
+		P2 = [i5 < a5]
+
+		(<a4:Loop>, <a9:End>)             (a6)
+		(                   ) = Sigma(P2, (  ));
+		(<i4:Loop>, <i9:End>)             (i6)
+
+		End:
+
+		(a8)      (<BLoop:a1>, <Bend:a5>)
+		(  ) = Phi(                     );
+		(i8)      (<BLoop:i1>, <Bend:i5>)
+
+		a10 = a9 + i9;
+		----------------------------------------
+
+
+
+How can we add information to this intermediate form ? Now the Phi()
+and Sigma() functions allows us to reason about forward dataflow
+(in the normal execution order, using Sigma) and backward dataflow 
+analysis (in the reverse order, using Phi). We can easily find the
+inductive variables (variables that depends on themselves, like the
+index or incrementing pointers in a loop), just using a simple 
+analysis:
+
+Lets consider the Sigma() before each Label, and try to iterate its 
+arguments:
+
+
+		
+		(<a4:Loop>, <a9:End>)             (a6)
+		(                   ) = Sigma(P2, (  ));
+		(<i4:Loop>, <i9:End>)             (i6)
+		
+
+	->	(<a5:Loop>,<a10:End>)
+		(                   )
+		(<i5:Loop>,   _|_   )
+
+
+	->      (<a6:Loop>,   _|_   )
+		(                   )
+		(<i6:Loop>,   _|_   )
+
+
+
+We take _|_ ("bottom") as a notation to say that a variable
+does not have any more successors after a certain iteration
+of the Sigma() function.
+
+After some iterations (in that example, 2), we notice that 
+the left-hand side and the right-hand side are identical 
+for variables a and i. Indeed, both side are written given
+a6 and i6. In the mathematical jargon, that is what is called
+a fixpoint (of a function F) : 
+
+	F(X) = X
+
+By doing that simple iteration-based analysis over our 
+symbolic functions, we are capable to deduce in an automated
+way which variables are inductives in loops. In our example,
+both a and i are inductive. This is very useful as you can imagine, 
+since those variables become of special interest for us, especially 
+when looking for  buffer overflows that might happen on buffers in 
+looping code.
+
+We will now somewhat specialize this analysis in the following
+part of this article, by showing how this representation can
+apply to
+
+
+
+
+
+
+-------------------[ III. Analysis
+
+
+	The previous part of the article introduced various notions
+in program analysis. We might not use all the formalism in the 
+future
+of this article, and focuss on concrete examples. However, keep in
+mind that we reason from now for analysis on the intermediate form
+programs. This intermediate form is suitable for both source code
+and binary code, but we will keep on staying at binary level for our
+examples, proposing the translation to C only for understanding
+purposes. Until now, we have shown our to understand data-flow 
+analysis
+and finding inductive variables from the (source or binary) code of 
+the program. 
+
+So what are the steps to find vulnerabilities now ?
+
+A first intuition is that there is no generic definition for a 
+vulnerability. But if we can describes them as behavior that 
+violates a certain precise property, we are able to state if a 
+program has a vulnerability or not. Generally, the property depends
+on the class of bugs you want to analyse. For instance, properties 
+that express buffer overflow safety or property that express a heap 
+corruption (say, a double free) are different ones. In the first 
+case, 
+we talk about the indexation of a certain memory zone which has to 
+never
+go further the limit of the allocated memory. Additionally, for
+having an overflow, this must be a write access. In case we have a
+read access, we could refer this as an info-leak bug, which 
+may be blindly or unblindly used by an attacker, depending if the
+result of the memory read can be inspected from outside the process
+or not. In all the three case, its interesting anyway to get the 
+information by our analyzer of this unsupposed behavior, because 
+this might lead to a wrong behavior, and thus, a bug.
+
+In this part of the article, we will look at different class of
+bugs, and understand how we can caracterize them, by running very
+simple and repetitive, easy to implement, algorithm. This algorithm
+is simple only because we act on an intermediate form that already
+indicates the meaningful dataflow and controlflow facts of the
+program. Additionally, we will reason either forward or backward,
+depending on what is the most adapted to the vulnerability.
+
+We will start by an example of numerical interval analysis and show
+how it can be useful to detect buffer overflows. We will then show
+how the dataflow graph without any value information can be useful
+for finding problems happening on the heap. We will enrich our 
+presentation by describing a very classic problem in program 
+analysis,
+which is  the discovery of equivalence between pointers (do they 
+point
+always on the same variable ? sometimes only ? never ?), also known 
+as
+alias analysis. We will explain why this analysis is mandatory for 
+any
+serious analyzer that acts on real-world programs. Finally, we will
+give some more hints about analyzing concurrency properties inside
+multithread code, trying to caracterize what is a race condition.
+
+
+
+------------[ A. Numerical intervals
+
+
+
+
+	When looking for buffer overflows or integer overflows, the 
+mattering information is about the values that can be taken by 
+memory indexes or integer variables, which is a numerical value.
+
+Obviously, it would not be serious to compute every single possible
+value for all variables of the program, at each program path : this
+would take too much time to compute and/or too much memory for the 
+values
+graph to get mapped entirely.
+
+By using certain abstractions like intervals, we can represent the 
+set
+of all possible values of a program a certain point of the program. 
+We
+will illustrate this by an example right now. The example itself is
+meaningless, but the interesting point is to understand the 
+mecanized
+way of deducing information using the dataflow information of the 
+program
+graph.
+
+
+We need to start by a very introductionary example, which consists 
+of
+finding
+
+
+Stub 4					Interval analysis of stub 4
+-------					---------------------------
+
+int  a, b;	
+
+b = 0;					b = [0 to 0]
+if (rand())		 
+ b--;					b = [-1 to -1]
+else
+ b++;					b = [1 to 1]
+
+					b = [-1 to 1]
+
+a = 1000000 / b;			a = [1000000 / -1 to 1000000 / 1] 
+					    [Reported Error: b can be 0]
+
+
+In this example, a flow-insensitive analyzer will merge the 
+interval of values
+at each program control flow merge. This is a seducing approach as 
+you need to
+pass a single time on the whole program to compute all intervals. 
+However, this
+approach is untractable most of the time. Why ? In this simple 
+example, the
+flow-insensitive analyzer will report a bug of potential division 
+by 0, whereas
+it is untrue that b can reach the value 0 at the division program 
+point. This
+is because 0 is in the interval [-1 to 1] that this false positive 
+is reported
+by the analyzer. How can we avoid this kind of over-conservative 
+analysis ?
+
+We need to introduce some flow-sensitiveness to the analysis, and 
+differentiate
+the interval for different program path of the program. If we do a 
+complete flow 
+sensitive analysis of this example, we have:
+
+
+Stub 4					Interval analysis of stub 4
+-------					---------------------------
+
+int  a, b;	
+
+b = 0;					b = [0 to 0]
+if (rand())		 
+ b--;					b = [-1 to -1]
+else
+ b++;					b = [1 to 1]
+
+					b = [-1 to -1 OR 1 to 1]
+
+a = 1000000 / b;			a = [1000000 / -1 to 1000000 / -1] or 
+					    [1000000 /  1 to 1000000 /  1] 
+					  = {-1000000 or 1000000}
+
+
+Then the false positive disapears. We may take care of avoiding to 
+be flow sensitive
+from the beginning. Indeed, if the flow-insensitive analysis gives 
+no bug, then no
+bugs will be reported by the flow-sensitive analysis either (at 
+least for this example).
+Additionally, computing the whole flow sensitive sets of intervals 
+at some program point
+will grow exponentially in the number of data flow merging point 
+(that is, Phi() function
+of the SSA form). 
+
+For this reason, the best approach seems to start with a completely 
+flow insensitive, 
+and refine the analysis on demand. If the program is transforted 
+into SSI form, then 
+it becomes pretty easy to know which source intervals we need to 
+use to compute the 
+destination variable interval of values. We will use the same kind 
+of analysis for 
+detecting buffer overflows, in that case the interval analysis will 
+be used on the 
+index variables that are used for accessing memory at a certain 
+offset from a given 
+base address.
+
+Before doing this, we might want to do a remark on the choice of an 
+interval abstraction
+itself. This abstraction does not work well when bit swapping is 
+involved into the 
+operations. Indeed, the intervals will generally have meaningless 
+values when bits are
+moved inside the variable. If a cryptographic operation used bit 
+shift that introduces 0 
+for replacing shifted bits, that would not be a a problem, but 
+swapping bits inside a given 
+word is a problem.
+
+
+	<FIXME example of bit shifting compatible with interval 
+abstraction>
+	<FIXME example of bit shifting incompatible with interval 
+abstraction>
+
+
+We will now analyze an example that involves a buffer overflow on 
+the heap. Before
+doing the interval analysis, we will do a first pass to inform us 
+about the statement
+related to memory allocation and disallocation. Knowing where 
+memory is allocated
+and disallocated is a pre-requirement for any further bound 
+checking analysis.
+
+
+Stub 5					Interval analysis with alloc annotations
+------					----------------------------------------
+
+char *buf;				buf = _|_ (uninitialized)
+int   n = rand();			n   = [-Inf, +Inf]
+buf = malloc(n)				buf = initialized of size [-Inf to Inf]
+i   = 0;				i   = [0,0], [0,1] ... [0,N]
+
+while (i <= n)				      
+{		
+  assert(i < N)			    
+  buf[i] = 0x00;			
+  	
+  i++;					i   = [0,1], [0,2] ... [0,N]
+					     (iter1  iter2 ... iterN)
+}
+return (i);
+
+
+
+As you can see, there is a one-byte-overflow in this example. It is 
+pretty trivial
+to spot it manually, however we want to develop an automatic 
+routine  for doing
+it. If we deploy the analysis that we have done in the previous 
+example, the assert()
+that was automatically inserted by the analyzer after each memory 
+access of the program 
+will fail after N iterations. This is because arrays in the C 
+language start with index 0 and 
+finish with an index inferior of 1 to their allocated size. 
+Whatever kind of 
+code will be inserted between those lines (except, of course, bit 
+swapping as 
+previously mentioned), we will always be able to propagate the 
+intervals and find
+that memory access are done beyond the allocated limit, then 
+finding a clear
+memory leak or memory overwrite vulnerability in the program.
+
+However, this specific example brings 2 more questions:
+
+	- We do not know the actual value of N. Is it a problem ? If we 
+	manage to see that the constraint over the index of buf is actually
+	the same variable (or have the same value than) the size of the
+	allocated buffer, then it is not a problem. We will develop this 
+in 
+	the alias analysis part of this article when this appears to be a
+	difficulty. 
+
+	- Whatever the value of N, and provided we managed to identify N
+	all definitions and use of the variable N, the analyzer will 
+require N
+	iteration over the loop to detect the vulnerability. This is not
+	acceptable, especially if N is very big, which in that case many
+	minuts will be necessary for analysing this loop, when we actually
+	want an answer in the next seconds.
+
+The answer for this optimization problem is a technique called 
+Widening, gathered
+from the theory of abstract interpretation. Instead of executing 
+the loop N
+times until the loop condition is false, we will directly in 1 
+iteration go to
+the last possible value in a certain interval, and this as soon as 
+we detect a
+monotonic increase of the interval. The previous example would then 
+compute
+like in:
+
+Stub 5					Interval analysis with Widening
+------					-------------------------------
+
+char *buf;				buf = _|_ (uninitialized)
+int   n = rand();			n   = [-Inf, +Inf]
+buf = malloc(n)				buf = initialized of size [-Inf to Inf]
+i   = 0;				i = [0,0]
+
+while (i <= n)
+{
+  assert(i < N); 			    iter1  iter2 iter3 iter4  ASSERT!
+  buf[i] = 0x00;			i = [0,0], [0,1] [0,2] [0,N] 	
+  i++;					i = [0,1], [0,2] [0,3] [0,N] 
+}
+return (i);
+
+
+Using this test, we can directly go to the biggest possible 
+interval in only 
+a few iterations, thus reducing drastically the requested time for 
+finding
+the vulnerability. However this optimization might introduce 
+additional
+difficulties when conditional statement is inside the loop:
+
+
+Stub 6					Interval analysis with Widening
+------					-------------------------------
+
+char *buf;				buf = _|_ (uninitialized)
+int   n = rand() + 2;			n   = [-Inf, +Inf]
+buf = malloc(n)				buf = initialized of size [-Inf to Inf]
+i   = 0;				i = [0,0]
+
+while (i <= n)				i = [0,0] [0,1] [0,2] [0,N] [0,N+1]
+{
+  if (i < n - 2)		        i = <same than previously for all 
+iterations>
+  {
+    assert(i < N - 1)			[Never triggered !]
+    buf[i] = 0x00;  			i = [0,0] [0,1] [0,2] [0,N] <False positive> 
+   
+  }			
+  i++;					i = [0,1] [0,2] [0,3] [0,N] [0,N+1]	
+}
+return (i);
+
+
+In this example, we cannot assume that the interval of i will be 
+the same everywhere
+in the loop (as we might be tempted to do as a first hint for 
+handling intervals in
+a loop). Indeed, in the middle of the loop stands a condition (with 
+predicate being 
+i < n - 2) which forbids the interval to grow in some part of the 
+code. This is problematic 
+especially if we decide to use widening until the loop breaking 
+condition. We will miss
+this more subtle repartition of values in the variables of the 
+loop. The solution for this
+is to use widening with thresholds. Instead of applying widening in 
+a single time over the
+entire loop, we will define a sequel of values which corresponds to 
+"strategic points" of
+the code, so that we can decide to increase precisely using a small-
+step values iteration.
+
+The strategic points can be the list of values on which a condition 
+is applied. In our case
+we would apply widening until n = N - 2 and not until n = N. This 
+way, we will not trigger
+a false positive anymore because of an overapproximation of the 
+intervals over the entire
+loop. When each step is realized, that allows to annotate which 
+program location is the subject
+of the widening in the future (in our case: the loop code before 
+and after the "if" statement).
+
+Note that, when we reach a threshold during widening, we might need 
+to apply a small-step
+iteration more than once before widening again until the next 
+threshold. For instance, 
+when predicates such as (a != immed_value) are met, they will 
+forbid the inner code of 
+the condition to have their interval propagated. However, they will 
+forbid this just one 
+iteration (provided a is an inductive variable, so its state will 
+change at next iteration) 
+or multiple iterations (if a is not an inductive variable and will 
+be modified only at another 
+moment in the loop iterative abstract execution). In the first 
+case, we need only 2 small-step
+abstract iterations to find out that the interval continues to grow 
+after a certain iteration.
+In the second case, we will need multiple iteration until some 
+condition inside the loop is
+reached. We then simply needs to make sure that the threshold list 
+includes the variable value
+used at this predicate (which heads the code where the variable a 
+will change). This way, we
+can apply only 2 small-step iterations between those "bounded 
+widening" steps, and avoid
+generating false positives using a very optimized but precise 
+abstract evaluation sequence.
+
+
+In our example, we took only an easy example: the threshold list is 
+only made of 2 elements (n
+and (n - 2)). But what if a condition is realized using 2 variables 
+and not a variable and 
+an immediate value ? in that case we have 3 cases:
+
+CASE1 - The 2 variables are inductive variables: in that case, the 
+threshold list of the two variables 
+must be fused, so widening do not step over a condition that would 
+make it lose precision. This
+seem to be a reasonable condition when one variable is the subject 
+of a constraint that involve
+a constant and the second variable is the subject of a constraint 
+that involve the first variable:
+
+
+Stub 7:						Threshold discovery
+-------						-------------------
+
+
+while (i < n)					Found threshold n
+{
+  if (a < i < b)				Found predicate involving a and b
+    (...)
+  if (a > sizeof(something))			Found threshold for a
+    (b = ...)
+  else if (b + 1 < sizeof(buffer))		Found threshold for b
+    (a = ...)
+}
+
+
+In that case, we can define the threshold of this loop being a list 
+of 2 values,
+one being sizeof(something), the other one being sizeof(buffer) or 
+sizeof(buffer) - 1
+in case the analyzer is a bit more clever (and if the assembly code 
+makes it clear
+that the condition applyes on sizeof(buffer) - 1).
+
+
+CASE2 - One of the variable is inductive and the other one is not. 
+
+
+So we have 2 subcases:
+
+ - The inductive variable is involved in a predicate that leads to 
+modification
+   of the non-inductive variable. It is not possible without the 2 
+variables 
+   being inductives !Thus we fall into the case 1 again.
+
+ - The non-inductive variable is involved in a predicate that leads 
+to
+   modification of the inductive variable. In that case, the non-
+inductive
+   variable would be invariant over the loop, which mean that a 
+test between 
+   its domain of values (its interval) and the domain of the 
+inductive
+   variable is required as a condition to enter the code stubs 
+headed by the
+   analyzed predicate. Again, we have 2 sub-subcases:
+
+	* Either the predicate is a test == or !=. In that case, we must 
+compute
+	the intesection of both variables intervals. If  the intersection 
+is void,
+	the test will never true, so its dead code. If the intersection is 
+itself
+	an interval (which will be the case most of the time), it means 
+that the
+	test will be true over this inductive variable intervals of value, 
+and 
+	false over the remaining domain of values. In that case, we need 
+to put
+	the bounds of the non-inductive variable interval into the 
+threshold list for 
+	the widening of inductive variables that depends on this non-
+inductive 
+	variable.
+	
+
+	* Or the predicate is a comparison : a < b (where a or b is an 
+inductive
+	variable). Same remarks holds : we compute the intersection 
+interval 
+	between a and b. If it is void, the test will always be true or 
+false and
+	we know this before entering the loop. If the interval is not 
+void, we 
+	need to put the bounds of the intersection interval in the 
+widening threshold
+	of the inductive variable.
+
+
+CASE3 - None of the variables are inductive variables
+
+In that case, the predicate that they define has a single value 
+over the
+entire loop, and can be computed before the loop takes place. We 
+then can
+turn the conditional code into an unconditional one and apply 
+widening
+like if the condition was not existing. Or if the condition is 
+always
+false, we would simply remove this code from the loop as the 
+content of
+the conditional statement will never be reached.
+
+As you can see, we need to be very careful in how we perform the 
+widening. If
+the widening is done without thresholds, the abstract numerical 
+values will
+be overapproximative, and our analysis will generate a lot of false 
+positives.
+
+By introducing thresholds, we sacrify very few performance and gain 
+a lot of 
+precision over the looping code analysis.
+
+
+
+------------[ B. Type state checking (aka double free, memory 
+leaks, etc)
+
+
+
+There are some other types of vulnerabilities that are slightly 
+different to
+check. In the previous part we explained how to reason about 
+intervals of 
+values to find buffer overflows in program. We presented an 
+optimization
+technique called Widening and we have studied how to weaken it for 
+gaining
+precision, by generating a threshold list from a set of predicates. 
+Note that
+we havent explicitely used what is called the "predicate 
+abstraction", which
+may lead to improving the efficiency of the analysis again. The 
+interested
+reader will for sure find resources about predicate abstraction on 
+any good
+research oriented search engine. Again, this article is not 
+intended to give
+all solutions of the problem of the world, but introduce the novice 
+hacker
+to the concrete problematic of program analysis.
+
+In this part of the article, we will study how to detect memory 
+leaks and
+heap corruptions. The basic technique to find them is not linked 
+with interval
+analysis, but interval analysis can be used to make type state 
+checking more
+accurate (reducing the number of false positives). 
+
+Lets take an example of memory leak to be concrete:
+
+
+Stub 8:
+-------
+
+1. u_int off  = 0;
+2. u_int ret  = MAXBUF;
+3. char  *buf = malloc(ret);
+
+4. do {
+5.     off += read(sock, buf + off, ret - off);
+6.     if (off == 0)
+7.       return (-ERR);
+8.     else if (ret == off)
+9.       buf = realloc(buf, ret * 2);
+10.} while (ret);
+
+11. printf("Received %s \n", buf);
+12. free(buf);
+13. return;
+
+
+
+In that case, there is no overflow but if some condition appears 
+after the read, an error
+is returned without freeing the buffer. This is not a vulnerability 
+as it, but it can
+help a lot for managing the memory layout of the heap while trying 
+to exploit a heap
+overflow vulnerability. Thus, we are also interested in detecting 
+memory leak that
+turns some particular exploits into powerful weapons.
+
+Using the graphical representation of control flow and data flow, 
+we can easily
+find out that the code is wrong:
+
+
+Graph analysis of Stub 8
+------------------------
+
+
+	o A				A: Allocation
+	|				
+	|
+	o<----
+        |     \  
+        o      \
+       / \      \
+      /   \      \			R: Return
+   R o     o REA /			REA: Realloc
+      \   /     /
+       \ /     /
+        o     /
+        |    /
+        |   /
+        |  /
+        | /
+        |/
+        o
+        |				F: Free
+      F o
+        | 
+      R o				R: Return
+
+
+
+Note that this representation is not a data flow graph but a
+control-flow graph annotated with data allocation information for
+the BUF variable. This allows us to reason about existing control 
+paths and sequence of memory related events. Another way of doing 
+this would have been to reason about data dependences together with
+the predicates, as done in the first part of this article with the 
+Labelled SSI form. We are not dogmatic towards one or another 
+intermediate form, and the reader is invited to ponder by himself 
+which representation fits better to his understanding. I invite
+you to think twice about the SSI form which is really a condensed
+view of lots of different information. For pedagogical purpose, we
+switch here to a more intuitive intermediate form that express a 
+similar class of problems.
+
+
+Stub 8:
+-------
+
+
+0. #define PACKET_HEADER_SIZE 20
+
+1. int   off  = 0;
+2. u_int ret  = 10;
+3. char  *buf = malloc(ret);				M
+
+4. do {
+5.     off += read(sock, buf + off, ret - off);
+6.     if (off <= 0)
+7.       return (-ERR);					R
+8.     else if (ret == off)
+9.       buf = realloc(buf, (ret = ret * 2));		REA
+10.} while (off != PACKET_HEADER_SIZE);
+
+11. printf("Received %s \n", buf);
+12. free(buf);						F
+13. return;						R
+
+
+Using simple DFS (Depth-First Search) over the graph representing 
+Stub 8, 
+we are capable of extracting sequences like:
+
+
+1,2,(3 M),4,5,6,8,10,11,(12 F),(12 R)		M...F...R	-noleak-
+
+1,2,(3 M),4,(5,6,8,10)*,11,(12 F),(12 R)	M(...)*F...R	-noleak-
+
+1,2,(3 M),4,5,6,8,10,5,6,(7 R)			M...R		-leak-
+
+1,2,(3 M),(4,5,6,8,10)*,5,6,(7 R)		M(...)*R	-leak-
+
+1,2,(3 M),4,5,6,8,(9 REA),10,5,6,(7 R)		M...REA...R	-leak-
+
+1,2,(3 M),4,5,6,(7 R)				M...R		-leak-
+
+etc
+
+More generally, we can represent the set of all possible traces for
+this example :
+
+
+		1,2,3,(5,6,(7 | 8(9 | Nop)) 10)*,(11,12,13)*
+
+
+with | meaning choice and * meaning potential looping over the 
+events
+placed between (). As the program might loop more than once or 
+twice,
+a lot of different traces are potentially vulnerable to the memory 
+leak
+(not only the few we have given), but all can be expressed using 
+this
+global generic regular expression over events of the loop, with 
+respect
+to this regular expression:
+
+
+			.*(M)[^F]*(R)
+
+
+that represent traces containing a malloc followed by a return 
+without 
+an intermediate free, which corresponds in our program to:
+
+
+			.*(3)[^12]*(7)
+
+		  =	.*(3).*(7)
+
+
+In other words, if we can extract a trace that leads to a return 
+after passing
+by an allocation not followed by a free (with an undetermined 
+number of states
+between those 2 steps), we found a memory leak bug.
+
+We can then compute the intersection of the global regular 
+expression trace
+and the vulnerable traces regular expression to extract all 
+potential 
+vulnerable path from a language of traces. In practice, we will not 
+generate
+all vulnerable traces but simply emit a few of them, until we find 
+one that
+we can indeed trigger. 
+
+Clearly, the first two trace have a void intersection (they dont 
+contain 7). So
+those traces are not vulnerable. However, the next traces 
+expressions match
+the pattern, thus are potential vulnerable paths for this 
+vulnerability.
+
+We could use the exact same system for detecting double free, 
+except that
+our trace pattern would be :
+
+			
+			.*(F)[^A]*(F)
+
+
+that is : a free followed by a second free on the same dataflow, 
+not passing
+through an allocation between those. A simple trace-based analyzer 
+can detect
+many cases of vulnerabilities using a single engine ! That 
+superclass of 
+vulnerability is made of so called type-state vulnerabilities, 
+following the idea that
+if the type of a variable does not change during the program, its 
+state does,
+thus the standard type checking approach is not sufficient to 
+detect this kind of 
+vulnerabilities.
+		
+
+As the careful reader might have noticed, this algorithm does not 
+take predicates
+in account, which means that if such a vulnerable trace is emitted, 
+we have no 
+garantee if the real conditions of the program will ever execute 
+it. Indeed, we 
+might extract a path of the program that "cross" on multiple 
+predicates, some
+being incompatible with others, thus generating infeasible paths 
+using our
+technique.
+
+For example in our Stub 8 translated to assembly code, a predicate-
+insensitive 
+analysis might generate the trace:
+
+		1,2,3,4,5,6,8,9,10,11,12,13
+
+which is impossible to execute because predicates holding at states 
+8 and 10 
+cannot be respectively true and false after just one iteration of 
+the loop. Thus 
+such a trace cannot exist in the real world. 
+ 
+
+We will not go further this topic for this article, but in the next 
+part, we will
+discuss various improvements of what should be a good analysis 
+engine to avoid
+generating too much false positives.
+
+
+
+------------[ C. How to improve
+
+
+	In this part, we will review various methods quickly to determine 
+how exactly
+it is possible to make the analysis more accurate and efficient. 
+Current researchers
+in program analysis used to call this a "counter-example guided" 
+verification. Various
+techniques taken from the world of Model Checking or Abstract 
+Interpretation can then
+be used, but we will not enter such theoretical concerns. Simply, 
+we will discuss the
+ideas of those techniques without entering details. The proposed 
+chevarista analyzer
+in appendix of this article only perform basic alias analysis, no 
+predicate analysis,
+and no thread scheduling analysis (as would be useful for detecting 
+race conditions).
+I will give the name of few analyzer that implement this analysis 
+and quote which
+techniques they are using.
+
+
+-------[ Predicate analysis and the predicate lattice
+
+
+Predicate abstraction is about collecting all the predicates in a 
+program, and
+constructing a mathematic object from this list called a lattice. A 
+lattice is
+a set of objects on which a certain (partial) order is defined 
+between elements
+of this set. A lattice has various theoretical properties that 
+makes it different
+than a partial order, but we will not give such details in this 
+article. We will
+discuss about the order itself and the types of objects we are 
+talking about:
+
+	- The order can be defined as the union of objects 
+
+				(P < Q iif P is included in Q)
+
+	- The objects can be predicates
+
+
+	- The conjunction (AND) of predicate can be the least upper bound 
+of N
+	predicates. Predicates (a > 42) and (b < 2) have as upper bound:
+
+				(a > 42) && (b < 2)
+
+	- The disjunction (OR) of predicates can be the greatest lower 
+bound of
+	N predicates. Predicates (a > 42) and (b < 2) would have as lower
+	bound:
+
+				(a > 42) || (b < 2)
+
+	So the lattice would look like:
+
+
+				(a > 42) && (b < 2)
+					/  \
+				       /    \
+				      /      \
+				(a > 42)     (b < 2)
+				      \      /
+                                       \    /
+                                        \  /
+	                        (a > 42) || (b < 2)
+
+
+Now imagine we have a program that have N predicates. If all 
+predicates
+can be true at the same time, the number of combinations between 
+predicates
+will be 2 at the power of N. THis is without counting the lattice 
+elements
+which are disjunctions between predicates. The total number of 
+combinations 
+will then be then 2*2pow(N) - N : We have to substract N because 
+the predicates
+made of a single atomic predicates are shared between the set of 
+conjunctives
+and the set of disjunctive predicates, which both have 2pow(N) 
+number of 
+elements including the atomic predicates, which is the base case 
+for a conjunction
+(pred && true) or a disjunction (pred || false). 
+
+We may also need to consider the other values of predicates : 
+false, and unknown.
+False would simply be the negation of a predicate, and unknown 
+would inform about
+the unknown truth value for a predicate (either false or true, but 
+we dont know).
+In that case, the number of possible combinations between 
+predicates is to count
+on the number of possible combinations of N predicates, each of 
+them being potentially
+true, false, or unknown. That makes up to 3pow(N) possibilities. 
+This approach is called
+three-valued logic.
+
+In other words, we have a exponential worse case space complexity 
+for constructing 
+the lattice of predicates that correspond to an analyzed program. 
+Very often, the 
+lattice will be smaller, as many predicates cannot be true at the 
+same time. However, 
+there is a big limitation in such a lattice: it is not capable to 
+analyze predicates 
+that mix AND and OR. It means that if we analyze a program that can 
+be reached using 
+many different set of predicates (say, by executing many different 
+possible paths, 
+which is the case for reusable functions), this lattice will not be 
+capable to give 
+the most precise "full" abstract representation for it, as it may 
+introduce some 
+flow-insensitivity in the analysis (e.g. a single predicate 
+combinations will represent 
+multiple different paths). As this might generate false positives, 
+it looks like a good 
+trade-off between precision and complexity. Of course, this lattice 
+is just provided as 
+an example and the reader should feel free to adapt it to its 
+precise needs and depending 
+on the size of the code to be verified. It is a good hint for a 
+given abstraction
+but we will see that other information than predicates are 
+important for program
+analysis.
+
+
+	
+---------[ Alias analysis is hard
+
+
+	A problem that arises in both source code but even more in binary 
+code
+automated auditing is the alias analysis between pointers. When do 
+pointers
+points on the same variables ? 
+
+		<FIXME>
+
+
+---------[ Hints on detecting race conditions
+
+
+	Another class of vulnerability that we are interested to detect
+automatically are race conditions. Those vulnerability requires a 
+different
+analysis to be discovered, as they relates to a scheduling property 
+: is
+it possible that 2 thread get interleaved (a,b,a,b) executions over 
+their
+critical sections where they share some variables ? If the 
+variables are
+all well locked, interleaved execution wont be a problem anyway. 
+But if 
+locking is badly handled (as it can happens in very big programs 
+such
+as Operating Systems), then a scheduling analysis might uncover the 
+problem.
+
+Which data structure can we use to perform such analysis ? The 
+approach
+of JavaPathFinder that is developed at NASA is to use a scheduling 
+graph.
+The scheduling graph is a non-cyclic (without loop) graph, where 
+nodes
+represents states of the program and and edges represents scheduling
+events that preempt the execution of one thread for executing 
+another.
+
+As this approach seems interesting to detect any potential 
+scheduling
+path (using again a Depth First Search over the scheduling graph) 
+that
+fails to lock properly a variable that is used in multiple different
+threads, it seems to be more delicate to apply it when we deal with
+more than 2 threads. Each potential node will have as much edges as
+there are threads, thus the scheduling graph will grow exponentially
+at each scheduling step. We could use a technique called partial
+order reduction to represent by a single node a big piece of code
+for which all instructions share the same scheduling property (like:
+it cannot be interrupted) or a same dataflow property (like: it uses
+the same set of variables) thus reducing the scheduling graph to 
+make
+it more abstract.
+
+
+-------------------[ IV. Chevarista: an analyzer of binary programs
+
+
+	
+   Chevarista is a project for analyzing binary code. In this 
+article, most of
+   the examples have been given in C or assembly, but Chevarista 
+only analyze
+   the binary code without any information from the source. 
+Everything it
+   needs is an entry point to start the analysis, which you can 
+always get
+   without troubles, for any (working ? ;) binary format like ELF, 
+PE, etc.
+
+   Chevarista is a simplier analyzer than everything that was 
+presented in
+   this article, however it aims at following this model, driven by 
+the succesful
+   results that were obtained using the current tool. In 
+particular, the
+   intermediate form of Chevarista at the moment is a graph that 
+contains
+   both data-flow and control-flow information, but with sigma and 
+phi 
+   functions let implicit.
+
+   For simplicity, we have chosen to work on SPARc binary code, but 
+after
+   reading that article, you might understand that the 
+representations
+   used are sufficiently abstract to be used on any architecture. 
+One could
+   argue that SPARC instruction set is RISC, and supporting CISC 
+architecture 
+   like INTEL or ARM where most of the instruction are conditional, 
+would be
+   a problem. You are right to object on this because  these 
+architectures
+   requires specific features of the architecture-dependant backend 
+of
+   the decompiler-analyzer. Currently, only the SPARc backend is 
+coded and there 
+   is an empty skeleton for the INTEL architecture.
+
+   What are, in the detail, the difference between such 
+architectures ?
+
+   They are essentially grouped into a single architecture-
+dependant component :
+	
+				The Backend
+
+   On INTEL 32bits processors, each instruction can perform 
+multiple operations. 
+   It is also the case for SPARC, but only when conditional flags 
+are affected 
+   by the result of the operation executed by the instruction. But 
+this is 
+   especially relevant for INTEL where instructions are more 
+complex. 
+
+   Lets take a simple example:
+
+
+--------------------- WIP ---------------
+
+   SPARC code			INTEL code		ARM code
+   ----------			----------		--------
+
+   st %g1, -4(%sp)		push %eax		
+   sub 4, %esp	
+
+
+   (...)
+
+
+			<FIXME>
+
+(...)
+
+
+between the involved variables: Was it an arithmetic operation ? 
+(+, -, *, /,
+%, etc) or a logic operation (bit resetting, shifting or testing) ?
+
+Most of the time, we want to analyze different pools of 
+instructions depending
+on their effect on the environment (which include the content of 
+memory and
+the value of registers, including the program counter)
+
+
+(...)
+
+-------------------------------------------
+
+   a/ Project modelization
+
+	<FIXME>
+
+   b/ Program transformation
+
+	<FIXME>
+
+   c/ Vulnerability checking
+
+	<FIXME>
+
+   d/ Vulnerable paths extraction
+
+	<FIXME>
+
+   e/ Future work : Refinement
+
+	
+	The final step of the analysis is refinement. Once you have 
+analyzed
+   a program for vulnerabilities and we have extracted the path of 
+the program
+   that looks like leading to a corruption, we need to recreate the 
+real conditions
+   of triggering the bug in the reality, and not in an abstract 
+description of the
+   program, as we did in that article. For this, we need to execute 
+for real (this
+   time) the program, and try to feed it with data that are deduced 
+from the 
+   conditional predicates that are on the abstract path of the 
+program that leads to
+   the potential vulnerability. The input values that we would give 
+to the program
+   must pass all the tests that are on the way of reaching the bug 
+in the real world.
+
+ 
+
+---------------[ V. Related Work
+
+
+
+	Almost no project about this topic has been initiated by the 
+underground. The
+	work of Nergal on finding integer overflow into Win32 binaries is 
+the first
+	notable attempt to mix research knowledge and reverse engineering 
+knowledge,
+	using a decompiler and a model checker. The work from Halvar Flake 
+in the framework 
+	of BinDiff/BinNavi is interesting but serves until now a different 
+purpose than 
+	finding vulnerabilities in binary code.
+
+	On a more theoretical point of view, the interested reader is 
+invited to look
+	at the reference for findings a lot of major readings in the field 
+of program
+	analysis. Automated reverse engineering, or decompiling, has been 
+studied in
+	the last 10 years only and the gap is still not completely filled 
+between those
+	2 worlds. This article tried to go into that direction by 
+introducing formal
+	techniques using a completely informal view.
+
+	Mostly 2 different theories can be studied : Model Checking and 
+Abstract 
+	Interpretation. Model Checking generally involves temporal logic 
+properties
+	expressed in languages such as LTL, CTL, or CTL*. Those properties 
+are then
+	translated to automata. Traces are then used as words and having 
+the automata
+	not recognizing a given trace will mean breaking a property. In 
+practice, the
+	formula is negated, so that the resulting automata will only 
+recognize the trace
+	leading to vulnerabilities, which sounds a more natural approach 
+for detecting
+	vulnerabilities. 
+
+	Abstract interpretation is about finding the most adequate system 
+representation 
+	for allowing the checking to be computable in a reasonable time 
+(else we might 
+	end up doing an "exhaustive bruteforce checking" if we try to 
+check all the potential
+ 	behavior of the program, which can be infinite). By reasoning 
+into an abstract
+	domain, we make the state-space to be finite (or at least reduced, 
+compared to the 
+	real state space) which turn our analysis to be tractable. The 
+strongest the
+	abstractions are, the fastest and imprecise our analysis will be. 
+All the job
+	consist in finding the best (when possible) or an approximative 
+abstraction that
+	is precise enough and strong enough to give results in seconds or 
+minuts.
+
+	In this article, we have presented some abstractions without 
+quoting them explicitely
+	(interval abstraction, trace abstraction, predicate abstraction 
+...). You can also
+	design product domains, where multiple abstractions are considered 
+at the same time,
+	which gives the best results, but for which automated procedures 
+requires more work
+	to be defined.
+
+
+------[ VI. Conclusion
+
+
+	I Hope to have encouraged the underground community to think about 
+using more
+	formal techniques for the discovery of bugs in programs. I do not 
+include this
+	dream automated tool, but a simplier one that shows this approach 
+as rewarding,
+	and I look forward seing more automated tools from the reverse 
+engineering 
+	community in the future. The chevarista analyzer will not be 
+continued as it, 
+	but is being reimplemented into a different analysis environment, 
+on top of a
+	dedicated language for reverse engineering and decompilation of 
+machine code.
+	Feel free to hack inside the code, you dont have to send me 
+patches as I do not
+	use this tool anymore for my own vulnerability auditing. I do not 
+wish to encourage
+	script kiddies into using such tools, as they will not know how to 
+exploit the
+	results anyway (no, this does not give you a root shell).
+
+
+------[ VII. Greetings
+
+	
+	None.
+
+
+------[ VIII. References
+
+
+ [2] TVLA
+  
+ [3] Abstract Interpretation
+
+ [4] Model CHecking
+
+ [5] Counterexample-guided refinement
+
+ [6] BinNavi
+
+ [7] JavaPathFinder
+
+ [8] UQBT-ng
+
+ [9] SSA
+  
+ [10] SSI
+
+ [11] Modern compiler implementation
+
+ [12] Blast model checker
+
+ [13] Autodafe
+
+ [14] Temporal logic
+
+ [15] ASTREE static analyzer
+
+
+
+
+------[ IX. The code    
+
+<FIXME>
+
+--
+Click here for low rates and flexible payments on interest only loans.
+http://tagline.hushmail.com/fc/CAaCXv1KoJOkRyIayQcDFpaDEihONBIz/
+
+_______________________________________________
+Full-Disclosure - We believe in it.
+Charter: http://lists.grok.org.uk/full-disclosure-charter.html
+Hosted and sponsored by Secunia - http://secunia.com/
