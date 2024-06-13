@@ -1,0 +1,664 @@
+diff --git a/src/Symfony/Bridge/ProxyManager/LazyProxy/PhpDumper/ProxyDumper.php b/src/Symfony/Bridge/ProxyManager/LazyProxy/PhpDumper/ProxyDumper.php
+index 480a5a598aa8..4ee40def66b1 100644
+--- a/src/Symfony/Bridge/ProxyManager/LazyProxy/PhpDumper/ProxyDumper.php
++++ b/src/Symfony/Bridge/ProxyManager/LazyProxy/PhpDumper/ProxyDumper.php
+@@ -58,7 +58,7 @@ public function getProxyFactoryCode(Definition $definition, $id, $factoryCode =
+         $instantiation = 'return';
+ 
+         if ($definition->isShared()) {
+-            $instantiation .= sprintf(' $this->%s[\'%s\'] =', \method_exists(ContainerBuilder::class, 'addClassResource') || ($definition->isPublic() && !$definition->isPrivate()) ? 'services' : 'privates', $id);
++            $instantiation .= sprintf(' $this->%s[%s] =', \method_exists(ContainerBuilder::class, 'addClassResource') || ($definition->isPublic() && !$definition->isPrivate()) ? 'services' : 'privates', var_export($id, true));
+         }
+ 
+         if (null === $factoryCode) {
+diff --git a/src/Symfony/Component/DependencyInjection/ContainerBuilder.php b/src/Symfony/Component/DependencyInjection/ContainerBuilder.php
+index 72307464a7b5..e6a2aa0531ea 100644
+--- a/src/Symfony/Component/DependencyInjection/ContainerBuilder.php
++++ b/src/Symfony/Component/DependencyInjection/ContainerBuilder.php
+@@ -868,6 +868,10 @@ public function setAlias($alias, $id)
+     {
+         $alias = $this->normalizeId($alias);
+ 
++        if ('' === $alias || '\\' === substr($alias, -1) || \strlen($alias) !== strcspn($alias, "\0\r\n'")) {
++            throw new InvalidArgumentException(sprintf('Invalid alias id: "%s"', $alias));
++        }
++
+         if (\is_string($id)) {
+             $id = new Alias($this->normalizeId($id));
+         } elseif (!$id instanceof Alias) {
+@@ -1021,6 +1025,10 @@ public function setDefinition($id, Definition $definition)
+ 
+         $id = $this->normalizeId($id);
+ 
++        if ('' === $id || '\\' === substr($id, -1) || \strlen($id) !== strcspn($id, "\0\r\n'")) {
++            throw new InvalidArgumentException(sprintf('Invalid service id: "%s"', $id));
++        }
++
+         unset($this->aliasDefinitions[$id], $this->removedIds[$id]);
+ 
+         return $this->definitions[$id] = $definition;
+diff --git a/src/Symfony/Component/DependencyInjection/Dumper/PhpDumper.php b/src/Symfony/Component/DependencyInjection/Dumper/PhpDumper.php
+index 0a1385ecc4a0..73c868f1e54c 100644
+--- a/src/Symfony/Component/DependencyInjection/Dumper/PhpDumper.php
++++ b/src/Symfony/Component/DependencyInjection/Dumper/PhpDumper.php
+@@ -483,7 +483,7 @@ private function addServiceInstance($id, Definition $definition, $isSimpleInstan
+         $instantiation = '';
+ 
+         if (!$isProxyCandidate && $definition->isShared()) {
+-            $instantiation = "\$this->services['$id'] = ".($isSimpleInstance ? '' : '$instance');
++            $instantiation = sprintf('$this->services[%s] = %s', $this->doExport($id), $isSimpleInstance ? '' : '$instance');
+         } elseif (!$isSimpleInstance) {
+             $instantiation = '$instance';
+         }
+@@ -679,6 +679,9 @@ private function addService($id, Definition $definition, &$file = null)
+      * Gets the $public '$id'$shared$autowired service.
+      *
+      * $return
++EOF;
++            $code = str_replace('*/', ' ', $code).<<<EOF
++
+      */
+     protected function {$methodName}($lazyInitialization)
+     {
+@@ -693,7 +696,7 @@ protected function {$methodName}($lazyInitialization)
+ 
+         if ($this->getProxyDumper()->isProxyCandidate($definition)) {
+             $factoryCode = $asFile ? "\$this->load('%s.php', false)" : '$this->%s(false)';
+-            $code .= $this->getProxyDumper()->getProxyFactoryCode($definition, $id, sprintf($factoryCode, $methodName));
++            $code .= $this->getProxyDumper()->getProxyFactoryCode($definition, $id, sprintf($factoryCode, $methodName, $this->doExport($id)));
+         }
+ 
+         if ($definition->isDeprecated()) {
+@@ -767,14 +770,14 @@ private function addInlineReference($id, Definition $definition, $targetId, $for
+ 
+         $code .= sprintf(<<<'EOTXT'
+ 
+-        if (isset($this->%s['%s'])) {
+-            return $this->%1$s['%2$s'];
++        if (isset($this->%s[%s])) {
++            return $this->%1$s[%2$s];
+         }
+ 
+ EOTXT
+             ,
+             'services',
+-            $id
++            $this->doExport($id)
+         );
+ 
+         return $code;
+@@ -1530,14 +1533,14 @@ private function getServiceConditionals($value)
+             if (!$this->container->hasDefinition($service)) {
+                 return 'false';
+             }
+-            $conditions[] = sprintf("isset(\$this->services['%s'])", $service);
++            $conditions[] = sprintf('isset($this->services[%s])', $this->doExport($service));
+         }
+         foreach (ContainerBuilder::getServiceConditionals($value) as $service) {
+             if ($this->container->hasDefinition($service) && !$this->container->getDefinition($service)->isPublic()) {
+                 continue;
+             }
+ 
+-            $conditions[] = sprintf("\$this->has('%s')", $service);
++            $conditions[] = sprintf('$this->has(%s)', $this->doExport($service));
+         }
+ 
+         if (!$conditions) {
+@@ -1776,6 +1779,8 @@ private function dumpLiteralClass($class)
+      */
+     private function dumpParameter($name)
+     {
++        $name = (string) $name;
++
+         if ($this->container->isCompiled() && $this->container->hasParameter($name)) {
+             $value = $this->container->getParameter($name);
+             $dumpedValue = $this->dumpValue($value, false);
+@@ -1785,11 +1790,11 @@ private function dumpParameter($name)
+             }
+ 
+             if (!preg_match("/\\\$this->(?:getEnv\('(?:\w++:)*+\w++'\)|targetDirs\[\d++\])/", $dumpedValue)) {
+-                return sprintf("\$this->parameters['%s']", $name);
++                return sprintf('$this->parameters[%s]', $this->doExport($name));
+             }
+         }
+ 
+-        return sprintf("\$this->getParameter('%s')", $name);
++        return sprintf('$this->getParameter(%s)', $this->doExport($name));
+     }
+ 
+     /**
+@@ -1813,7 +1818,7 @@ private function getServiceCall($id, Reference $reference = null)
+ 
+         if ($this->container->hasDefinition($id) && $definition = $this->container->getDefinition($id)) {
+             if ($definition->isSynthetic()) {
+-                $code = sprintf('$this->get(\'%s\'%s)', $id, null !== $reference ? ', '.$reference->getInvalidBehavior() : '');
++                $code = sprintf('$this->get(%s%s)', $this->doExport($id), null !== $reference ? ', '.$reference->getInvalidBehavior() : '');
+             } elseif (null !== $reference && ContainerInterface::IGNORE_ON_UNINITIALIZED_REFERENCE === $reference->getInvalidBehavior()) {
+                 $code = 'null';
+                 if (!$definition->isShared()) {
+@@ -1822,7 +1827,7 @@ private function getServiceCall($id, Reference $reference = null)
+             } elseif ($this->isTrivialInstance($definition)) {
+                 $code = substr($this->addNewInstance($definition, '', '', $id), 8, -2);
+                 if ($definition->isShared()) {
+-                    $code = sprintf('$this->services[\'%s\'] = %s', $id, $code);
++                    $code = sprintf('$this->services[%s] = %s', $this->doExport($id), $code);
+                 }
+                 $code = "($code)";
+             } elseif ($this->asFiles && $definition->isShared() && !$this->isHotPath($definition)) {
+@@ -1833,14 +1838,14 @@ private function getServiceCall($id, Reference $reference = null)
+         } elseif (null !== $reference && ContainerInterface::IGNORE_ON_UNINITIALIZED_REFERENCE === $reference->getInvalidBehavior()) {
+             return 'null';
+         } elseif (null !== $reference && ContainerInterface::EXCEPTION_ON_INVALID_REFERENCE !== $reference->getInvalidBehavior()) {
+-            $code = sprintf('$this->get(\'%s\', /* ContainerInterface::NULL_ON_INVALID_REFERENCE */ %d)', $id, ContainerInterface::NULL_ON_INVALID_REFERENCE);
++            $code = sprintf('$this->get(%s, /* ContainerInterface::NULL_ON_INVALID_REFERENCE */ %d)', $this->doExport($id), ContainerInterface::NULL_ON_INVALID_REFERENCE);
+         } else {
+-            $code = sprintf('$this->get(\'%s\')', $id);
++            $code = sprintf('$this->get(%s)', $this->doExport($id));
+         }
+ 
+         // The following is PHP 5.5 syntax for what could be written as "(\$this->services['$id'] ?? $code)" on PHP>=7.0
+ 
+-        return "\${(\$_ = isset(\$this->services['$id']) ? \$this->services['$id'] : $code) && false ?: '_'}";
++        return sprintf("\${(\$_ = isset(\$this->services[%s]) ? \$this->services[%1\$s] : %s) && false ?: '_'}", $this->doExport($id), $code);
+     }
+ 
+     /**
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/ContainerBuilderTest.php b/src/Symfony/Component/DependencyInjection/Tests/ContainerBuilderTest.php
+index 40afaa169d02..73cb670cdb12 100644
+--- a/src/Symfony/Component/DependencyInjection/Tests/ContainerBuilderTest.php
++++ b/src/Symfony/Component/DependencyInjection/Tests/ContainerBuilderTest.php
+@@ -195,6 +195,38 @@ public function testNonSharedServicesReturnsDifferentInstances()
+         $this->assertNotSame($builder->get('bar'), $builder->get('bar'));
+     }
+ 
++    /**
++     * @expectedException \Symfony\Component\DependencyInjection\Exception\InvalidArgumentException
++     * @dataProvider provideBadId
++     */
++    public function testBadAliasId($id)
++    {
++        $builder = new ContainerBuilder();
++        $builder->setAlias($id, 'foo');
++    }
++
++    /**
++     * @expectedException \Symfony\Component\DependencyInjection\Exception\InvalidArgumentException
++     * @dataProvider provideBadId
++     */
++    public function testBadDefinitionId($id)
++    {
++        $builder = new ContainerBuilder();
++        $builder->setDefinition($id, new Definition('Foo'));
++    }
++
++    public function provideBadId()
++    {
++        return [
++            [''],
++            ["\0"],
++            ["\r"],
++            ["\n"],
++            ["'"],
++            ['ab\\'],
++        ];
++    }
++
+     /**
+      * @expectedException        \Symfony\Component\DependencyInjection\Exception\RuntimeException
+      * @expectedExceptionMessage You have requested a synthetic service ("foo"). The DIC does not know how to construct this service.
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/Dumper/PhpDumperTest.php b/src/Symfony/Component/DependencyInjection/Tests/Dumper/PhpDumperTest.php
+index 6d985eaca360..761f7ef4dd08 100644
+--- a/src/Symfony/Component/DependencyInjection/Tests/Dumper/PhpDumperTest.php
++++ b/src/Symfony/Component/DependencyInjection/Tests/Dumper/PhpDumperTest.php
+@@ -234,12 +234,18 @@ public function testAddServiceIdWithUnsupportedCharacters()
+     {
+         $class = 'Symfony_DI_PhpDumper_Test_Unsupported_Characters';
+         $container = new ContainerBuilder();
++        $container->setParameter("'", 'oh-no');
++        $container->register("foo*/oh-no", 'FooClass')->setPublic(true);
+         $container->register('bar$', 'FooClass')->setPublic(true);
+         $container->register('bar$!', 'FooClass')->setPublic(true);
+         $container->compile();
+         $dumper = new PhpDumper($container);
+-        eval('?>'.$dumper->dump(['class' => $class]));
+ 
++        $this->assertStringEqualsFile(self::$fixturesPath.'/php/services_unsupported_characters.php', $dumper->dump(['class' => $class]));
++
++        require_once self::$fixturesPath.'/php/services_unsupported_characters.php';
++
++        $this->assertTrue(method_exists($class, 'getFooOhNoService'));
+         $this->assertTrue(method_exists($class, 'getBarService'));
+         $this->assertTrue(method_exists($class, 'getBar2Service'));
+     }
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services33.php b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services33.php
+index 98e34bc9b1f5..d4019a50a7ed 100644
+--- a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services33.php
++++ b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services33.php
+@@ -66,7 +66,7 @@ public function isFrozen()
+      */
+     protected function getFooService()
+     {
+-        return $this->services['Bar\Foo'] = new \Bar\Foo();
++        return $this->services['Bar\\Foo'] = new \Bar\Foo();
+     }
+ 
+     /**
+@@ -76,6 +76,6 @@ protected function getFooService()
+      */
+     protected function getFoo2Service()
+     {
+-        return $this->services['Foo\Foo'] = new \Foo\Foo();
++        return $this->services['Foo\\Foo'] = new \Foo\Foo();
+     }
+ }
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_adawson.php b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_adawson.php
+index f222fc6e606f..7986897d375a 100644
+--- a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_adawson.php
++++ b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_adawson.php
+@@ -88,10 +88,10 @@ public function isFrozen()
+      */
+     protected function getBusService()
+     {
+-        $this->services['App\Bus'] = $instance = new \App\Bus(${($_ = isset($this->services['App\Db']) ? $this->services['App\Db'] : $this->getDbService()) && false ?: '_'});
++        $this->services['App\\Bus'] = $instance = new \App\Bus(${($_ = isset($this->services['App\\Db']) ? $this->services['App\\Db'] : $this->getDbService()) && false ?: '_'});
+ 
+-        $instance->handler1 = ${($_ = isset($this->services['App\Handler1']) ? $this->services['App\Handler1'] : $this->getHandler1Service()) && false ?: '_'};
+-        $instance->handler2 = ${($_ = isset($this->services['App\Handler2']) ? $this->services['App\Handler2'] : $this->getHandler2Service()) && false ?: '_'};
++        $instance->handler1 = ${($_ = isset($this->services['App\\Handler1']) ? $this->services['App\\Handler1'] : $this->getHandler1Service()) && false ?: '_'};
++        $instance->handler2 = ${($_ = isset($this->services['App\\Handler2']) ? $this->services['App\\Handler2'] : $this->getHandler2Service()) && false ?: '_'};
+ 
+         return $instance;
+     }
+@@ -103,9 +103,9 @@ protected function getBusService()
+      */
+     protected function getDbService()
+     {
+-        $this->services['App\Db'] = $instance = new \App\Db();
++        $this->services['App\\Db'] = $instance = new \App\Db();
+ 
+-        $instance->schema = ${($_ = isset($this->services['App\Schema']) ? $this->services['App\Schema'] : $this->getSchemaService()) && false ?: '_'};
++        $instance->schema = ${($_ = isset($this->services['App\\Schema']) ? $this->services['App\\Schema'] : $this->getSchemaService()) && false ?: '_'};
+ 
+         return $instance;
+     }
+@@ -117,13 +117,13 @@ protected function getDbService()
+      */
+     protected function getHandler1Service()
+     {
+-        $a = ${($_ = isset($this->services['App\Processor']) ? $this->services['App\Processor'] : $this->getProcessorService()) && false ?: '_'};
++        $a = ${($_ = isset($this->services['App\\Processor']) ? $this->services['App\\Processor'] : $this->getProcessorService()) && false ?: '_'};
+ 
+-        if (isset($this->services['App\Handler1'])) {
+-            return $this->services['App\Handler1'];
++        if (isset($this->services['App\\Handler1'])) {
++            return $this->services['App\\Handler1'];
+         }
+ 
+-        return $this->services['App\Handler1'] = new \App\Handler1(${($_ = isset($this->services['App\Db']) ? $this->services['App\Db'] : $this->getDbService()) && false ?: '_'}, ${($_ = isset($this->services['App\Schema']) ? $this->services['App\Schema'] : $this->getSchemaService()) && false ?: '_'}, $a);
++        return $this->services['App\\Handler1'] = new \App\Handler1(${($_ = isset($this->services['App\\Db']) ? $this->services['App\\Db'] : $this->getDbService()) && false ?: '_'}, ${($_ = isset($this->services['App\\Schema']) ? $this->services['App\\Schema'] : $this->getSchemaService()) && false ?: '_'}, $a);
+     }
+ 
+     /**
+@@ -133,13 +133,13 @@ protected function getHandler1Service()
+      */
+     protected function getHandler2Service()
+     {
+-        $a = ${($_ = isset($this->services['App\Processor']) ? $this->services['App\Processor'] : $this->getProcessorService()) && false ?: '_'};
++        $a = ${($_ = isset($this->services['App\\Processor']) ? $this->services['App\\Processor'] : $this->getProcessorService()) && false ?: '_'};
+ 
+-        if (isset($this->services['App\Handler2'])) {
+-            return $this->services['App\Handler2'];
++        if (isset($this->services['App\\Handler2'])) {
++            return $this->services['App\\Handler2'];
+         }
+ 
+-        return $this->services['App\Handler2'] = new \App\Handler2(${($_ = isset($this->services['App\Db']) ? $this->services['App\Db'] : $this->getDbService()) && false ?: '_'}, ${($_ = isset($this->services['App\Schema']) ? $this->services['App\Schema'] : $this->getSchemaService()) && false ?: '_'}, $a);
++        return $this->services['App\\Handler2'] = new \App\Handler2(${($_ = isset($this->services['App\\Db']) ? $this->services['App\\Db'] : $this->getDbService()) && false ?: '_'}, ${($_ = isset($this->services['App\\Schema']) ? $this->services['App\\Schema'] : $this->getSchemaService()) && false ?: '_'}, $a);
+     }
+ 
+     /**
+@@ -149,13 +149,13 @@ protected function getHandler2Service()
+      */
+     protected function getProcessorService()
+     {
+-        $a = ${($_ = isset($this->services['App\Registry']) ? $this->services['App\Registry'] : $this->getRegistryService()) && false ?: '_'};
++        $a = ${($_ = isset($this->services['App\\Registry']) ? $this->services['App\\Registry'] : $this->getRegistryService()) && false ?: '_'};
+ 
+-        if (isset($this->services['App\Processor'])) {
+-            return $this->services['App\Processor'];
++        if (isset($this->services['App\\Processor'])) {
++            return $this->services['App\\Processor'];
+         }
+ 
+-        return $this->services['App\Processor'] = new \App\Processor($a, ${($_ = isset($this->services['App\Db']) ? $this->services['App\Db'] : $this->getDbService()) && false ?: '_'});
++        return $this->services['App\\Processor'] = new \App\Processor($a, ${($_ = isset($this->services['App\\Db']) ? $this->services['App\\Db'] : $this->getDbService()) && false ?: '_'});
+     }
+ 
+     /**
+@@ -165,9 +165,9 @@ protected function getProcessorService()
+      */
+     protected function getRegistryService()
+     {
+-        $this->services['App\Registry'] = $instance = new \App\Registry();
++        $this->services['App\\Registry'] = $instance = new \App\Registry();
+ 
+-        $instance->processor = [0 => ${($_ = isset($this->services['App\Db']) ? $this->services['App\Db'] : $this->getDbService()) && false ?: '_'}, 1 => ${($_ = isset($this->services['App\Bus']) ? $this->services['App\Bus'] : $this->getBusService()) && false ?: '_'}];
++        $instance->processor = [0 => ${($_ = isset($this->services['App\\Db']) ? $this->services['App\\Db'] : $this->getDbService()) && false ?: '_'}, 1 => ${($_ = isset($this->services['App\\Bus']) ? $this->services['App\\Bus'] : $this->getBusService()) && false ?: '_'}];
+ 
+         return $instance;
+     }
+@@ -179,12 +179,12 @@ protected function getRegistryService()
+      */
+     protected function getSchemaService()
+     {
+-        $a = ${($_ = isset($this->services['App\Db']) ? $this->services['App\Db'] : $this->getDbService()) && false ?: '_'};
++        $a = ${($_ = isset($this->services['App\\Db']) ? $this->services['App\\Db'] : $this->getDbService()) && false ?: '_'};
+ 
+-        if (isset($this->services['App\Schema'])) {
+-            return $this->services['App\Schema'];
++        if (isset($this->services['App\\Schema'])) {
++            return $this->services['App\\Schema'];
+         }
+ 
+-        return $this->services['App\Schema'] = new \App\Schema($a);
++        return $this->services['App\\Schema'] = new \App\Schema($a);
+     }
+ }
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_inline_requires.php b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_inline_requires.php
+index a23a69367413..59582d9eb575 100644
+--- a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_inline_requires.php
++++ b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_inline_requires.php
+@@ -87,7 +87,7 @@ public function isFrozen()
+      */
+     protected function getParentNotExistsService()
+     {
+-        return $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\ParentNotExists'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\ParentNotExists();
++        return $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\ParentNotExists'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\ParentNotExists();
+     }
+ 
+     /**
+@@ -97,7 +97,7 @@ protected function getParentNotExistsService()
+      */
+     protected function getC1Service()
+     {
+-        return $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C1'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C1();
++        return $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\includes\\HotPath\\C1'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C1();
+     }
+ 
+     /**
+@@ -110,7 +110,7 @@ protected function getC2Service()
+         include_once $this->targetDirs[1].'/includes/HotPath/C2.php';
+         include_once $this->targetDirs[1].'/includes/HotPath/C3.php';
+ 
+-        return $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C2'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C2(${($_ = isset($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C3']) ? $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C3'] : ($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C3'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C3())) && false ?: '_'});
++        return $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\includes\\HotPath\\C2'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C2(${($_ = isset($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\includes\\HotPath\\C3']) ? $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\includes\\HotPath\\C3'] : ($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\includes\\HotPath\\C3'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C3())) && false ?: '_'});
+     }
+ 
+     /**
+@@ -122,7 +122,7 @@ protected function getC3Service()
+     {
+         include_once $this->targetDirs[1].'/includes/HotPath/C3.php';
+ 
+-        return $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C3'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C3();
++        return $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\includes\\HotPath\\C3'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\includes\HotPath\C3();
+     }
+ 
+     public function getParameter($name)
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_inline_self_ref.php b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_inline_self_ref.php
+index a2573eae6d3a..271aeb668b27 100644
+--- a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_inline_self_ref.php
++++ b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_inline_self_ref.php
+@@ -69,7 +69,7 @@ protected function getFooService()
+         $b = new \App\Baz($a);
+         $b->bar = $a;
+ 
+-        $this->services['App\Foo'] = $instance = new \App\Foo($b);
++        $this->services['App\\Foo'] = $instance = new \App\Foo($b);
+ 
+         $a->foo = $instance;
+ 
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_rot13_env.php b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_rot13_env.php
+index 7c903b11d072..8d1465c44ba3 100644
+--- a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_rot13_env.php
++++ b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_rot13_env.php
+@@ -67,7 +67,7 @@ public function isFrozen()
+      */
+     protected function getRot13EnvVarProcessorService()
+     {
+-        return $this->services['Symfony\Component\DependencyInjection\Tests\Dumper\Rot13EnvVarProcessor'] = new \Symfony\Component\DependencyInjection\Tests\Dumper\Rot13EnvVarProcessor();
++        return $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Dumper\\Rot13EnvVarProcessor'] = new \Symfony\Component\DependencyInjection\Tests\Dumper\Rot13EnvVarProcessor();
+     }
+ 
+     /**
+@@ -78,7 +78,7 @@ protected function getRot13EnvVarProcessorService()
+     protected function getContainer_EnvVarProcessorsLocatorService()
+     {
+         return $this->services['container.env_var_processors_locator'] = new \Symfony\Component\DependencyInjection\ServiceLocator(['rot13' => function () {
+-            return ${($_ = isset($this->services['Symfony\Component\DependencyInjection\Tests\Dumper\Rot13EnvVarProcessor']) ? $this->services['Symfony\Component\DependencyInjection\Tests\Dumper\Rot13EnvVarProcessor'] : ($this->services['Symfony\Component\DependencyInjection\Tests\Dumper\Rot13EnvVarProcessor'] = new \Symfony\Component\DependencyInjection\Tests\Dumper\Rot13EnvVarProcessor())) && false ?: '_'};
++            return ${($_ = isset($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Dumper\\Rot13EnvVarProcessor']) ? $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Dumper\\Rot13EnvVarProcessor'] : ($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Dumper\\Rot13EnvVarProcessor'] = new \Symfony\Component\DependencyInjection\Tests\Dumper\Rot13EnvVarProcessor())) && false ?: '_'};
+         }]);
+     }
+ 
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_subscriber.php b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_subscriber.php
+index 9424a7611433..dbb51eab3285 100644
+--- a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_subscriber.php
++++ b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_subscriber.php
+@@ -73,7 +73,7 @@ public function isFrozen()
+      */
+     protected function getTestServiceSubscriberService()
+     {
+-        return $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber();
++        return $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\TestServiceSubscriber'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber();
+     }
+ 
+     /**
+@@ -84,13 +84,13 @@ protected function getTestServiceSubscriberService()
+     protected function getFooServiceService()
+     {
+         return $this->services['foo_service'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber((new \Symfony\Component\DependencyInjection\ServiceLocator(['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\CustomDefinition' => function () {
+-            $f = function (\Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition $v = null) { return $v; }; return $f(${($_ = isset($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition']) ? $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition'] : ($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition())) && false ?: '_'});
++            $f = function (\Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition $v = null) { return $v; }; return $f(${($_ = isset($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\CustomDefinition']) ? $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\CustomDefinition'] : ($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\CustomDefinition'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition())) && false ?: '_'});
+         }, 'Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\TestServiceSubscriber' => function () {
+-            $f = function (\Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber $v) { return $v; }; return $f(${($_ = isset($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber']) ? $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber'] : ($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber())) && false ?: '_'});
++            $f = function (\Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber $v) { return $v; }; return $f(${($_ = isset($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\TestServiceSubscriber']) ? $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\TestServiceSubscriber'] : ($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\TestServiceSubscriber'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber())) && false ?: '_'});
+         }, 'bar' => function () {
+-            $f = function (\Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition $v) { return $v; }; return $f(${($_ = isset($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber']) ? $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber'] : ($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber())) && false ?: '_'});
++            $f = function (\Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition $v) { return $v; }; return $f(${($_ = isset($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\TestServiceSubscriber']) ? $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\TestServiceSubscriber'] : ($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\TestServiceSubscriber'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\TestServiceSubscriber())) && false ?: '_'});
+         }, 'baz' => function () {
+-            $f = function (\Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition $v = null) { return $v; }; return $f(${($_ = isset($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition']) ? $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition'] : ($this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition())) && false ?: '_'});
++            $f = function (\Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition $v = null) { return $v; }; return $f(${($_ = isset($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\CustomDefinition']) ? $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\CustomDefinition'] : ($this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\CustomDefinition'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition())) && false ?: '_'});
+         }]))->withContext('foo_service', $this));
+     }
+ 
+@@ -101,6 +101,6 @@ protected function getFooServiceService()
+      */
+     protected function getCustomDefinitionService()
+     {
+-        return $this->services['Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition();
++        return $this->services['Symfony\\Component\\DependencyInjection\\Tests\\Fixtures\\CustomDefinition'] = new \Symfony\Component\DependencyInjection\Tests\Fixtures\CustomDefinition();
+     }
+ }
+diff --git a/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_unsupported_characters.php b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_unsupported_characters.php
+new file mode 100644
+index 000000000000..a4c841cabe6e
+--- /dev/null
++++ b/src/Symfony/Component/DependencyInjection/Tests/Fixtures/php/services_unsupported_characters.php
+@@ -0,0 +1,178 @@
++<?php
++
++use Symfony\Component\DependencyInjection\Argument\RewindableGenerator;
++use Symfony\Component\DependencyInjection\ContainerInterface;
++use Symfony\Component\DependencyInjection\Container;
++use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
++use Symfony\Component\DependencyInjection\Exception\LogicException;
++use Symfony\Component\DependencyInjection\Exception\RuntimeException;
++use Symfony\Component\DependencyInjection\ParameterBag\FrozenParameterBag;
++
++/**
++ * This class has been auto-generated
++ * by the Symfony Dependency Injection Component.
++ *
++ * @final since Symfony 3.3
++ */
++class Symfony_DI_PhpDumper_Test_Unsupported_Characters extends Container
++{
++    private $parameters;
++    private $targetDirs = [];
++
++    public function __construct()
++    {
++        $this->parameters = $this->getDefaultParameters();
++
++        $this->services = [];
++        $this->methodMap = [
++            'bar$' => 'getBarService',
++            'bar$!' => 'getBar2Service',
++            'foo*/oh-no' => 'getFooohnoService',
++        ];
++
++        $this->aliases = [];
++    }
++
++    public function getRemovedIds()
++    {
++        return [
++            'Psr\\Container\\ContainerInterface' => true,
++            'Symfony\\Component\\DependencyInjection\\ContainerInterface' => true,
++        ];
++    }
++
++    public function compile()
++    {
++        throw new LogicException('You cannot compile a dumped container that was already compiled.');
++    }
++
++    public function isCompiled()
++    {
++        return true;
++    }
++
++    public function isFrozen()
++    {
++        @trigger_error(sprintf('The %s() method is deprecated since Symfony 3.3 and will be removed in 4.0. Use the isCompiled() method instead.', __METHOD__), E_USER_DEPRECATED);
++
++        return true;
++    }
++
++    /**
++     * Gets the public 'bar$' shared service.
++     *
++     * @return \FooClass
++     */
++    protected function getBarService()
++    {
++        return $this->services['bar$'] = new \FooClass();
++    }
++
++    /**
++     * Gets the public 'bar$!' shared service.
++     *
++     * @return \FooClass
++     */
++    protected function getBar2Service()
++    {
++        return $this->services['bar$!'] = new \FooClass();
++    }
++
++    /**
++     * Gets the public 'foo oh-no' shared service.
++     *
++     * @return \FooClass
++     */
++    protected function getFooohnoService()
++    {
++        return $this->services['foo*/oh-no'] = new \FooClass();
++    }
++
++    public function getParameter($name)
++    {
++        $name = (string) $name;
++        if (!(isset($this->parameters[$name]) || isset($this->loadedDynamicParameters[$name]) || array_key_exists($name, $this->parameters))) {
++            $name = $this->normalizeParameterName($name);
++
++            if (!(isset($this->parameters[$name]) || isset($this->loadedDynamicParameters[$name]) || array_key_exists($name, $this->parameters))) {
++                throw new InvalidArgumentException(sprintf('The parameter "%s" must be defined.', $name));
++            }
++        }
++        if (isset($this->loadedDynamicParameters[$name])) {
++            return $this->loadedDynamicParameters[$name] ? $this->dynamicParameters[$name] : $this->getDynamicParameter($name);
++        }
++
++        return $this->parameters[$name];
++    }
++
++    public function hasParameter($name)
++    {
++        $name = (string) $name;
++        $name = $this->normalizeParameterName($name);
++
++        return isset($this->parameters[$name]) || isset($this->loadedDynamicParameters[$name]) || array_key_exists($name, $this->parameters);
++    }
++
++    public function setParameter($name, $value)
++    {
++        throw new LogicException('Impossible to call set() on a frozen ParameterBag.');
++    }
++
++    public function getParameterBag()
++    {
++        if (null === $this->parameterBag) {
++            $parameters = $this->parameters;
++            foreach ($this->loadedDynamicParameters as $name => $loaded) {
++                $parameters[$name] = $loaded ? $this->dynamicParameters[$name] : $this->getDynamicParameter($name);
++            }
++            $this->parameterBag = new FrozenParameterBag($parameters);
++        }
++
++        return $this->parameterBag;
++    }
++
++    private $loadedDynamicParameters = [];
++    private $dynamicParameters = [];
++
++    /**
++     * Computes a dynamic parameter.
++     *
++     * @param string $name The name of the dynamic parameter to load
++     *
++     * @return mixed The value of the dynamic parameter
++     *
++     * @throws InvalidArgumentException When the dynamic parameter does not exist
++     */
++    private function getDynamicParameter($name)
++    {
++        throw new InvalidArgumentException(sprintf('The dynamic parameter "%s" must be defined.', $name));
++    }
++
++    private $normalizedParameterNames = [];
++
++    private function normalizeParameterName($name)
++    {
++        if (isset($this->normalizedParameterNames[$normalizedName = strtolower($name)]) || isset($this->parameters[$normalizedName]) || array_key_exists($normalizedName, $this->parameters)) {
++            $normalizedName = isset($this->normalizedParameterNames[$normalizedName]) ? $this->normalizedParameterNames[$normalizedName] : $normalizedName;
++            if ((string) $name !== $normalizedName) {
++                @trigger_error(sprintf('Parameter names will be made case sensitive in Symfony 4.0. Using "%s" instead of "%s" is deprecated since Symfony 3.4.', $name, $normalizedName), E_USER_DEPRECATED);
++            }
++        } else {
++            $normalizedName = $this->normalizedParameterNames[$normalizedName] = (string) $name;
++        }
++
++        return $normalizedName;
++    }
++
++    /**
++     * Gets the default parameters.
++     *
++     * @return array An array of the default parameters
++     */
++    protected function getDefaultParameters()
++    {
++        return [
++            '\'' => 'oh-no',
++        ];
++    }
++}

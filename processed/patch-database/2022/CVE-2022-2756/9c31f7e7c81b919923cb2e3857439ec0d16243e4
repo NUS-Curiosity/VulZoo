@@ -1,0 +1,589 @@
+diff --git a/API/Controllers/AccountController.cs b/API/Controllers/AccountController.cs
+index 2360133082..9afd4be729 100644
+--- a/API/Controllers/AccountController.cs
++++ b/API/Controllers/AccountController.cs
+@@ -70,13 +70,21 @@ public class AccountController : BaseApiController
+         /// </summary>
+         /// <param name="resetPasswordDto"></param>
+         /// <returns></returns>
++        [AllowAnonymous]
+         [HttpPost("reset-password")]
+         public async Task<ActionResult> UpdatePassword(ResetPasswordDto resetPasswordDto)
+         {
++            // TODO: Log this request to Audit Table
+             _logger.LogInformation("{UserName} is changing {ResetUser}'s password", User.GetUsername(), resetPasswordDto.UserName);
+-            var user = await _userManager.Users.SingleAsync(x => x.UserName == resetPasswordDto.UserName);
+ 
+-            if (resetPasswordDto.UserName != User.GetUsername() && !(User.IsInRole(PolicyConstants.AdminRole) || User.IsInRole(PolicyConstants.ChangePasswordRole)))
++            var user = await _userManager.Users.SingleOrDefaultAsync(x => x.UserName == resetPasswordDto.UserName);
++            if (user == null) return Ok(); // Don't report BadRequest as that would allow brute forcing to find accounts on system
++
++
++            if (resetPasswordDto.UserName == User.GetUsername() && !(User.IsInRole(PolicyConstants.ChangePasswordRole) || User.IsInRole(PolicyConstants.AdminRole)))
++                return Unauthorized("You are not permitted to this operation.");
++
++            if (resetPasswordDto.UserName != User.GetUsername() && !User.IsInRole(PolicyConstants.AdminRole))
+                 return Unauthorized("You are not permitted to this operation.");
+ 
+             var errors = await _accountService.ChangeUserPassword(user, resetPasswordDto.Password);
+@@ -94,6 +102,7 @@ public async Task<ActionResult> UpdatePassword(ResetPasswordDto resetPasswordDto
+         /// </summary>
+         /// <param name="registerDto"></param>
+         /// <returns></returns>
++        [AllowAnonymous]
+         [HttpPost("register")]
+         public async Task<ActionResult<UserDto>> RegisterFirstUser(RegisterDto registerDto)
+         {
+@@ -155,6 +164,7 @@ public async Task<ActionResult<UserDto>> RegisterFirstUser(RegisterDto registerD
+         /// </summary>
+         /// <param name="loginDto"></param>
+         /// <returns></returns>
++        [AllowAnonymous]
+         [HttpPost("login")]
+         public async Task<ActionResult<UserDto>> Login(LoginDto loginDto)
+         {
+@@ -173,14 +183,14 @@ public async Task<ActionResult<UserDto>> Login(LoginDto loginDto)
+                     "You are missing an email on your account. Please wait while we migrate your account.");
+             }
+ 
+-            if (!validPassword)
++            var result = await _signInManager
++                .CheckPasswordSignInAsync(user, loginDto.Password, true);
++
++            if (result.IsLockedOut)
+             {
+-                return Unauthorized("Your credentials are not correct");
++                return Unauthorized("You've been locked out from too many authorization attempts. Please wait 10 minutes.");
+             }
+ 
+-            var result = await _signInManager
+-                .CheckPasswordSignInAsync(user, loginDto.Password, false);
+-
+             if (!result.Succeeded)
+             {
+                 return Unauthorized(result.IsNotAllowed ? "You must confirm your email first" : "Your credentials are not correct.");
+@@ -212,6 +222,7 @@ public async Task<ActionResult<UserDto>> Login(LoginDto loginDto)
+         /// </summary>
+         /// <param name="tokenRequestDto"></param>
+         /// <returns></returns>
++        [AllowAnonymous]
+         [HttpPost("refresh-token")]
+         public async Task<ActionResult<TokenRequestDto>> RefreshToken([FromBody] TokenRequestDto tokenRequestDto)
+         {
+@@ -462,6 +473,7 @@ await _emailService.SendConfirmationEmail(new ConfirmationEmailDto()
+             return BadRequest("There was an error setting up your account. Please check the logs");
+         }
+ 
++        [AllowAnonymous]
+         [HttpPost("confirm-email")]
+         public async Task<ActionResult<UserDto>> ConfirmEmail(ConfirmEmailDto dto)
+         {
+diff --git a/API/Controllers/AdminController.cs b/API/Controllers/AdminController.cs
+index 2c945b5fea..045cc63dc2 100644
+--- a/API/Controllers/AdminController.cs
++++ b/API/Controllers/AdminController.cs
+@@ -1,5 +1,6 @@
+ ﻿using System.Threading.Tasks;
+ using API.Entities;
++using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Identity;
+ using Microsoft.AspNetCore.Mvc;
+ 
+@@ -18,6 +19,7 @@ public AdminController(UserManager<AppUser> userManager)
+         /// Checks if an admin exists on the system. This is essentially a check to validate if the system has been setup.
+         /// </summary>
+         /// <returns></returns>
++        [AllowAnonymous]
+         [HttpGet("exists")]
+         public async Task<ActionResult<bool>> AdminExists()
+         {
+diff --git a/API/Controllers/BaseApiController.cs b/API/Controllers/BaseApiController.cs
+index bb3886ab80..dfedd7a0a1 100644
+--- a/API/Controllers/BaseApiController.cs
++++ b/API/Controllers/BaseApiController.cs
+@@ -1,10 +1,12 @@
+-﻿using Microsoft.AspNetCore.Mvc;
++﻿using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Mvc;
+ 
+ namespace API.Controllers
+ {
+     [ApiController]
+     [Route("api/[controller]")]
++    [Authorize]
+     public class BaseApiController : ControllerBase
+     {
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/API/Controllers/FallbackController.cs b/API/Controllers/FallbackController.cs
+index ae8bad21fb..a765269b80 100644
+--- a/API/Controllers/FallbackController.cs
++++ b/API/Controllers/FallbackController.cs
+@@ -1,24 +1,26 @@
+ ﻿using System.IO;
+ using API.Services;
++using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
+ 
+-namespace API.Controllers
++namespace API.Controllers;
++
++[AllowAnonymous]
++public class FallbackController : Controller
+ {
+-    public class FallbackController : Controller
+-    {
+-        // ReSharper disable once S4487
+-        // ReSharper disable once NotAccessedField.Local
+-        private readonly ITaskScheduler _taskScheduler;
++    // ReSharper disable once S4487
++    // ReSharper disable once NotAccessedField.Local
++    private readonly ITaskScheduler _taskScheduler;
+ 
+-        public FallbackController(ITaskScheduler taskScheduler)
+-        {
+-            // This is used to load TaskScheduler on startup without having to navigate to a Controller that uses.
+-            _taskScheduler = taskScheduler;
+-        }
++    public FallbackController(ITaskScheduler taskScheduler)
++    {
++        // This is used to load TaskScheduler on startup without having to navigate to a Controller that uses.
++        _taskScheduler = taskScheduler;
++    }
+ 
+-        public ActionResult Index()
+-        {
+-            return PhysicalFile(Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "index.html"), "text/HTML");
+-        }
++    public ActionResult Index()
++    {
++        return PhysicalFile(Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "index.html"), "text/HTML");
+     }
+ }
++
+diff --git a/API/Controllers/ImageController.cs b/API/Controllers/ImageController.cs
+index b34b9f6b2d..1a19666d64 100644
+--- a/API/Controllers/ImageController.cs
++++ b/API/Controllers/ImageController.cs
+@@ -137,6 +137,8 @@ public async Task<ActionResult> GetBookmarkImage(int chapterId, int pageNum, str
+         [HttpGet("cover-upload")]
+         public ActionResult GetCoverUploadImage(string filename)
+         {
++            if (filename.Contains("..")) return BadRequest("Invalid Filename");
++
+             var path = Path.Join(_directoryService.TempDirectory, filename);
+             if (string.IsNullOrEmpty(path) || !_directoryService.FileSystem.File.Exists(path)) return BadRequest($"File does not exist");
+             var format = _directoryService.FileSystem.Path.GetExtension(path).Replace(".", "");
+diff --git a/API/Controllers/OPDSController.cs b/API/Controllers/OPDSController.cs
+index 4dee326bed..d5be778573 100644
+--- a/API/Controllers/OPDSController.cs
++++ b/API/Controllers/OPDSController.cs
+@@ -17,10 +17,12 @@
+ using API.Helpers;
+ using API.Services;
+ using Kavita.Common;
++using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
+ 
+ namespace API.Controllers;
+ 
++[AllowAnonymous]
+ public class OpdsController : BaseApiController
+ {
+     private readonly IUnitOfWork _unitOfWork;
+diff --git a/API/Controllers/ReaderController.cs b/API/Controllers/ReaderController.cs
+index 758c6d5ab5..3aab19e897 100644
+--- a/API/Controllers/ReaderController.cs
++++ b/API/Controllers/ReaderController.cs
+@@ -57,6 +57,11 @@ public async Task<ActionResult> GetPdf(int chapterId)
+             var chapter = await _cacheService.Ensure(chapterId);
+             if (chapter == null) return BadRequest("There was an issue finding pdf file for reading");
+ 
++            // Validate the user has access to the PDF
++            var series = await _unitOfWork.SeriesRepository.GetSeriesForChapter(chapter.Id,
++                await _unitOfWork.UserRepository.GetUserIdByUsernameAsync(User.GetUsername()));
++            if (series == null) return BadRequest("Invalid Access");
++
+             try
+             {
+                 var path = _cacheService.GetCachedFile(chapter);
+diff --git a/API/Controllers/ReadingListController.cs b/API/Controllers/ReadingListController.cs
+index a4285431e6..ccd27a7838 100644
+--- a/API/Controllers/ReadingListController.cs
++++ b/API/Controllers/ReadingListController.cs
+@@ -3,15 +3,18 @@
+ using System.Threading.Tasks;
+ using API.Comparators;
+ using API.Data;
++using API.Data.Repositories;
+ using API.DTOs.ReadingLists;
+ using API.Entities;
+ using API.Extensions;
+ using API.Helpers;
+ using API.SignalR;
++using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
+ 
+ namespace API.Controllers
+ {
++    [Authorize]
+     public class ReadingListController : BaseApiController
+     {
+         private readonly IUnitOfWork _unitOfWork;
+@@ -73,8 +76,18 @@ public async Task<ActionResult<IEnumerable<ReadingListItemDto>>> GetListForUser(
+             var userId = await _unitOfWork.UserRepository.GetUserIdByUsernameAsync(User.GetUsername());
+             var items = await _unitOfWork.ReadingListRepository.GetReadingListItemDtosByIdAsync(readingListId, userId);
+             return Ok(items);
++        }
++
++        private async Task<AppUser?> UserHasReadingListAccess(int readingListId)
++        {
++            var user = await _unitOfWork.UserRepository.GetUserByUsernameAsync(User.GetUsername(),
++                AppUserIncludes.ReadingLists);
++            if (user.ReadingLists.SingleOrDefault(rl => rl.Id == readingListId) == null && !await _unitOfWork.UserRepository.IsUserAdminAsync(user))
++            {
++                return null;
++            }
+ 
+-            //return Ok(await _unitOfWork.ReadingListRepository.AddReadingProgressModifiers(userId, items.ToList()));
++            return user;
+         }
+ 
+         /// <summary>
+@@ -86,6 +99,11 @@ public async Task<ActionResult<IEnumerable<ReadingListItemDto>>> GetListForUser(
+         public async Task<ActionResult> UpdateListItemPosition(UpdateReadingListPosition dto)
+         {
+             // Make sure UI buffers events
++            var user = await UserHasReadingListAccess(dto.ReadingListId);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
+             var items = (await _unitOfWork.ReadingListRepository.GetReadingListItemsByIdAsync(dto.ReadingListId)).ToList();
+             var item = items.Find(r => r.Id == dto.ReadingListItemId);
+             items.Remove(item);
+@@ -112,10 +130,15 @@ public async Task<ActionResult> UpdateListItemPosition(UpdateReadingListPosition
+         [HttpPost("delete-item")]
+         public async Task<ActionResult> DeleteListItem(UpdateReadingListPosition dto)
+         {
++            var user = await UserHasReadingListAccess(dto.ReadingListId);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
++
+             var readingList = await _unitOfWork.ReadingListRepository.GetReadingListByIdAsync(dto.ReadingListId);
+             readingList.Items = readingList.Items.Where(r => r.Id != dto.ReadingListItemId).ToList();
+ 
+-
+             var index = 0;
+             foreach (var readingListItem in readingList.Items)
+             {
+@@ -141,9 +164,14 @@ public async Task<ActionResult> DeleteListItem(UpdateReadingListPosition dto)
+         [HttpPost("remove-read")]
+         public async Task<ActionResult> DeleteReadFromList([FromQuery] int readingListId)
+         {
+-            var userId = await _unitOfWork.UserRepository.GetUserIdByUsernameAsync(User.GetUsername());
+-            var items = await _unitOfWork.ReadingListRepository.GetReadingListItemDtosByIdAsync(readingListId, userId);
+-            items = await _unitOfWork.ReadingListRepository.AddReadingProgressModifiers(userId, items.ToList());
++            var user = await UserHasReadingListAccess(readingListId);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
++
++            var items = await _unitOfWork.ReadingListRepository.GetReadingListItemDtosByIdAsync(readingListId, user.Id);
++            items = await _unitOfWork.ReadingListRepository.AddReadingProgressModifiers(user.Id, items.ToList());
+ 
+             // Collect all Ids to remove
+             var itemIdsToRemove = items.Where(item => item.PagesRead == item.PagesTotal).Select(item => item.Id);
+@@ -176,15 +204,13 @@ public async Task<ActionResult> DeleteReadFromList([FromQuery] int readingListId
+         [HttpDelete]
+         public async Task<ActionResult> DeleteList([FromQuery] int readingListId)
+         {
+-            var user = await _unitOfWork.UserRepository.GetUserWithReadingListsByUsernameAsync(User.GetUsername());
+-            var isAdmin = await _unitOfWork.UserRepository.IsUserAdminAsync(user);
+-            var readingList = user.ReadingLists.SingleOrDefault(r => r.Id == readingListId);
+-            if (readingList == null && !isAdmin)
++            var user = await UserHasReadingListAccess(readingListId);
++            if (user == null)
+             {
+-                return BadRequest("User is not associated with this reading list");
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
+             }
+ 
+-            readingList = await _unitOfWork.ReadingListRepository.GetReadingListByIdAsync(readingListId);
++            var readingList = await _unitOfWork.ReadingListRepository.GetReadingListByIdAsync(readingListId);
+ 
+             user.ReadingLists.Remove(readingList);
+ 
+@@ -213,13 +239,14 @@ public async Task<ActionResult<ReadingListDto>> CreateList(CreateReadingListDto
+                 return BadRequest("A list of this name already exists");
+             }
+ 
+-            user.ReadingLists.Add(DbFactory.ReadingList(dto.Title, string.Empty, false));
++            var readingList = DbFactory.ReadingList(dto.Title, string.Empty, false);
++            user.ReadingLists.Add(readingList);
+ 
+             if (!_unitOfWork.HasChanges()) return BadRequest("There was a problem creating list");
+ 
+             await _unitOfWork.CommitAsync();
+ 
+-            return Ok(await _unitOfWork.ReadingListRepository.GetReadingListDtoByTitleAsync(dto.Title));
++            return Ok(await _unitOfWork.ReadingListRepository.GetReadingListDtoByTitleAsync(user.Id, dto.Title));
+         }
+ 
+         /// <summary>
+@@ -233,7 +260,11 @@ public async Task<ActionResult> UpdateList(UpdateReadingListDto dto)
+             var readingList = await _unitOfWork.ReadingListRepository.GetReadingListByIdAsync(dto.ReadingListId);
+             if (readingList == null) return BadRequest("List does not exist");
+ 
+-
++            var user = await UserHasReadingListAccess(readingList.Id);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
+ 
+             if (!string.IsNullOrEmpty(dto.Title))
+             {
+@@ -277,7 +308,12 @@ public async Task<ActionResult> UpdateList(UpdateReadingListDto dto)
+         [HttpPost("update-by-series")]
+         public async Task<ActionResult> UpdateListBySeries(UpdateReadingListBySeriesDto dto)
+         {
+-            var user = await _unitOfWork.UserRepository.GetUserWithReadingListsByUsernameAsync(User.GetUsername());
++            var user = await UserHasReadingListAccess(dto.ReadingListId);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
++
+             var readingList = user.ReadingLists.SingleOrDefault(l => l.Id == dto.ReadingListId);
+             if (readingList == null) return BadRequest("Reading List does not exist");
+             var chapterIdsForSeries =
+@@ -314,7 +350,11 @@ public async Task<ActionResult> UpdateListBySeries(UpdateReadingListBySeriesDto
+         [HttpPost("update-by-multiple")]
+         public async Task<ActionResult> UpdateListByMultiple(UpdateReadingListByMultipleDto dto)
+         {
+-            var user = await _unitOfWork.UserRepository.GetUserWithReadingListsByUsernameAsync(User.GetUsername());
++            var user = await UserHasReadingListAccess(dto.ReadingListId);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
+             var readingList = user.ReadingLists.SingleOrDefault(l => l.Id == dto.ReadingListId);
+             if (readingList == null) return BadRequest("Reading List does not exist");
+ 
+@@ -354,7 +394,11 @@ public async Task<ActionResult> UpdateListByMultiple(UpdateReadingListByMultiple
+         [HttpPost("update-by-multiple-series")]
+         public async Task<ActionResult> UpdateListByMultipleSeries(UpdateReadingListByMultipleSeriesDto dto)
+         {
+-            var user = await _unitOfWork.UserRepository.GetUserWithReadingListsByUsernameAsync(User.GetUsername());
++            var user = await UserHasReadingListAccess(dto.ReadingListId);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
+             var readingList = user.ReadingLists.SingleOrDefault(l => l.Id == dto.ReadingListId);
+             if (readingList == null) return BadRequest("Reading List does not exist");
+ 
+@@ -388,9 +432,14 @@ public async Task<ActionResult> UpdateListByMultipleSeries(UpdateReadingListByMu
+         [HttpPost("update-by-volume")]
+         public async Task<ActionResult> UpdateListByVolume(UpdateReadingListByVolumeDto dto)
+         {
+-            var user = await _unitOfWork.UserRepository.GetUserWithReadingListsByUsernameAsync(User.GetUsername());
++            var user = await UserHasReadingListAccess(dto.ReadingListId);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
+             var readingList = user.ReadingLists.SingleOrDefault(l => l.Id == dto.ReadingListId);
+             if (readingList == null) return BadRequest("Reading List does not exist");
++
+             var chapterIdsForVolume =
+                 (await _unitOfWork.ChapterRepository.GetChaptersAsync(dto.VolumeId)).Select(c => c.Id).ToList();
+ 
+@@ -419,7 +468,11 @@ public async Task<ActionResult> UpdateListByVolume(UpdateReadingListByVolumeDto
+         [HttpPost("update-by-chapter")]
+         public async Task<ActionResult> UpdateListByChapter(UpdateReadingListByChapterDto dto)
+         {
+-            var user = await _unitOfWork.UserRepository.GetUserWithReadingListsByUsernameAsync(User.GetUsername());
++            var user = await UserHasReadingListAccess(dto.ReadingListId);
++            if (user == null)
++            {
++                return BadRequest("You do not have permissions on this reading list or the list doesn't exist");
++            }
+             var readingList = user.ReadingLists.SingleOrDefault(l => l.Id == dto.ReadingListId);
+             if (readingList == null) return BadRequest("Reading List does not exist");
+ 
+diff --git a/API/Controllers/ThemeController.cs b/API/Controllers/ThemeController.cs
+index bf68e86413..69793df465 100644
+--- a/API/Controllers/ThemeController.cs
++++ b/API/Controllers/ThemeController.cs
+@@ -24,6 +24,7 @@ public ThemeController(IUnitOfWork unitOfWork, IThemeService themeService, ITask
+         _taskScheduler = taskScheduler;
+     }
+ 
++    [AllowAnonymous]
+     [HttpGet]
+     public async Task<ActionResult<IEnumerable<SiteThemeDto>>> GetThemes()
+     {
+diff --git a/API/Controllers/UploadController.cs b/API/Controllers/UploadController.cs
+index ca84acc8ba..c7def14083 100644
+--- a/API/Controllers/UploadController.cs
++++ b/API/Controllers/UploadController.cs
+@@ -59,6 +59,8 @@ public async Task<ActionResult<string>> GetImageFromFile(UploadUrlDto dto)
+                 if (string.IsNullOrEmpty(path) || !_directoryService.FileSystem.File.Exists(path))
+                     return BadRequest($"Could not download file");
+ 
++                if (!await _imageService.IsImage(path)) return BadRequest("Url does not return a valid image");
++
+                 return $"coverupload_{dateString}.{format}";
+             }
+             catch (FlurlHttpException ex)
+diff --git a/API/Data/Repositories/ReadingListRepository.cs b/API/Data/Repositories/ReadingListRepository.cs
+index 0294d6224a..26b2f7579d 100644
+--- a/API/Data/Repositories/ReadingListRepository.cs
++++ b/API/Data/Repositories/ReadingListRepository.cs
+@@ -17,7 +17,7 @@ public interface IReadingListRepository
+     Task<IEnumerable<ReadingListItemDto>> GetReadingListItemDtosByIdAsync(int readingListId, int userId);
+     Task<ReadingListDto> GetReadingListDtoByIdAsync(int readingListId, int userId);
+     Task<IEnumerable<ReadingListItemDto>> AddReadingProgressModifiers(int userId, IList<ReadingListItemDto> items);
+-    Task<ReadingListDto> GetReadingListDtoByTitleAsync(string title);
++    Task<ReadingListDto> GetReadingListDtoByTitleAsync(int userId, string title);
+     Task<IEnumerable<ReadingListItem>> GetReadingListItemsByIdAsync(int readingListId);
+ 
+     Task<IEnumerable<ReadingListDto>> GetReadingListDtosForSeriesAndUserAsync(int userId, int seriesId,
+@@ -211,10 +211,10 @@ public async Task<IEnumerable<ReadingListItemDto>> AddReadingProgressModifiers(i
+         return items;
+     }
+ 
+-    public async Task<ReadingListDto> GetReadingListDtoByTitleAsync(string title)
++    public async Task<ReadingListDto> GetReadingListDtoByTitleAsync(int userId, string title)
+     {
+         return await _context.ReadingList
+-            .Where(r => r.Title.Equals(title))
++            .Where(r => r.Title.Equals(title) && r.AppUserId == userId)
+             .ProjectTo<ReadingListDto>(_mapper.ConfigurationProvider)
+             .SingleOrDefaultAsync();
+     }
+diff --git a/API/Extensions/IdentityServiceExtensions.cs b/API/Extensions/IdentityServiceExtensions.cs
+index 043e5c9193..5cc4718bb2 100644
+--- a/API/Extensions/IdentityServiceExtensions.cs
++++ b/API/Extensions/IdentityServiceExtensions.cs
+@@ -1,4 +1,5 @@
+-﻿using System.Text;
++﻿using System;
++using System.Text;
+ using System.Threading.Tasks;
+ using API.Constants;
+ using API.Data;
+@@ -32,6 +33,11 @@ public static IServiceCollection AddIdentityServices(this IServiceCollection ser
+                     opt.Password.RequiredLength = 6;
+ 
+                     opt.SignIn.RequireConfirmedEmail = true;
++
++                    opt.Lockout.AllowedForNewUsers = true;
++                    opt.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(10);
++                    opt.Lockout.MaxFailedAccessAttempts = 5;
++
+                 })
+                 .AddTokenProvider<DataProtectorTokenProvider<AppUser>>(TokenOptions.DefaultProvider)
+                 .AddRoles<AppRole>()
+diff --git a/API/Services/ImageService.cs b/API/Services/ImageService.cs
+index a1ab70fd09..4dd31db8c7 100644
+--- a/API/Services/ImageService.cs
++++ b/API/Services/ImageService.cs
+@@ -27,6 +27,8 @@ public interface IImageService
+     /// <param name="filePath">Full path to the image to convert</param>
+     /// <returns>File of written webp image</returns>
+     Task<string> ConvertToWebP(string filePath, string outputPath);
++
++    Task<bool> IsImage(string filePath);
+ }
+ 
+ public class ImageService : IImageService
+@@ -115,6 +117,23 @@ public async Task<string> ConvertToWebP(string filePath, string outputPath)
+         return outputFile;
+     }
+ 
++    public async Task<bool> IsImage(string filePath)
++    {
++        try
++        {
++            var info = await SixLabors.ImageSharp.Image.IdentifyAsync(filePath);
++            if (info == null) return false;
++
++            return true;
++        }
++        catch (Exception ex)
++        {
++            /* Swallow Exception */
++        }
++
++        return false;
++    }
++
+ 
+     /// <inheritdoc />
+     public string CreateThumbnailFromBase64(string encodedImage, string fileName)
+diff --git a/Kavita.Common/Kavita.Common.csproj b/Kavita.Common/Kavita.Common.csproj
+index 7c99c09fcf..debd9b5a94 100644
+--- a/Kavita.Common/Kavita.Common.csproj
++++ b/Kavita.Common/Kavita.Common.csproj
+@@ -4,7 +4,7 @@
+         <TargetFramework>net6.0</TargetFramework>
+         <Company>kavitareader.com</Company>
+         <Product>Kavita</Product>
+-        <AssemblyVersion>0.5.4.0</AssemblyVersion>
++        <AssemblyVersion>0.5.4.1</AssemblyVersion>
+         <NeutralLanguage>en</NeutralLanguage>
+     </PropertyGroup>
+ 
+diff --git a/README.md b/README.md
+index e4f47b7956..b92725d049 100644
+--- a/README.md
++++ b/README.md
+@@ -21,12 +21,12 @@ your reading collection with your friends and family!
+ - [x] Serve up Manga/Webtoons/Comics (cbr, cbz, zip/rar, 7zip, raw images) and Books (epub, pdf)
+ - [x] First class responsive readers that work great on any device (phone, tablet, desktop)
+ - [x] Dark mode and customizable theming support
+-- [ ] Provide hooks into metadata providers to fetch metadata for Comics, Manga, and Books
++- [ ] Provide a plugin system to allow external metadata integration and scrobbling for read status, ratings, and reviews
+ - [x] Metadata should allow for collections, want to read integration from 3rd party services, genres.
+ - [x] Ability to manage users, access, and ratings
+-- [ ] Ability to sync ratings and reviews to external services
+ - [x] Fully Accessible with active accessibility audits
+ - [x] Dedicated webtoon reading mode
++- [ ] Full localization support
+ - [ ] And so much [more...](https://github.com/Kareadita/Kavita/projects)
+ 
+ ## Support
+@@ -93,6 +93,9 @@ Thank you to [<img src="/Logo/jetbrains.svg" alt="" width="32"> JetBrains](http:
+ ## Palace-Designs
+ We would like to extend a big thank you to [<img src="/Logo/hosting-sponsor.png" alt="" width="128">](https://www.palace-designs.com/) who hosts our infrastructure pro-bono.
+ 
++## Huntr
++We would like to extend a big thank you to [Huntr](https://huntr.dev/repos/kareadita/kavita) who has worked with Kavita in reporting security vulnerabilities. If you are interested in 
++being paid to help secure Kavita, please give them a try.
+ 
+ ### License
+ 
+diff --git a/SECURITY.md b/SECURITY.md
+new file mode 100644
+index 0000000000..56f010fb3c
+--- /dev/null
++++ b/SECURITY.md
+@@ -0,0 +1,10 @@
++# Security Policy
++
++## Supported Versions
++
++Security is maintained on latest stable version only. 
++
++## Reporting a Vulnerability
++
++
++Please reach out to majora2007 via our Discord or you can (and should) report your vulnerability via [Huntr](https://huntr.dev/repos/kareadita/kavita).

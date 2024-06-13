@@ -1,0 +1,602 @@
+diff --git a/docs/user/library/metadata/geotools.rst b/docs/user/library/metadata/geotools.rst
+index f6ebdc2f86b..2f3fea95496 100644
+--- a/docs/user/library/metadata/geotools.rst
++++ b/docs/user/library/metadata/geotools.rst
+@@ -55,13 +55,19 @@ In rare cases, such as OSGi plug-in system, adding additional jars to the ``CLAS
+ JNDI
+ ^^^^
+ 
+-If you are working in a Java Enterprise Edition environment, and would like to configure GeoTools to look up services in a specific context use the following::
++To configure GeoTools to look up services in a specific context use the following:
++
++.. code-block:: java
+   
+-  GeoTools.init( applicationContext ); // JNDI configuration
++   GeoTools.init( context ); // JNDI configuration
+ 
+-GeoTools uses names of the format ``jdbc:EPSG`` internally these are adapted for use with your ``applicationContext`` using the ``GeoTools.fixName`` method::
++For JNDI lookup GeooTools uses:
+ 
+-  String name = GeoTools.fixName("jdbc.EPSG");
++.. code-block:: java
++
++   DataSource dataSource = (DataSource) GeoTools.jndiLookup(name);
++   
++The ``jndiLookup(String)`` is to safe lookups by default. The default use of ``GeoTools.DEFAULT_JNDI_VALIDATOR`` ensures only no-schema and java schema lookups are allowed. To relax this policy you may supply your own approach using ``GeoTools.setJNDINameValidator(Predicate<String>)``.
+ 
+ XML
+ ^^^
+diff --git a/docs/user/welcome/upgrade.rst b/docs/user/welcome/upgrade.rst
+index b1e6805519a..72cb08e9269 100644
+--- a/docs/user/welcome/upgrade.rst
++++ b/docs/user/welcome/upgrade.rst
+@@ -70,6 +70,28 @@ Fixing this required changes to multiple classes:
+ GeoTools 25.x
+ -------------
+ 
++GeoTools
++^^^^^^^^
++
++In GeoTools 25.7 ``GeoTools.getInitialContext().look(name)`` and related methods have been deprecated, with ``GeoTools.jndiLookup(name)``. We have also taken an opportunity to remove ``GeoTools.fixName( context, name )`` 
++
++The use of ``GeoTools.jndiLookup(name)`` is subject to validation with the default ``GeoTools.DEFAULT_JNDI_VALIDATOR`` validator used limit name lookup.
++
++BEFORE
++
++.. code-block:: java
++
++   context = GeoTools.getInitialContext();
++   String fixedName = GeoTools.fixName( context, name );
++   return (DataSource) context.lookup(fixedName);
++
++AFTER
++
++.. code-block:: java
++
++   return (DataSource) GeoTools.jndiLookup(name);
++
++
+ More variable arguments support in core classes
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 
+diff --git a/modules/library/jdbc/src/main/java/org/geotools/data/jdbc/datasource/JNDIDataSourceFactory.java b/modules/library/jdbc/src/main/java/org/geotools/data/jdbc/datasource/JNDIDataSourceFactory.java
+index 1105f2fbe47..c65484d3d5a 100644
+--- a/modules/library/jdbc/src/main/java/org/geotools/data/jdbc/datasource/JNDIDataSourceFactory.java
++++ b/modules/library/jdbc/src/main/java/org/geotools/data/jdbc/datasource/JNDIDataSourceFactory.java
+@@ -64,7 +64,7 @@ public boolean canProcess(Map<String, ?> params) {
+     public DataSource createNewDataSource(Map<String, ?> params) throws IOException {
+         String refName = (String) JNDI_REFNAME.lookUp(params);
+         try {
+-            return (DataSource) GeoTools.getInitialContext().lookup(refName);
++            return (DataSource) GeoTools.jndiLookup(refName);
+         } catch (Exception e) {
+             throw new DataSourceException("Could not find the specified data source in JNDI", e);
+         }
+@@ -83,11 +83,6 @@ public Param[] getParametersInfo() {
+     /** Make sure a JNDI context is available */
+     @Override
+     public boolean isAvailable() {
+-        try {
+-            GeoTools.getInitialContext();
+-            return true;
+-        } catch (Exception e) {
+-            return false;
+-        }
++        return GeoTools.isJNDIAvailable();
+     }
+ }
+diff --git a/modules/library/jdbc/src/main/java/org/geotools/jdbc/JDBCJNDIDataStoreFactory.java b/modules/library/jdbc/src/main/java/org/geotools/jdbc/JDBCJNDIDataStoreFactory.java
+index 87b7717fdf6..ff85d6b9a40 100644
+--- a/modules/library/jdbc/src/main/java/org/geotools/jdbc/JDBCJNDIDataStoreFactory.java
++++ b/modules/library/jdbc/src/main/java/org/geotools/jdbc/JDBCJNDIDataStoreFactory.java
+@@ -21,7 +21,6 @@
+ import java.util.Map;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+-import javax.naming.Context;
+ import javax.naming.NamingException;
+ import javax.sql.DataSource;
+ import org.geotools.data.DataStore;
+@@ -90,23 +89,16 @@ protected DataSource createDataSource(Map<String, ?> params, SQLDialect dialect)
+         String jndiName = (String) JNDI_REFNAME.lookUp(params);
+         if (jndiName == null) throw new IOException("Missing " + JNDI_REFNAME.description);
+ 
+-        Context ctx = null;
+         DataSource ds = null;
+ 
+         try {
+-            ctx = GeoTools.getInitialContext();
+-        } catch (NamingException e) {
+-            throw new RuntimeException(e);
+-        }
+-
+-        try {
+-            ds = (DataSource) ctx.lookup(jndiName);
++            ds = (DataSource) GeoTools.jndiLookup(jndiName);
+         } catch (NamingException e1) {
+             // check if the user did not specify "java:comp/env"
+             // and this code is running in a J2EE environment
+             try {
+                 if (jndiName.startsWith(J2EERootContext) == false) {
+-                    ds = (DataSource) ctx.lookup(J2EERootContext + jndiName);
++                    ds = (DataSource) GeoTools.jndiLookup(J2EERootContext + jndiName);
+                     // success --> issue a waring
+                     Logger.getLogger(this.getClass().getName())
+                             .log(
+@@ -135,12 +127,7 @@ protected DataSource createDataSource(Map<String, ?> params, SQLDialect dialect)
+      */
+     @Override
+     public boolean isAvailable() {
+-        try {
+-            GeoTools.getInitialContext();
+-            return true;
+-        } catch (NamingException e) {
+-            return false;
+-        }
++        return GeoTools.isJNDIAvailable();
+     }
+ 
+     /** Override to omit all those parameters which define the creation of the connection. */
+diff --git a/modules/library/metadata/pom.xml b/modules/library/metadata/pom.xml
+index 2c3a648632e..02a6ee289d4 100644
+--- a/modules/library/metadata/pom.xml
++++ b/modules/library/metadata/pom.xml
+@@ -134,6 +134,11 @@
+       <version>${project.version}</version>
+       <scope>compile</scope>
+     </dependency>
++    <dependency>
++      <groupId>org.mockito</groupId>
++      <artifactId>mockito-core</artifactId>
++      <scope>test</scope>
++    </dependency>
+   </dependencies>
+ 
+   <build>
+diff --git a/modules/library/metadata/src/main/java/org/geotools/util/factory/GeoTools.java b/modules/library/metadata/src/main/java/org/geotools/util/factory/GeoTools.java
+index 6a2ab77358a..ce3fe70cd54 100644
+--- a/modules/library/metadata/src/main/java/org/geotools/util/factory/GeoTools.java
++++ b/modules/library/metadata/src/main/java/org/geotools/util/factory/GeoTools.java
+@@ -25,6 +25,8 @@
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Modifier;
+ import java.net.MalformedURLException;
++import java.net.URI;
++import java.net.URISyntaxException;
+ import java.net.URL;
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+@@ -38,6 +40,7 @@
+ import java.util.Properties;
+ import java.util.Set;
+ import java.util.StringTokenizer;
++import java.util.function.Predicate;
+ import java.util.jar.Manifest;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+@@ -87,6 +90,7 @@
+  * @author Martin Desruisseaux
+  */
+ public final class GeoTools {
++
+     /** Properties about this geotools build */
+     private static final Properties PROPS;
+ 
+@@ -301,6 +305,29 @@ private static Properties loadProperites(String resource) {
+         BINDINGS = Collections.unmodifiableMap(bindings);
+     }
+ 
++    /**
++     * Default JNDI name validator, allows lookups only on names without a scheme, or using the
++     * <code>java</code> scheme.
++     */
++    public static final Predicate<String> DEFAULT_JNDI_VALIDATOR =
++            name -> {
++                Logger LOGGER = Logging.getLogger(GeoTools.class);
++                try {
++                    URI uri = new URI(name);
++                    boolean result = uri.getScheme() == null || uri.getScheme().equals("java");
++                    if (!result)
++                        LOGGER.warning(
++                                "JNDI lookup allowed only on java scheme, or no scheme. Found instead: "
++                                        + name);
++                    return result;
++                } catch (URISyntaxException e) {
++                    LOGGER.log(Level.WARNING, "Invalid JNDI name provided", e);
++                    return false;
++                }
++            };
++
++    private static Predicate<String> jndiValidator = DEFAULT_JNDI_VALIDATOR;
++
+     /**
+      * Binds the specified {@linkplain System#getProperty(String) system property} to the specified
+      * key. Only one key can be bound to a given system property. However the same key can be binded
+@@ -735,13 +762,13 @@ public static void init() {
+     /**
+      * Provides GeoTools with the JNDI context for resource lookup.
+      *
+-     * @param applicationContext The initial context to use.
+-     * @see #getInitialContext
++     * @param initialContext The initial context to use for JNDI lookup
++     * @see #jndiLookup(String)
+      * @since 2.4
+      */
+-    public static void init(final InitialContext applicationContext) {
++    public static void init(final InitialContext initialContext) {
+         synchronized (GeoTools.class) {
+-            context = applicationContext;
++            context = initialContext;
+         }
+         fireConfigurationChanged();
+     }
+@@ -934,30 +961,24 @@ static <T, D extends T> T instantiate(String className, Class<T> type, D default
+         }
+         return defaultValue;
+     }
++
+     /**
+      * Returns the default initial context.
+      *
+-     * @param hints An optional set of hints, or {@code null} if none.
+      * @return The initial context (never {@code null}).
+      * @throws NamingException if the initial context can't be created.
+-     * @see #init(InitialContext)
+-     * @since 2.4
+-     * @deprecated hints isn't really used. Use the function without hints
++     * @deprecated Please use {@link #jndiLookup(String)} instead, or provide an {@link
++     *     InitialContext} to the {@link #init(InitialContext)} method and use it directly.
+      */
+     @Deprecated
+-    public static synchronized InitialContext getInitialContext(final Hints hints)
+-            throws NamingException {
+-
+-        return getInitialContext();
++    public static synchronized InitialContext getInitialContext() throws NamingException {
++        Logging.getLogger(GeoTools.class)
++                .severe(
++                        "Please don't use GeoTools.getInitialContext(), perform lookups using GeoTools.jndiLookup(s) instead.");
++        return getJNDIContext();
+     }
+ 
+-    /**
+-     * Returns the default initial context.
+-     *
+-     * @return The initial context (never {@code null}).
+-     * @throws NamingException if the initial context can't be created.
+-     */
+-    public static synchronized InitialContext getInitialContext() throws NamingException {
++    private static synchronized InitialContext getJNDIContext() throws NamingException {
+         if (context == null) {
+             try {
+                 context = new InitialContext();
+@@ -968,6 +989,45 @@ public static synchronized InitialContext getInitialContext() throws NamingExcep
+         return context;
+     }
+ 
++    /**
++     * Checks if JNDI is available, either because it was initialized, or because it was possible to
++     * create one.
++     */
++    public static boolean isJNDIAvailable() {
++        try {
++            // see if we have a context, or can create one
++            return getJNDIContext() != null;
++        } catch (NamingException e) {
++            return false;
++        }
++    }
++
++    /**
++     * Sets up a function that will be called to validate the JNDI lookups. If not set, the
++     * DEFAULT_JNDI_VALIDATOR is used. The function may want to log the reason why a given name was
++     * denied lookup.
++     *
++     * @param validator A function returning true if the lookups are meant to be performed, false
++     *     otherwise.
++     */
++    public static void setJNDINameValidator(Predicate<String> validator) {
++        jndiValidator = validator;
++    }
++
++    /**
++     * Looks up an object from the JNDI {@link InitialContext}. By default, it only allows lookups
++     * with no scheme, or inside the <code>java</code> scheme. One can set up a custom name
++     * validation routine using
++     *
++     * @param name
++     * @return
++     * @throws NamingException
++     */
++    public static Object jndiLookup(String name) throws NamingException {
++        if (!jndiValidator.test(name)) return null;
++        return getJNDIContext().lookup(name);
++    }
++
+     private static NamingException handleException(Exception e) {
+         final Logger LOGGER = Logging.getLogger(GeoTools.class);
+         final String propFileName = "jndi.properties";
+@@ -1064,7 +1124,11 @@ public static synchronized void clearInitialContext() throws NamingException {
+      * @return Name fixed up with {@link Context#composeName(String,String)}, or {@code null} if the
+      *     given name was null.
+      * @since 2.4
++     * @deprecated With no replacement, GeoTools now uses JNDI lookups as instructed in {@link
++     *     #jndiLookup(String)}, but does not put any object in the contex, the downstream
++     *     application should do it if necessary instead.
+      */
++    @Deprecated
+     public static String fixName(final String name) {
+         return fixName(null, name, null);
+     }
+@@ -1079,7 +1143,11 @@ public static String fixName(final String name) {
+      * @return Name fixed up with {@link Context#composeName(String,String)}, or {@code null} if the
+      *     given name was null.
+      * @since 2.4
++     * @deprecated With no replacement, GeoTools now uses JNDI lookups as instructed in {@link *
++     *     #jndiLookup(String)}, but does not put any object in the contex, the downstream *
++     *     application should do it if necessary instead.
+      */
++    @Deprecated
+     public static String fixName(final Context context, final String name) {
+         return (context != null) ? fixName(context, name, null) : name;
+     }
+@@ -1088,7 +1156,12 @@ public static String fixName(final Context context, final String name) {
+      * Implementation of {@code fixName} method. If the context is {@code null}, then the
+      * {@linkplain #getInitialContext GeoTools initial context} will be fetch only when first
+      * needed.
++     *
++     * @deprecated With no replacement, GeoTools now uses JNDI lookups as instructed in {@link *
++     *     #jndiLookup(String)}, but does not put any object in the contex, the downstream *
++     *     application should do it if necessary instead.
+      */
++    @Deprecated
+     private static String fixName(Context context, final String name, final Hints hints) {
+         String fixed = null;
+         if (name != null) {
+diff --git a/modules/library/metadata/src/test/java/org/geotools/util/factory/FactoryRegistryTest.java b/modules/library/metadata/src/test/java/org/geotools/util/factory/FactoryRegistryTest.java
+index 0c19d343de2..2aa23f629a7 100644
+--- a/modules/library/metadata/src/test/java/org/geotools/util/factory/FactoryRegistryTest.java
++++ b/modules/library/metadata/src/test/java/org/geotools/util/factory/FactoryRegistryTest.java
+@@ -68,6 +68,7 @@ public void ensureHintsLoaded() {
+      * @param creator {@code true} if the registry should be an instance of {@link
+      *     org.geotools.util.factory.FactoryCreator}.
+      */
++    @SuppressWarnings("PMD.UnusedPrivateMethod") // PMD getting confused here?
+     private FactoryRegistry getRegistry(
+             final boolean creator,
+             final Factory factory1,
+diff --git a/modules/library/metadata/src/test/java/org/geotools/util/factory/GeoToolsTest.java b/modules/library/metadata/src/test/java/org/geotools/util/factory/GeoToolsTest.java
+index a1293cca0b9..091edd8b9b0 100644
+--- a/modules/library/metadata/src/test/java/org/geotools/util/factory/GeoToolsTest.java
++++ b/modules/library/metadata/src/test/java/org/geotools/util/factory/GeoToolsTest.java
+@@ -29,11 +29,15 @@
+ import java.util.Map;
+ import java.util.jar.Manifest;
+ import javax.media.jai.JAI;
++import javax.naming.InitialContext;
++import javax.naming.NamingException;
+ import org.apache.commons.logging.LogFactory;
+ import org.geotools.util.NullEntityResolver;
+ import org.geotools.util.PreventLocalEntityResolver;
+ import org.geotools.util.Version;
++import org.junit.Before;
+ import org.junit.Test;
++import org.mockito.Mockito;
+ import org.opengis.filter.Filter;
+ import org.xml.sax.EntityResolver;
+ 
+@@ -46,6 +50,13 @@
+  * @author Martin Desruisseaux
+  */
+ public final class GeoToolsTest {
++
++    @Before
++    public void clearJNDI() throws NamingException {
++        GeoTools.clearInitialContext();
++        GeoTools.setJNDINameValidator(GeoTools.DEFAULT_JNDI_VALIDATOR);
++    }
++
+     /** Makes sures that J2SE 1.4 assertions are enabled. */
+     @Test
+     public void testAssertionEnabled() {
+@@ -194,6 +205,7 @@ public void testSystemHints() {
+      * We avoid the tests that would require a real initial context.
+      */
+     @Test
++    @SuppressWarnings("deprecation")
+     public void testFixName() {
+         assertNull(GeoTools.fixName(null));
+         assertEquals("simpleName", GeoTools.fixName("simpleName"));
+@@ -262,4 +274,36 @@ public void testEntityResolver() {
+             Hints.scanSystemProperties();
+         }
+     }
++
++    @Test
++    public void testLookupValidation() throws Exception {
++        // setup mock initial context (need a JNDI provider otherwise, like simple-jndi)
++        InitialContext ctx = Mockito.mock(InitialContext.class);
++        Object test1 = new Object();
++        String name1 = "java://test1";
++        Mockito.when(ctx.lookup(name1)).thenReturn(test1);
++        Object test2 = new Object();
++        String name2 = "ftp://test2";
++        Mockito.when(ctx.lookup(name2)).thenReturn(test2);
++        Object test3 = new Object();
++        String name3 = "http://test3";
++        Mockito.when(ctx.lookup(name3)).thenReturn(test3);
++        Object test4 = new Object();
++        String name4 = "java://test4{}"; // invalid URI
++        Mockito.when(ctx.lookup(name4)).thenReturn(test4);
++
++        // using default validator
++        GeoTools.init(ctx);
++        assertSame(test1, GeoTools.jndiLookup(name1));
++        assertNull(GeoTools.jndiLookup(name2));
++        assertNull(GeoTools.jndiLookup(name3));
++        assertNull(GeoTools.jndiLookup(name4));
++
++        // setup an "accept all" filter
++        GeoTools.setJNDINameValidator(name -> true);
++        assertSame(test1, GeoTools.jndiLookup(name1));
++        assertSame(test2, GeoTools.jndiLookup(name2));
++        assertSame(test3, GeoTools.jndiLookup(name3));
++        assertSame(test4, GeoTools.jndiLookup(name4));
++    }
+ }
+diff --git a/modules/library/referencing/src/main/java/org/geotools/referencing/factory/AbstractEpsgMediator.java b/modules/library/referencing/src/main/java/org/geotools/referencing/factory/AbstractEpsgMediator.java
+index 159a2787a18..6712c2a977b 100644
+--- a/modules/library/referencing/src/main/java/org/geotools/referencing/factory/AbstractEpsgMediator.java
++++ b/modules/library/referencing/src/main/java/org/geotools/referencing/factory/AbstractEpsgMediator.java
+@@ -20,7 +20,6 @@
+ import java.sql.SQLException;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+-import javax.naming.InitialContext;
+ import javax.sql.DataSource;
+ import org.geotools.metadata.iso.citation.Citations;
+ import org.geotools.util.SimpleInternationalString;
+@@ -73,11 +72,8 @@ static DataSource lookupDataSource(Hints hints) throws FactoryException {
+             return (DataSource) hint;
+         } else if (hint instanceof String) {
+             String name = (String) hint;
+-            InitialContext context;
+             try {
+-                context = GeoTools.getInitialContext();
+-                // name = GeoTools.fixName( context, name );
+-                return (DataSource) context.lookup(name);
++                return (DataSource) GeoTools.jndiLookup(name);
+             } catch (Exception e) {
+                 throw new FactoryException("EPSG_DATA_SOURCE '" + name + "' not found:" + e, e);
+             }
+diff --git a/modules/library/referencing/src/main/java/org/geotools/referencing/factory/epsg/AbstractEpsgFactory.java b/modules/library/referencing/src/main/java/org/geotools/referencing/factory/epsg/AbstractEpsgFactory.java
+index 2fbcd21263d..fe9a8e9fb51 100644
+--- a/modules/library/referencing/src/main/java/org/geotools/referencing/factory/epsg/AbstractEpsgFactory.java
++++ b/modules/library/referencing/src/main/java/org/geotools/referencing/factory/epsg/AbstractEpsgFactory.java
+@@ -303,7 +303,7 @@ public AbstractEpsgFactory(final Hints userHints) throws FactoryException {
+             if (hint instanceof String) {
+                 String name = (String) hint;
+                 try {
+-                    dataSource = (DataSource) GeoTools.getInitialContext().lookup(name);
++                    dataSource = (DataSource) GeoTools.jndiLookup(name);
+                 } catch (NamingException e) {
+                     throw new FactoryException("A EPSG_DATA_SOURCE hint is required:" + e);
+                 }
+diff --git a/modules/library/referencing/src/main/java/org/geotools/referencing/factory/epsg/ThreadedEpsgFactory.java b/modules/library/referencing/src/main/java/org/geotools/referencing/factory/epsg/ThreadedEpsgFactory.java
+index 30c71547d1e..96a67329c80 100644
+--- a/modules/library/referencing/src/main/java/org/geotools/referencing/factory/epsg/ThreadedEpsgFactory.java
++++ b/modules/library/referencing/src/main/java/org/geotools/referencing/factory/epsg/ThreadedEpsgFactory.java
+@@ -22,9 +22,7 @@
+ import java.util.jar.Attributes.Name;
+ import java.util.logging.Level;
+ import java.util.logging.LogRecord;
+-import javax.naming.InitialContext;
+ import javax.naming.NamingException;
+-import javax.naming.NoInitialContextException;
+ import javax.sql.DataSource;
+ import org.geotools.metadata.i18n.ErrorKeys;
+ import org.geotools.metadata.i18n.Errors;
+@@ -91,28 +89,12 @@ public class ThreadedEpsgFactory extends DeferredAuthorityFactory
+      */
+     public static final String DATASOURCE_NAME = "java:comp/env/jdbc/EPSG";
+ 
+-    /**
+-     * {@code true} if automatic registration of {@link #datasourceName} is allowed. Set to {@code
+-     * false} for now because the registration has not been correctly tested in JEE environment.
+-     *
+-     * @todo Consider removing completly the code related to JNDI binding. In such case, this field
+-     *     and the {@link #registerInto} field would be removed.
+-     */
+-    private static final boolean ALLOW_REGISTRATION = false;
+-
+     /** The default priority level for this factory. */
+     protected static final int PRIORITY = MAXIMUM_PRIORITY - 10;
+ 
+     /** The factories to be given to the backing store. */
+     private final ReferencingFactoryContainer factories;
+ 
+-    /**
+-     * The context where to register {@link #datasource}, or {@code null} if it should not be
+-     * registered. This is used only as a way to pass "hiden" return value between {@link
+-     * #createDataSource()} and {@link #createBackingStore()}.
+-     */
+-    private transient InitialContext registerInto;
+-
+     /**
+      * The data source name. If it was not specified by the {@link Hints#EPSG_DATA_SOURCE
+      * EPSG_DATA_SOURCE} hint, then this is the {@value #DATASOURCE_NAME} value.
+@@ -301,15 +283,10 @@ public synchronized void setDataSource(final DataSource datasource) throws SQLEx
+      * @throws SQLException if an error occured while creating the data source.
+      */
+     protected DataSource createDataSource() throws SQLException {
+-        InitialContext context = null;
+         DataSource source = null;
+         try {
+-            context = GeoTools.getInitialContext();
+-            source = (DataSource) context.lookup(datasourceName);
+-        } catch (IllegalArgumentException | NoInitialContextException exception) {
+-            // Fall back on 'return null' below.
+-        } catch (NamingException exception) {
+-            registerInto = context;
++            source = (DataSource) GeoTools.jndiLookup(datasourceName);
++        } catch (IllegalArgumentException | NamingException exception) {
+             // Fall back on 'return null' below.
+         }
+         return source;
+@@ -380,14 +357,7 @@ private AbstractAuthorityFactory createBackingStore0() throws FactoryException,
+          * Try to gets the DataSource from JNDI. In case of success, it will be tried
+          * for a connection before any DataSource declared in META-INF/services/.
+          */
+-        DataSource source;
+-        final InitialContext context;
+-        try {
+-            source = createDataSource();
+-            context = registerInto;
+-        } finally {
+-            registerInto = null;
+-        }
++        DataSource source = createDataSource();
+         if (source == null) {
+             throw new FactoryNotFoundException(Errors.format(ErrorKeys.NO_DATA_SOURCE));
+         }
+@@ -398,27 +368,6 @@ private AbstractAuthorityFactory createBackingStore0() throws FactoryException,
+         } finally {
+             datasource = null;
+         }
+-        /*
+-         * We now have a working connection. If a naming directory is running but didn't contains
+-         * the "jdbc/EPSG" entry, add it now. In such case, a message is prepared and logged.
+-         */
+-        LogRecord record;
+-        if (ALLOW_REGISTRATION && context != null) {
+-            try {
+-                context.bind(datasourceName, source);
+-                record =
+-                        Loggings.format(
+-                                Level.FINE,
+-                                LoggingKeys.CREATED_DATASOURCE_ENTRY_$1,
+-                                datasourceName);
+-            } catch (NamingException exception) {
+-                record =
+-                        Loggings.format(
+-                                Level.WARNING, LoggingKeys.CANT_BIND_DATASOURCE_$1, datasourceName);
+-                record.setThrown(exception);
+-            }
+-            log(record);
+-        }
+         this.datasource = source; // Stores the data source only after success.
+         return factory;
+     }
+diff --git a/modules/unsupported/postgis-raster/src/main/java/org/geotools/gce/pgraster/PGRasterConfig.java b/modules/unsupported/postgis-raster/src/main/java/org/geotools/gce/pgraster/PGRasterConfig.java
+index 1735566f580..353a5397b20 100644
+--- a/modules/unsupported/postgis-raster/src/main/java/org/geotools/gce/pgraster/PGRasterConfig.java
++++ b/modules/unsupported/postgis-raster/src/main/java/org/geotools/gce/pgraster/PGRasterConfig.java
+@@ -117,7 +117,7 @@ static Document parse(File cfgfile) {
+         String jndi = first(db, "jndi").map(this::nodeValue).orElse(null);
+         if (jndi != null) {
+             try {
+-                dataSource = (DataSource) GeoTools.getInitialContext().lookup(jndi);
++                dataSource = (DataSource) GeoTools.jndiLookup(jndi);
+             } catch (NamingException e) {
+                 throw new IllegalArgumentException("Error performing JNDI lookup for: " + jndi, e);
+             }

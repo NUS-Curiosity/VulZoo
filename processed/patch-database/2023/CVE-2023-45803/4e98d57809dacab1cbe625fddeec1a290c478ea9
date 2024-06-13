@@ -1,0 +1,201 @@
+diff --git a/.readthedocs.yml b/.readthedocs.yml
+index 78bd2064f6..7c59df5b3a 100644
+--- a/.readthedocs.yml
++++ b/.readthedocs.yml
+@@ -3,7 +3,7 @@ version: 2
+ build:
+   os: ubuntu-22.04
+   tools:
+-    python: "3"
++    python: "3.11"
+ 
+ python:
+   install:
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 27038fef47..6c37aeba10 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,3 +1,8 @@
++2.0.7 (2023-10-17)
++==================
++
++* Made body stripped from HTTP requests changing the request method to GET after HTTP 303 "See Other" redirect responses.
++
+ 2.0.6 (2023-10-02)
+ ==================
+ 
+@@ -167,6 +172,11 @@ Fixed
+ * Fixed a socket leak if ``HTTPConnection.connect()`` fails (`#2571 <https://github.com/urllib3/urllib3/pull/2571>`__).
+ * Fixed ``urllib3.contrib.pyopenssl.WrappedSocket`` and ``urllib3.contrib.securetransport.WrappedSocket`` close methods (`#2970 <https://github.com/urllib3/urllib3/issues/2970>`__)
+ 
++1.26.18 (2023-10-17)
++====================
++
++* Made body stripped from HTTP requests changing the request method to GET after HTTP 303 "See Other" redirect responses.
++
+ 1.26.17 (2023-10-02)
+ ====================
+ 
+diff --git a/dummyserver/handlers.py b/dummyserver/handlers.py
+index 9fde80e041..86201a116f 100644
+--- a/dummyserver/handlers.py
++++ b/dummyserver/handlers.py
+@@ -281,6 +281,12 @@ def encodingrequest(self, request: httputil.HTTPServerRequest) -> Response:
+     def headers(self, request: httputil.HTTPServerRequest) -> Response:
+         return Response(json.dumps(dict(request.headers)))
+ 
++    def headers_and_params(self, request: httputil.HTTPServerRequest) -> Response:
++        params = request_params(request)
++        return Response(
++            json.dumps({"headers": dict(request.headers), "params": params})
++        )
++
+     def multi_headers(self, request: httputil.HTTPServerRequest) -> Response:
+         return Response(json.dumps({"headers": list(request.headers.get_all())}))
+ 
+diff --git a/src/urllib3/_collections.py b/src/urllib3/_collections.py
+index f1cb60654a..55b0324797 100644
+--- a/src/urllib3/_collections.py
++++ b/src/urllib3/_collections.py
+@@ -10,6 +10,8 @@
+     # dependency, and is not available at runtime.
+     from typing import Protocol
+ 
++    from typing_extensions import Self
++
+     class HasGettableStringKeys(Protocol):
+         def keys(self) -> typing.Iterator[str]:
+             ...
+@@ -391,6 +393,24 @@ def getlist(
+             # meets our external interface requirement of `Union[List[str], _DT]`.
+             return vals[1:]
+ 
++    def _prepare_for_method_change(self) -> Self:
++        """
++        Remove content-specific header fields before changing the request
++        method to GET or HEAD according to RFC 9110, Section 15.4.
++        """
++        content_specific_headers = [
++            "Content-Encoding",
++            "Content-Language",
++            "Content-Location",
++            "Content-Type",
++            "Content-Length",
++            "Digest",
++            "Last-Modified",
++        ]
++        for header in content_specific_headers:
++            self.discard(header)
++        return self
++
+     # Backwards compatibility for httplib
+     getheaders = getlist
+     getallmatchingheaders = getlist
+diff --git a/src/urllib3/_version.py b/src/urllib3/_version.py
+index 2d0d430896..e2b88f1d68 100644
+--- a/src/urllib3/_version.py
++++ b/src/urllib3/_version.py
+@@ -1,4 +1,4 @@
+ # This file is protected via CODEOWNERS
+ from __future__ import annotations
+ 
+-__version__ = "2.0.6"
++__version__ = "2.0.7"
+diff --git a/src/urllib3/connectionpool.py b/src/urllib3/connectionpool.py
+index 113d264d79..70048b7aed 100644
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -11,6 +11,7 @@
+ from types import TracebackType
+ 
+ from ._base_connection import _TYPE_BODY
++from ._collections import HTTPHeaderDict
+ from ._request_methods import RequestMethods
+ from .connection import (
+     BaseSSLError,
+@@ -892,7 +893,11 @@ def urlopen(  # type: ignore[override]
+         redirect_location = redirect and response.get_redirect_location()
+         if redirect_location:
+             if response.status == 303:
++                # Change the method according to RFC 9110, Section 15.4.4.
+                 method = "GET"
++                # And lose the body not to transfer anything sensitive.
++                body = None
++                headers = HTTPHeaderDict(headers)._prepare_for_method_change()
+ 
+             try:
+                 retries = retries.increment(method, url, response=response, _pool=self)
+diff --git a/src/urllib3/poolmanager.py b/src/urllib3/poolmanager.py
+index 7a998ee896..8b8fac9e0d 100644
+--- a/src/urllib3/poolmanager.py
++++ b/src/urllib3/poolmanager.py
+@@ -7,7 +7,7 @@
+ from types import TracebackType
+ from urllib.parse import urljoin
+ 
+-from ._collections import RecentlyUsedContainer
++from ._collections import HTTPHeaderDict, RecentlyUsedContainer
+ from ._request_methods import RequestMethods
+ from .connection import ProxyConfig
+ from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme
+@@ -448,9 +448,12 @@ def urlopen(  # type: ignore[override]
+         # Support relative URLs for redirecting.
+         redirect_location = urljoin(url, redirect_location)
+ 
+-        # RFC 7231, Section 6.4.4
+         if response.status == 303:
++            # Change the method according to RFC 9110, Section 15.4.4.
+             method = "GET"
++            # And lose the body not to transfer anything sensitive.
++            kw["body"] = None
++            kw["headers"] = HTTPHeaderDict(kw["headers"])._prepare_for_method_change()
+ 
+         retries = kw.get("retries")
+         if not isinstance(retries, Retry):
+diff --git a/test/with_dummyserver/test_connectionpool.py b/test/with_dummyserver/test_connectionpool.py
+index fdfb2c9aba..ebfaf3878f 100644
+--- a/test/with_dummyserver/test_connectionpool.py
++++ b/test/with_dummyserver/test_connectionpool.py
+@@ -480,6 +480,17 @@ def test_redirect(self) -> None:
+             assert r.status == 200
+             assert r.data == b"Dummy server!"
+ 
++    def test_303_redirect_makes_request_lose_body(self) -> None:
++        with HTTPConnectionPool(self.host, self.port) as pool:
++            response = pool.request(
++                "POST",
++                "/redirect",
++                fields={"target": "/headers_and_params", "status": "303 See Other"},
++            )
++        data = response.json()
++        assert data["params"] == {}
++        assert "Content-Type" not in HTTPHeaderDict(data["headers"])
++
+     def test_bad_connect(self) -> None:
+         with HTTPConnectionPool("badhost.invalid", self.port) as pool:
+             with pytest.raises(MaxRetryError) as e:
+diff --git a/test/with_dummyserver/test_poolmanager.py b/test/with_dummyserver/test_poolmanager.py
+index da802a38b3..ab0111e45b 100644
+--- a/test/with_dummyserver/test_poolmanager.py
++++ b/test/with_dummyserver/test_poolmanager.py
+@@ -244,6 +244,20 @@ def test_redirect_without_preload_releases_connection(self) -> None:
+             assert r._pool.num_connections == 1
+             assert len(http.pools) == 1
+ 
++    def test_303_redirect_makes_request_lose_body(self) -> None:
++        with PoolManager() as http:
++            response = http.request(
++                "POST",
++                f"{self.base_url}/redirect",
++                fields={
++                    "target": f"{self.base_url}/headers_and_params",
++                    "status": "303 See Other",
++                },
++            )
++        data = response.json()
++        assert data["params"] == {}
++        assert "Content-Type" not in HTTPHeaderDict(data["headers"])
++
+     def test_unknown_scheme(self) -> None:
+         with PoolManager() as http:
+             unknown_scheme = "unknown"

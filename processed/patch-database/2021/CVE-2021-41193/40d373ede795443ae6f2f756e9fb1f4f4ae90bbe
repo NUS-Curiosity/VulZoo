@@ -1,0 +1,4059 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 000000000..dd36f814c
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,15 @@
++#
++# .gitattributes
++#
++# used to remove files from deployment using `git archive`
++#
++
++.gitattributes  export-ignore
++.gitignore      export-ignore
++
++BUILDCONTROL    export-ignore
++
++contrib         export-ignore
++docs            export-ignore
++mediaengine     export-ignore
++tools           export-ignore
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 000000000..7217cab0b
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,50 @@
++*.[oa]
++.*.swp
++*.class
++bin
++gen
++libs
++obj
++local.properties
++*.log
++
++/netprobe
++/verifyd
++/vidloop
++/zcall
++/coin
++/tmp
++/scripts/tmp
++
++/build
++.DS_STORE
++xcuserdata
++xcshareddata
++zcontrib
++ztest
++BUILDCONTROL.local
++artifacts
++version.buildinfo
++*.jnilib
++config.mk
++
++test/audio_test/ios/build/
++tools/zmm/build/
++
++*.aecdump
++*.rtpdump
++
++test/data/near16_out.pcm
++test/data/near32_out.pcm
++test/data/out.pcm
++test/data/out2.pcm
++test/data/rtp.dat
++
++android/java/org/
++
++src/protobuf/proto/
++
++contrib/webrtc
++
++scan/
++
+diff --git a/Makefile b/Makefile
+index 21c70cd4c..6e5c440bf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -33,25 +33,21 @@ else
+ VER_PATCH := $(BUILD_NUMBER)
+ endif
+ 
+-VER_BRANCH := $(shell git rev-parse --abbrev-ref HEAD || echo "Fetching branch failed")
++VER_BRANCH := $(shell git rev-parse --abbrev-ref HEAD || echo "")
+ 
+ ifeq ($(VER_BRANCH),master)
+ AVS_PROJECT := avsmaster
+ AVS_RELEASE := 0
+-AVS_VERSION := 0.$(VER_PATCH)
+-else ifeq ($(VER_BRANCH),open_source)
+-AVS_PROJECT := avsopen
+-AVS_RELEASE := 1
+-AVS_VERSION := $(VER_MAJOR).$(VER_MINOR).$(VER_PATCH)
++AVS_VERSION := 0.0.$(VER_PATCH)
+ else
+ AVS_PROJECT := avs
+ AVS_RELEASE := 1
+ AVS_VERSION := $(VER_MAJOR).$(VER_MINOR).$(VER_PATCH)
+ endif
+ 
+-
+ MK_COMPONENTS := toolchain contrib avs tools test android iosx dist
+ 
++
+ #--- Configuration ---
+ 
+ -include config.mk
+@@ -91,7 +87,7 @@ endif
+ 
+ #--- All My Targets ---
+ 
+-all: test
++all: tools test
+ 
+ ifeq ($(AVS_OS),android)
+ wrapper: android
+diff --git a/docs/devicepair.md b/docs/devicepair.md
+new file mode 100644
+index 000000000..d4f37d279
+--- /dev/null
++++ b/docs/devicepair.md
+@@ -0,0 +1,54 @@
++Device Pairing
++==============
++
++
++
++Flow Diagram
++------------
++
++
++```
++      .------.               .-------.             .------.
++      | old  |               |       |             |  new |
++      |device|               |verifyd|             |device|
++      '------'               '-------'             '------'
++         |                       |                     |     [ User start a ]
++         |                       |   POST /create      |     [ new pairing  ]
++         |                       |<--------------------|
++         |                       |   200 OK (id=42)    |
++         |                       |-------------------->|
++devpair  |                       |                     |     [ Show Pairing ID ]
++publish()|                       |                     |
++         |                       |                     |
++         |  PUT /publish?id=42   |                     |
++         |  (SDP Offer)          |                     |
++         |---------------------->|                     |
++         |  200 OK               |                     |  poll
++         |<----------------------|                     +--.
++         |                       |  GET /publish?id=42 | /|\
++         |                       |<--------------------|  |
++         |                       |   200 OK (SDP Offer)|  |
++         |                       |-------------------->|  |
++         |                       |                     +--'
++         |                       |                     | ~~~ devpair_create()
++         |                       |                     | ~~~ devpair_accept()
++         |                       |                     |
++         |                       |  PUT /accept?id=42  |
++         |                       |   (SDP Answer)      |
++         |                       |<--------------------|
++   poll  |                       |      200 OK         |
++      .--+                       |-------------------->|
++     /|\ |  GET /accept?id=42    |                     |
++      |  |---------------------->|                     |
++      |  |  200 OK (SDP Answer)  |                     |
++      |  |<----------------------|                     |
++      '--+                       |                     |
++devpair  |                       |                     |
++ack()    |                       |                     |
++         |                       |                     |
++         |<================= DataChannel =============>|     [  Started]
++
++
++TODO: transfer data (ledger)
++
++```
+diff --git a/docs/flowmgr.md b/docs/flowmgr.md
+new file mode 100644
+index 000000000..ca5ac9d5f
+--- /dev/null
++++ b/docs/flowmgr.md
+@@ -0,0 +1,145 @@
++Flow Manager
++============
++
++In Zeta, calling is split into two more or less independent parts: call
++state handling and media handling.  Call state handling controls which
++users and devices have joined a call in a conversation.  Media handling
++makes sure that audio and video data is being exchanged between all
++devices that have joined a call.
++
++The flow manager is a component of the AVS library that implements media
++handling for calling.  It takes care of both the network and the AV side
++of call media: it establishes media flows between devices, records audio
++and video from the recording devices present in the system, encodes these
++and sends them over the media flows, it receives encoded media from the
++network, decodes it and plays it back on playback devices.
++
++This document describes both the interface and function of the flow
++manager in great detail.
++
++
++Basics
++------
++
++Calling happens in the context of conversations.  Each conversation has an
++associated call which devices can join.  Whether a device can join a call
++and for how long is being controlled by the service.  This is determined by
++the call state handling component of calling and is not being discussed
++here.
++
++In order to be able to participate in a call, a device needs to be able to
++exchange data with remote locations. Since there can be several devices
++that can potentially join a call, the remote location is not predetermined
++and it can change during a call. However, for each device there is at most
++one such location at any given time. The relationship between exactly two
++devices for exchanging media is called a media flow.
++
++Media flows are controlled by the service. Before starting a call, a device
++asks the service for a set of flows, called 'posting for flows.' The
++service determines any potential other devices in the call and creates a
++media flow the asking devices and each of these. They receive their flows
++without having asked for them through the `call.flow-add` event.
++
++When a device has received a flow, be it by asking or throug an event, it
++starts preparing the flow. This entails an offer/answer exchange for media
++capabilities followed by an ICE exchange to determine and open actual
++network connections.
++
++A call starts once at least two devices have joined call. When this
++happens, the service determines which media flow should be used to
++exchange media over and informs the device by 'activating the flow'
++through a `call.flow-active` event. Only when a flow is active is a device
++allowed to send media over it. However, it does not have to. The device
++can decide to keep the call muted or it can keep it on hold while being in
++the call of another conversation.
++
++Sending and receiving of media ends when the flow is being deactivated by
++the service, yet again by way of a `call.flow-active` event.
++
++Once the device determines that it doesn't want to be in a call anymore,
++it can delete all its flows. If the other side of a flow decides to delete
++it, the device will be informed by the service through a
++`call.flow-delete` event.
++
++
++The Flow Manager API
++--------------------
++
++The flow manager is a single object that provides a number of functions to
++be called by the user and calls a number of callbacks to be registered by
++the user.
++
++There is only one flow manager per application. Functions that operate on
++a per-conversation basis use the conversation ID as an argument.
++
++
++Service Connection
++------------------
++
++The flow manager needs to communicate to the service. It does so both
++through HTTP requests and events.
++
++It emits HTTP requests through a callback registered at creation time.
++This callback will contain all parts of the HTTP request as arguments.
++Additionally, it contains an opaque pointer to a context. It is the user's
++responsibility to create and dispatch an HTTP request. Once a response
++arrives, the user must pass it to the flow manager through the
++`flowmgr_resp()` function, passing the context pointer from the request.
++
++Additionally, all events must be passed to the flow manager through the
++`flowmgr_event()` function.
++
++
++Managing Calls
++--------------
++
++When the API user anticipates that a call might start, it calls the
++`flowmgr_acquire_flows()` function. This will cause the flow manager to
++request flows from the service. The user can now proceed with call states.
++Eventually, the service will activate one of the flows in response to the
++device call state being set to active.
++
++Now there's two options: if setting up media on the activated flow fails,
++an error is emitted allowing the user to alert its user and wind down the
++call. If, however, it succeeds, something called audio categories comes
++into play.
++
++It is also important that flows are released (flowmgr_release_flows()) after
++a call participant has been set to "idle" and response has been received.
++
++Media Categories
++----------------
++
++Media categories describe how recording and playback of media should be
++handled for a conversation. Currently, there are four:
++
++*  _regular_: this is the normal mode where only notification sounds are
++   emitted from the conversation and no recording takes place;
++*  _muted_: the conversation has been muted and no playback or recording
++   should happen (note that this is independent of any muting feature
++   implemented by UI);
++*  _call_: the conversation has actively joined a call, incoming media is
++   being played back and recorded media is being streamed to the network;
++*  _playback_: an embedded media element in the conversation is playing
++   its media.
++
++The media category for each conversation is managed by the user of the
++flow manager. In most cases, it will do so using the media manager.
++
++The flow manager does, however, request a certain media category necessary
++for its operation. When a flow has been activated, it requests the _call_
++category. When an active flow has been deactivated, it requests the
++_regular_ category. It is up to the user to actually set the requested
++category and perform any necessary action for a change.
++
++The flow manager requests a changed through `flowmgr_mcat_h`
++callback. Any change to the media category of a conversation needs to be
++communicated using the `flowmgr_mcat_changed()` function.
++
++So, when a flow is being activated by the service, the flow manager will
++request the _call_ media category for that conversation. It will only
++start playback and recording, however, once it has been notified that this
++change has happened.
++
++Similarly, the user can decide at any time to revoke the _call_ media
++category in which case the flow manager stops playback and recording.
+diff --git a/docs/local_avs_on_ios.md b/docs/local_avs_on_ios.md
+new file mode 100644
+index 000000000..fd637ed1a
+--- /dev/null
++++ b/docs/local_avs_on_ios.md
+@@ -0,0 +1,52 @@
++
++# Building ZClient-iOS with local AVS
++
++## Requirements
++
++Xcode7
++Cocoa pods: sudo gem install cocoapods
++Carthage: brew install carthage
++
++## Set up xcode_link dir
++
++Make a link to avsball:
++
++```
++mkdir xcode_link
++cd xcode_link
++ln -s ../avs/build/dist/ios/avsball ios
++```
++
++## Getting Zclient dependencies
++
++Get pods and whatever
++
++```
++cd zclient-ios
++pod init
++carthage bootstrap
++```
++
++## Add getcomponents to Build Phases
++
++Open xcworkspace file in Xcode
++Add following line to "Check Pods manifest.lock" in build phases
++
++```
++${HOME}/Library/Python/2.7/bin/getcomponents --verbose --force --build-control ${SRCROOT}/BUILDCONTROL --platform ios
++```
++
++## Fix Buildconfig to get local AVS
++
++Copy BUILDCONFIG to BUILDCONFIG.local, replace avs with local & add the paths section
++
++```
++[libraries]
++avs: local
++
++[paths]
++avs: ../xcode_link
++```
++
++## Profit
++
+diff --git a/docs/release-process.txt b/docs/release-process.txt
+new file mode 100644
+index 000000000..98ecf2555
+--- /dev/null
++++ b/docs/release-process.txt
+@@ -0,0 +1,25 @@
++Release Process for AVS:
++-----------------------
++
++
++Different projects have different release policy:
++
++
++  avs:          master     This is the main development branch
++                release    This is the release branch, only for bugfixes
++                           (commits in release branch are merged back to master)
++
++
++  zcontrib:     master     Should always have production ready code in their master branch
++                           New features are kept in a feature-branch
++
++
++  mediaengine:  master     Should always have production ready code in their master branch
++                           New features are kept in a feature-branch
++
++
++
++NOTE:  The release branch would only need updating if externally relevant stuff has been updated.
++
++
++...
+diff --git a/mk/dist.mk b/mk/dist.mk
+index 180bbcae9..72b552fcd 100644
+--- a/mk/dist.mk
++++ b/mk/dist.mk
+@@ -53,7 +53,7 @@ ifeq ($(DIST_ARCH),)
+ endif
+ 
+ DIST_ARCH_android := $(filter armv7 arm64 i386 x86_64 osx,$(DIST_ARCH))
+-DIST_ARCH_ios := $(filter armv7 arm64 x86_64,$(DIST_ARCH))
++DIST_ARCH_ios := $(filter arm64 x86_64,$(DIST_ARCH))
+ 
+ DIST_FMWK_VERSION := A
+ DIST_BUNDLE_LIB_NAME := AVS Library
+@@ -106,7 +106,8 @@ DIST_BUNDLE_LIB := \
+ DIST_AND_TARGETS := $(BUILD_DIST_AND)/avs.aar
+ 
+ DIST_IOS_TARGETS := \
+-	$(BUILD_DIST_IOS)/$(BUILD_LIB_REL).framework.zip
++	$(BUILD_DIST_IOS)/$(BUILD_LIB_REL).framework.zip \
++	$(BUILD_DIST_IOS)/$(BUILD_LIB_REL).xcframework.zip
+ 
+ 
+ DIST_OSX_TARGETS := \
+@@ -148,6 +149,7 @@ AVS_ARCH_NAME := $1\n\
+ 	cp android/obj/local/$2/libavs.so $(BUILD_DIST_AND)/debug/$2/libavs.so
+ endef
+ 
++
+ .PHONY: $(BUILD_DIST_AND)/avs.aar
+ $(BUILD_DIST_AND)/avs.aar:
+ 	@mkdir -p $(BUILD_DIST_AND)/aar
+@@ -287,13 +289,28 @@ $(BUILD_DIST_IOS)/$(BUILD_LIB_REL)/$(BUILD_LIB_REL):
+ 	@for arch in $(DIST_ARCH_ios) ; do \
+ 		$(MAKE) contrib AVS_OS=ios AVS_ARCH=$$arch && \
+ 		$(MAKE) $(JOBS) avs AVS_OS=ios AVS_ARCH=$$arch && \
+-		$(MAKE) iosx AVS_OS=ios AVS_ARCH=$$arch ; \
++		$(MAKE) iosx AVS_OS=ios AVS_ARCH=$$arch && \
++		echo "creating dSYM for ios-$$arch" && \
++		dsymutil $(BUILD_BASE)/ios-$$arch/lib/avs.framework/avs \
++			2>/dev/null && \
++		mkdir -p $(BUILD_BASE)/ios-$$arch/lib/avs.framework/Headers && \
++		touch $(BUILD_BASE)/ios-$$arch/lib/avs.framework/Headers && \
++		cp -a iosx/include/* \
++			$(BUILD_BASE)/ios-$$arch/lib/avs.framework/Headers && \
++		cp -a include/avs_wcall.h \
++			$(BUILD_BASE)/ios-$$arch/lib/avs.framework/Headers && \
++		mkdir -p $(BUILD_BASE)/ios-$$arch/lib/avs.framework/Modules && \
++		touch $(BUILD_BASE)/ios-$$arch/lib/avs.framework/Modules && \
++		cp -a iosx/module.modulemap $(BUILD_BASE)/ios-$$arch/lib/avs.framework/Modules ; \
+ 	done
+ 	@mkdir -p $(dir $@)
++
+ 	lipo -create -output $@ \
+ 		$(foreach arch,$(DIST_ARCH_ios),\
+ 		-arch $(arch) $(BUILD_BASE)/ios-$(arch)/lib/avs.framework/avs)
+ 
++
++
+ dist_test: $(BUILD_DIST_IOS)/$(BUILD_LIB_REL)/$(BUILD_LIB_REL)
+ 
+ .PHONY: $(BUILD_DIST_OSX)/$(BUILD_LIB_REL)/$(BUILD_LIB_REL)
+@@ -317,9 +334,30 @@ $(BUILD_DIST_BASE)/%/$(BUILD_LIB_REL).framework.zip: \
+ 	dsymutil -o $(BUILD_DIST_BASE)/$*/Carthage/Build/iOS/avs.framework.dSYM \
+ 		$(BUILD_DIST_BASE)/$*/$(BUILD_LIB_REL)/$(BUILD_LIB_REL) \
+ 		2>/dev/null
++
+ 	@( cd $(BUILD_DIST_BASE)/$* && \
+ 		zip --symlinks -r $@ Carthage )
+ 
++
++$(BUILD_DIST_IOS)/$(BUILD_LIB_REL).xcframework.zip:
++	@for arch in $(DIST_ARCH_ios) ; do \
++	     cp -a $(BUILD_DIST_IOS)/$(BUILD_LIB_REL)/Info.plist \
++			$(BUILD_BASE)/ios-$$arch/lib/avs.framework/ ; \
++	done
++	/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -create-xcframework \
++	     $(foreach arch,$(DIST_ARCH_ios),\
++                -framework $(BUILD_BASE)/ios-$(arch)/lib/avs.framework/) \
++		-output $(BUILD_DIST_IOS)/$(BUILD_LIB_REL)/avs.xcframework
++	@for arch in arm64 x86_64-simulator ; do \
++             mkdir -p $(BUILD_DIST_IOS)/$(BUILD_LIB_REL)/avs.xcframework/ios-$$arch/dSYMs && \
++	     mv $(BUILD_DIST_IOS)/$(BUILD_LIB_REL)/avs.xcframework/ios-$$arch/avs.framework/avs.dSYM \
++		$(BUILD_DIST_IOS)/$(BUILD_LIB_REL)/avs.xcframework/ios-$$arch/dSYMs ; \
++	done
++	cp -R $(BUILD_DIST_IOS)/$(BUILD_LIB_REL)/avs.xcframework \
++		$(BUILD_DIST_BASE)/ios/avs.xcframework
++	@( cd $(BUILD_DIST_BASE)/ios && \
++		zip --symlinks -r avs.xcframework.zip avs.xcframework )
++
+ #--- iOSX Tarballs ---
+ 
+ $(BUILD_DIST_IOS)/$(BUILD_BALL_REL)/lib/libavsobjc.a:
+@@ -341,7 +379,7 @@ $(BUILD_DIST)/%/lib/libavsobjc.stripped.a: $(BUILD_DIST)/%/lib/libavsobjc.a
+ #--- avscore Tarballs ---
+ 
+ $(BUILD_DIST_BASE)/%/avscore.tar.bz2:
+-	$(MAKE) contrib_librem AVS_OS=$* AVS_ARCH=x86_64 DIST=1
++	$(MAKE) tools contrib_librem AVS_OS=$* AVS_ARCH=x86_64 DIST=1
+ 	@mkdir -p $(dir $@)/avscore
+ 	@cp -a $(BUILD_BASE)/$*-x86_64/lib \
+ 	       $(BUILD_BASE)/$*-x86_64/share \
+diff --git a/mk/target.mk b/mk/target.mk
+index d2e6bc4b7..ecc1ff19d 100644
+--- a/mk/target.mk
++++ b/mk/target.mk
+@@ -180,6 +180,10 @@ ifeq ($(AVS_OS),)
+ AVS_OS := $(HOST_OS)
+ AVS_ARCH := $(HOST_ARCH)
+ endif
++ifeq ($(AVS_ARCH),arm64s)
++AVS_ARCH := arm64
++AVS_SIM := yes
++endif
+ ifeq ($(AVS_ARCH),)
+ ifeq ($(AVS_OS),android)
+ AVS_ARCH := armv7
+@@ -514,8 +518,13 @@ AVS_OS_FAMILY := darwin
+ # SDK
+ #
+ ifeq ($(AVS_ARCH),x86_64)
++AVS_SIM = yes
++endif
++
++
++ifdef AVS_SIM
+ SDK := iphonesimulator
+-HOST_OPTIONS := --host=arm-apple-darwin
++HOST_OPTIONS := --host=arm-apple-darwin 
+ else
+ SDK := iphoneos
+ endif
+@@ -544,8 +553,7 @@ CPPFLAGS += \
+ LFLAGS	 += \
+ 	 -arch $(AVS_ARCH) \
+ 	 -isysroot $(SDK_PATH) \
+-	 -no-cpp-precomp \
+-	 -Wl,-read_only_relocs,suppress
++	 -no-cpp-precomp
+ SH_LFLAGS += -dynamiclib
+ LIBS	 += \
+ 	-lz \
+diff --git a/mk/tools.mk b/mk/tools.mk
+index a38a43194..81484d261 100644
+--- a/mk/tools.mk
++++ b/mk/tools.mk
+@@ -2,7 +2,8 @@
+ # tools.mk
+ #
+ 
+-TOOLS_ALL += zcall
++TOOLS_ALL += zcall verifyd
++#TOOLS_ALL += netprobe
+ 
+ TOOLS_MKS := $(patsubst %,tools/%/tool.mk,$(TOOLS_ALL))
+ TOOLS_OBJ_PATH := $(BUILD_OBJ)/tools
+diff --git a/src/audio_io/osx/audio_io_osx.cpp b/src/audio_io/osx/audio_io_osx.cpp
+index 4235bbb6c..535910396 100644
+--- a/src/audio_io/osx/audio_io_osx.cpp
++++ b/src/audio_io/osx/audio_io_osx.cpp
+@@ -636,6 +636,7 @@ namespace webrtc {
+             }
+             au_play_ = NULL;
+         }
++
+         return 0;
+     }
+     
+@@ -1412,5 +1413,4 @@ namespace webrtc {
+             rec_delay_ += (rec_buffer_total_size_ - noSamp10ms) / (rec_fs_hz_ / 1000);
+         }
+     }
+-    
+ }
+diff --git a/src/audio_level/audio_level.c b/src/audio_level/audio_level.c
+index b4106b932..97105e525 100644
+--- a/src/audio_level/audio_level.c
++++ b/src/audio_level/audio_level.c
+@@ -141,8 +141,8 @@ int audio_level_json(struct list *levell,
+ 
+ 		ja = jzon_alloc_object();
+ 		if (ja) {
+-			jzon_add_str(ja, "userid", userid);
+-			jzon_add_str(ja, "clientid", clientid);
++			jzon_add_str(ja, "userid", "%s", userid);
++			jzon_add_str(ja, "clientid", "%s", clientid);
+ 			jzon_add_int(ja, "audio_level",
+ 				     (int32_t)a->aulevel_smooth);
+ 			jzon_add_int(ja, "audio_level_now",
+diff --git a/src/ecall/ecall.c b/src/ecall/ecall.c
+index d090901d5..83a5d7093 100644
+--- a/src/ecall/ecall.c
++++ b/src/ecall/ecall.c
+@@ -2060,7 +2060,8 @@ int ecall_start(struct ecall *ecall, enum icall_call_type call_type,
+ {
+ 	int err;
+ 
+-	info("ecall(%p): start\n", ecall);
++	info("ecall(%p): start call_type=%d cbr=%d\n",
++	     ecall, call_type, audio_cbr);
+ 
+ 	if (!ecall)
+ 		return EINVAL;
+@@ -2149,7 +2150,7 @@ int ecall_answer(struct ecall *ecall, enum icall_call_type call_type,
+ #endif
+ 	
+ 
+-	info("ecall(%p): answer on pending econn %p call_type=%d\n", ecall, ecall->econn, call_type);
++	info("ecall(%p): answer on pending econn %p call_type=%d cbr=%d\n", ecall, ecall->econn, call_type, audio_cbr);
+ 
+ 	if (!ecall->econn) {
+ 		warning("ecall: answer: econn does not exist!\n");
+diff --git a/src/econn_fmt/msg.c b/src/econn_fmt/msg.c
+index 64b7907be..f6e2c0b0f 100644
+--- a/src/econn_fmt/msg.c
++++ b/src/econn_fmt/msg.c
+@@ -308,7 +308,6 @@ static int econn_keys_decode(struct list *keyl, struct json_object *jobj)
+ 	return 0;
+ }
+ 
+-
+ int econn_message_encode(char **strp, const struct econn_message *msg)
+ {
+ 	struct json_object *jobj = NULL;
+@@ -425,10 +424,10 @@ int econn_message_encode(char **strp, const struct econn_message *msg)
+ 
+ 		jzon_add_bool(jobj, "update",
+ 			      msg->u.confconn.update);
+-		jzon_add_str(jobj, "tool",
+-			      msg->u.confconn.tool);
++		jzon_add_str(jobj, "tool", 
++			     "%s", msg->u.confconn.tool);
+ 		jzon_add_str(jobj, "toolver",
+-			      msg->u.confconn.toolver);
++			     "%s", msg->u.confconn.toolver);
+ 		jzon_add_int(jobj, "status",
+ 			      msg->u.confconn.status);
+ 		jzon_add_bool(jobj, "selective_audio",
+diff --git a/src/peerflow/cbr_detector_remote.cpp b/src/peerflow/cbr_detector_remote.cpp
+index d113e404f..58013c2cd 100644
+--- a/src/peerflow/cbr_detector_remote.cpp
++++ b/src/peerflow/cbr_detector_remote.cpp
+@@ -21,6 +21,9 @@
+ 
+ #include "cbr_detector_remote.h"
+ 
++#define MAX_MISSMATCH 10
++#define MIN_MATCH 100
++
+ namespace wire {
+ 
+ CbrDetectorRemote::CbrDetectorRemote()
+@@ -43,21 +46,26 @@ CbrDetectorRemote::Result CbrDetectorRemote::Decrypt(cricket::MediaType media_ty
+ 
+ 	if (media_type == cricket::MEDIA_TYPE_AUDIO) {
+ 		if (data_len == frame_size && frame_size >= 40) {
++			missmatch_count = 0;
+ 			frame_count++;
+-			if (frame_count > 200 && !detected) {
++			if (frame_count > MIN_MATCH && !detected) {
+ 				info("CBR detector: remote cbr detected\n");
+ 				detected = true;
+ 			}
+ 		}
+ 		else {
+-			frame_count = 0;
+-			frame_size = data_len;
+-			if (detected) {
+-				info("CBR detector: remote cbr detected disabled\n");
+-				detected = false;
++			missmatch_count++;
++			if (!detected
++			    || (detected && missmatch_count > MAX_MISSMATCH)) {
++				frame_count = 0;
++				frame_size = data_len;
++				missmatch_count = 0;
++				if (detected) {
++					info("CBR detector: remote cbr detected disabled\n");
++					detected = false;
++				}
+ 			}
+ 		}
+-
+ 	}
+ 
+ 	memcpy(dst, src, data_len);
+diff --git a/src/peerflow/cbr_detector_remote.h b/src/peerflow/cbr_detector_remote.h
+index a0495b827..58da120fe 100644
+--- a/src/peerflow/cbr_detector_remote.h
++++ b/src/peerflow/cbr_detector_remote.h
+@@ -48,6 +48,7 @@ class CbrDetectorRemote : public rtc::RefCountedObject<webrtc::FrameDecryptorInt
+ 	bool detected;
+ 	uint32_t frame_count;
+ 	uint32_t frame_size;
++	uint32_t missmatch_count;
+ };
+ 
+ }  // namespace wire
+diff --git a/src/wcall/wcall.c b/src/wcall/wcall.c
+index ee59792a0..129901bd1 100644
+--- a/src/wcall/wcall.c
++++ b/src/wcall/wcall.c
+@@ -2552,8 +2552,8 @@ int wcall_i_answer(struct wcall *wcall,
+ 	call_type = (call_type == WCALL_CALL_TYPE_FORCED_AUDIO) ?
+ 		    WCALL_CALL_TYPE_NORMAL : call_type;
+ 
+-	info(APITAG "wcall(%p): answer calltype=%s\n",
+-	     wcall, wcall_call_type_name(call_type));
++	info(APITAG "wcall(%p): answer calltype=%s cbr=%d\n",
++	     wcall, wcall_call_type_name(call_type), audio_cbr);
+ 
+ 	if (wcall->disable_audio)
+ 		wcall->disable_audio = false;
+diff --git a/test/test_acm.cpp b/test/test_acm.cpp
+index 584e3b68d..99ca7ec86 100644
+--- a/test/test_acm.cpp
++++ b/test/test_acm.cpp
+@@ -716,7 +716,6 @@ TEST(acm, wifi_channel_20ms_20pct_loss)
+     EXPECT_LT( stats.avg_expand_rate, 25.0 );
+ }
+ 
+-#if 0
+ TEST(acm, wifi_channel_20ms_20pct_loss_fec)
+ {
+     float cpu_load;
+@@ -749,4 +748,3 @@ TEST(acm, wifi_channel_20ms_20pct_loss_fec)
+     EXPECT_LT( stats.max_expand_rate, 10.0 );
+     EXPECT_LT( stats.avg_expand_rate, 6.0 );
+ }
+-#endif
+diff --git a/tools/aueffect/main.c b/tools/aueffect/main.c
+new file mode 100644
+index 000000000..d65f2e12b
+--- /dev/null
++++ b/tools/aueffect/main.c
+@@ -0,0 +1,46 @@
++#include <ctype.h>
++#include <getopt.h>
++#include <stdlib.h>
++#include <time.h>
++#include <re.h>
++#include <avs.h>
++
++static void progress_handler(int progress, void *arg)
++{
++	printf("Progress=%d\n", progress);
++}
++
++
++static void log_handler(uint32_t level, const char *msg, void *arg)
++{
++	fprintf(stdout, msg, arg);
++}
++
++
++struct log log_def = {
++	.h = log_handler
++}; 
++
++int main(int argc, char *argv[])
++{
++	char *wavin;
++	char *wavout;
++	int err;
++
++	log_set_min_level(LOG_LEVEL_DEBUG);
++	//log_register_handler(&log_def);
++	
++	if (argc != 3) {
++		fprintf(stderr, "Usage: %s wavin wavout\n", argv[0]);
++		return 22;
++	}
++
++	wavin = argv[1];
++	wavout = argv[2];
++
++	err = apply_effect_to_wav(wavin, wavout, AUDIO_EFFECT_NONE, false,
++				  progress_handler, NULL);
++	printf("WAV completed with err=%d\n", err);
++
++	return 0;
++}
+diff --git a/tools/aueffect/tool.mk b/tools/aueffect/tool.mk
+new file mode 100644
+index 000000000..66cb97443
+--- /dev/null
++++ b/tools/aueffect/tool.mk
+@@ -0,0 +1,11 @@
++TOOL 		:= aueffect
++aueffect_SRCS	+= \
++		main.c
++
++aueffect_CPPFLAGS := $(AVS_CPPFLAGS) $(MENG_CPPFLAGS)
++aueffect_CFLAGS := $(AVS_CFLAGS) $(AVS_CFLAGS)
++aueffect_LIBS := $(AVS_LIBS) $(MENG_LIBS)
++aueffect_DEPS := $(AVS_DEPS) $(MENG_DEPS)
++aueffect_LIB_FILES := $(AVS_STATIC) $(MENG_STATIC)
++
++include mk/tool.mk
+diff --git a/tools/logparse/analyse_wireshark_dump.m b/tools/logparse/analyse_wireshark_dump.m
+new file mode 100644
+index 000000000..27c67bed1
+--- /dev/null
++++ b/tools/logparse/analyse_wireshark_dump.m
+@@ -0,0 +1,312 @@
++close all
++clear all
++
++fid = fopen('ios_edge_through_android_hotspot4.txt','rt');
++str = fread(fid, '*char')';
++fclose(fid);
++
++% Wire settings
++fs = 48000;
++pt_target = 111;
++% Whatsapp settings
++%fs = 16000;
++%pt_target = 120;
++% facebook messenger settings
++%fs = 16000;
++%pt_target = 101;
++% facetime
++%fs = 24000;
++%pt_target = [104,119,13];
++
++ix = strfind(str, 'No. ');
++
++time_buf = [];
++pt_buf = [];
++seq_buf = [];
++ts_buf = [];
++src_buf = [];
++dst_buf = [];
++src_port_buf = [];
++dst_port_buf = [];
++nBytes_buf = [];
++msg_buf = [];
++attr_type_buf = [];
++attr_length_buf = [];
++len_buf = [];
++toc_buf = [];
++
++for i = 1 : length(ix)-1
++    tmp_str = str(ix(i) : ix(i+1)-1);
++
++    % Get the time and srcs
++    ix0 = strfind(tmp_str, 'Info');
++    if length(ix0) > 0
++        a = textscan(tmp_str(strfind(tmp_str, 'Info')+5:end),'%d%f%s%s%s%d');
++        
++        time = a{2};
++        src = a{3};
++        dst = a{4};
++        protocol = a{5};
++        len = a{6};
++        
++        ix0 = strfind(tmp_str,'Src Port:');
++        ix00 = strfind(tmp_str(ix0:end),'(');
++        ix01 = strfind(tmp_str(ix0:end),')');
++        tmp_str0 = tmp_str(ix0:end);
++        if length(tmp_str0) > 0
++            src_port = str2num(tmp_str0(ix00(1)+1 : ix01(1)-1));
++            dst_port = str2num(tmp_str0(ix00(2)+1 : ix01(2)-1));
++        else
++            src_port = -1;
++            dst_port = -1;
++        end
++        ix1 = strfind(tmp_str, '0000  ');
++        s = tmp_str(ix1(end)+5 : ix1(end)+5+30);
++        toc = hex2dec(s(4:5));
++        
++        [a,b] = size(protocol);
++        if a > 1 || b > 1
++           protocol = 'N/A';
++        end
++        
++        if strcmp(protocol,'UDP')
++            msg_len = -1;
++            msg_type = -1;
++            attr_type = -1;
++            attr_length = -1;
++            ix0 = strfind(tmp_str,'[Length:');
++            a = textscan(tmp_str(ix0+length('[Length:') : end), '%d');
++            msg_len = a{1};        
++            hdr_len = len - msg_len;
++            if msg_len > 16 
++                if hdr_len == 42
++                    % Ipv4 + Ethernet
++                    ix1 = strfind(tmp_str(ix0:end), '0020  ');
++                    s = tmp_str(ix0+ix1+5+10*3 : ix0+ix1+5+10*3+30);
++                    pt = hex2dec(s(4:5));
++                    seq_nr = hex2dec([s(7:8),s(10:11)]);
++                    ix2 = strfind(tmp_str(ix0:end), '0030  ');
++                    s2 = tmp_str(ix0+ix2+5 : ix0+ix2+5+30);
++                    timestamp = hex2dec([s(13:14),s(16:17),s2(1:2),s2(4:5)]);
++                else
++                    % Ipv4
++                    ix1 = strfind(tmp_str(ix0:end), '0010  ');
++                    s = tmp_str(ix0+ix1+5+12*3 : ix0+ix1+5+12*3+30);
++                    pt = hex2dec(s(4:5));
++                    seq_nr = hex2dec([s(7:8),s(10:11)]);
++                    ix1 = strfind(tmp_str(ix0:end), '0020  ');
++                    s = tmp_str(ix0+ix1+5 : ix0+ix1+5+30);
++                    timestamp = hex2dec([s(1:2),s(4:5),s(7:8),s(10:11)]);            
++                end
++            else
++                pt = -1;
++                seq_nr = -1;
++                timestamp = -1;
++            end
++            payload_len = double(msg_len);    
++        elseif strcmp(protocol,'TFTP') || strcmp(protocol,'STUN')
++            ix0 = strfind(tmp_str,'Message Length:');
++            a = textscan(tmp_str(ix0+length('Message Length:') : end), '%d');
++            msg_len = a{1};
++            hdr_len = len - msg_len;
++        
++            if msg_len < 20
++                msg_type = -1;
++                attr_type = -1;
++                attr_length = -1;
++                pt = -1;
++                seq_nr = -1;
++                timestamp = -1;
++                payload_len = 0;
++            else
++                if hdr_len == 62
++                    % ipv4 + Ethernet
++                    ix1 = strfind(tmp_str(ix0:end), '0020  ');
++                    s = tmp_str(ix0+ix1+5+10*3 : ix0+ix1+5+10*3+30);
++                    msg_type = hex2dec([s(1:2),s(4:5)]);            
++            
++                    ix1 = strfind(tmp_str(ix0:end), '0040  ');
++                    s = tmp_str(ix0+ix1+5+10*3 : ix0+ix1+5+10*3+30);
++                    attr_type = hex2dec([s(1:2),s(4:5)]);            
++                    attr_length = hex2dec([s(7:8),s(10:11)]);
++                    pt = hex2dec(s(16:17));
++            
++                    ix1 = strfind(tmp_str(ix0:end), '0050  ');
++                    s = tmp_str(ix0+ix1+5 : ix0+ix1+5+30);            
++                    seq_nr = hex2dec([s(1:2),s(4:5)]);
++                    timestamp = hex2dec([s(7:8),s(10:11),s(13:14),s(16:17)]);
++            
++                    payload_len = double(len) - 80;            
++                else
++                    % ipv4
++                    ix1 = strfind(tmp_str(ix0:end), '0010  ');
++                    s = tmp_str(ix0+ix1+5+12*3 : ix0+ix1+5+12*3+30);
++                    msg_type = hex2dec([s(1:2),s(4:5)]);
++                        
++                    ix1 = strfind(tmp_str(ix0:end), '0030  ');
++                    s = tmp_str(ix0+ix1+5 : ix0+ix1+5+30);
++                    attr_type = hex2dec([s(1:2),s(4:5)]);
++                    attr_length = hex2dec([s(7:8),s(10:11)]);
++        
++                    ix1 = strfind(tmp_str(ix0:end), '0040  ');
++                    s = tmp_str(ix0+ix1+5 : ix0+ix1+30);
++                    pt = hex2dec(s(4:5));
++            
++                    seq_nr = hex2dec([s(7:8),s(10:11)]);
++                    timestamp = hex2dec([s(13:14),s(16:17),s(19:20),s(22:23)]);
++        
++                    payload_len = double(len) - 64;            
++                end
++            end
++            if strcmp(protocol,'TFTP')
++                pt = -2;
++            end
++        else
++            msg_len = -1;
++            msg_type = -1;
++            attr_type = -1;
++            attr_length = -1;
++            pt = -1;
++            seq_nr = -1;
++            timestamp = -1;
++            payload_len = -1;
++        end
++                    
++        if ~strcmp(protocol,'N/A') && ...
++           ~strcmp(protocol,'IPv6') && ...
++           ~strcmp(protocol,'ARP') && ...
++           ~strcmp(protocol,'MDNS') && ...
++           ~strcmp(protocol,'ICMPv6') && ...
++           ~strcmp(protocol,'DHCPv6') && ...
++           ~strcmp(protocol,'LLMNR')
++        
++            time_buf = [time_buf, time];
++            pt_buf = [pt_buf, pt];
++            seq_buf = [seq_buf, seq_nr];
++            ts_buf = [ts_buf, timestamp];
++            src_buf = [src_buf, ip2num(src{1})];
++            dst_buf = [dst_buf, ip2num(dst{1})];
++            src_port_buf = [src_port_buf, src_port];
++            dst_port_buf = [dst_port_buf, dst_port];
++            nBytes_buf =  [nBytes_buf, payload_len];
++            msg_buf = [msg_buf, msg_type];
++            attr_type_buf = [attr_type_buf, attr_type];
++            attr_length_buf = [attr_length_buf, attr_length];
++            len_buf = [len_buf, len];    
++            toc_buf = [toc_buf, toc];
++        end                
++    end
++end
++
++
++flows = find_flows(src_buf, dst_buf, src_port_buf, dst_port_buf);
++
++figure
++plot_rate(time_buf, len_buf, pt_buf, dst_buf, ip2num('192.168.43.13'), pt_target, 'dst');
++figure
++plot_rate(time_buf, len_buf, pt_buf, src_buf, ip2num('192.168.43.13'), pt_target, 'src');
++
++for i = 1 : length(flows)
++    
++    idx = find(src_buf == flows(i).src);
++    idx = intersect(idx, find(dst_buf == flows(i).dst));
++    idx = intersect(idx, find(src_port_buf == flows(i).src_port));
++    idx = intersect(idx, find(dst_port_buf == flows(i).dst_port));
++
++    fprintf('Src %s %d Dst %s %d \n', num2ip(flows(i).src), flows(i).src_port, num2ip(flows(i).dst), flows(i).dst_port);     
++    fprintf('%d packets send from time %f to %f \n', length(idx), time_buf(idx(1)), time_buf(idx(end)));
++    t = time_buf(idx(end)) - time_buf(idx(1));
++    fprintf('average bitrate = %f bps average packet rate = %f p/s \n', sum(8*len_buf(idx))/t, length(idx)/t);
++
++    dst_buf_ = dst_buf(idx);
++    data_ = nBytes_buf(idx);
++    pt_ = pt_buf(idx);
++    seq_ = seq_buf(idx);
++    timestamp_ = ts_buf(idx);
++    time_ = time_buf(idx);
++    msg_ = msg_buf(idx);
++
++    idx = [];
++    for j = 1 : length(pt_target)
++        idx = [idx,find(pt_ == pt_target(j))];
++    end
++    idx = sort(idx);
++
++    if length(idx) > 2%10
++        pt_ = pt_(idx);
++        data_ = data_(idx);
++        seq_ = seq_(idx);
++        timestamp_ = timestamp_(idx);
++        time_ = time_(idx);
++        msg_ = msg_(idx);
++
++        if 0
++            [seq_,idx] = sort(seq_);
++            timestamp_ = timestamp_(idx);
++            pt_ = pt_(idx);
++            data_ = data_(idx);
++            time_ = time_(idx);
++        end
++
++        figure
++
++        subplot(5,2,1)
++        plot(time_(2:end),seq_(2:end) - seq_(1:end-1))
++        subplot(5,2,3)
++        dts = (timestamp_(2:end) - timestamp_(1:end-1))/fs;
++        dts = [dts(1),dts];
++        plot(time_, dts)
++        h = hist(dts, [0:0.01:0.5]);
++        h = h/sum(h);
++        subplot(5,2,4)
++        bar([0:0.01:0.5],h)
++        axis([0 0.2 0 1])
++   
++        pps = pps_smther(time_);
++    
++        subplot(5,2,2)
++        plot(time_, pps)
++        subplot(5,2,8)
++        plot(time_, data_*8./dts)
++        subplot(5,2,10)
++        plot(time_,data_*8)
++        grid on
++
++        subplot(5,2,7)
++        h = hist(data_*8./dts, [0:2000:100000]);
++        h = h/sum(h);
++        bar([0:2000:100000],h)
++        axis([0 100000 0 0.5])
++        grid on
++
++        subplot(5,2,9)
++        h = hist(data_*8, [0:100:5000]);
++        h = h/sum(h);
++        bar([0:100:5000],h)
++        axis([0 5000 0 0.5])
++        grid on
++
++        Delay = time_ - (timestamp_/fs);
++        Delay = Delay - min(Delay);
++        subplot(5,2,6)
++        plot(time_, Delay)
++        axis([min(time_) max(time_) 0 10])
++        grid on
++
++        subplot(5,2,5)
++        h = hist(Delay, [0:0.5:20]);
++        h = h/sum(h);
++        plot([0:0.5:20],cumsum(h))
++        axis([1 20 0.9 1.0])
++        grid on
++
++        t = sprintf('Src %s %d Dst %s %d \n', num2ip(flows(i).src), flows(i).src_port, num2ip(flows(i).dst), flows(i).dst_port); 
++        set(gcf,'NextPlot','add');
++        axes;
++        h = title(t);
++        set(gca,'Visible','off');
++        set(h,'Visible','on');
++        
++    end
++end
++
+diff --git a/tools/logparse/extract_data.m b/tools/logparse/extract_data.m
+new file mode 100644
+index 000000000..06324b0a5
+--- /dev/null
++++ b/tools/logparse/extract_data.m
+@@ -0,0 +1,421 @@
++close all
++clear
++
++files = dir('*.log');
++%files = files(1:5000);
++nFiles = length(files);
++
++% joining/ignoring
++selfJoined = zeros(nFiles, 1);
++otherJoined = zeros(nFiles, 1);
++selfJoinedFirst = zeros(nFiles, 1);
++isIgnoringCall = zeros(nFiles, 1);
++
++% stats
++qual_reps = zeros(nFiles, 1);
++dur = zeros(nFiles, 1);
++ps = zeros(nFiles, 3);
++rtt = zeros(nFiles, 3);
++up_plr = zeros(nFiles, 3);
++dn_plr = zeros(nFiles, 3);
++up_jtr = zeros(nFiles, 3);
++dn_jtr = zeros(nFiles, 3);
++rate = zeros(nFiles, 3);
++jBsize = zeros(nFiles, 3);
++fec = zeros(nFiles, 3);
++exp = zeros(nFiles, 3);
++acc = zeros(nFiles, 3);
++dcc = zeros(nFiles, 3);
++
++% metrics
++start_time = cell(nFiles, 1);
++success = zeros(nFiles, 1);
++flows = zeros(nFiles, 1);
++estab_time = zeros(nFiles, 1);
++media_time = zeros(nFiles, 1);
++setup_time = zeros(nFiles, 1);
++loc_cand = cell(nFiles, 1);
++rem_cand = cell(nFiles, 1);
++session_ids = cell(nFiles, 1);
++user_ids = cell(nFiles, 1);
++
++fid = fopen('sessions.txt','wt');
++for i = 1 : length(files)
++    % read log file
++    fid_log = fopen(files(i).name, 'rt');
++    str = fread(fid_log, '*char')';
++    fclose(fid_log);
++    
++    start_time{i} = str(1:23);
++
++    ix0 = strfind(str, 'self isJoined: 1');
++    selfJoined(i) = ~isempty(ix0);
++    ix1 = strfind(str, 'other isJoined: 1');
++    otherJoined(i) = ~isempty(ix1);
++    selfJoinedFirst(i) = selfJoined(i) && otherJoined(i) && ix0(1) < ix1(1);
++    
++    isIgnoringCall(i) = ~isempty(strfind(str, 'isIgnoringCall: 1'));
++    
++    ix = strfind(str, 'Receive Quality Statistics');
++    qual_reps(i) = length(ix);
++    
++    if qual_reps(i) == 1
++        % log contains one quality report
++        c = regexp(str(ix:ix+100), '(?<=]\slast\s)\d+', 'match');
++        dur(i) = str2double(c{1});
++        
++        if dur(i) > 0
++            % stats
++            ix_start = strfind(str(ix:min(ix+ 200, end)), 'packet size stats');
++            ix_end   = strfind(str(ix:min(ix+1200, end)), '|');
++            str2 = str(ix+ix_start(1)-1:ix+ix_end(end)-1);
++            ps(i,:)     = extract_numbers(str2, 'packet size stats 20-40-60 ms');
++            rtt(i,:)    = extract_numbers(str2, 'RTT (ms)');
++            dn_jtr(i,:) = extract_numbers(str2, 'Jitter (samples)');
++            up_plr(i,:) = extract_numbers(str2, 'Uplink Packet Loss');
++            up_jtr(i,:) = extract_numbers(str2, 'Uplink Jitter');
++            rate(i,:)   = extract_numbers(str2, 'Bitrate (kbps)');
++            jBsize(i,:) = extract_numbers(str2, 'Buffer Size (ms)');
++            dn_plr(i,:)    = extract_numbers(str2, 'Packet Loss Rate');
++            fec(i,:)    = extract_numbers(str2, 'FEC Corrected Rate');
++            exp(i,:)    = extract_numbers(str2, 'Expand Rate');
++            acc(i,:)    = extract_numbers(str2, 'Accelerate Rate');
++            dcc(i,:)    = extract_numbers(str2, 'Preemptive Rate');
++        end
++    end
++    
++    % metrics
++    ix2 = strfind(str, 'metrics/complete');
++    if ~isempty(ix2)
++        ix_end = strfind(str(ix2:min(ix2+500, end)), '}');
++        [success(i), rem_cand{i}, loc_cand{i}, session_ids{i}, user_ids{i}, flows(i), estab_time(i), media_time(i), setup_time(i)] = get_metrics(str(ix2(1):ix2(1)+ix_end(1)-1));
++        if success(i)
++            fprintf(fid, 'time: %s session_id: %s user_id: %s duration: %d remote candidate: %s local candidate: %s flows: %d \n', ...
++                start_time{i}, session_ids{i}, user_ids{i}, dur(i), rem_cand{i}, loc_cand{i}, flows(i));
++        end
++    else
++        % use this if no metrics/complete found in log (doesn't seem to happen)
++        success(i) = -1;
++    end
++    
++    if mod(i, 5000) == 0
++        fprintf('cnt = %d\n', i);
++    end
++end
++fclose all;
++
++fprintf('\nLogs total: %d\n', nFiles);
++fprintf('--> Self Joined:   %d\n', sum(selfJoined));
++fprintf('--> Other Joined:  %d\n', sum(otherJoined));
++fprintf('--> Both Joined:   %d\n', sum(selfJoined & otherJoined));
++fprintf('----> Self Joined first: %d\n', sum(selfJoinedFirst));
++fprintf('--> Ignoring Call: %d\n', sum(isIgnoringCall));
++fprintf('\nLogs with 0 quality reports: %d\n', sum(qual_reps == 0));
++fprintf('--> With metrics failed:  %d\n', sum(qual_reps == 0 & success == 0));
++fprintf('--> With metrics success: %d\n', sum(qual_reps == 0 & success == 1));
++fprintf('\nLogs with 1 quality report: %d\n', sum(qual_reps == 1));
++fprintf('--> With metrics failed:  %d\n', sum(qual_reps == 1 & success == 0));
++fprintf('----> With duration == 0:   %d\n', sum(qual_reps == 1 & success == 0 & dur == 0));
++fprintf('----> With duration > 0:    %d\n', sum(qual_reps == 1 & success == 0 & dur > 0));
++fprintf('--> With metrics success: %d\n', sum(qual_reps == 1 & success == 1));
++fprintf('----> With duration == 0:   %d\n', sum(qual_reps == 1 & success == 1 & dur == 0));
++fprintf('----> With duration > 0:    %d\n', sum(qual_reps == 1 & success == 1 & dur > 0));
++%fprintf('------> With min(RTT) > max(RTT): %d\n', sum(qual_reps == 1 & success == 1 & dur > 0 & rtt(:, 2) < rtt(:, 3)));
++fprintf('----> With num_flows == 1:  %d\n', sum(qual_reps == 1 & success == 1 & flows == 1));
++fprintf('----> With num_flows > 1:   %d\n', sum(qual_reps == 1 & success == 1 & flows > 1));
++fprintf('\nLogs with 2+ quality reports: %d\n', sum(qual_reps > 1));
++fprintf('--> With metrics failed:  %d\n', sum(qual_reps > 1 & success == 0));
++fprintf('--> With metrics success: %d\n', sum(qual_reps > 1 & success == 1));
++if min(success) < 0
++    fprintf('Logs without any metrics (neither success or failed): %d\n', sum(success == -1));
++end
++
++
++
++% session and user maps
++[sessions_map, sessions_sorted, sessions_count] = mapper(session_ids);
++[users_map, users_sorted, users_count] = mapper(user_ids);
++
++% show details of users with most logs
++fprintf('Total user IDs: %d\n', length(users_count));
++for ind = 1:20
++    user = users_sorted{ind};
++    fprintf('User ID %s has %d logs\n', user, users_count(ind));
++end
++
++fprintf('\n');
++
++% show details of sessions with most logs
++fprintf('Total session IDs: %d\n', length(sessions_count));
++for ind = 1:10
++    ses = sessions_sorted{ind};
++    log_ixs = sessions_map(ses);
++    if ~strcmp(user_ids(log_ixs), 'ffffffff-ffff-ffff-ffff-ffffffffffff')
++        fprintf('Session ID %s has %d logs:\n', ses, sessions_count(ind));
++        % sort by time
++        t = zeros(size(log_ixs));
++        for k = 1:length(log_ixs)
++            str = start_time{log_ixs(k)};
++            t(k) = posixtime(datetime(str(1:end-4), 'InputFormat', 'yyyy/MM/dd HH:mm:ss'));
++            t(k) = t(k) + str2double(str(end-2:end)) / 1000;
++        end
++        [~, i] = sort(t);
++        log_ixs = log_ixs(i);
++        for k = log_ixs
++            fprintf('  %s user ID: %s, flows: %d, duration: %d\n', ...
++                start_time{k}, user_ids{k}, flows(k), dur(k));
++        end
++    end
++end
++
++
++% indices of valid stats
++ind = dur > 0 & rtt(:, 3) < rtt(:, 2) & flows == 1;
++
++ps_ = ps(ind, :);
++rtt_ = rtt(ind, :);
++rate_ = rate(ind, :);
++jBsize_ = jBsize(ind, :);
++up_jtr_ = up_jtr(ind, :);
++dn_jtr_ = dn_jtr(ind, :);
++up_plr_ = up_plr(ind, :);
++dn_plr_ = dn_plr(ind, :);
++fec_ = fec(ind, :);
++exp_ = exp(ind, :);
++acc_ = acc(ind, :);
++dcc_ = dcc(ind, :);
++rem_cand_ = rem_cand(ind);
++loc_cand_ = loc_cand(ind);
++
++% RTT spread
++bins = 0:250:10000;
++H_rtt_spr = hist(rtt_(:,2) - rtt_(:,3),bins);
++H_rtt_spr = H_rtt_spr / sum(H_rtt_spr);
++
++figure
++bar(bins, H_rtt_spr)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 max(H_rtt_spr)*1.1])
++xlabel('RTT spread (ms)')
++
++% RTT avg / max
++bins = 0:50:2000;
++H_rtt_avg = hist(rtt_(:,1),bins);
++H_rtt_avg = H_rtt_avg / sum(H_rtt_avg);
++
++figure
++subplot(2,1,1)
++bar(bins, H_rtt_avg)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 max(H_rtt_avg)*1.1])
++xlabel('avg RTT (ms)')
++
++bins = 0:250:10000;
++H_rtt_max = hist(rtt_(:,2),bins);
++H_rtt_max = H_rtt_max / sum(H_rtt_max);
++
++subplot(2,1,2)
++bar(bins, H_rtt_max)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 max(H_rtt_max)*1.1])
++xlabel('Max RTT (ms)')
++
++% Jitter Buffer Size, avg / max
++bins = 0:50:2000;
++H_jbSize_avg = hist(jBsize_(:,1),bins);
++H_jbSize_avg = H_jbSize_avg / sum(H_jbSize_avg);
++
++figure
++subplot(2,1,1)
++bar(bins, H_jbSize_avg)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 max(H_jbSize_avg)*1.1])
++xlabel('Avg JB size (ms)')
++
++bins = 0:250:10000;
++H_jbSize_max = hist(jBsize_(:,1),bins);
++H_jbSize_max = H_jbSize_max / sum(H_jbSize_max);
++
++subplot(2,1,2)
++bar(bins, H_jbSize_max)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 max(H_jbSize_max)*1.1])
++xlabel('Max JB size (ms)')
++
++% Packet loss rate
++bins = [0:1:20];
++H_plr_avg = hist(dn_plr_(:,1),bins);
++H_plr_avg = H_plr_avg / sum(H_plr_avg);
++
++figure
++subplot(2,1,1)
++bar(bins, H_plr_avg)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Avg Packet loss rate (%)')
++
++bins = [0:5:100];
++H_plr_max = hist(dn_plr_(:,2),bins);
++H_plr_max = H_plr_max / sum(H_plr_max);
++
++subplot(2,1,2)
++bar(bins, H_plr_max)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Max Packet loss rate (%)')
++
++% Fec correction rate
++bins = [0:1:20];
++H_fec_avg = hist(fec_(:,1),bins);
++H_fec_avg = H_fec_avg / sum(H_fec_avg);
++
++figure
++subplot(2,1,1)
++bar(bins, H_fec_avg)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Avg FEC correction rate (%)')
++
++bins = [0:5:100];
++H_fec_max = hist(fec_(:,2),bins);
++H_fec_max = H_fec_max / sum(H_fec_max);
++
++subplot(2,1,2)
++bar(bins, H_fec_max)
++axis([0 max(bins) 0 1.0])
++xlabel('Max FEC correction rate (%)')
++
++% Expansion rate
++bins = [0:1:20];
++H_exp_avg = hist(exp_(:,1),bins);
++H_exp_avg = H_exp_avg / sum(H_exp_avg);
++
++figure
++subplot(2,1,1)
++bar(bins, H_exp_avg)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Avg Expansion rate (%)')
++
++bins = [0:5:100];
++H_exp_max = hist(exp_(:,2),bins);
++H_exp_max = H_exp_max / sum(H_exp_max);
++
++subplot(2,1,2)
++bar(bins, H_exp_max)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Max Expansion rate (%)')
++
++% Accelerate rate
++bins = [0:1:20];
++H_acc_avg = hist(acc_(:,1),bins);
++H_acc_avg = H_acc_avg / sum(H_acc_avg);
++
++figure
++subplot(2,1,1)
++bar(bins, H_acc_avg)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Avg Accelerate rate (%)')
++
++bins = [0:5:100];
++H_acc_max = hist(acc_(:,2),bins);
++H_acc_max = H_acc_max / sum(H_acc_max);
++
++subplot(2,1,2)
++bar(bins, H_acc_max)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Max Accelerate rate (%)')
++
++% Decelerate rate
++bins = [0:1:20];
++H_dcc_avg = hist(dcc_(:,1),bins);
++H_dcc_avg = H_dcc_avg / sum(H_dcc_avg);
++
++figure
++subplot(2,1,1)
++bar(bins, H_dcc_avg)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Avg Decelerate rate (%)')
++
++subplot(2,1,2)
++
++bins = [0:5:100];
++H_dcc_max = hist(dcc_(:,2),bins);
++H_dcc_max = H_dcc_max / sum(H_dcc_max);
++
++bar(bins, H_dcc_max)
++axis([-bins(2)/2 bins(end)+bins(2)/2 0 1])
++xlabel('Max Decelerate rate, in 10 sec (%)')
++
++% Metrics
++ix_prflx = strcmp(rem_cand_, 'prflx');
++ix_srflx = strcmp(rem_cand_, 'srflx');
++ix_host  = strcmp(rem_cand_, 'host');
++ix_relay = strcmp(rem_cand_, 'relay');
++
++figure
++H_met = [sum(ix_prflx), sum(ix_srflx), sum(ix_host), sum(ix_relay)] / length(rem_cand_) * 100;
++bar(0:3, H_met)
++axis([-0.5 3.5 0 100])
++grid on
++ax = gca;
++ax.XTickLabel = {'prflx','srflx','host','relay'};
++xlabel('Remote Candidate')
++
++% Calculate the total delay rtt + Jb for different connection types
++TotAvgDelay = jBsize_(:,1);%rtt_(:,1);% + jBsize_(:,1);
++bins = [0:50:5000];
++Ha = hist(TotAvgDelay,bins);
++Ha = Ha / sum(Ha);
++Hp = hist(TotAvgDelay(ix_prflx),bins);
++Hp = Hp / sum(Hp);
++Hs = hist(TotAvgDelay(ix_srflx),bins);
++Hs = Hs / sum(Hs);
++Hh = hist(TotAvgDelay(ix_host),bins);
++Hh = Hh / sum(Hh);
++Hr = hist(TotAvgDelay(ix_relay),bins);
++Hr = Hr / sum(Hr);
++
++figure
++subplot(5,1,1)
++bar(bins, Ha)
++axis([0 2500 0 0.25])
++legend('all')
++subplot(5,1,2)
++bar(bins, Hp)
++axis([0 2500 0 0.25])
++legend('prflx')
++subplot(5,1,3)
++bar(bins, Hs)
++axis([0 2500 0 0.25])
++legend('srflx')
++subplot(5,1,4)
++bar(bins, Hh)
++axis([0 2500 0 0.25])
++legend('host')
++subplot(5,1,5)
++bar(bins, Hr)
++axis([0 2500 0 0.25])
++legend('relay')
++xlabel('Delay (ms)')
++
++figure
++plot(bins,cumsum(Ha),'y')
++hold
++plot(bins,cumsum(Hp),'r')
++plot(bins,cumsum(Hs),'g')
++plot(bins,cumsum(Hh),'c')
++plot(bins,cumsum(Hr))
++axis([0 2500 0.0 1])
++grid on
++legend('all','prflx','srflx','host','relay')
++xlabel('Delay (ms)')
++
++figure
++plot(bins,cumsum(Ha),'y')
++hold
++plot(bins,cumsum(Hp),'r')
++plot(bins,cumsum(Hs),'g')
++plot(bins,cumsum(Hh),'c')
++plot(bins,cumsum(Hr))
++axis([0 5000 0.9 1.0])
++grid on
++legend('all','prflx','srflx','host','relay')
++xlabel('Delay (ms)')
++
++save extracted_data selfJoined selfJoinedFirst otherJoined isIgnoringCall start_time ...
++    session_ids user_ids success rem_cand loc_cand flows media_time estab_time setup_time ...
++    dur ps rtt rate jBsize up_plr dn_plr up_jtr dn_jtr fec exp acc dcc ...
++    sessions_map sessions_sorted sessions_count users_map users_sorted users_count;
++
+diff --git a/tools/logparse/extract_numbers.m b/tools/logparse/extract_numbers.m
+new file mode 100644
+index 000000000..32827f306
+--- /dev/null
++++ b/tools/logparse/extract_numbers.m
+@@ -0,0 +1,12 @@
++function a = extract_numbers(str, key)
++
++key = strrep(key, ' ', '\s');
++key = strrep(key, '(', '\(');
++key = strrep(key, ')', '\)');
++pattern = ['(?<=' key '[\s\|:]+)[\d\.]+[\s\|]+[\d\.]+[\s\|]+[\d\.]+'];
++substr = regexpi(str, pattern, 'match');
++if isempty(substr)
++    a = 0;
++else
++    a = sscanf(substr{1}, '%f | %f | %f')';
++end
+diff --git a/tools/logparse/find_flows.m b/tools/logparse/find_flows.m
+new file mode 100644
+index 000000000..1328c154e
+--- /dev/null
++++ b/tools/logparse/find_flows.m
+@@ -0,0 +1,75 @@
++function flows = find_flows(srcs, dsts, src_ports, dst_ports)
++
++flows = [];
++%src = [];
++%dst = [];
++%src_port = [];
++%dst_port = [];
++
++n = 1;
++vec = srcs;
++Usrcs = [];
++while max(vec) > 0
++    Usrcs(n) = max(vec);
++    vec(find(vec == max(vec))) = 0;
++    n = n + 1;
++end
++
++n = 1;
++vec = src_ports;
++Usrc_ports = [];
++while max(vec) > 0
++    Usrc_ports(n) = max(vec);
++    vec(find(vec == max(vec))) = 0;
++    n = n + 1;
++end
++
++n = 1;
++vec = dsts;
++Udsts = [];
++while max(vec) > 0
++    Udsts(n) = max(vec);
++    vec(find(vec == max(vec))) = 0;
++    n = n + 1;
++end
++
++n = 1;
++vec = dst_ports;
++Udst_ports = [];
++while max(vec) > 0
++    Udst_ports(n) = max(vec);
++    vec(find(vec == max(vec))) = 0;
++    n = n + 1;
++end
++
++num_flows = 0;
++
++for i = 1 : length(Usrcs)
++   idx = find(srcs == Usrcs(i));
++   dsts_ = dsts(idx);
++   src_ports_ = src_ports(idx);
++   dst_ports_ = dst_ports(idx);
++   for j = 1 : length(Udsts)
++        idx = find(dsts_ == Udsts(j));
++        src_ports__ = src_ports_(idx);
++        dst_ports__ = dst_ports_(idx);
++        for k = 1 : length(Usrc_ports)
++            idx = find(src_ports__ == Usrc_ports(k));
++            dst_ports___ = dst_ports__(idx);
++            for z = 1 : length(Udst_ports)
++                idx = find(dst_ports___ == Udst_ports(z));
++                if(length(idx) > 0)
++                    num_flows = num_flows + 1;
++                    flows(num_flows).src = Usrcs(i);
++                    flows(num_flows).dst = Udsts(j);
++                    flows(num_flows).src_port = Usrc_ports(k);
++                    flows(num_flows).dst_port = Udst_ports(z);
++                end
++            end
++        end
++   end    
++end
++
++%for i = 1 : num_flows
++%   fprintf('Src %s %d Dst %s %d \n', num2ip(flows(i).src), flows(i).src_port, num2ip(flows(i).dst), flows(i).dst_port); 
++%end
+diff --git a/tools/logparse/get_metrics.m b/tools/logparse/get_metrics.m
+new file mode 100644
+index 000000000..c52d628ac
+--- /dev/null
++++ b/tools/logparse/get_metrics.m
+@@ -0,0 +1,59 @@
++function [success, local_candidate, remote_candidate, session_id, user_id, ...
++    num_flows, estab_time, media_time, setup_time] = get_metrics2(str)
++
++local_candidate = '';
++remote_candidate = '';
++session_id = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
++user_id = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
++num_flows = 0;
++estab_time = 0;
++setup_time = 0;
++media_time = 0;
++
++str = strrep(str, '"', '');    % remove all "
++success = ~isempty(strfind(str, 'success: true'));
++if success
++    c = regexp(str, '(?<=local_candidate:\s)\w+', 'match');
++    local_candidate = c{1};
++    
++    c = regexp(str, '(?<=remote_candidate:\s)\w+', 'match');
++    remote_candidate = c{1};
++    
++    ids = regexp(str, '(?<=session:\s)[\w-]+', 'match');
++    if isempty(ids)
++%        disp(['weird session: ' str]);
++    else
++        session_id = ids{1}(1:36);
++        if length(ids{1}) >= 75 && ids{1}(38) == 'U'
++            user_id = ids{1}(40:75);
++        end
++    end
++    
++    c = regexp(str, '(?<=num_flows:\s)\w+', 'match');
++    if isempty(c)
++%        disp(['weird num_flows: ' str]);
++    else
++        num_flows = str2double(c{1});
++    end
++    
++    c = regexp(str, '(?<=estab_time:\s)\w+', 'match');
++    if isempty(c)
++        disp(['weird estab_time: ' str]);
++    else
++        estab_time = str2double(c{1});
++    end
++    
++    c = regexp(str, '(?<=setup_time:\s)\w+', 'match');
++    if isempty(c)
++%        disp(['weird setup_time: ' str]);
++    else
++        setup_time = str2double(c{1});
++    end
++    
++    c = regexp(str, '(?<=media_time:\s)\w+', 'match');
++    if isempty(c)
++        disp(['weird media_time: ' str]);
++    else
++        media_time = str2double(c{1});
++    end
++end
+diff --git a/tools/logparse/ip2num.m b/tools/logparse/ip2num.m
+new file mode 100644
+index 000000000..9d647858f
+--- /dev/null
++++ b/tools/logparse/ip2num.m
+@@ -0,0 +1,16 @@
++function num = ip2num(ipadr)
++
++ix = strfind(ipadr, '.');
++ix = [0,ix];
++
++if(length(ix) > 1)
++    num = 0;    
++    for i =  1 : length(ix)-1
++        fak = 2^(8*(length(ix)-i));
++        num = num + str2num(ipadr(ix(i)+1 : ix(i+1)-1))*fak;
++    end
++    fak = 1;
++    num = num + str2num(ipadr(ix(i+1)+1 : end))*fak;
++else
++    num = -1;
++end
+diff --git a/tools/logparse/mapper.m b/tools/logparse/mapper.m
+new file mode 100644
+index 000000000..10c8c0efb
+--- /dev/null
++++ b/tools/logparse/mapper.m
+@@ -0,0 +1,24 @@
++function [map, ids_sorted, ids_count] = mapper(ids)
++
++% hash map from id -> indices
++map = containers.Map;
++for k = 1:length(ids)
++    id = ids{k};
++    if isKey(map, id)
++        map(id) = [map(id), k];
++    else
++        map(id) = k;
++    end
++end
++
++remove(map, 'ffffffff-ffff-ffff-ffff-ffffffffffff');
++
++% sort by number of occurences
++ids_sorted = keys(map);
++ids_count = zeros(length(ids_sorted), 1);
++for k = 1:length(ids_sorted)
++    ids_count(k) = length(map(ids_sorted{k}));
++end
++[ids_count, ind] = sort(ids_count, 'descend');
++ids_sorted = ids_sorted(ind);
++
+diff --git a/tools/logparse/match_logs.m b/tools/logparse/match_logs.m
+new file mode 100644
+index 000000000..204d8a8fb
+--- /dev/null
++++ b/tools/logparse/match_logs.m
+@@ -0,0 +1,109 @@
++close all
++clear all
++
++load extracted_data;
++
++rtt_comb = zeros(100,3);
++jBsize_comb = zeros(100,3);
++TURN = zeros(100,1);
++matches = 1;
++
++id_matched = zeros(1,length(session_ids(:,1)));
++
++
++for i = 1 : length(session_ids(:,1))
++    if id_matched(i) == 0
++        sid = session_ids(i,:);
++        for j = 1 : length(session_ids(:,1))
++            if j ~= i && met(i,1) > -1 && met(j,1) > -1 && id_matched(j) == 0 
++                err = sid - session_ids(j,:);
++                e = err * err';
++      
++                if( e == 0)
++                    sid
++                    session_ids(j,:)
++                    fprintf('found matching session_ids = %d with %d \n', i, j);
++                    id_matched(j) = 1;
++                    id_matched(i) = 1;
++                    %rtt(j,:)
++                    %rtt(i,:)
++                    %jBsize(j,:)
++                    %jBsize(i,:)
++                    rtt_comb(matches,1) = (rtt(j,1) + rtt(i,1))/2;
++                    rtt_comb(matches,2) = max([rtt(j,2),rtt(i,2)]);
++                    rtt_comb(matches,3) = min([rtt(j,3),rtt(i,3)]);                    
++                    
++                    jBsize_comb(matches,:) = jBsize(j,:) + jBsize(i,:);
++                    
++                    if( met(i,1) == 3)
++                        if(met(j,1) == 3)
++                            TURN(matches) = 2;
++                        else
++                            TURN(matches) = 1;
++                        end
++                    else
++                        if(met(j,1) == 3)
++                            TURN(matches) = 1;
++                        else
++                            TURN(matches) = 0;
++                        end
++                    end
++                    
++                    %met(j,:)
++                    %met(i,:)
++                    
++                    matches = matches + 1;
++                    %pause
++                end     
++            end
++        end
++    end
++    if id_matched(i) == 0
++       fprintf('could not find a match for %s \n', session_ids(i,:)); 
++    end
++end
++
++bins = [0 : 50 : 2500];
++D = rtt_comb(:,1);% + jBsize_comb(:,1);
++H = hist(D,bins);
++H = H / sum(H);
++figure; plot(bins,cumsum(H)*100)
++grid on
++xlabel('rtt Nw + Jb (ms)')
++ylabel('cummulative frequency')
++D = rtt_comb(:,1);
++H = hist(D,bins);
++figure; plot(bins,cumsum(H))
++H = H / sum(H);
++figure; plot(bins,cumsum(H))
++figure; plot(bins,cumsum(H)*100)
++grid on
++xlabel('rtt Nw (ms)')
++ylabel('cummulative frequency')
++D = jBsize_comb(:,1);
++H = hist(D,bins);
++figure; plot(bins,cumsum(H))
++H = H / sum(H);
++figure; plot(bins,cumsum(H))
++figure; plot(bins,cumsum(H)*100)
++grid on
++xlabel('rtt Nw (ms)')
++ylabel('cummulative frequency')
++
++idx = find(TURN == 0);
++H0 = hist(D(idx),bins);
++H0 = H0 / sum(H0);
++figure; 
++plot(bins,cumsum(H)*100,'k')
++hold
++plot(bins,cumsum(H0)*100)
++grid on
++idx = find(TURN == 1);
++H1 = hist(D(idx),bins);
++H1 = H1 / sum(H1);
++plot(bins,cumsum(H1)*100,'r')
++idx = find(TURN == 2);
++H2 = hist(D(idx),bins);
++H2 = H2 / sum(H2);
++plot(bins,cumsum(H2)*100,'g')
++
+diff --git a/tools/logparse/num2ip.m b/tools/logparse/num2ip.m
+new file mode 100644
+index 000000000..7b475157e
+--- /dev/null
++++ b/tools/logparse/num2ip.m
+@@ -0,0 +1,12 @@
++function ip = num2ip(num)
++
++fak = 2^(8*3);
++d = floor(num/fak);
++rem = num - d*fak;
++ip = num2str(d);
++for i =  1 : 3
++    fak = 2^(8*(3-i));
++    d = floor(rem/fak);
++    rem = rem - d*fak;
++    ip = strcat(ip,'.',num2str(d));
++end
+\ No newline at end of file
+diff --git a/tools/logparse/plot_rate.m b/tools/logparse/plot_rate.m
+new file mode 100644
+index 000000000..dcc7623b4
+--- /dev/null
++++ b/tools/logparse/plot_rate.m
+@@ -0,0 +1,132 @@
++function plot_rate(time, data_len, pt, ip, ip_target, pt_audio, direction)
++
++idx = find(ip == ip_target);
++time_ = time(idx);
++data_len_ = data_len(idx);
++
++rate = zeros(size(time_));
++for i = 1 : length(time_)
++    idx = find( (time_(i)-1) < time_);% < (time(i)+1));
++    t = time_(idx);
++    d = data_len_(idx);
++    idx = find( (time_(i)+1) > t);
++
++    if( idx(end) < length(t))
++        rate(i) = 8*sum(d(idx))/( (t(idx(end)+1)) - (t(idx(1))));
++    elseif(i > 1)
++        rate(i) = rate(i-1);
++    else
++        rate(i) = 0;
++    end
++end
++
++arg = strcat(direction,'=',num2ip(ip_target));
++title(arg);
++subplot(4,1,1)
++plot(time_, rate/1000)
++grid on
++legend('Total')
++ylabel('Rate (kbps)')
++
++idx = find(pt == -1);
++time_ = time(idx);
++data_len_ = data_len(idx);
++ip_ = ip(idx);
++
++idx = find(ip_ == ip_target);
++time_ = time_(idx);
++data_len_ = data_len_(idx);
++
++rate = zeros(size(time_));
++for i = 1 : length(time_)
++    idx = find( (time_(i)-1) < time_);% < (time(i)+1));
++    t = time_(idx);
++    d = data_len_(idx);
++    idx = find( (time_(i)+1) > t);
++
++    if( idx(end) < length(t))
++        rate(i) = 8*sum(d(idx))/( (t(idx(end)+1)) - (t(idx(1))));
++    elseif(i > 1)
++        rate(i) = rate(i-1);
++    else
++        rate(i) = 0;
++    end
++end
++
++subplot(4,1,2)
++plot(time_, rate/1000)
++grid on
++legend('TCP')
++ylabel('Rate (kbps)')
++
++idx = find(pt ~= -1);
++idx = intersect(idx, find(pt ~= pt_audio(1)));
++for j = 2 : length(pt_audio)
++    idx = intersect(idx, find(pt ~= pt_audio(j)));
++end
++time_ = time(idx);
++data_len_ = data_len(idx);
++ip_ = ip(idx);
++
++idx = find(ip_ == ip_target);
++time_ = time_(idx);
++data_len_ = data_len_(idx);
++
++rate = zeros(size(time_));
++for i = 1 : length(time_)
++    idx = find( (time_(i)-1) < time_);% < (time(i)+1));
++    t = time_(idx);
++    d = data_len_(idx);
++    idx = find( (time_(i)+1) > t);
++
++    if( idx(end) < length(t))
++        rate(i) = 8*sum(d(idx))/( (t(idx(end)+1)) - (t(idx(1))));
++    elseif(i > 1)
++        rate(i) = rate(i-1);
++    else
++        rate(i) = 0;
++    end
++end
++
++subplot(4,1,3)
++plot(time_, rate/1000)
++grid on
++legend('UDP msc')
++ylabel('Rate (kbps)')
++
++idx = [];
++for j = 1 : length(pt_audio)
++    idx = [idx,find(pt == pt_audio(j))];
++end
++idx = sort(idx);
++
++time_ = time(idx);
++data_len_ = data_len(idx);
++ip_ = ip(idx);
++
++idx = find(ip_ == ip_target);
++time_ = time_(idx);
++data_len_ = data_len_(idx);
++
++rate = zeros(size(time_));
++for i = 1 : length(time_)
++    idx = find( (time_(i)-1) < time_);% < (time(i)+1));
++    t = time_(idx);
++    d = data_len_(idx);
++    idx = find( (time_(i)+1) > t);
++
++    if( idx(end) < length(t))
++        rate(i) = 8*sum(d(idx))/( (t(idx(end)+1)) - (t(idx(1))));
++    elseif(i > 1)
++        rate(i) = rate(i-1);
++    else
++        rate(i) = 0;
++    end
++end
++
++subplot(4,1,4)
++plot(time_, rate/1000)
++grid on
++legend('UDP Audio')
++xlabel('Time (s)')
++ylabel('Rate (kbps)')
+\ No newline at end of file
+diff --git a/tools/logparse/pps_smther.m b/tools/logparse/pps_smther.m
+new file mode 100644
+index 000000000..929eb0edd
+--- /dev/null
++++ b/tools/logparse/pps_smther.m
+@@ -0,0 +1,22 @@
++function pps = pps_smther(time)
++
++pps = zeros(size(time));
++for i = 1 : length(time)
++idx = find( (time(i)-1) < time);% < (time(i)+1));
++t = time(idx);
++idx = find( (time(i)+1) > t);
++
++%time(i)
++%t(idx)
++
++%if(time(i) > 26)
++%    pause
++%end
++if( idx(end) < length(t))
++pps(i) = length(idx)/( (t(idx(end)+1)) - (t(idx(1))));
++elseif(i > 1)
++pps(i) = pps(i-1);
++else
++pps(i) = 0;
++end
++end
+\ No newline at end of file
+diff --git a/tools/logparse/print_logs.m b/tools/logparse/print_logs.m
+new file mode 100644
+index 000000000..43f92f7f6
+--- /dev/null
++++ b/tools/logparse/print_logs.m
+@@ -0,0 +1,47 @@
++function print_logs(id1, id2)
++
++load extracted_data;
++load extracted_maps
++
++i = get_logs(users_map, sessions_map, id1);
++if nargin == 2
++    ii = get_logs(users_map, sessions_map, id2);
++    i = intersect(i, ii);
++end
++
++% sort by time
++t = zeros(size(i));
++for k = 1:length(i)
++    str = start_time{i(k)};
++    t(k) = posixtime(datetime(str(1:end-4), 'InputFormat', 'yyyy/MM/dd HH:mm:ss'));
++    t(k) = t(k) + str2double(str(end-2:end)) / 1000;
++end
++[~, ii] = sort(t);
++i = i(ii);
++
++if 0
++    fprintf('         Time             Session ID      User ID   Flows  Loc. Cand.  Rem. Cand.  Media Tm.  Dur.  RTT  PLoss JBSize\n');
++    for k = i
++        fprintf('%s  %s..%s  %s..%s   %d   %8s    %8s   %8.1f    %4d  %4d   %4d\n', ...
++            start_time{k}, session_ids{k}(1:5), session_ids{k}(end-4:end), user_ids{k}(1:5), user_ids{k}(end-4:end), ...
++            flows(k), rem_cand{k}, loc_cand{k}, media_time(k)/1e3, dur(k), rtt(k), jBsize(k));
++    end
++else
++    fprintf('         Time                         Session ID                             User ID                Flows  Loc. Cand.  Rem. Cand.  Media Tm.  Dur.  RTT  PLoss JBSize\n');
++    for k = i
++        fprintf('%s  %s  %s   %d   %8s    %8s   %8.1f    %4d  %4d   %4d\n', ...
++            start_time{k}, session_ids{k}, user_ids{k}, flows(k), rem_cand{k}, loc_cand{k}, media_time(k)/1e3, dur(k), rtt(k), jBsize(k));
++    end
++end
++            
++function log_ix = get_logs(users_map, sessions_map, id)
++if isKey(users_map, id)
++    disp(['User ID: ' id]);
++    log_ix = users_map(id);
++elseif isKey(sessions_map, id)
++    disp(['Session ID: ' id]);
++    log_ix = sessions_map(id);
++else
++    error([id, ' exists neither in the users_map nor sessions_map']);
++    log_ix = [];
++end
+diff --git a/tools/logparse/run_to_add_path.m b/tools/logparse/run_to_add_path.m
+new file mode 100644
+index 000000000..dca9707b8
+--- /dev/null
++++ b/tools/logparse/run_to_add_path.m
+@@ -0,0 +1 @@
++addpath(pwd);
+diff --git a/tools/netprobe/main.c b/tools/netprobe/main.c
+new file mode 100644
+index 000000000..e12a18d75
+--- /dev/null
++++ b/tools/netprobe/main.c
+@@ -0,0 +1,477 @@
++/*
++* Wire
++* Copyright (C) 2016 Wire Swiss GmbH
++*
++* This program is free software: you can redistribute it and/or modify
++* it under the terms of the GNU General Public License as published by
++* the Free Software Foundation, either version 3 of the License, or
++* (at your option) any later version.
++*
++* This program is distributed in the hope that it will be useful,
++* but WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++* GNU General Public License for more details.
++*
++* You should have received a copy of the GNU General Public License
++* along with this program. If not, see <http://www.gnu.org/licenses/>.
++*/
++/* libavs -- Network Prober
++ */
++
++#include <ctype.h>
++#include <getopt.h>
++#include <stdlib.h>
++#include <time.h>
++#include <re.h>
++#include <avs.h>
++
++
++/* Defaults for arguments
++ */
++#define DEFAULT_REQUEST_URL "https://prod-nginz-https.wire.com"
++#define DEFAULT_NOTIFICATION_URL "https://prod-nginz-ssl.wire.com"
++#define DEV_REQUEST_URL "https://staging-nginz-https.zinfra.io"
++#define DEV_NOTIFICATION_URL "https://staging-nginz-ssl.zinfra.io"
++
++
++/* Globals
++ */
++
++static struct engine *engine = NULL;
++static struct config *g_config = NULL;
++static struct probe_entry {
++	struct netprobe *np;
++	struct sa turn_srv;
++	bool secure;
++	int proto;
++} netprobev[32];
++static size_t netprobec;
++static size_t netprobec_ok;
++static const char *turn_uri;
++
++struct lookup_entry {
++	struct zapi_ice_server turn;
++	char *host;
++	int port;
++	int proto;
++	bool secure;
++	uint64_t ts;
++	
++	struct le le;
++};
++
++
++static int start_netprobe(const struct sa *turn_srv,
++			  int proto, bool secure,
++			  const char *username, const char *password);
++
++static void dns_handler(int dns_err, const struct sa *srv, void *arg)
++{
++	struct lookup_entry *lent = arg;
++	struct sa turn_srv;
++
++	re_printf("DNS lookup for: %s err=%d\n", lent->host, dns_err);
++	if (dns_err)
++		goto out;
++
++	sa_cpy(&turn_srv, srv);
++	sa_set_port(&turn_srv, lent->port);
++
++	re_printf("DNS lookup success: %s -> %J(proto=%s secure=%d)\n",
++		  lent->host, &turn_srv, net_proto2name(lent->proto),
++		  lent->secure);
++	
++	start_netprobe(&turn_srv, lent->proto, lent->secure,
++		       lent->turn.username, lent->turn.credential);
++ out:
++	mem_deref(lent);
++}
++
++
++static void lent_destructor(void *arg)
++{
++	struct lookup_entry *lent = arg;
++
++	mem_deref(lent->host);
++}
++
++
++static int turn_dns_lookup(struct zapi_ice_server *turn,
++			   struct stun_uri *uri)
++{
++	struct lookup_entry *lent;
++	int err = 0;
++
++	lent = mem_zalloc(sizeof(*lent), lent_destructor);
++	if (!lent)
++		return ENOMEM;
++
++	lent->turn = *turn;
++	lent->ts = tmr_jiffies();
++	lent->proto = uri->proto;
++	lent->secure = uri->secure;
++	lent->port = uri->port;
++	err = str_dup(&lent->host, uri->host);
++	if (err)
++		goto out;
++
++	re_printf("dns_lookup for: %s:%d\n", lent->host, lent->port);
++	
++	err = dns_lookup(lent->host, dns_handler, lent);
++	if (err) {
++		warning("dns_lookup: failed: %m\n", err);
++		goto out;
++	}
++ out:
++	if (err)
++		mem_deref(lent);
++
++	return err;
++}
++
++
++static void cfg_resp_handler(int err, const struct http_msg *msg,
++			     struct mbuf *mb, struct json_object *jobj,
++			     void *arg)
++{
++	char *json_str = NULL;
++	struct zapi_ice_server *servers;
++	size_t nservers = 0;
++	size_t i;
++
++	re_printf("config ready! err=%d\n");
++	if (err == ECONNABORTED)
++		goto out;
++
++	if (!err && jobj) {
++		err = jzon_encode(&json_str, jobj);
++		if (err)
++			goto out;
++	}
++
++	re_printf("CONFIG: %s\n", json_str);
++
++	config_update(g_config, err, json_str, str_len(json_str));
++	mem_deref(json_str);
++	
++	servers = config_get_iceservers(g_config, &nservers);
++	re_printf("Probing: %d servers\n", nservers);
++
++	for (i = 0; i < nservers; ++i) {
++		struct zapi_ice_server *turn = &servers[i];
++		struct stun_uri uri;
++
++		err = stun_uri_decode(&uri, turn->url);
++		if (err)
++			err = turn_dns_lookup(turn, &uri);
++		else {
++			start_netprobe(&uri.addr, uri.proto, uri.secure,
++				       turn->username, turn->credential);
++		}
++	}
++
++	
++ out:
++	if (err)
++		error("config request failed: %m\n", err);
++}
++
++static int config_req_handler(void *arg)
++{
++	printf("requesing config\n");
++	return rest_request(NULL, engine_get_restcli(engine), 0,
++			    "GET", cfg_resp_handler, NULL,
++			    "/calls/config/v2", NULL);
++	
++}
++
++
++
++
++static void ready_handler(void *arg)
++{
++	struct stun_uri uri;
++	int err;
++
++	dns_init(NULL);
++	
++	(void)uri;
++	(void)err;
++	
++	re_printf("engine ready.\n");
++
++	config_alloc(&g_config, config_req_handler, NULL, NULL);
++	config_start(g_config);
++
++#if 0
++	err = stun_uri_decode(&uri, turn_uri);
++	if (err) {
++		warning("netprobe: ready_handler: failed to parse URI: %s\n",
++			turn_uri);
++		return;
++	}
++
++	start_netprobe(&uri.addr, uri.proto, uri.secure, "", "");
++#endif
++}
++
++
++static void error_handler(int err, void *arg)
++{
++	error("Engine just broken: %m.\n", err);
++}
++
++
++static void engine_shutdown_handler(void *arg)
++{
++	(void) arg;
++
++	re_printf("The engine shutted down.\n");
++	re_cancel();
++}
++
++
++static void signal_handler(int sig)
++{
++	static bool term = false;
++
++	if (term) {
++		warning("Aborted.\n");
++		exit(0);
++	}
++
++	term = true;
++
++	warning("Terminating ...\n");
++
++	engine_shutdown(engine);
++}
++
++
++static void netprobe_handler(int err, const struct netprobe_result *result,
++			     void *arg)
++{
++	struct probe_entry *np;
++	size_t ix = (size_t)arg;
++
++	if (err) {
++		warning("netprobe failed (%m)\n", err);
++		goto out;
++	}
++
++	np = &netprobev[ix];
++
++	re_printf("Network Probe results for %s TURN%s-server at %J\n",
++		  net_proto2name(np->proto),
++		  np->secure ? "S" : "", &np->turn_srv);
++	re_printf("    Average RTT:   %.1f milliseconds\n",
++		  result->rtt_avg / 1000.0);
++	re_printf("    transmitted:   %u packets\n", result->n_pkt_sent);
++	re_printf("    received:      %u packets\n", result->n_pkt_recv);
++	re_printf("\n");
++
++ out:
++	netprobec_ok++;
++
++	if (netprobec_ok >= netprobec) {
++		info("netprobing done. shutting down..\n");
++		engine_shutdown(engine);
++	}
++}
++
++
++static int start_netprobe(const struct sa *turn_srv,
++			  int proto, bool secure,
++			  const char *username, const char *password)
++{
++	int err;
++
++	re_printf("starting netprobe with TURN%s-server %J"
++		  " (proto=%s) ..\n",
++		  secure ? "S" : "", turn_srv,
++		  net_proto2name(proto));
++
++#define PACKET_COUNT 50
++#define PACKET_INTERVAL 20
++
++	if (netprobec >= ARRAY_SIZE(netprobev)) {
++		warning("reached maximum %zu netprobes\n", netprobec);
++		return 0;
++	}
++
++	netprobev[netprobec].turn_srv = *turn_srv;
++	netprobev[netprobec].secure = secure;
++	netprobev[netprobec].proto = proto;
++	
++
++	err = netprobe_alloc(&netprobev[netprobec].np,
++			     turn_srv, proto, secure,
++			     username, password,
++			     PACKET_COUNT, PACKET_INTERVAL,
++			     netprobe_handler, (void *)netprobec);
++	if (err) {
++		warning("could not create netprobe (%m)\n", err);
++		goto out;
++	}
++
++	netprobec++;
++
++ out:
++	return err;
++}
++
++
++static void usage(void)
++{
++	(void)re_fprintf(stderr,
++			 "usage: netprobe [-dh] -e <email> -p <password>"
++			 " [-r <url> -n <url>] [-t] [-t] [-d] [-d]"
++			 " [-l <path>]"
++			 "\n");
++	(void)re_fprintf(stderr, "\t-c <path>      config and cache "
++				 		  "directory\n");
++	(void)re_fprintf(stderr, "\t-d             Turn on debugging "
++			                          "(twice for more)\n");
++	(void)re_fprintf(stderr, "\t-e <email>     Email address\n");
++	(void)re_fprintf(stderr, "\t-p <password>  Password\n");
++	(void)re_fprintf(stderr, "\t-l <path>      Send debug log to file\n");
++	(void)re_fprintf(stderr, "\t-n <url>       Backend notification URL"
++				 " (optional)\n");
++	(void)re_fprintf(stderr, "\t-r <url>       Backend request URL"
++				 " (optional)\n");
++	(void)re_fprintf(stderr, "\t-D             Use dev environment\n");
++	(void)re_fprintf(stderr, "\t-u <TURN>      Force a TURN uri\n");
++
++	(void)re_fprintf(stderr, "\t-h             Show options\n");
++	(void)re_fprintf(stderr, "\n");
++	(void)re_fprintf(stderr, "URLs default to regular backend.\n");
++}
++
++
++int main(int argc, char *argv[])
++{
++	const char *email = NULL;
++	const char *password = NULL;
++	const char *request_uri = DEFAULT_REQUEST_URL;
++	const char *notification_uri = DEFAULT_NOTIFICATION_URL;
++	enum log_level level = LOG_LEVEL_WARN;
++	size_t i;
++
++	int err = 0;
++
++	for (;;) {
++		const int c = getopt(argc, argv, "de:l:n:p:r:tDu:");
++		if (c < 0)
++			break;
++
++		switch (c) {
++
++		case 'd':
++			if (level == LOG_LEVEL_INFO)
++				level = LOG_LEVEL_DEBUG;
++			else
++				level = LOG_LEVEL_INFO;
++			break;
++
++		case 'D':
++			request_uri = DEV_REQUEST_URL;
++			notification_uri = DEV_NOTIFICATION_URL;
++			break;
++
++		case 'e':
++			email = optarg;
++			break;
++
++		case 'n':
++			notification_uri = optarg;
++			break;
++
++		case 'p':
++			password = optarg;
++			break;
++
++		case 'r':
++			request_uri = optarg;
++			break;
++
++		case 'u':
++			turn_uri = optarg;
++			break;
++
++		case '?':
++			err = EINVAL;
++			/* fall through */
++		case 'h':
++			usage();
++			return err;
++		}
++	}
++
++	log_set_min_level(level);
++
++	if (email == NULL) {
++		(void)re_fprintf(stderr, "Missing email.\n");
++		err = EINVAL;
++		goto out;
++	}
++	if (password == NULL) {
++		(void)re_fprintf(stderr, "Missing password.\n");
++		err = EINVAL;
++		goto out;
++	}
++
++	err = libre_init();
++	if (err) {
++		(void)re_fprintf(stderr, "libre init failed: %m\n", err);
++		goto out;
++	}
++
++	err = avs_init(AVS_FLAG_EXPERIMENTAL);
++	if (err) {
++		(void)re_fprintf(stderr, "avs init failed: %m\n", err);
++		goto out;
++	}
++
++	sys_coredump_set(true);
++
++	err = engine_init("audummy");
++	if (err) {
++		(void)re_fprintf(stderr, "engine init failed: %m\n", err);
++		goto out;
++	}
++
++	err = engine_alloc(&engine, request_uri, notification_uri, email,
++			   password, NULL, false, false,
++			   "netprobe/" AVS_VERSION,
++			   ready_handler, error_handler,
++			   engine_shutdown_handler, 0);
++	if (err) {
++		(void)re_fprintf(stderr, "Engine init failed: %m\n", err);
++		goto out;
++	}
++
++	err = re_main(signal_handler);
++
++ out:
++	for (i=0; i<netprobec; i++)
++		mem_deref(netprobev[i].np);
++
++	mem_deref(g_config);
++	mem_deref(engine);
++
++	engine_close();
++	dns_close();
++
++	libre_close();
++
++	/* check for memory leaks */
++	mem_debug();
++	tmr_debug();
++
++	if (err) {
++		return 1;
++	}
++	else {
++		return 0;
++	}
++}
+diff --git a/tools/netprobe/tool.mk b/tools/netprobe/tool.mk
+new file mode 100644
+index 000000000..b43e51959
+--- /dev/null
++++ b/tools/netprobe/tool.mk
+@@ -0,0 +1,12 @@
++
++TOOL 		:= netprobe
++netprobe_SRCS	+= \
++		main.c
++
++netprobe_CPPFLAGS := $(AVS_CPPFLAGS) $(MENG_CPPFLAGS)
++netprobe_CFLAGS := $(AVS_CFLAGS) $(AVS_CFLAGS)
++netprobe_LIBS := $(AVS_LIBS) $(MENG_LIBS)
++netprobe_DEPS := $(AVS_DEPS) $(MENG_DEPS)
++netprobe_LIB_FILES := $(AVS_STATIC) $(MENG_STATIC)
++
++include mk/tool.mk
+diff --git a/tools/packetdump/extract_audio_dump.py b/tools/packetdump/extract_audio_dump.py
+new file mode 100755
+index 000000000..26f3ccf10
+--- /dev/null
++++ b/tools/packetdump/extract_audio_dump.py
+@@ -0,0 +1,154 @@
++from array import *
++import matplotlib.pyplot as pyplot
++import sys
++import os
++
++def read_uint8(f):
++    tmp = f.read(1)
++    if tmp == "": return -1;
++    out = int(tmp.encode('hex'),16)
++    return out
++
++def read_uint16(f, order='big'):
++    if order == 'big':
++        seq = [0,1];
++    else:
++        seq = [1,0];
++    tmp = f.read(2)
++    if tmp == "": return -1;
++    out = 0
++    for j in seq: out = (out << 8) + int(tmp[j].encode('hex'),16)
++    return out
++
++def read_uint32(f, order='big'):
++    if order == 'big':
++        seq = [0,1,2,3];
++    else:
++        seq = [3,2,1,0];
++    tmp = f.read(4)
++    out = 0
++    for j in seq: out = (out << 8) + int(tmp[j].encode('hex'),16)
++    return out
++
++file_name = sys.argv[1];
++
++pre, ext = os.path.splitext(file_name)
++
++pt_count = {};
++d_min = {};
++f = open(file_name,"rb")
++try:
++    byte = f.read(30)
++    print byte
++    length = read_uint16(f);
++    D_min = 0xffffffff;
++    packets = 0;
++    #print length
++    while length != -1:
++        plen = read_uint16(f);
++        time = read_uint32(f);
++        if plen < 1:
++            #print length;
++            #print plen;
++            tmp = f.read(length - 8);
++            #print time
++        else:
++            tmp = read_uint8(f);
++            pt = read_uint8(f);
++            seq = read_uint16(f);
++            timestamp = read_uint32(f);
++            ssrc = read_uint32(f);
++            tmp = f.read(plen - 12);
++            packets = packets + 1;
++            D = time - timestamp/48;
++            if (pt in pt_count):
++                pt_count[pt] = pt_count[pt] + 1;
++                if(D < d_min[pt]): d_min[pt] = D
++            else:
++                pt_count[pt] = 1;
++                d_min[pt] = D;
++            #print time, seq
++        length = read_uint16(f);
++
++    pt_opus = -1;
++    max_cnt = -1;
++    for p, c in pt_count.iteritems():
++        if c > max_cnt:
++            pt_opus = p;
++            max_cnt = c;
++#print pt_opus
++    D_min = d_min[pt];
++#print D_min;
++finally:
++    f.close()
++
++f = open(file_name,"rb")
++try:
++    packets = 0;
++    timeBuf = array('f',[]);
++    d1Buf = array('f',[]);
++    dBuf = array('L',[]);
++    timestampBuf = array('L',[]);
++    seqBuf = array('L',[]);
++    D_min_smth = time * 0.0001;
++    alpha = 0.0001;
++    prev_timestamp = -1;
++    byte = f.read(30)
++    length = read_uint16(f);
++    while length != -1:
++        plen = read_uint16(f);
++        time = read_uint32(f);
++            #if packets < 10:
++            #print plen, time
++        if plen < 1:
++            tmp = f.read(length - 8);
++        else:
++            tmp = read_uint8(f);
++            pt = read_uint8(f);
++            seq = read_uint16(f);
++            timestamp = read_uint32(f);
++            ssrc = read_uint32(f);
++            tmp = f.read(plen - 12);
++            if pt == pt_opus:
++                timeBuf.append(float(time)/1000.0);
++                seqBuf.append(seq);
++                timestampBuf.append(timestamp);
++                d = time - timestamp/48;
++                d1Buf.append(d);
++                d = d - D_min;
++                #if d == 0:
++                #print time, seq, d
++                if d < D_min_smth:
++                    D_min_smth = d;
++                else:
++                    D_min_smth = D_min_smth*(1-alpha) + d*alpha;
++                #d = d - int(D_min_smth)
++                dBuf.append(d);
++                packets = packets + 1;
++        length = read_uint16(f);
++finally:
++    f.close()
++
++#print timeBuf[0:10]
++#print seqBuf[0:10]
++#print timestampBuf[0:10]
++#print dBuf[0:10]
++
++maxD = max(dBuf);
++pyplot.figure();
++#pyplot.subplot(2,1,1);
++#pyplot.plot(timeBuf,d1Buf);
++#pyplot.xlim(min(timeBuf), max(timeBuf))
++#pyplot.ylim(min(dBuf), maxD*1.2)
++#pyplot.ylabel('Delay (ms) tot')
++#pyplot.xlabel('Time (s)')
++#pyplot.subplot(2,1,2);
++pyplot.plot(timeBuf,dBuf);
++pyplot.xlim(min(timeBuf), max(timeBuf))
++pyplot.ylim(min(dBuf), maxD*1.2)
++pyplot.ylabel('Delay (ms) tot')
++pyplot.xlabel('Time (s)')
++
++pyplot.savefig(pre + '_Delay.png');
++
++#pyplot.show();
+diff --git a/tools/packetdump/extract_video_dump.py b/tools/packetdump/extract_video_dump.py
+new file mode 100755
+index 000000000..3c552c0b7
+--- /dev/null
++++ b/tools/packetdump/extract_video_dump.py
+@@ -0,0 +1,202 @@
++from array import *
++import matplotlib.pyplot as pyplot
++import sys
++import os
++
++def read_uint8(f):
++    tmp = f.read(1)
++    if tmp == "": return -1;
++    out = int(tmp.encode('hex'),16)
++    return out
++
++def read_uint16(f, order='big'):
++    if order == 'big':
++        seq = [0,1];
++    else:
++        seq = [1,0];
++    tmp = f.read(2)
++    if tmp == "": return -1;
++    out = 0
++    for j in seq: out = (out << 8) + int(tmp[j].encode('hex'),16)
++    return out
++
++def read_uint32(f, order='big'):
++    if order == 'big':
++        seq = [0,1,2,3];
++    else:
++        seq = [3,2,1,0];
++    tmp = f.read(4)
++    out = 0
++    for j in seq: out = (out << 8) + int(tmp[j].encode('hex'),16)
++    return out
++
++file_name = sys.argv[1];
++
++pre, ext = os.path.splitext(file_name)
++
++f = open(file_name,"rb")
++try:
++    byte = f.read(30)
++    print byte
++    length = read_uint16(f);
++    D_min = 0xffffffff;
++    packets = 0;
++    while length != -1:
++        plen = read_uint16(f);
++        time = read_uint32(f);
++        Vp8Len = read_uint32(f);
++        tmp = read_uint8(f);
++        pt = read_uint8(f);
++        seq = read_uint16(f);
++        timestamp = read_uint32(f);
++        ssrc = read_uint32(f);
++        byte = f.read(18)
++        packets = packets + 1;
++        D = time - timestamp/90;
++        if(D < D_min): D_min = D
++        length = read_uint16(f);
++finally:
++    f.close()
++
++f = open(file_name,"rb")
++try:
++    byte = f.read(30)
++    length = read_uint16(f);
++    packets = 0;
++    timeTot = array('f',[]);
++    timeBase = array('f',[]);
++    timeRtx = array('f',[]);
++    dTot = array('L',[]);
++    dBase = array('L',[]);
++    dRtx = array('f',[]);
++    Vp8Len = array('L',[]);
++    timestampBuf = array('L',[]);
++    seqBuf = array('L',[]);
++    ptBuf = array('L',[]);
++    D_min_smth = time * 0.0001;
++    alpha = 0.0001;
++    prev_timestamp = -1;
++    rtxPt = -1000;
++    while length != -1:
++        plen = read_uint16(f);
++        time = read_uint32(f);
++        timeTot.append(float(time)/1000.0);
++        Vp8Len.append(read_uint32(f,'little'));
++        tmp = read_uint8(f);
++        pt = read_uint8(f);
++        ptBuf.append(pt);
++        seq = read_uint16(f);
++        seqBuf.append(seq);
++        timestamp = read_uint32(f);
++        timestampBuf.append(timestamp);
++        ssrc = read_uint32(f);
++        byte = f.read(18);
++        d = time - timestamp/90;
++        d = d - D_min;
++        if d < D_min_smth:
++            D_min_smth = d;
++        else:
++            D_min_smth = D_min_smth*(1-alpha) + d*alpha;
++        d = d - int(D_min_smth)
++        dTot.append(d);
++        if (pt == 100 or pt == 228):
++            dBase.append(d);
++            timeBase.append(float(time)/1000.0);
++        else:
++            dRtx.append(d);
++            timeRtx.append(float(time)/1000.0);
++            rtxPt = pt & 0x7f;
++        packets = packets + 1;
++        length = read_uint16(f);
++finally:
++    f.close()
++
++maxD = max(dTot);
++#if maxD > 1000:
++    #maxD = 1000;
++pyplot.figure();
++pyplot.subplot(3,1,1);
++pyplot.plot(timeTot,dTot);
++pyplot.xlim(min(timeTot), max(timeTot))
++pyplot.ylim(min(dTot), maxD*1.2)
++pyplot.ylabel('Delay (ms) tot')
++#pyplot.title('Total')
++pyplot.subplot(3,1,2);
++pyplot.plot(timeBase,dBase);
++pyplot.xlim(min(timeTot), max(timeTot))
++pyplot.ylim(min(dTot), max(dBase)*1.2)
++pyplot.ylabel('Delay (ms) base')
++#pyplot.title('Base')
++pyplot.subplot(3,1,3);
++pyplot.plot(timeRtx,dRtx,'.');
++pyplot.xlim(min(timeTot), max(timeTot))
++pyplot.ylim(min(dTot), maxD*1.2)
++pyplot.ylabel('Delay (ms) rtx')
++pyplot.xlabel('Time (s)')
++#pyplot.title('Rtx')
++
++#pyplot.show();
++
++pyplot.savefig(pre + '_Delay.png');
++
++# Plot the bitrate
++timeRate = array('f',[]);
++Rate = array('f',[]);
++Pps = array('f',[]);
++Fps = array('f',[]);
++loss = array('f',[]);
++for i in range(0,packets-1):
++    t1 = timeTot[i];
++    t2 = t1;
++    j = i;
++    totBytes = Vp8Len[j];
++    pkts = 1;
++    frames = 0;
++    seqArr = array('f',[]);
++    while t2 < (t1 + 1):
++        j = j + 1;
++        if j > (packets-1):
++            t2 = t1 + 3;
++        else:
++            totBytes = totBytes + Vp8Len[j];
++            if ptBuf[j] == 228 or ptBuf[j] == (rtxPt + 128):
++                frames = frames + 1;
++            if ptBuf[j] == 100 or ptBuf[j] == 228:
++                seqArr.append(seqBuf[j]);
++            pkts = pkts + 1;
++            t2 = timeTot[j];
++    dt = t2 - t1;
++    timeRate.append((t1 + t2)/2);
++    Rate.append((totBytes*8)/dt);
++    Pps.append(pkts/dt);
++    Fps.append(frames/dt);
++    if len(seqArr) > 1:
++        dSeq = (max(seqArr)-min(seqArr));
++        L = dSeq - len(seqArr);
++        if dSeq > 0:
++            L = L/(max(seqArr)-min(seqArr));
++            loss.append(L*100)
++    else:
++        loss.append(100)
++
++pyplot.figure();
++pyplot.subplot(4,1,1);
++pyplot.plot(timeRate,Rate);
++pyplot.xlim(min(timeTot), max(timeTot))
++pyplot.ylabel('Rate (bps)')
++pyplot.subplot(4,1,2);
++pyplot.plot(timeRate,Pps);
++pyplot.xlim(min(timeTot), max(timeTot))
++pyplot.ylabel('Rate (pps)')
++pyplot.subplot(4,1,3);
++pyplot.plot(timeRate,Fps);
++pyplot.xlim(min(timeTot), max(timeTot))
++pyplot.ylabel('Rate (Fps)')
++pyplot.subplot(4,1,4);
++pyplot.plot(timeRate,loss);
++pyplot.xlim(min(timeTot), max(timeTot))
++pyplot.ylim(0, 100)
++pyplot.ylabel('Loss Rate (%)')
++pyplot.xlabel('Time (s)')
++pyplot.savefig(pre + '_Rate.png');
++
+diff --git a/tools/verifyd/main.c b/tools/verifyd/main.c
+new file mode 100644
+index 000000000..b26da65e9
+--- /dev/null
++++ b/tools/verifyd/main.c
+@@ -0,0 +1,448 @@
++/*
++* Wire
++* Copyright (C) 2016 Wire Swiss GmbH
++*
++* This program is free software: you can redistribute it and/or modify
++* it under the terms of the GNU General Public License as published by
++* the Free Software Foundation, either version 3 of the License, or
++* (at your option) any later version.
++*
++* This program is distributed in the hope that it will be useful,
++* but WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++* GNU General Public License for more details.
++*
++* You should have received a copy of the GNU General Public License
++* along with this program. If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#define _BSD_SOURCE 1
++#define _DEFAULT_SOURCE 1
++#include <getopt.h>
++#include <stdio.h>
++#include <re.h>
++#include <avs.h>
++
++
++struct ident_entry {
++	uint64_t id;
++	char *ident;
++
++	struct {
++		char *publish;
++		char *accept;
++	} content;
++};
++
++
++static struct {
++	struct http_sock *sock;
++	struct tmr tmr;
++	struct dict *idents;
++} verifyd = {
++	.sock = NULL,
++};
++
++
++static void ie_destructor(void *arg)
++{
++	struct ident_entry *ie = arg;
++
++	mem_deref(ie->content.publish);
++	mem_deref(ie->content.accept);
++	mem_deref(ie->ident);
++}
++
++
++static void handle_post_create(struct http_conn *conn,
++			       struct mbuf *mb, size_t clen)
++{
++	struct ident_entry *ie = NULL;
++	uint64_t ident;
++	char key[256];
++	int err = 0;
++
++	ident = 1 + rand_u64() & 0xf;  // XXX for testing
++
++	re_snprintf(key, sizeof(key), "%llu", ident);
++
++	info("POST: new pairing id %llu\n", ident);
++
++	ie = mem_zalloc(sizeof(*ie), ie_destructor);
++
++	ie->id = ident;
++	str_dup(&ie->ident, key);
++
++	err = dict_add(verifyd.idents, key, ie);
++	if (err)
++		goto out;
++
++	mem_deref(ie); /* Owned by the dictionary */
++
++	http_creply(conn, 200, "OK",
++		    "application/json",
++		    "{\"pairid\":\"%llu\"}", ident);
++
++ out:
++	if (err) {
++		warning("internal error (%m)\n" ,err);
++	}
++}
++
++
++static void handle_put_publish(struct http_conn *conn,
++			       const struct http_msg *msg,
++			       struct mbuf *mb, size_t clen)
++{
++	struct ident_entry *ie = NULL;
++	struct pl pl;
++	char *key = NULL;
++	int err;
++
++	err = re_regex(msg->prm.p, msg->prm.l, "?pairid=[0-9]+", &pl);
++	if (err) {
++		warning("invalid input\n");
++		goto out;
++	}
++
++	pl_strdup(&key, &pl);
++
++	ie = dict_lookup(verifyd.idents, key);
++	if (!ie) {
++		info("publish: pairing-id %s not found\n", key);
++		http_ereply(conn, 404, "Not found");
++		goto out;
++	}
++
++	debug("publish: saving content(%zu): %b\n",
++		  clen, mbuf_buf(mb), mbuf_get_left(mb));
++
++	mbuf_strdup(mb, &ie->content.publish, clen);
++
++	http_reply(conn, 200, "OK", NULL);
++
++	http_conn_close(conn);
++
++ out:
++	mem_deref(key);
++}
++
++
++static void handle_put_accept(struct http_conn *conn,
++			      const struct http_msg *msg,
++			      struct mbuf *mb, size_t clen)
++{
++	struct ident_entry *ie = NULL;
++	struct pl pl;
++	char *key = NULL;
++	int err;
++
++	err = re_regex(msg->prm.p, msg->prm.l, "?pairid=[0-9]+", &pl);
++	if (err) {
++		warning("invalid input\n");
++		goto out;
++	}
++
++	pl_strdup(&key, &pl);
++
++	ie = dict_lookup(verifyd.idents, key);
++	if (!ie) {
++		info("accept: pairing-id %s not found\n", key);
++		http_ereply(conn, 404, "Not found");
++		goto out;
++	}
++
++	debug("accept: saving content(%zu): %b\n",
++		  clen, mbuf_buf(mb), mbuf_get_left(mb));
++
++	mbuf_strdup(mb, &ie->content.accept, clen);
++
++	http_reply(conn, 200, "OK", NULL);
++
++	http_conn_close(conn);
++
++ out:
++	mem_deref(key);
++}
++
++
++static void handle_get_publish(struct http_conn *conn,
++			       const struct http_msg *msg,
++			       struct mbuf *mb, size_t clen)
++{
++	struct ident_entry *ie = NULL;
++	struct pl pl;
++	char *key = NULL;
++	int err;
++
++	info("handle get publish\n");
++
++	err = re_regex(msg->prm.p, msg->prm.l, "?pairid=[0-9]+", &pl);
++	if (err) {
++		warning("invalid input\n");
++		goto out;
++	}
++
++	pl_strdup(&key, &pl);
++
++	ie = dict_lookup(verifyd.idents, key);
++	if (!ie) {
++		info("publish: pairing-id %s not found\n", key);
++		http_ereply(conn, 404, "Not found");
++		goto out;
++	}
++
++	debug("handle get publish (content=%s)\n", ie->content.publish);
++
++	if (ie->content.publish) {
++		http_creply(conn, 200, "OK",
++			    "application/json", "%s", ie->content.publish);
++	}
++	else {
++		http_ereply(conn, 404, "Not Yet");
++	}
++
++	http_conn_close(conn);
++
++ out:
++	mem_deref(key);
++}
++
++
++static void handle_get_accept(struct http_conn *conn,
++			      const struct http_msg *msg,
++			      struct mbuf *mb, size_t clen)
++{
++	struct ident_entry *ie = NULL;
++	struct pl pl;
++	char *key = NULL;
++	int err;
++
++	info("handle get accept\n");
++
++	err = re_regex(msg->prm.p, msg->prm.l, "?pairid=[0-9]+", &pl);
++	if (err) {
++		warning("invalid input\n");
++		goto out;
++	}
++
++	pl_strdup(&key, &pl);
++
++	ie = dict_lookup(verifyd.idents, key);
++	if (!ie) {
++		info("accept: pairing-id %s not found\n", key);
++		http_ereply(conn, 404, "Not found");
++		goto out;
++	}
++
++	debug("handle get accept (content=%s)\n", ie->content.accept);
++
++	if (ie->content.accept) {
++		http_creply(conn, 200, "OK",
++			    "application/json", "%s", ie->content.accept);
++	}
++	else {
++		http_ereply(conn, 404, "Not Yet");
++	}
++
++	http_conn_close(conn);
++
++ out:
++	mem_deref(key);
++}
++
++
++static void http_req_handler(struct http_conn *conn,
++			     const struct http_msg *msg, void *arg)
++{
++	struct mbuf *mb = mbuf_alloc(1024);
++	int err = 0;
++	(void)arg;
++
++	info("restsrv: request %r %r%r from %J\n",
++	     &msg->met, &msg->path, &msg->prm,
++	     http_conn_peer(conn));
++
++	if (0 == pl_strcasecmp(&msg->met, "POST") &&
++	    0 == pl_strcasecmp(&msg->path, "/create")) {
++
++		handle_post_create(conn, msg->mb, (size_t)msg->clen);
++	}
++	else if (0 == pl_strcasecmp(&msg->met, "PUT") &&
++		 0 == pl_strcasecmp(&msg->path, "/publish")) {
++
++		handle_put_publish(conn, msg, msg->mb, (size_t)msg->clen);
++	}
++	else if (0 == pl_strcasecmp(&msg->met, "PUT") &&
++		 0 == pl_strcasecmp(&msg->path, "/accept")) {
++
++		handle_put_accept(conn, msg, msg->mb, (size_t)msg->clen);
++	}
++	else if (0 == pl_strcasecmp(&msg->met, "GET") &&
++		 0 == pl_strcasecmp(&msg->path, "/publish")) {
++
++		handle_get_publish(conn, msg, msg->mb, (size_t)msg->clen);
++	}
++	else if (0 == pl_strcasecmp(&msg->met, "GET") &&
++		 0 == pl_strcasecmp(&msg->path, "/accept")) {
++
++		handle_get_accept(conn, msg, msg->mb, (size_t)msg->clen);
++	}
++	else {
++		warning("no such resource\n");
++		err = ENOENT;
++		goto out;
++	}
++
++ out:
++	if (err) {
++		http_ereply(conn, 400, "Bad Request");
++		warning("restsrv: response 400 Bad Request (%m)\n", err);
++
++		http_conn_close(conn);
++	}
++
++	mem_deref(mb);
++}
++
++
++static int srv_init(uint16_t lport)
++{
++	struct sa laddr;
++	struct tcp_sock *tsock;
++	int err;
++
++	info("srv_init: lport=%d\n", (int)lport);
++
++	err = sa_set_str(&laddr, "0.0.0.0", lport);
++	if (err)
++		return err;
++
++	err = http_listen(&verifyd.sock, &laddr, http_req_handler, NULL);
++	if (err) {
++		re_fprintf(stderr, "http_listen: failed: %m\n", err);
++		return err;
++	}
++
++	tsock = http_sock_tcp(verifyd.sock);
++	if (tsock) {
++		tcp_sock_local_get(tsock, &laddr);
++	}
++
++	re_fprintf(stderr, "verifyd: listening on %J\n", &laddr);
++
++	return 0;
++}
++
++
++static void srv_close(void)
++{
++	verifyd.sock = mem_deref(verifyd.sock);
++}
++
++
++static void signal_handler(int sig)
++{
++	static bool term = false;
++
++	if (term) {
++		warning("Aborted.\n");
++		exit(0);
++	}
++
++	term = true;
++
++	warning("Terminating ...\n");
++
++	re_cancel();
++}
++
++
++static void usage(const char *cmd)
++{
++	re_fprintf(stderr, "usage: %s -p <port>\n", cmd);
++}
++
++
++static void init_timeout(void *arg)
++{
++	int local_port = *(int *)arg;
++
++	info("init_timeout: srv_init\n");
++	srv_init((uint16_t)local_port);
++}
++
++
++int main(int argc, char **argv)
++{
++	int local_port = -1;
++	int err = 0;
++
++	for (;;) {
++		const int c = getopt(argc, argv, "p:");
++
++		if (c < 0)
++			break;
++
++		switch (c) {
++
++		case 'p':
++			local_port = atoi(optarg);
++			break;
++
++		default:
++			break;
++
++		}
++	}
++
++	if (local_port == -1) {
++		usage(argv[0]);
++		err = EINVAL;
++		goto out;
++	}
++
++	err = libre_init();
++	if (err) {
++		(void)re_fprintf(stderr, "libre init failed: %m\n", err);
++		goto out;
++	}
++
++	err = avs_init(0);
++	if (err) {
++		(void)re_fprintf(stderr, "avs init failed: %m\n", err);
++		goto out;
++	}
++
++	err = dict_alloc(&verifyd.idents);
++	if (err) {
++		re_fprintf(stderr,
++			   "%s: cannot alloc idetifier dictionary: %m\n",
++			   argv[0], err);
++		goto out;
++	}
++
++	log_set_min_level(LOG_LEVEL_INFO);
++
++	tmr_init(&verifyd.tmr);
++
++	tmr_start(&verifyd.tmr, 1, init_timeout, &local_port);
++
++	re_printf("re_main\n");
++	re_main(signal_handler);
++	re_printf("re_main DONE!\n");
++
++ out:
++	tmr_cancel(&verifyd.tmr);
++	mem_deref(verifyd.idents);
++
++	srv_close();
++
++	libre_close();
++
++	/* check for memory leaks */
++	mem_debug();
++	tmr_debug();
++
++	return err;
++}
+diff --git a/tools/verifyd/tool.mk b/tools/verifyd/tool.mk
+new file mode 100644
+index 000000000..0090427df
+--- /dev/null
++++ b/tools/verifyd/tool.mk
+@@ -0,0 +1,12 @@
++
++TOOL 		:= verifyd
++verifyd_SRCS	+= \
++		main.c
++
++verifyd_CPPFLAGS := $(AVS_CPPFLAGS) $(MENG_CPPFLAGS)
++verifyd_CFLAGS := $(AVS_CFLAGS) $(AVS_CFLAGS)
++verifyd_LIBS := $(AVS_LIBS) $(MENG_LIBS)
++verifyd_DEPS := $(AVS_DEPS) $(MENG_DEPS)
++verifyd_LIB_FILES := $(AVS_STATIC) $(MENG_STATIC)
++
++include mk/tool.mk
+diff --git a/tools/zcall/conv.c b/tools/zcall/conv.c
+index 638e4ed94..5c0788068 100644
+--- a/tools/zcall/conv.c
++++ b/tools/zcall/conv.c
+@@ -1255,7 +1255,6 @@ static void prekey_handler(const char *userid,
+ 	output("prekey_handler: %zu bytes, user:%s[%u] -> %s\n",
+ 	       key_len, userid, id, clientid);
+ 
+-
+ 	err = client_id_load(lclientid, sizeof(lclientid));
+ 	if (err) {
+ 		debug("my clientid not set -- cannot store prekeys\n");
+@@ -1277,6 +1276,10 @@ static void prekey_handler(const char *userid,
+ 				err);
+ 		}
+ 	}
++
++	if (last) {
++		output("prekey_handler: all prekeys fetched\n");
++	}
+ }
+ 
+ 
+diff --git a/tools/zcall/how_to_batch_test.txt b/tools/zcall/how_to_batch_test.txt
+new file mode 100644
+index 000000000..2e61074ce
+--- /dev/null
++++ b/tools/zcall/how_to_batch_test.txt
+@@ -0,0 +1,22 @@
++How to run a batch test between zcall on android and zcall on OS X
++
++1) Compile zcall on osx
++	make
++2) compile avs library for android
++	make dist_android DIST_ARCH=armv7
++3) build zcall for android
++	make AVS_OS=android tools
++4) push zcall onto a android device
++	make AVS_OS=android android_zcall 
++5) start zcall on OS X as normal 
++6) start zcall on android
++	adb shell
++	cd /data/local/tmp
++	zcall -e bla@blu -p fgtr -c /data/local/tmp -T
++7) Set side A to auto answer
++	:set autoanswer 1
++8) Start batch calling on side B
++	:batch_call 10 2	- 10 calls that last 2 seconds each
++
++ 
++ 
+\ No newline at end of file
+diff --git a/webrtc/patch/webrtc_android.patch b/webrtc/patch/webrtc_android.patch
+deleted file mode 100644
+index 40097caa3..000000000
+--- a/webrtc/patch/webrtc_android.patch
++++ /dev/null
+@@ -1,279 +0,0 @@
+-diff --git a/modules/utility/include/jvm_android.h b/modules/utility/include/jvm_android.h
+-index 3caab87761..44f4c2260c 100644
+---- a/modules/utility/include/jvm_android.h
+-+++ b/modules/utility/include/jvm_android.h
+-@@ -149,9 +149,10 @@ class JNIEnvironment {
+- //   JVM::Uninitialize();
+- class JVM {
+-  public:
+-+  static void Initialize(JavaVM* jvm);
+-   // Stores global handles to the Java VM interface.
+-   // Should be called once on a thread that is attached to the JVM.
+--  static void Initialize(JavaVM* jvm);
+-+  static void Initialize(JavaVM* jvm, JNIEnv *jni);
+-   // Like the method above but also passes the context to the ContextUtils
+-   // class. This method should be used by pure-C++ Android users that can't call
+-   // ContextUtils.initialize directly.
+-@@ -178,7 +179,7 @@ class JVM {
+-   JavaVM* jvm() const { return jvm_; }
+- 
+-  protected:
+--  JVM(JavaVM* jvm);
+-+  JVM(JavaVM* jvm, JNIEnv *jni);
+-   ~JVM();
+- 
+-  private:
+-diff --git a/modules/utility/source/jvm_android.cc b/modules/utility/source/jvm_android.cc
+-index 8e24daa0f2..b94c059d28 100644
+---- a/modules/utility/source/jvm_android.cc
+-+++ b/modules/utility/source/jvm_android.cc
+-@@ -21,6 +21,37 @@
+- namespace webrtc {
+- 
+- JVM* g_jvm;
+-+JavaVM *g_vm;
+-+
+-+
+-+class Jni_Env {
+-+public:
+-+  Jni_Env() {
+-+    env = GetEnv(g_vm);
+-+    attached = false;
+-+    if (!env) {
+-+      RTC_LOG(INFO) << "Jni_Env::Attaching thread to JVM";
+-+
+-+      jint ret = g_vm->AttachCurrentThread(&env, nullptr);
+-+      if (ret == JNI_OK) {
+-+	attached = true;
+-+      }
+-+      else {
+-+	attached = false;
+-+	env = nullptr;
+-+      }
+-+    }
+-+  }
+-+
+-+  ~Jni_Env() {
+-+    if (attached) {
+-+      g_vm->DetachCurrentThread();
+-+    }
+-+  }
+-+
+-+  JNIEnv *env;
+-+  bool attached;
+-+};
+- 
+- // TODO(henrika): add more clases here if needed.
+- struct {
+-@@ -49,11 +80,14 @@ void LoadClasses(JNIEnv* jni) {
+-     RTC_CHECK(globalRef) << c.name;
+-     c.clazz = globalRef;
+-   }
+-+
+-+  RTC_LOG(INFO) << "LoadClasses: done";
+- }
+- 
+- void FreeClassReferences(JNIEnv* jni) {
+-   for (auto& c : loaded_classes) {
+--    jni->DeleteGlobalRef(c.clazz);
+-+    Jni_Env jenv;
+-+    jenv.env->DeleteGlobalRef(c.clazz);
+-     c.clazz = nullptr;
+-   }
+- }
+-@@ -105,8 +139,9 @@ GlobalRef::~GlobalRef() {
+- jboolean GlobalRef::CallBooleanMethod(jmethodID methodID, ...) {
+-   va_list args;
+-   va_start(args, methodID);
+--  jboolean res = jni_->CallBooleanMethodV(j_object_, methodID, args);
+--  CHECK_EXCEPTION(jni_) << "Error during CallBooleanMethod";
+-+  Jni_Env jenv;
+-+  jboolean res = jenv.env->CallBooleanMethodV(j_object_, methodID, args);
+-+  CHECK_EXCEPTION(jenv.env) << "Error during CallBooleanMethod";
+-   va_end(args);
+-   return res;
+- }
+-@@ -114,8 +149,9 @@ jboolean GlobalRef::CallBooleanMethod(jmethodID methodID, ...) {
+- jint GlobalRef::CallIntMethod(jmethodID methodID, ...) {
+-   va_list args;
+-   va_start(args, methodID);
+--  jint res = jni_->CallIntMethodV(j_object_, methodID, args);
+--  CHECK_EXCEPTION(jni_) << "Error during CallIntMethod";
+-+  Jni_Env jenv;
+-+  jint res = jenv.env->CallIntMethodV(j_object_, methodID, args);
+-+  CHECK_EXCEPTION(jenv.env) << "Error during CallIntMethod";
+-   va_end(args);
+-   return res;
+- }
+-@@ -123,7 +159,9 @@ jint GlobalRef::CallIntMethod(jmethodID methodID, ...) {
+- void GlobalRef::CallVoidMethod(jmethodID methodID, ...) {
+-   va_list args;
+-   va_start(args, methodID);
+--  jni_->CallVoidMethodV(j_object_, methodID, args);
+-+  Jni_Env jni;
+-+  if (jni.env)
+-+    jni.env->CallVoidMethodV(j_object_, methodID, args);
+-   CHECK_EXCEPTION(jni_) << "Error during CallVoidMethod";
+-   va_end(args);
+- }
+-@@ -136,8 +174,9 @@ NativeRegistration::NativeRegistration(JNIEnv* jni, jclass clazz)
+- 
+- NativeRegistration::~NativeRegistration() {
+-   RTC_LOG(INFO) << "NativeRegistration::dtor";
+--  jni_->UnregisterNatives(j_class_);
+--  CHECK_EXCEPTION(jni_) << "Error during UnregisterNatives";
+-+  Jni_Env jenv;
+-+  jenv.env->UnregisterNatives(j_class_);
+-+  CHECK_EXCEPTION(jenv.env) << "Error during UnregisterNatives";
+- }
+- 
+- std::unique_ptr<GlobalRef> NativeRegistration::NewObject(const char* name,
+-@@ -146,41 +185,47 @@ std::unique_ptr<GlobalRef> NativeRegistration::NewObject(const char* name,
+-   RTC_LOG(INFO) << "NativeRegistration::NewObject";
+-   va_list args;
+-   va_start(args, signature);
+--  jobject obj = jni_->NewObjectV(
+-+  Jni_Env jenv;
+-+  jobject obj = jenv.env->NewObjectV(
+-       j_class_, GetMethodID(jni_, j_class_, name, signature), args);
+--  CHECK_EXCEPTION(jni_) << "Error during NewObjectV";
+-+  CHECK_EXCEPTION(jenv.env) << "Error during NewObjectV";
+-   va_end(args);
+-   return std::unique_ptr<GlobalRef>(new GlobalRef(jni_, obj));
+- }
+- 
+- // JavaClass implementation.
+- jmethodID JavaClass::GetMethodId(const char* name, const char* signature) {
+--  return GetMethodID(jni_, j_class_, name, signature);
+-+  Jni_Env jenv;
+-+  return GetMethodID(jenv.env, j_class_, name, signature);
+- }
+- 
+- jmethodID JavaClass::GetStaticMethodId(const char* name,
+-                                        const char* signature) {
+--  return GetStaticMethodID(jni_, j_class_, name, signature);
+-+  Jni_Env jenv;
+-+  return GetStaticMethodID(jenv.env, j_class_, name, signature);
+- }
+- 
+- jobject JavaClass::CallStaticObjectMethod(jmethodID methodID, ...) {
+-   va_list args;
+-   va_start(args, methodID);
+--  jobject res = jni_->CallStaticObjectMethodV(j_class_, methodID, args);
+--  CHECK_EXCEPTION(jni_) << "Error during CallStaticObjectMethod";
+-+  Jni_Env jenv;
+-+  jobject res = jenv.env->CallStaticObjectMethodV(j_class_, methodID, args);
+-+  CHECK_EXCEPTION(jenv.env) << "Error during CallStaticObjectMethod";
+-   return res;
+- }
+- 
+- jint JavaClass::CallStaticIntMethod(jmethodID methodID, ...) {
+-   va_list args;
+-   va_start(args, methodID);
+--  jint res = jni_->CallStaticIntMethodV(j_class_, methodID, args);
+--  CHECK_EXCEPTION(jni_) << "Error during CallStaticIntMethod";
+-+  Jni_Env jenv;
+-+  jint res = jenv.env->CallStaticIntMethodV(j_class_, methodID, args);
+-+  CHECK_EXCEPTION(jenv.env) << "Error during CallStaticIntMethod";
+-   return res;
+- }
+- 
+- // JNIEnvironment implementation.
+- JNIEnvironment::JNIEnvironment(JNIEnv* jni) : jni_(jni) {
+-+  (void)jni_;
+-   RTC_LOG(INFO) << "JNIEnvironment::ctor";
+- }
+- 
+-@@ -196,36 +241,48 @@ std::unique_ptr<NativeRegistration> JNIEnvironment::RegisterNatives(
+-   RTC_LOG(INFO) << "JNIEnvironment::RegisterNatives: " << name;
+-   RTC_DCHECK(thread_checker_.IsCurrent());
+-   jclass clazz = LookUpClass(name);
+--  jni_->RegisterNatives(clazz, methods, num_methods);
+--  CHECK_EXCEPTION(jni_) << "Error during RegisterNatives";
+-+  Jni_Env jenv;
+-+  jenv.env->RegisterNatives(clazz, methods, num_methods);
+-+  CHECK_EXCEPTION(jenv.env) << "Error during RegisterNatives";
+-   return std::unique_ptr<NativeRegistration>(
+--      new NativeRegistration(jni_, clazz));
+-+      new NativeRegistration(jenv.env, clazz));
+- }
+- 
+- std::string JNIEnvironment::JavaToStdString(const jstring& j_string) {
+-   RTC_DCHECK(thread_checker_.IsCurrent());
+--  const char* jchars = jni_->GetStringUTFChars(j_string, nullptr);
+--  CHECK_EXCEPTION(jni_);
+--  const int size = jni_->GetStringUTFLength(j_string);
+--  CHECK_EXCEPTION(jni_);
+-+  Jni_Env jenv;
+-+  const char* jchars = jenv.env->GetStringUTFChars(j_string, nullptr);
+-+  CHECK_EXCEPTION(jenv.env);
+-+  const int size = jenv.env->GetStringUTFLength(j_string);
+-+  CHECK_EXCEPTION(jenv.env);
+-   std::string ret(jchars, size);
+--  jni_->ReleaseStringUTFChars(j_string, jchars);
+--  CHECK_EXCEPTION(jni_);
+-+  jenv.env->ReleaseStringUTFChars(j_string, jchars);
+-+  CHECK_EXCEPTION(jenv.env);
+-   return ret;
+- }
+- 
+- // static
+- void JVM::Initialize(JavaVM* jvm) {
+-+  Jni_Env jenv;
+-+
+-+  Initialize(jvm, jenv.env);
+-+}
+-+
+-+void JVM::Initialize(JavaVM* jvm, JNIEnv *jni) {
+-   RTC_LOG(INFO) << "JVM::Initialize";
+-   RTC_CHECK(!g_jvm);
+--  g_jvm = new JVM(jvm);
+-+  g_jvm = new JVM(jvm, jni);
+- }
+- 
+- void JVM::Initialize(JavaVM* jvm, jobject context) {
+--  Initialize(jvm);
+-+  g_vm = jvm;
+-+  Jni_Env jenv;
+-+  JNIEnv* jni = jenv.env;
+-+
+-+  Initialize(jvm, jni);
+- 
+-   // Pass in the context to the new ContextUtils class.
+--  JNIEnv* jni = g_jvm->jni();
+-+  //JNIEnv* jni = g_jvm->jni();
+-   jclass context_utils = FindClass(jni, "org/webrtc/ContextUtils");
+-   jmethodID initialize_method = jni->GetStaticMethodID(
+-       context_utils, "initialize", "(Landroid/content/Context;)V");
+-@@ -246,10 +303,11 @@ JVM* JVM::GetInstance() {
+-   return g_jvm;
+- }
+- 
+--JVM::JVM(JavaVM* jvm) : jvm_(jvm) {
+-+JVM::JVM(JavaVM* jvm, JNIEnv *jni) : jvm_(jvm) {
+-   RTC_LOG(INFO) << "JVM::JVM";
+--  RTC_CHECK(jni()) << "AttachCurrentThread() must be called on this thread.";
+--  LoadClasses(jni());
+-+  RTC_CHECK(jni) << "AttachCurrentThread() must be called on this thread.";
+-+  g_jvm = this;
+-+  LoadClasses(jni);
+- }
+- 
+- JVM::~JVM() {
+-@@ -266,6 +324,7 @@ std::unique_ptr<JNIEnvironment> JVM::environment() {
+-   // its JNIEnv, we should share the JavaVM, and use GetEnv to discover the
+-   // thread's JNIEnv. (Assuming it has one, if not, use AttachCurrentThread).
+-   // See // http://developer.android.com/training/articles/perf-jni.html.
+-+#if 0
+-   JNIEnv* jni = GetEnv(jvm_);
+-   if (!jni) {
+-     RTC_LOG(LS_ERROR)
+-@@ -273,6 +332,8 @@ std::unique_ptr<JNIEnvironment> JVM::environment() {
+-     return std::unique_ptr<JNIEnvironment>();
+-   }
+-   return std::unique_ptr<JNIEnvironment>(new JNIEnvironment(jni));
+-+#endif
+-+  return std::unique_ptr<JNIEnvironment>(new JNIEnvironment(nullptr));
+- }
+- 
+- JavaClass JVM::GetClass(const char* name) {
+diff --git a/webrtc/scripts/build.sh b/webrtc/scripts/build.sh
+deleted file mode 100755
+index ba549f8c3..000000000
+--- a/webrtc/scripts/build.sh
++++ /dev/null
+@@ -1,15 +0,0 @@
+-#! /bin/bash
+-
+-DIR=$(dirname "${BASH_SOURCE[0]}")
+-
+-PLAT=$(uname)
+-if [ "$PLAT" == "Darwin" ]
+-then
+-	$DIR/build_iosx.sh
+-elif [ "$PLAT" == "Linux" ]
+-then
+-	$DIR/build_linux.sh
+-else
+-	echo "Platform $PLAT not supported"
+-fi
+-
+diff --git a/webrtc/scripts/build_iosx.sh b/webrtc/scripts/build_iosx.sh
+deleted file mode 100755
+index 162b04d54..000000000
+--- a/webrtc/scripts/build_iosx.sh
++++ /dev/null
+@@ -1,51 +0,0 @@
+-#! /bin/bash
+-
+-SCRIPT_DIR=${BASH_SOURCE%/*}
+-. "$SCRIPT_DIR/version.sh"
+-
+-if [ -e depot_tools ]; then
+-	pushd depot_tools > /dev/null
+-	git pull
+-	popd > /dev/null
+-else
+-	git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+-fi
+-
+-export PATH=$PATH:$PWD/depot_tools
+-
+-if [ -e webrtc_checkout ]; then
+-	pushd webrtc_checkout/ > /dev/null
+-else
+-	mkdir webrtc_checkout
+-	pushd webrtc_checkout/ > /dev/null
+-	fetch --nohooks webrtc_ios
+-fi
+-
+-pushd src > /dev/null
+-if [ "$WEBRTC_COMMIT" == "" ]; then
+-	git checkout remotes/branch-heads/$WEBRTC_RELEASE
+-else
+-	git checkout $WEBRTC_COMMIT
+-fi
+-gclient sync
+-
+-for PATCH in ../../patch/*.patch; do 
+-  patch -p1 < $PATCH
+-done
+-
+-export ARGS="is_debug=false rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false use_custom_libcxx=false"
+-gn gen out/osx-x86_64 -args="target_os=\"mac\" target_cpu=\"x64\" $ARGS"
+-ninja -C out/osx-x86_64
+-
+-gn gen out/ios-x86_64 -args="target_os=\"ios\" target_cpu=\"x64\" $ARGS"
+-ninja -C out/ios-x86_64
+-
+-gn gen out/ios-armv7 -args="target_os=\"ios\" target_cpu=\"arm\" $ARGS"
+-ninja -C out/ios-armv7
+-
+-gn gen out/ios-arm64 -args="target_os=\"ios\" target_cpu=\"arm64\" $ARGS"
+-ninja -C out/ios-arm64
+-
+-popd > /dev/null
+-popd > /dev/null
+-
+diff --git a/webrtc/scripts/build_linux.sh b/webrtc/scripts/build_linux.sh
+deleted file mode 100755
+index 1d25bdda1..000000000
+--- a/webrtc/scripts/build_linux.sh
++++ /dev/null
+@@ -1,59 +0,0 @@
+-#! /bin/bash
+-
+-SCRIPT_DIR=${BASH_SOURCE%/*}
+-. "$SCRIPT_DIR/version.sh"
+-
+-if [ -e depot_tools ]; then
+-	pushd depot_tools
+-	git pull
+-	popd
+-else
+-	git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+-fi
+-
+-export PATH=$PATH:$PWD/depot_tools
+-
+-if [ -e webrtc_checkout ]; then
+-	pushd webrtc_checkout/
+-else
+-	mkdir webrtc_checkout
+-	pushd webrtc_checkout/
+-	fetch --nohooks webrtc_android
+-fi
+-
+-pushd src > /dev/null
+-
+-if [ "$WEBRTC_COMMIT" == "" ]; then
+-	git checkout remotes/branch-heads/$WEBRTC_RELEASE
+-else
+-	git checkout $WEBRTC_COMMIT
+-fi
+-yes | gclient sync
+-
+-sed s/sudo/echo\ sudo/g build/install-build-deps-android.sh > build/install-build-deps-android-nosudo.sh
+-. build/install-build-deps-android-nosudo.sh --quick-check
+-. build/android/envsetup.sh 
+-
+-for PATCH in ../../patch/*.patch; do 
+-  patch -p1 < $PATCH
+-done
+-
+-export ARGS="is_debug=false rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false use_custom_libcxx=false"
+-gn gen out/linux-x86_64 -args="target_os=\"linux\" target_cpu=\"x64\" $ARGS"
+-ninja -C out/linux-x86_64
+-
+-gn gen out/android-i386 -args="target_os=\"android\" target_cpu=\"x86\" $ARGS"
+-ninja -C out/android-i386
+-
+-gn gen out/android-x86_64 -args="target_os=\"android\" target_cpu=\"x64\" $ARGS"
+-ninja -C out/android-x86_64
+-
+-gn gen out/android-armv7 -args="target_os=\"android\" target_cpu=\"arm\" $ARGS"
+-ninja -C out/android-armv7
+-
+-gn gen out/android-arm64 -args="target_os=\"android\" target_cpu=\"arm64\" $ARGS"
+-ninja -C out/android-arm64
+-
+-popd > /dev/null
+-popd > /dev/null
+-
+diff --git a/webrtc/scripts/cpheader.sh b/webrtc/scripts/cpheader.sh
+deleted file mode 100755
+index b63317345..000000000
+--- a/webrtc/scripts/cpheader.sh
++++ /dev/null
+@@ -1,10 +0,0 @@
+-#! /bin/bash
+-
+-srcfile=$1
+-dstfile=${srcfile/webrtc_checkout\/src/$2\/include}
+-
+-dstpath=`dirname $dstfile`
+-
+-mkdir -p $dstpath
+-cp $srcfile $dstfile
+-
+diff --git a/webrtc/scripts/package.sh b/webrtc/scripts/package.sh
+deleted file mode 100755
+index 0e5e97626..000000000
+--- a/webrtc/scripts/package.sh
++++ /dev/null
+@@ -1,66 +0,0 @@
+-#! /bin/bash
+-
+-SCRIPT_DIR=${BASH_SOURCE%/*}
+-. "$SCRIPT_DIR/version.sh"
+-
+-if [ "$BUILD_NUMBER" == "" ]; then
+-	export BUILD_NUMBER=local;
+-fi
+-
+-AVS_OS="osx ios linux android"
+-
+-WEBRTC_RB="$WEBRTC_RELEASE.$BUILD_NUMBER"
+-DEST_DIR="../contrib/webrtc"
+-
+-HOST_OS=$(uname)
+-
+-if [ "$HOST_OS" == "Darwin" ]; then
+-	echo "Packaging header files"
+-	rm -r $WEBRTC_RB 2> /dev/null
+-	mkdir -p $WEBRTC_RB/include
+-	echo WEBRTC_RELEASE=$WEBRTC_RELEASE > $WEBRTC_RB/version.txt
+-	echo WEBRTC_COMMIT=$WEBRTC_COMMIT >> $WEBRTC_RB/version.txt
+-	find webrtc_checkout/src -type f -iname "*.h" -exec scripts/cpheader.sh {} $WEBRTC_RB \;
+-	zip -9r webrtc_${WEBRTC_RB}_headers.zip $WEBRTC_RB version.txt
+-
+-fi
+-
+-for OS in $AVS_OS; do
+-	echo "Packaging $OS files"
+-	rm -r $WEBRTC_RB 2> /dev/null
+-
+-	for p in webrtc_checkout/src/out/${OS}*; do
+-		dst=$WEBRTC_RB/lib/${p/webrtc_checkout\/src\/out\//}
+-		if [ -e $p/obj/libwebrtc.a ]; then
+-			mkdir -p $dst
+-			cp $p/obj/libwebrtc.a $dst/
+-		fi
+-
+-		jar=$p/obj/modules/audio_device/audio_device_java__process_prebuilt-desugar.jar
+-		if [ -e $jar ]; then
+-			mkdir -p $WEBRTC_RB/java
+-			cp $jar $WEBRTC_RB/java/audiodev.jar
+-		fi
+-
+-		jar=$p/obj/rtc_base/base_java__process_prebuilt-desugar.jar
+-		if [ -e $jar ]; then
+-			mkdir -p $WEBRTC_RB/java
+-			cp $jar $WEBRTC_RB/java/base.jar
+-		fi
+-
+-		if [ "$HOST_OS" == "Darwin" ] && [ "$OS" == "ios" ]; then
+-			mkdir -p $WEBRTC_RB/ios
+-			cp webrtc_checkout/src/sdk/objc/components/audio/RTCAudioSession+Configuration.mm $WEBRTC_RB/ios
+-			cp webrtc_checkout/src/sdk/objc/helpers/UIDevice+RTCDevice.mm $WEBRTC_RB/ios
+-		fi
+-	done
+-
+-
+-	if [ -e $WEBRTC_RB ]; then
+-		zip -9r webrtc_${WEBRTC_RB}_${OS}.zip $WEBRTC_RB
+-	fi
+-done
+-
+-echo "Copying zips to $DEST_DIR"
+-mkdir -p $DEST_DIR
+-cp *.zip $DEST_DIR
+diff --git a/webrtc/scripts/version.sh b/webrtc/scripts/version.sh
+deleted file mode 100755
+index c8be83316..000000000
+--- a/webrtc/scripts/version.sh
++++ /dev/null
+@@ -1,4 +0,0 @@
+-
+-export WEBRTC_RELEASE=m79
+-export WEBRTC_COMMIT=b484ec0082948ae086c2ba4142b4d2bf8bc4dd4b
+-

@@ -1,0 +1,922 @@
+diff --git a/bundles/org.openhab.binding.exec/README.md b/bundles/org.openhab.binding.exec/README.md
+index 489ff5901f4a..dc8ccfc92a3f 100644
+--- a/bundles/org.openhab.binding.exec/README.md
++++ b/bundles/org.openhab.binding.exec/README.md
+@@ -8,8 +8,17 @@ Currently, the binding supports a single type of Thing, being the `command` Thin
+ 
+ ## Binding Configuration
+ 
+-The binding does not require any specific configuration.
++For security reasons all commands need to be whitelisted.
++Allowed commands need to be added to the `misc/exec.whitelist` file in the configuration directory.
++Every command needs to be on a separate line.
+ 
++Example:
++
++```shell
++/bin/echo "Hello world!"
++/usr/local/bin/apcaccess status
++php ./configurations/scripts/script.php %2$s
++```
+ 
+ **Linux:**
+ Note that the commands are executed in the context and with the privileges of the process running the Java Virtual Machine.
+@@ -27,7 +36,6 @@ It is not advised to run the virtual machine as superuser/root.
+ The "command" Thing requires the command to execute on the shell.
+ Optionally one can specify:
+ 
+-
+ - `transform` - A [transformation](https://www.openhab.org/docs/configuration/transformations.html) to apply on the execution result string.
+ - `interval` - An interval, in seconds, the command will be repeatedly executed. Default is 60 seconds, set to 0 to avoid automatic repetition.
+ - `timeout` - A time-out, in seconds, the execution of the command will time out, and lastly,
+@@ -39,7 +47,6 @@ For each shell command, a separate Thing has to be defined.
+ Thing exec:command:uniquename [command="/command/to/execute here", interval=15, timeout=5, autorun=false]
+ ```
+ 
+-
+ The `command` itself can be enhanced using the well known syntax of the [Java formatter class syntax](https://docs.oracle.com/javase/8/docs/api/java/util/Formatter.html#syntax).
+ The following parameters are automatically added:
+ 
+diff --git a/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecBindingConstants.java b/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecBindingConstants.java
+index f58b177c8736..83c6ed98389c 100644
+--- a/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecBindingConstants.java
++++ b/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecBindingConstants.java
+@@ -13,17 +13,19 @@
+ package org.openhab.binding.exec.internal;
+ 
+ import org.eclipse.jdt.annotation.NonNullByDefault;
++import org.eclipse.smarthome.config.core.ConfigConstants;
+ import org.eclipse.smarthome.core.thing.ThingTypeUID;
+ 
++import java.io.File;
++
+ /**
+- * The {@link ExecBinding} class defines common constants, which are
++ * The {@link ExecBindingConstants} class defines common constants, which are
+  * used across the whole binding.
+  *
+  * @author Karel Goderis - Initial contribution
+  */
+ @NonNullByDefault
+ public class ExecBindingConstants {
+-
+     public static final String BINDING_ID = "exec";
+ 
+     // List of all Thing Type UIDs
+@@ -35,5 +37,4 @@ public class ExecBindingConstants {
+     public static final String EXIT = "exit";
+     public static final String RUN = "run";
+     public static final String LAST_EXECUTION = "lastexecution";
+-
+ }
+diff --git a/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecHandlerFactory.java b/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecHandlerFactory.java
+index a98a0c1112d6..6bd853a3c579 100644
+--- a/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecHandlerFactory.java
++++ b/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecHandlerFactory.java
+@@ -12,11 +12,6 @@
+  */
+ package org.openhab.binding.exec.internal;
+ 
+-import static org.openhab.binding.exec.internal.ExecBindingConstants.THING_COMMAND;
+-
+-import java.util.Collections;
+-import java.util.Set;
+-
+ import org.eclipse.jdt.annotation.NonNullByDefault;
+ import org.eclipse.jdt.annotation.Nullable;
+ import org.eclipse.smarthome.core.thing.Thing;
+@@ -25,7 +20,16 @@
+ import org.eclipse.smarthome.core.thing.binding.ThingHandler;
+ import org.eclipse.smarthome.core.thing.binding.ThingHandlerFactory;
+ import org.openhab.binding.exec.internal.handler.ExecHandler;
++import org.osgi.service.component.annotations.Activate;
+ import org.osgi.service.component.annotations.Component;
++import org.osgi.service.component.annotations.Reference;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.Collections;
++import java.util.Set;
++
++import static org.openhab.binding.exec.internal.ExecBindingConstants.THING_COMMAND;
+ 
+ /**
+  * The {@link ExecHandlerFactory} is responsible for creating things and thing
+@@ -36,8 +40,14 @@
+ @NonNullByDefault
+ @Component(service = ThingHandlerFactory.class, configurationPid = "binding.exec")
+ public class ExecHandlerFactory extends BaseThingHandlerFactory {
+-
+     private static final Set<ThingTypeUID> SUPPORTED_THING_TYPES_UIDS = Collections.singleton(THING_COMMAND);
++    private final Logger logger = LoggerFactory.getLogger(ExecHandlerFactory.class);
++    private final ExecWhitelistWatchService execWhitelistWatchService;
++
++    @Activate
++    public ExecHandlerFactory(@Reference ExecWhitelistWatchService execWhitelistWatchService) {
++        this.execWhitelistWatchService = execWhitelistWatchService;
++    }
+ 
+     @Override
+     public boolean supportsThingType(ThingTypeUID thingTypeUID) {
+@@ -49,7 +59,7 @@ public boolean supportsThingType(ThingTypeUID thingTypeUID) {
+         ThingTypeUID thingTypeUID = thing.getThingTypeUID();
+ 
+         if (thingTypeUID.equals(THING_COMMAND)) {
+-            return new ExecHandler(thing);
++            return new ExecHandler(thing, execWhitelistWatchService);
+         }
+ 
+         return null;
+diff --git a/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecWhitelistWatchService.java b/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecWhitelistWatchService.java
+new file mode 100644
+index 000000000000..4a2ff8c22c89
+--- /dev/null
++++ b/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/ExecWhitelistWatchService.java
+@@ -0,0 +1,81 @@
++/**
++ * Copyright (c) 2010-2020 Contributors to the openHAB project
++ *
++ * See the NOTICE file(s) distributed with this work for additional
++ * information.
++ *
++ * This program and the accompanying materials are made available under the
++ * terms of the Eclipse Public License 2.0 which is available at
++ * http://www.eclipse.org/legal/epl-2.0
++ *
++ * SPDX-License-Identifier: EPL-2.0
++ */
++package org.openhab.binding.exec.internal;
++
++import org.eclipse.jdt.annotation.NonNullByDefault;
++import org.eclipse.jdt.annotation.Nullable;
++import org.eclipse.smarthome.config.core.ConfigConstants;
++import org.eclipse.smarthome.core.service.AbstractWatchService;
++import org.osgi.service.component.annotations.Activate;
++import org.osgi.service.component.annotations.Component;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.WatchEvent;
++import java.util.HashSet;
++import java.util.Set;
++
++import static java.nio.file.StandardWatchEventKinds.*;
++
++/**
++ * The {@link ExecWhitelistWatchService} provides a whitelist check for exec commands
++ *
++ * @author Jan N. Klug - Initial contribution
++ */
++@Component(service = ExecWhitelistWatchService.class)
++@NonNullByDefault
++public class ExecWhitelistWatchService extends AbstractWatchService {
++    private static final String COMMAND_WHITELIST_PATH = ConfigConstants.getConfigFolder() + File.separator + "misc";
++    private static final String COMMAND_WHITELIST_FILE = "exec.whitelist";
++    private final Set<String> commandWhitelist = new HashSet<>();
++
++    @Activate
++    public ExecWhitelistWatchService() {
++        super(COMMAND_WHITELIST_PATH);
++    }
++
++    @Override
++    protected boolean watchSubDirectories() {
++        return false;
++    }
++
++    @Override
++    protected WatchEvent.Kind<?>[] getWatchEventKinds(@Nullable Path directory) {
++        return new WatchEvent.Kind<?>[] { ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY };
++    }
++
++    @Override
++    protected void processWatchEvent(@Nullable WatchEvent<?> event,  WatchEvent.@Nullable Kind<?> kind, @Nullable Path path) {
++        if (path.endsWith(COMMAND_WHITELIST_FILE)) {
++            commandWhitelist.clear();
++            try  {
++                Files.lines(path).forEach(commandWhitelist::add);
++                logger.debug("Updated command whitelist: {}", commandWhitelist);
++            } catch (IOException e) {
++                logger.warn("Cannot read whitelist file, exec binding commands won't be processed: {}", e.getMessage());
++            }
++        }
++    }
++
++    /**
++     * Check if a command is whitelisted
++     *
++     * @param command the command to check alias
++     * @return true if whitelisted, false if not
++     */
++    public boolean isWhitelisted(String command) {
++        return commandWhitelist.contains(command);
++    }
++}
+diff --git a/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/handler/ExecHandler.java b/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/handler/ExecHandler.java
+index fca7fb05e6a0..2c43f64e3e45 100644
+--- a/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/handler/ExecHandler.java
++++ b/bundles/org.openhab.binding.exec/src/main/java/org/openhab/binding/exec/internal/handler/ExecHandler.java
+@@ -12,22 +12,6 @@
+  */
+ package org.openhab.binding.exec.internal.handler;
+ 
+-import static org.openhab.binding.exec.internal.ExecBindingConstants.*;
+-
+-import java.io.BufferedReader;
+-import java.io.IOException;
+-import java.io.InputStreamReader;
+-import java.math.BigDecimal;
+-import java.time.ZonedDateTime;
+-import java.util.Arrays;
+-import java.util.Calendar;
+-import java.util.IllegalFormatException;
+-import java.util.concurrent.ScheduledFuture;
+-import java.util.concurrent.TimeUnit;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+-import java.util.regex.PatternSyntaxException;
+-
+ import org.apache.commons.lang.StringUtils;
+ import org.eclipse.jdt.annotation.NonNullByDefault;
+ import org.eclipse.jdt.annotation.Nullable;
+@@ -44,17 +28,35 @@
+ import org.eclipse.smarthome.core.transform.TransformationService;
+ import org.eclipse.smarthome.core.types.Command;
+ import org.eclipse.smarthome.core.types.RefreshType;
++import org.openhab.binding.exec.internal.ExecWhitelistWatchService;
+ import org.osgi.framework.BundleContext;
+ import org.osgi.framework.FrameworkUtil;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.math.BigDecimal;
++import java.time.ZonedDateTime;
++import java.util.Arrays;
++import java.util.Calendar;
++import java.util.IllegalFormatException;
++import java.util.concurrent.ScheduledFuture;
++import java.util.concurrent.TimeUnit;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.regex.PatternSyntaxException;
++
++import static org.openhab.binding.exec.internal.ExecBindingConstants.*;
++
+ /**
+  * The {@link ExecHandler} is responsible for handling commands, which are
+  * sent to one of the channels.
+  *
+  * @author Karel Goderis - Initial contribution
+  * @author Constantin Piber - Added better argument support (delimiter and pass to shell)
++ * @author Jan N. Klug - Add command whitelist check
+  */
+ @NonNullByDefault
+ public class ExecHandler extends BaseThingHandler {
+@@ -68,6 +70,7 @@ public class ExecHandler extends BaseThingHandler {
+      */
+     public static final String[] SHELL_WINDOWS = new String[] { "cmd" };
+     public static final String[] SHELL_NIX = new String[] { "sh", "bash", "zsh", "csh" };
++    private final ExecWhitelistWatchService execWhitelistWatchService;
+ 
+     private Logger logger = LoggerFactory.getLogger(ExecHandler.class);
+ 
+@@ -88,9 +91,10 @@ public class ExecHandler extends BaseThingHandler {
+ 
+     private static Runtime rt = Runtime.getRuntime();
+ 
+-    public ExecHandler(Thing thing) {
++    public ExecHandler(Thing thing, ExecWhitelistWatchService execWhitelistWatchService) {
+         super(thing);
+         this.bundleContext = FrameworkUtil.getBundle(ExecHandler.class).getBundleContext();
++        this.execWhitelistWatchService = execWhitelistWatchService;
+     }
+ 
+     @Override
+@@ -101,7 +105,7 @@ public void handleCommand(ChannelUID channelUID, Command command) {
+             if (channelUID.getId().equals(RUN)) {
+                 if (command instanceof OnOffType) {
+                     if (command == OnOffType.ON) {
+-                        scheduler.schedule(periodicExecutionRunnable, 0, TimeUnit.SECONDS);
++                        scheduler.schedule(this::execute, 0, TimeUnit.SECONDS);
+                     }
+                 }
+             } else if (channelUID.getId().equals(INPUT)) {
+@@ -109,10 +113,10 @@ public void handleCommand(ChannelUID channelUID, Command command) {
+                     String previousInput = lastInput;
+                     lastInput = command.toString();
+                     if (lastInput != null && !lastInput.equals(previousInput)) {
+-                        if (getConfig().get(AUTORUN) != null && ((Boolean) getConfig().get(AUTORUN)).booleanValue()) {
++                        if (getConfig().get(AUTORUN) != null && ((Boolean) getConfig().get(AUTORUN))) {
+                             logger.trace("Executing command '{}' after a change of the input channel to '{}'",
+                                     getConfig().get(COMMAND), lastInput);
+-                            scheduler.schedule(periodicExecutionRunnable, 0, TimeUnit.SECONDS);
++                            scheduler.schedule(this::execute, 0, TimeUnit.SECONDS);
+                         }
+                     }
+                 }
+@@ -123,11 +127,10 @@ public void handleCommand(ChannelUID channelUID, Command command) {
+     @Override
+     public void initialize() {
+         if (executionJob == null || executionJob.isCancelled()) {
+-            if (((BigDecimal) getConfig().get(INTERVAL)) != null
+-                    && ((BigDecimal) getConfig().get(INTERVAL)).intValue() > 0) {
++            if ((getConfig().get(INTERVAL)) != null && ((BigDecimal) getConfig().get(INTERVAL))
++                    .intValue() > 0) {
+                 int pollingInterval = ((BigDecimal) getConfig().get(INTERVAL)).intValue();
+-                executionJob = scheduler.scheduleWithFixedDelay(periodicExecutionRunnable, 0, pollingInterval,
+-                        TimeUnit.SECONDS);
++                executionJob = scheduler.scheduleWithFixedDelay(this::execute, 0, pollingInterval, TimeUnit.SECONDS);
+             }
+         }
+ 
+@@ -142,166 +145,161 @@ public void dispose() {
+         }
+     }
+ 
+-    protected Runnable periodicExecutionRunnable = new Runnable() {
++    public void execute() {
++        String commandLine = (String) getConfig().get(COMMAND);
++        if (!execWhitelistWatchService.isWhitelisted(commandLine)) {
++            logger.warn("Tried to execute '{}', but it is not contained in whitelist.", commandLine);
++            return;
++        }
+ 
+-        @Override
+-        public void run() {
+-            String commandLine = (String) getConfig().get(COMMAND);
++        int timeOut = 60000;
++        if ((getConfig().get(TIME_OUT)) != null) {
++            timeOut = ((BigDecimal) getConfig().get(TIME_OUT)).intValue() * 1000;
++        }
+ 
+-            int timeOut = 60000;
+-            if (((BigDecimal) getConfig().get(TIME_OUT)) != null) {
+-                timeOut = ((BigDecimal) getConfig().get(TIME_OUT)).intValue() * 1000;
+-            }
++        if (commandLine != null && !commandLine.isEmpty()) {
++            updateState(RUN, OnOffType.ON);
+ 
+-            if (commandLine != null && !commandLine.isEmpty()) {
+-                updateState(RUN, OnOffType.ON);
++            // For some obscure reason, when using Apache Common Exec, or using a straight implementation of
++            // Runtime.Exec(), on Mac OS X (Yosemite and El Capitan), there seems to be a lock race condition
++            // randomly appearing (on UNIXProcess) *when* one tries to gobble up the stdout and sterr output of the
++            // subprocess in separate threads. It seems to be common "wisdom" to do that in separate threads, but
++            // only when keeping everything between .exec() and .waitfor() in the same thread, this lock race
++            // condition seems to go away. This approach of not reading the outputs in separate threads *might* be a
++            // problem for external commands that generate a lot of output, but this will be dependent on the limits
++            // of the underlying operating system.
+ 
+-                // For some obscure reason, when using Apache Common Exec, or using a straight implementation of
+-                // Runtime.Exec(), on Mac OS X (Yosemite and El Capitan), there seems to be a lock race condition
+-                // randomly appearing (on UNIXProcess) *when* one tries to gobble up the stdout and sterr output of the
+-                // subprocess in separate threads. It seems to be common "wisdom" to do that in separate threads, but
+-                // only when keeping everything between .exec() and .waitfor() in the same thread, this lock race
+-                // condition seems to go away. This approach of not reading the outputs in separate threads *might* be a
+-                // problem for external commands that generate a lot of output, but this will be dependent on the limits
+-                // of the underlying operating system.
++            try {
++                if (lastInput != null) {
++                    commandLine = String.format(commandLine, Calendar.getInstance().getTime(), lastInput);
++                } else {
++                    commandLine = String.format(commandLine, Calendar.getInstance().getTime());
++                }
++            } catch (IllegalFormatException e) {
++                logger.warn(
++                        "An exception occurred while formatting the command line with the current time and input values : '{}'",
++                        e.getMessage());
++                updateState(RUN, OnOffType.OFF);
++                updateState(OUTPUT, new StringType(e.getMessage()));
++                return;
++            }
+ 
++            String[] cmdArray;
++            String[] shell;
++            if (commandLine.contains(CMD_LINE_DELIMITER)) {
++                logger.debug("Splitting by '{}'", CMD_LINE_DELIMITER);
+                 try {
+-                    if (lastInput != null) {
+-                        commandLine = String.format(commandLine, Calendar.getInstance().getTime(), lastInput);
+-                    } else {
+-                        commandLine = String.format(commandLine, Calendar.getInstance().getTime());
+-                    }
+-                } catch (IllegalFormatException e) {
+-                    logger.warn(
+-                            "An exception occurred while formatting the command line with the current time and input values : '{}'",
+-                            e.getMessage());
++                    cmdArray = commandLine.split(CMD_LINE_DELIMITER);
++                } catch (PatternSyntaxException e) {
++                    logger.warn("An exception occurred while splitting '{}' : '{}'", commandLine, e.getMessage());
+                     updateState(RUN, OnOffType.OFF);
++                    updateState(OUTPUT, new StringType(e.getMessage()));
+                     return;
+                 }
+-
+-                String[] cmdArray;
+-                String[] shell;
+-                if (commandLine.contains(CMD_LINE_DELIMITER)) {
+-                    logger.debug("Splitting by '{}'", CMD_LINE_DELIMITER);
+-                    try {
+-                        cmdArray = commandLine.split(CMD_LINE_DELIMITER);
+-                    } catch (PatternSyntaxException e) {
+-                        logger.warn("An exception occurred while splitting '{}' : '{}'", commandLine, e.getMessage());
++            } else {
++                // Invoke shell with 'c' option and pass string
++                logger.debug("Passing to shell for parsing command.");
++                switch (getOperatingSystemType()) {
++                    case WINDOWS:
++                        shell = SHELL_WINDOWS;
++                        logger.debug("OS: WINDOWS ({})", getOperatingSystemName());
++                        cmdArray = createCmdArray(shell, "/c", commandLine);
++                        break;
++                    case LINUX:
++                    case MAC:
++                    case SOLARIS:
++                        // assume sh is present, should all be POSIX-compliant
++                        shell = SHELL_NIX;
++                        logger.debug("OS: *NIX ({})", getOperatingSystemName());
++                        cmdArray = createCmdArray(shell, "-c", commandLine);
++                        break;
++                    default:
++                        logger.debug("OS: Unknown ({})", getOperatingSystemName());
++                        logger.warn("OS {} not supported, please manually split commands!", getOperatingSystemName());
+                         updateState(RUN, OnOffType.OFF);
+-                        updateState(OUTPUT, new StringType(e.getMessage()));
++                        updateState(OUTPUT, new StringType("OS not supported, please manually split commands!"));
+                         return;
+-                    }
+-                } else {
+-                    // Invoke shell with 'c' option and pass string
+-                    logger.debug("Passing to shell for parsing command.");
+-                    switch (getOperatingSystemType()) {
+-                        case WINDOWS:
+-                            shell = SHELL_WINDOWS;
+-                            logger.debug("OS: WINDOWS ({})", getOperatingSystemName());
+-                            cmdArray = createCmdArray(shell, "/c", commandLine);
+-                            break;
+-
+-                        case LINUX:
+-                        case MAC:
+-                        case SOLARIS:
+-                            // assume sh is present, should all be POSIX-compliant
+-                            shell = SHELL_NIX;
+-                            logger.debug("OS: *NIX ({})", getOperatingSystemName());
+-                            cmdArray = createCmdArray(shell, "-c", commandLine);
+-
+-                        default:
+-                            logger.debug("OS: Unknown ({})", getOperatingSystemName());
+-                            logger.warn("OS {} not supported, please manually split commands!",
+-                                    getOperatingSystemName());
+-                            updateState(RUN, OnOffType.OFF);
+-                            updateState(OUTPUT, new StringType("OS not supported, please manually split commands!"));
+-                            return;
+-                    }
+                 }
++            }
+ 
+-                if (cmdArray.length == 0) {
+-                    logger.trace("Empty command received, not executing");
+-                    return;
+-                }
++            if (cmdArray.length == 0) {
++                logger.trace("Empty command received, not executing");
++                return;
++            }
+ 
+-                logger.trace("The command to be executed will be '{}'", Arrays.asList(cmdArray));
++            logger.trace("The command to be executed will be '{}'", Arrays.asList(cmdArray));
+ 
+-                Process proc = null;
+-                try {
+-                    proc = rt.exec(cmdArray);
+-                } catch (Exception e) {
+-                    logger.warn("An exception occurred while executing '{}' : '{}'", Arrays.asList(cmdArray),
+-                            e.getMessage());
+-                    updateState(RUN, OnOffType.OFF);
+-                    updateState(OUTPUT, new StringType(e.getMessage()));
+-                    return;
+-                }
++            Process proc;
++            try {
++                proc = rt.exec(cmdArray);
++            } catch (Exception e) {
++                logger.warn("An exception occurred while executing '{}' : '{}'", Arrays.asList(cmdArray),
++                        e.getMessage());
++                updateState(RUN, OnOffType.OFF);
++                updateState(OUTPUT, new StringType(e.getMessage()));
++                return;
++            }
+ 
+-                StringBuilder outputBuilder = new StringBuilder();
+-                StringBuilder errorBuilder = new StringBuilder();
++            StringBuilder outputBuilder = new StringBuilder();
++            StringBuilder errorBuilder = new StringBuilder();
+ 
+-                try (InputStreamReader isr = new InputStreamReader(proc.getInputStream());
+-                        BufferedReader br = new BufferedReader(isr)) {
+-                    String line = null;
+-                    while ((line = br.readLine()) != null) {
+-                        outputBuilder.append(line).append("\n");
+-                        logger.debug("Exec [{}]: '{}'", "OUTPUT", line);
+-                    }
+-                    isr.close();
+-                } catch (IOException e) {
+-                    logger.warn("An exception occurred while reading the stdout when executing '{}' : '{}'",
+-                            commandLine, e.getMessage());
++            try (InputStreamReader isr = new InputStreamReader(proc.getInputStream());
++                    BufferedReader br = new BufferedReader(isr)) {
++                String line;
++                while ((line = br.readLine()) != null) {
++                    outputBuilder.append(line).append("\n");
++                    logger.debug("Exec [{}]: '{}'", "OUTPUT", line);
+                 }
++            } catch (IOException e) {
++                logger.warn("An exception occurred while reading the stdout when executing '{}' : '{}'", commandLine,
++                        e.getMessage());
++            }
+ 
+-                try (InputStreamReader isr = new InputStreamReader(proc.getErrorStream());
+-                        BufferedReader br = new BufferedReader(isr)) {
+-                    String line = null;
+-                    while ((line = br.readLine()) != null) {
+-                        errorBuilder.append(line).append("\n");
+-                        logger.debug("Exec [{}]: '{}'", "ERROR", line);
+-                    }
+-                    isr.close();
+-                } catch (IOException e) {
+-                    logger.warn("An exception occurred while reading the stderr when executing '{}' : '{}'",
+-                            commandLine, e.getMessage());
++            try (InputStreamReader isr = new InputStreamReader(proc.getErrorStream());
++                    BufferedReader br = new BufferedReader(isr)) {
++                String line;
++                while ((line = br.readLine()) != null) {
++                    errorBuilder.append(line).append("\n");
++                    logger.debug("Exec [{}]: '{}'", "ERROR", line);
+                 }
++            } catch (IOException e) {
++                logger.warn("An exception occurred while reading the stderr when executing '{}' : '{}'", commandLine,
++                        e.getMessage());
++            }
+ 
+-                boolean exitVal = false;
+-                try {
+-                    exitVal = proc.waitFor(timeOut, TimeUnit.MILLISECONDS);
+-                } catch (InterruptedException e) {
+-                    logger.warn("An exception occurred while waiting for the process ('{}') to finish : '{}'",
+-                            commandLine, e.getMessage());
+-                }
++            boolean exitVal = false;
++            try {
++                exitVal = proc.waitFor(timeOut, TimeUnit.MILLISECONDS);
++            } catch (InterruptedException e) {
++                logger.warn("An exception occurred while waiting for the process ('{}') to finish : '{}'", commandLine,
++                        e.getMessage());
++            }
+ 
+-                if (!exitVal) {
+-                    logger.warn("Forcibly termininating the process ('{}') after a timeout of {} ms", commandLine,
+-                            timeOut);
+-                    proc.destroyForcibly();
+-                }
++            if (!exitVal) {
++                logger.warn("Forcibly termininating the process ('{}') after a timeout of {} ms", commandLine, timeOut);
++                proc.destroyForcibly();
++            }
+ 
+-                updateState(RUN, OnOffType.OFF);
+-                updateState(EXIT, new DecimalType(proc.exitValue()));
++            updateState(RUN, OnOffType.OFF);
++            updateState(EXIT, new DecimalType(proc.exitValue()));
+ 
+-                outputBuilder.append(errorBuilder.toString());
++            outputBuilder.append(errorBuilder.toString());
+ 
+-                outputBuilder.append(errorBuilder.toString());
++            outputBuilder.append(errorBuilder.toString());
+ 
+-                String transformedResponse = StringUtils.chomp(outputBuilder.toString());
+-                String transformation = (String) getConfig().get(TRANSFORM);
++            String transformedResponse = StringUtils.chomp(outputBuilder.toString());
++            String transformation = (String) getConfig().get(TRANSFORM);
+ 
+-                if (transformation != null && transformation.length() > 0) {
+-                    transformedResponse = transformResponse(transformedResponse, transformation);
+-                }
++            if (transformation != null && transformation.length() > 0) {
++                transformedResponse = transformResponse(transformedResponse, transformation);
++            }
+ 
+-                updateState(OUTPUT, new StringType(transformedResponse));
++            updateState(OUTPUT, new StringType(transformedResponse));
+ 
+-                DateTimeType stampType = new DateTimeType(ZonedDateTime.now());
+-                updateState(LAST_EXECUTION, stampType);
+-            }
++            DateTimeType stampType = new DateTimeType(ZonedDateTime.now());
++            updateState(LAST_EXECUTION, stampType);
+         }
+-
+-    };
++    }
+ 
+     protected @Nullable String transformResponse(String response, String transformation) {
+         String transformedResponse;
+@@ -311,8 +309,8 @@ public void run() {
+             String transformationType = parts[0];
+             String transformationFunction = parts[1];
+ 
+-            TransformationService transformationService = TransformationHelper.getTransformationService(bundleContext,
+-                    transformationType);
++            TransformationService transformationService = TransformationHelper
++                    .getTransformationService(bundleContext, transformationType);
+             if (transformationService != null) {
+                 transformedResponse = transformationService.transform(transformationFunction, response);
+             } else {
+@@ -343,8 +341,8 @@ protected String[] splitTransformationConfig(String transformation) {
+         Matcher matcher = EXTRACT_FUNCTION_PATTERN.matcher(transformation);
+ 
+         if (!matcher.matches()) {
+-            throw new IllegalArgumentException("given transformation function '" + transformation
+-                    + "' does not follow the expected pattern '<function>(<pattern>)'");
++            throw new IllegalArgumentException(
++                    "given transformation function '" + transformation + "' does not follow the expected pattern '<function>(<pattern>)'");
+         }
+         matcher.reset();
+ 
+@@ -361,8 +359,8 @@ protected String[] splitTransformationConfig(String transformation) {
+      * or (if command already starts with one of the shells) splits by space.
+      *
+      * @param shell (path), picks to first one to execute the command
+-     * @param "c"-option string
+-     * @param command to execute
++     * @param cOption "c"-option string
++     * @param commandLine to execute
+      * @return command array
+      */
+     protected String[] createCmdArray(String[] shell, String cOption, String commandLine) {
+@@ -396,13 +394,8 @@ protected String[] createCmdArray(String[] shell, String cOption, String command
+      * @author Constantin Piber (for Memin) - Initial contribution
+      */
+     public enum OS {
+-        WINDOWS,
+-        LINUX,
+-        MAC,
+-        SOLARIS,
+-        UNKNOWN,
+-        NOT_SET
+-    };
++        WINDOWS, LINUX, MAC, SOLARIS, UNKNOWN, NOT_SET
++    }
+ 
+     private static OS os = OS.NOT_SET;
+ 
+diff --git a/bundles/org.openhab.transform.exec/README.md b/bundles/org.openhab.transform.exec/README.md
+index 41b76eed8ca2..7fdeceb370f1 100644
+--- a/bundles/org.openhab.transform.exec/README.md
++++ b/bundles/org.openhab.transform.exec/README.md
+@@ -7,6 +7,18 @@ In the given command line the placeholder `%s` is substituted with the input val
+ 
+ The external program must either be in the executable search path of the server process, or an absolute path has to be used.
+ 
++For security reasons all commands need to be whitelisted.
++Allowed commands need to be added to the `misc/exec.whitelist` file in the configuration directory.
++Every command needs to be on a separate line.
++
++Example:
++
++```shell
++/bin/date -v1d -v+1m -v-1d -v-%s
++numfmt --to=iec-i --suffix=B --padding=7 %s
++
++```
++
+ ## Examples
+ 
+ ### General Setup
+@@ -51,7 +63,7 @@ Or replace it with
+ numfmt --to=iec-i --suffix=B --padding=7 %s
+ ```
+ 
+-When the input argument for `%s` is 1234567 it will return the bytes formated in a better readable form
++When the input argument for `%s` is 1234567 it will return the bytes formatted in a better readable form
+ 
+ ```shell
+ 1.2MiB
+diff --git a/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/ExecTransformationService.java b/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/ExecTransformationService.java
+index ed778b5d6d77..bcc6a70c3784 100644
+--- a/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/ExecTransformationService.java
++++ b/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/ExecTransformationService.java
+@@ -17,7 +17,9 @@
+ import org.eclipse.smarthome.core.transform.TransformationException;
+ import org.eclipse.smarthome.core.transform.TransformationService;
+ import org.eclipse.smarthome.io.net.exec.ExecUtil;
++import org.osgi.service.component.annotations.Activate;
+ import org.osgi.service.component.annotations.Component;
++import org.osgi.service.component.annotations.Reference;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -25,20 +27,25 @@
+  * The implementation of {@link TransformationService} which transforms the
+  * input by command line.
+  *
+- * @author Pauli Anttila
++ * @author Pauli Anttila - Initial contribution
++ * @author Jan N. Klug - added command whitelist service
+  */
+ @NonNullByDefault
+ @Component(immediate = true, property = { "smarthome.transform=EXEC" })
+ public class ExecTransformationService implements TransformationService {
+-
+     private final Logger logger = LoggerFactory.getLogger(ExecTransformationService.class);
++    private final ExecTransformationWhitelistWatchService execTransformationWhitelistWatchService;
++
++    @Activate
++    public ExecTransformationService(
++            @Reference ExecTransformationWhitelistWatchService execTransformationWhitelistWatchService) {
++        this.execTransformationWhitelistWatchService = execTransformationWhitelistWatchService; }
+ 
+     /**
+      * Transforms the input <code>source</code> by the command line.
+      *
+-     * @param commandLine the command to execute. Command line should contain %s string,
+-     *                        which will be replaced by the input data.
+-     * @param source      the input to transform
++     * @param commandLine the command to execute. Command line should contain %s string, which will be replaced by the input data.
++     * @param source the input to transform
+      */
+     @Override
+     public @Nullable String transform(String commandLine, String source) throws TransformationException {
+@@ -46,6 +53,10 @@ public class ExecTransformationService implements TransformationService {
+             throw new TransformationException("the given parameters 'commandLine' and 'source' must not be null");
+         }
+ 
++        if (!execTransformationWhitelistWatchService.isWhitelisted(commandLine)) {
++            logger.warn("Tried to execute '{}', but it is not contained in whitelist.", commandLine);
++            return null;
++        }
+         logger.debug("about to transform '{}' by the commandline '{}'", source, commandLine);
+ 
+         long startTime = System.currentTimeMillis();
+@@ -56,5 +67,4 @@ public class ExecTransformationService implements TransformationService {
+ 
+         return result;
+     }
+-
+ }
+diff --git a/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/ExecTransformationWhitelistWatchService.java b/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/ExecTransformationWhitelistWatchService.java
+new file mode 100644
+index 000000000000..4981579f4881
+--- /dev/null
++++ b/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/ExecTransformationWhitelistWatchService.java
+@@ -0,0 +1,81 @@
++/**
++ * Copyright (c) 2010-2020 Contributors to the openHAB project
++ *
++ * See the NOTICE file(s) distributed with this work for additional
++ * information.
++ *
++ * This program and the accompanying materials are made available under the
++ * terms of the Eclipse Public License 2.0 which is available at
++ * http://www.eclipse.org/legal/epl-2.0
++ *
++ * SPDX-License-Identifier: EPL-2.0
++ */
++package org.openhab.transform.exec.internal;
++
++import org.eclipse.jdt.annotation.NonNullByDefault;
++import org.eclipse.jdt.annotation.Nullable;
++import org.eclipse.smarthome.config.core.ConfigConstants;
++import org.eclipse.smarthome.core.service.AbstractWatchService;
++import org.osgi.service.component.annotations.Activate;
++import org.osgi.service.component.annotations.Component;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.WatchEvent;
++import java.util.HashSet;
++import java.util.Set;
++
++import static java.nio.file.StandardWatchEventKinds.*;
++
++/**
++ * The {@link ExecTransformationWhitelistWatchService} provides a whitelist check for exec commands
++ *
++ * @author Jan N. Klug - Initial contribution
++ */
++@Component(service = ExecTransformationWhitelistWatchService.class)
++@NonNullByDefault
++public class ExecTransformationWhitelistWatchService extends AbstractWatchService {
++    private static final String COMMAND_WHITELIST_PATH = ConfigConstants.getConfigFolder() + File.separator + "misc";
++    private static final String COMMAND_WHITELIST_FILE = "exec.whitelist";
++    private final Set<String> commandWhitelist = new HashSet<>();
++
++    @Activate
++    public ExecTransformationWhitelistWatchService() {
++        super(COMMAND_WHITELIST_PATH);
++    }
++
++    @Override
++    protected boolean watchSubDirectories() {
++        return false;
++    }
++
++    @Override
++    protected WatchEvent.Kind<?>[] getWatchEventKinds(@Nullable Path directory) {
++        return new WatchEvent.Kind<?>[] { ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY };
++    }
++
++    @Override
++    protected void processWatchEvent(@Nullable WatchEvent<?> event,  WatchEvent.@Nullable Kind<?> kind, @Nullable Path path) {
++        if (path.endsWith(COMMAND_WHITELIST_FILE)) {
++            commandWhitelist.clear();
++            try  {
++                Files.lines(path).forEach(commandWhitelist::add);
++                logger.debug("Updated command whitelist: {}", commandWhitelist);
++            } catch (IOException e) {
++                logger.warn("Cannot read whitelist file, exec transformations won't be processed: {}", e.getMessage());
++            }
++        }
++    }
++
++    /**
++     * Check if a command is whitelisted
++     *
++     * @param command the command to check alias
++     * @return true if whitelisted, false if not
++     */
++    public boolean isWhitelisted(String command) {
++        return commandWhitelist.contains(command);
++    }
++}
+diff --git a/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/profiles/ExecTransformationProfile.java b/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/profiles/ExecTransformationProfile.java
+index 3648c769d45f..b2d8fd744605 100644
+--- a/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/profiles/ExecTransformationProfile.java
++++ b/bundles/org.openhab.transform.exec/src/main/java/org/openhab/transform/exec/internal/profiles/ExecTransformationProfile.java
+@@ -13,6 +13,7 @@
+ package org.openhab.transform.exec.internal.profiles;
+ 
+ import org.eclipse.jdt.annotation.NonNullByDefault;
++import org.eclipse.jdt.annotation.Nullable;
+ import org.eclipse.smarthome.core.library.types.StringType;
+ import org.eclipse.smarthome.core.thing.profiles.ProfileCallback;
+ import org.eclipse.smarthome.core.thing.profiles.ProfileContext;
+@@ -31,7 +32,6 @@
+  * Profile to offer the ExecTransformationservice on a ItemChannelLink
+  *
+  * @author Stefan Triller - initial contribution
+- *
+  */
+ @NonNullByDefault
+ public class ExecTransformationProfile implements StateProfile {
+@@ -47,10 +47,8 @@ public class ExecTransformationProfile implements StateProfile {
+     private static final String FUNCTION_PARAM = "function";
+     private static final String SOURCE_FORMAT_PARAM = "sourceFormat";
+ 
+-    @NonNullByDefault({})
+-    private final String function;
+-    @NonNullByDefault({})
+-    private final String sourceFormat;
++    private @Nullable String function;
++    private @Nullable String sourceFormat;
+ 
+     public ExecTransformationProfile(ProfileCallback callback, ProfileContext context, TransformationService service) {
+         this.service = service;
+@@ -61,6 +59,7 @@ public ExecTransformationProfile(ProfileCallback callback, ProfileContext contex
+ 
+         logger.debug("Profile configured with '{}'='{}', '{}'={}", FUNCTION_PARAM, paramFunction, SOURCE_FORMAT_PARAM,
+                 paramSource);
++
+         // SOURCE_FORMAT_PARAM is an advanced parameter and we assume "%s" if it is not set
+         if (paramSource == null) {
+             paramSource = "%s";
+@@ -117,11 +116,19 @@ public void onStateUpdateFromHandler(State state) {
+ 
+     private Type transformState(Type state) {
+         String result = state.toFullString();
+-        try {
+-            result = TransformationHelper.transform(service, function, sourceFormat, state.toFullString());
+-        } catch (TransformationException e) {
++        String function = this.function;
++        String sourceFormat = this.sourceFormat;
++
++        if (function == null || sourceFormat == null) {
+             logger.warn("Could not transform state '{}' with function '{}' and format '{}'", state, function,
+                     sourceFormat);
++        } else {
++            try {
++                result = TransformationHelper.transform(service, function, sourceFormat, state.toFullString());
++            } catch (TransformationException e) {
++                logger.warn("Could not transform state '{}' with function '{}' and format '{}'", state, function,
++                        sourceFormat);
++            }
+         }
+         StringType resultType = new StringType(result);
+         logger.debug("Transformed '{}' into '{}'", state, resultType);

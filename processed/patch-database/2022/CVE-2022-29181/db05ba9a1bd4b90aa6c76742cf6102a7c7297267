@@ -1,0 +1,257 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 60965d6021..61bb5588b7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -28,6 +28,7 @@ This version of Nokogiri uses [`jar-dependencies`](https://github.com/mkristian/
+ 
+ * [CRuby] UTF-16-encoded documents longer than ~4000 code points now serialize properly. Previously the serialized document was corrupted when it exceeded the length of libxml2's internal string buffer. [[#752](https://github.com/sparklemotion/nokogiri/issues/752)]
+ * [HTML5] The Gumbo parser now correctly handles text at the end of `form` elements.
++* `{HTML4,XML}::SAX::{Parser,ParserContext}` constructor methods now raise `TypeError` instead of segfaulting when an incorrect type is passed. (Thanks to [@agustingianni](https://github.com/agustingianni) from the Github Security Lab for reporting!)
+ 
+ 
+ ### Improved
+@@ -36,7 +37,7 @@ This version of Nokogiri uses [`jar-dependencies`](https://github.com/mkristian/
+ * Avoid compile-time conflict with system-installed `gumbo.h` on OpenBSD. [[#2464](https://github.com/sparklemotion/nokogiri/issues/2464)]
+ * Remove calls to `vasprintf` in favor of platform-independent `rb_vsprintf`
+ * Prefer `ruby_xmalloc` to `malloc` within the C extension. [[#2480](https://github.com/sparklemotion/nokogiri/issues/2480)] (Thanks, [@Garfield96](https://github.com/Garfield96)!)
+-* Installation from source on systems missing libiconv will once again generate a helpful error message (broken since v1.11.0). [#2505]
++* Installation from source on systems missing libiconv will once again generate a helpful error message (broken since v1.11.0). [[#2505](https://github.com/sparklemotion/nokogiri/issues/2505)]
+ 
+ 
+ ## 1.13.5 / 2022-05-04
+diff --git a/ext/java/nokogiri/Html4SaxParserContext.java b/ext/java/nokogiri/Html4SaxParserContext.java
+index 7c6f1aba1b..2e8a3d272d 100644
+--- a/ext/java/nokogiri/Html4SaxParserContext.java
++++ b/ext/java/nokogiri/Html4SaxParserContext.java
+@@ -231,6 +231,13 @@ static EncodingType get(final int ordinal)
+              IRubyObject data,
+              IRubyObject encoding)
+   {
++    if (!(data instanceof RubyString)) {
++      throw context.getRuntime().newTypeError("data must be kind_of String");
++    }
++    if (!(encoding instanceof RubyString)) {
++      throw context.getRuntime().newTypeError("data must be kind_of String");
++    }
++
+     Html4SaxParserContext ctx = Html4SaxParserContext.newInstance(context.runtime, (RubyClass) klass);
+     ctx.setInputSourceFile(context, data);
+     String javaEncoding = findEncodingName(context, encoding);
+@@ -247,6 +254,10 @@ static EncodingType get(final int ordinal)
+            IRubyObject data,
+            IRubyObject encoding)
+   {
++    if (!(encoding instanceof RubyFixnum)) {
++      throw context.getRuntime().newTypeError("encoding must be kind_of String");
++    }
++
+     Html4SaxParserContext ctx = Html4SaxParserContext.newInstance(context.runtime, (RubyClass) klass);
+     ctx.setIOInputSource(context, data, context.nil);
+     String javaEncoding = findEncodingName(context, encoding);
+diff --git a/ext/java/nokogiri/XmlSaxParserContext.java b/ext/java/nokogiri/XmlSaxParserContext.java
+index 05c7cfea5f..53ea7383b0 100644
+--- a/ext/java/nokogiri/XmlSaxParserContext.java
++++ b/ext/java/nokogiri/XmlSaxParserContext.java
+@@ -131,9 +131,12 @@ public class XmlSaxParserContext extends ParserContext
+   parse_io(ThreadContext context,
+            IRubyObject klazz,
+            IRubyObject data,
+-           IRubyObject enc)
++           IRubyObject encoding)
+   {
+-    //int encoding = (int)enc.convertToInteger().getLongValue();
++    // check the type of the unused encoding to match behavior of CRuby
++    if (!(encoding instanceof RubyFixnum)) {
++      throw context.getRuntime().newTypeError("encoding must be kind_of String");
++    }
+     final Ruby runtime = context.runtime;
+     XmlSaxParserContext ctx = newInstance(runtime, (RubyClass) klazz);
+     ctx.initialize(runtime);
+diff --git a/ext/java/nokogiri/internals/ParserContext.java b/ext/java/nokogiri/internals/ParserContext.java
+index 8c8a7749b1..27fa835dc8 100644
+--- a/ext/java/nokogiri/internals/ParserContext.java
++++ b/ext/java/nokogiri/internals/ParserContext.java
+@@ -60,6 +60,12 @@ public abstract class ParserContext extends RubyObject
+     source = new InputSource();
+     ParserContext.setUrl(context, source, url);
+ 
++    Ruby ruby = context.getRuntime();
++
++    if (!(data.respondsTo("read"))) {
++      throw ruby.newTypeError("must respond to :read");
++    }
++
+     source.setByteStream(new IOInputStream(data));
+     if (java_encoding != null) {
+       source.setEncoding(java_encoding);
+@@ -75,7 +81,7 @@ public abstract class ParserContext extends RubyObject
+     Ruby ruby = context.getRuntime();
+ 
+     if (!(data instanceof RubyString)) {
+-      throw ruby.newArgumentError("must be kind_of String");
++      throw ruby.newTypeError("must be kind_of String");
+     }
+ 
+     RubyString stringData = (RubyString) data;
+diff --git a/ext/nokogiri/html4_sax_parser_context.c b/ext/nokogiri/html4_sax_parser_context.c
+index dec0d88fe5..54adca4cb4 100644
+--- a/ext/nokogiri/html4_sax_parser_context.c
++++ b/ext/nokogiri/html4_sax_parser_context.c
+@@ -19,9 +19,8 @@ parse_memory(VALUE klass, VALUE data, VALUE encoding)
+ {
+   htmlParserCtxtPtr ctxt;
+ 
+-  if (NIL_P(data)) {
+-    rb_raise(rb_eArgError, "data cannot be nil");
+-  }
++  Check_Type(data, T_STRING);
++
+   if (!(int)RSTRING_LEN(data)) {
+     rb_raise(rb_eRuntimeError, "data cannot be empty");
+   }
+diff --git a/ext/nokogiri/xml_sax_parser_context.c b/ext/nokogiri/xml_sax_parser_context.c
+index 60449347ae..60c491984b 100644
+--- a/ext/nokogiri/xml_sax_parser_context.c
++++ b/ext/nokogiri/xml_sax_parser_context.c
+@@ -2,6 +2,8 @@
+ 
+ VALUE cNokogiriXmlSaxParserContext ;
+ 
++static ID id_read;
++
+ static void
+ deallocate(xmlParserCtxtPtr ctxt)
+ {
+@@ -26,6 +28,10 @@ parse_io(VALUE klass, VALUE io, VALUE encoding)
+   xmlParserCtxtPtr ctxt;
+   xmlCharEncoding enc = (xmlCharEncoding)NUM2INT(encoding);
+ 
++  if (!rb_respond_to(io, id_read)) {
++    rb_raise(rb_eTypeError, "argument expected to respond to :read");
++  }
++
+   ctxt = xmlCreateIOParserCtxt(NULL, NULL,
+                                (xmlInputReadCallback)noko_io_read,
+                                (xmlInputCloseCallback)noko_io_close,
+@@ -62,9 +68,8 @@ parse_memory(VALUE klass, VALUE data)
+ {
+   xmlParserCtxtPtr ctxt;
+ 
+-  if (NIL_P(data)) {
+-    rb_raise(rb_eArgError, "data cannot be nil");
+-  }
++  Check_Type(data, T_STRING);
++
+   if (!(int)RSTRING_LEN(data)) {
+     rb_raise(rb_eRuntimeError, "data cannot be empty");
+   }
+@@ -278,4 +283,6 @@ noko_init_xml_sax_parser_context()
+   rb_define_method(cNokogiriXmlSaxParserContext, "recovery", get_recovery, 0);
+   rb_define_method(cNokogiriXmlSaxParserContext, "line", line, 0);
+   rb_define_method(cNokogiriXmlSaxParserContext, "column", column, 0);
++
++  id_read = rb_intern("read");
+ }
+diff --git a/lib/nokogiri/html4/sax/parser.rb b/lib/nokogiri/html4/sax/parser.rb
+index 2a074b6b92..1f8c03af6c 100644
+--- a/lib/nokogiri/html4/sax/parser.rb
++++ b/lib/nokogiri/html4/sax/parser.rb
+@@ -28,7 +28,7 @@ class Parser < Nokogiri::XML::SAX::Parser
+         ###
+         # Parse html stored in +data+ using +encoding+
+         def parse_memory(data, encoding = "UTF-8")
+-          raise ArgumentError unless data
++          raise TypeError unless String === data
+           return if data.empty?
+ 
+           ctx = ParserContext.memory(data, encoding)
+diff --git a/test/html4/sax/test_parser.rb b/test/html4/sax/test_parser.rb
+index 3917dce2e7..4dc6ac61fd 100644
+--- a/test/html4/sax/test_parser.rb
++++ b/test/html4/sax/test_parser.rb
+@@ -54,7 +54,7 @@ def test_parse_file_with_dir
+         end
+ 
+         def test_parse_memory_nil
+-          assert_raises(ArgumentError) do
++          assert_raises(TypeError) do
+             @parser.parse_memory(nil)
+           end
+         end
+@@ -161,6 +161,12 @@ def test_parsing_dom_error_from_io
+         def test_empty_processing_instruction
+           @parser.parse_memory("<strong>this will segfault<?strong>")
+         end
++
++        it "handles invalid types gracefully" do
++          assert_raises(TypeError) { Nokogiri::HTML::SAX::Parser.new.parse(0xcafecafe) }
++          assert_raises(TypeError) { Nokogiri::HTML::SAX::Parser.new.parse_memory(0xcafecafe) }
++          assert_raises(TypeError) { Nokogiri::HTML::SAX::Parser.new.parse_io(0xcafecafe) }
++        end
+       end
+     end
+   end
+diff --git a/test/html4/sax/test_parser_context.rb b/test/html4/sax/test_parser_context.rb
+index 0a0eda64c8..594a3ac821 100644
+--- a/test/html4/sax/test_parser_context.rb
++++ b/test/html4/sax/test_parser_context.rb
+@@ -40,6 +40,15 @@ def test_from_file
+           ctx.parse_with(parser)
+           # end
+         end
++
++        def test_graceful_handling_of_invalid_types
++          assert_raises(TypeError) { ParserContext.new(0xcafecafe) }
++          assert_raises(TypeError) { ParserContext.memory(0xcafecafe, "UTF-8") }
++          assert_raises(TypeError) { ParserContext.io(0xcafecafe, 1) }
++          assert_raises(TypeError) { ParserContext.io(StringIO.new("asdf"), "should be an index into ENCODINGS") }
++          assert_raises(TypeError) { ParserContext.file(0xcafecafe, "UTF-8") }
++          assert_raises(TypeError) { ParserContext.file("path/to/file", 0xcafecafe) }
++        end
+       end
+     end
+   end
+diff --git a/test/xml/sax/test_parser.rb b/test/xml/sax/test_parser.rb
+index 6c0f1fc883..ac7d4ead0a 100644
+--- a/test/xml/sax/test_parser.rb
++++ b/test/xml/sax/test_parser.rb
+@@ -73,6 +73,12 @@ class TestCase
+           end
+         end
+ 
++        it "handles invalid types gracefully" do
++          assert_raises(TypeError) { Nokogiri::XML::SAX::Parser.new.parse(0xcafecafe) }
++          assert_raises(TypeError) { Nokogiri::XML::SAX::Parser.new.parse_memory(0xcafecafe) }
++          assert_raises(TypeError) { Nokogiri::XML::SAX::Parser.new.parse_io(0xcafecafe) }
++        end
++
+         it :test_namespace_declaration_order_is_saved do
+           parser.parse(<<~EOF)
+             <root xmlns:foo='http://foo.example.com/' xmlns='http://example.com/'>
+@@ -263,7 +269,7 @@ def call_parse_io_with_encoding(encoding)
+         end
+ 
+         it :test_render_parse_nil_param do
+-          assert_raises(ArgumentError) { parser.parse_memory(nil) }
++          assert_raises(TypeError) { parser.parse_memory(nil) }
+         end
+ 
+         it :test_bad_encoding_args do
+diff --git a/test/xml/sax/test_parser_context.rb b/test/xml/sax/test_parser_context.rb
+index e38efd271c..ba98579439 100644
+--- a/test/xml/sax/test_parser_context.rb
++++ b/test/xml/sax/test_parser_context.rb
+@@ -80,6 +80,13 @@ def test_recovery
+           assert(pc.recovery)
+         end
+ 
++        def test_graceful_handling_of_invalid_types
++          assert_raises(TypeError) { ParserContext.new(0xcafecafe) }
++          assert_raises(TypeError) { ParserContext.memory(0xcafecafe) }
++          assert_raises(TypeError) { ParserContext.io(0xcafecafe, 1) }
++          assert_raises(TypeError) { ParserContext.io(StringIO.new("asdf"), "should be an index into ENCODINGS") }
++        end
++
+         def test_from_io
+           ctx = ParserContext.new(StringIO.new("fo"), "UTF-8")
+           assert(ctx)

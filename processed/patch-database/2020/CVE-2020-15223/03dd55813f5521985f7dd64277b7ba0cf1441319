@@ -1,0 +1,299 @@
+diff --git a/.golangci.yml b/.golangci.yml
+index 1a6ec235..41a57ab9 100644
+--- a/.golangci.yml
++++ b/.golangci.yml
+@@ -6,7 +6,6 @@ linters:
+     - deadcode
+     - unused
+     - structcheck
+-    - errcheck
+     - gosimple
+     - bodyclose
+     - staticcheck
+diff --git a/access_error.go b/access_error.go
+index f003a6a8..e48cd561 100644
+--- a/access_error.go
++++ b/access_error.go
+@@ -53,5 +53,6 @@ func (f *Fosite) writeJsonError(rw http.ResponseWriter, err error) {
+ 	}
+ 
+ 	rw.WriteHeader(rfcerr.Code)
+-	rw.Write(js)
++	// ignoring the error because the connection is broken when it happens
++	_, _ = rw.Write(js)
+ }
+diff --git a/access_write.go b/access_write.go
+index ba467c20..ce3c7c1e 100644
+--- a/access_write.go
++++ b/access_write.go
+@@ -39,5 +39,5 @@ func (f *Fosite) WriteAccessResponse(rw http.ResponseWriter, requester AccessReq
+ 	rw.Header().Set("Content-Type", "application/json;charset=UTF-8")
+ 
+ 	rw.WriteHeader(http.StatusOK)
+-	rw.Write(js)
++	_, _ = rw.Write(js)
+ }
+diff --git a/authorize_error.go b/authorize_error.go
+index 3c038c6e..3608ca48 100644
+--- a/authorize_error.go
++++ b/authorize_error.go
+@@ -53,7 +53,7 @@ func (f *Fosite) WriteAuthorizeError(rw http.ResponseWriter, ar AuthorizeRequest
+ 		}
+ 
+ 		rw.WriteHeader(rfcerr.Code)
+-		rw.Write(js)
++		_, _ = rw.Write(js)
+ 		return
+ 	}
+ 
+diff --git a/errors.go b/errors.go
+index f6b388be..04009c74 100644
+--- a/errors.go
++++ b/errors.go
+@@ -163,11 +163,6 @@ var (
+ 		Hint:        "Token validation failed.",
+ 		Code:        http.StatusUnauthorized,
+ 	}
+-	ErrRevocationClientMismatch = &RFC6749Error{
+-		Name:        errRevocationClientMismatchName,
+-		Description: "Token was not issued to the client making the revocation request",
+-		Code:        http.StatusBadRequest,
+-	}
+ 	ErrLoginRequired = &RFC6749Error{
+ 		Name:        errLoginRequired,
+ 		Description: "The Authorization Server requires End-User authentication",
+diff --git a/errors_test.go b/errors_test.go
+index 4e974794..424f722e 100644
+--- a/errors_test.go
++++ b/errors_test.go
+@@ -28,13 +28,6 @@ import (
+ 	"github.com/stretchr/testify/assert"
+ )
+ 
+-func TestAddDebug(t *testing.T) {
+-	err := ErrRevocationClientMismatch.WithDebug("debug")
+-	assert.NotEqual(t, err, ErrRevocationClientMismatch)
+-	assert.Empty(t, ErrRevocationClientMismatch.Debug)
+-	assert.NotEmpty(t, err.Debug)
+-}
+-
+ func TestIs(t *testing.T) {
+ 	assert.True(t, errors.Is(ErrUnknownRequest, ErrUnknownRequest))
+ 	assert.True(t, errors.Is(ErrUnknownRequest, &RFC6749Error{
+diff --git a/go_mod_indirect_pins.go b/go_mod_indirect_pins.go
+index 79dc9d90..a1f4691c 100644
+--- a/go_mod_indirect_pins.go
++++ b/go_mod_indirect_pins.go
+@@ -5,5 +5,6 @@ package fosite
+ import (
+ 	_ "github.com/gorilla/websocket"
+ 	_ "github.com/mattn/goveralls"
++
+ 	_ "github.com/ory/go-acc"
+ )
+diff --git a/handler/oauth2/revocation.go b/handler/oauth2/revocation.go
+index 782b9081..aef9bcbf 100644
+--- a/handler/oauth2/revocation.go
++++ b/handler/oauth2/revocation.go
+@@ -57,21 +57,32 @@ func (r *TokenRevocationHandler) RevokeToken(ctx context.Context, token string,
+ 	}
+ 
+ 	var ar fosite.Requester
+-	var err error
+-	if ar, err = discoveryFuncs[0](); err != nil {
+-		ar, err = discoveryFuncs[1]()
++	var err1, err2 error
++	if ar, err1 = discoveryFuncs[0](); err1 != nil {
++		ar, err2 = discoveryFuncs[1]()
+ 	}
+-	if err != nil {
+-		return err
++	// err2 can only be not nil if first err1 was not nil
++	if err2 != nil {
++		return storeErrorsToRevocationError(err1, err2)
+ 	}
+ 
+ 	if ar.GetClient().GetID() != client.GetID() {
+-		return errors.WithStack(fosite.ErrRevocationClientMismatch)
++		return errors.WithStack(fosite.ErrUnauthorizedClient)
+ 	}
+ 
+ 	requestID := ar.GetID()
+-	r.TokenRevocationStorage.RevokeRefreshToken(ctx, requestID)
+-	r.TokenRevocationStorage.RevokeAccessToken(ctx, requestID)
++	err1 = r.TokenRevocationStorage.RevokeRefreshToken(ctx, requestID)
++	err2 = r.TokenRevocationStorage.RevokeAccessToken(ctx, requestID)
+ 
+-	return nil
++	return storeErrorsToRevocationError(err1, err2)
++}
++
++func storeErrorsToRevocationError(err1, err2 error) error {
++	// both errors are 404 or nil <=> the token is revoked
++	if (errors.Is(err1, fosite.ErrNotFound) || err1 == nil) && (errors.Is(err2, fosite.ErrNotFound) || err2 == nil) {
++		return nil
++	}
++
++	// there was an unexpected error => the token may still exist and the client should retry later
++	return errors.WithStack(fosite.ErrTemporarilyUnavailable)
+ }
+diff --git a/handler/oauth2/revocation_test.go b/handler/oauth2/revocation_test.go
+index 81d11aa6..0822c3e1 100644
+--- a/handler/oauth2/revocation_test.go
++++ b/handler/oauth2/revocation_test.go
+@@ -57,7 +57,7 @@ func TestRevokeToken(t *testing.T) {
+ 	}{
+ 		{
+ 			description: "should fail - token was issued to another client",
+-			expectErr:   fosite.ErrRevocationClientMismatch,
++			expectErr:   fosite.ErrUnauthorizedClient,
+ 			client:      &fosite.DefaultClient{ID: "bar"},
+ 			mock: func() {
+ 				token = "foo"
+@@ -134,8 +134,8 @@ func TestRevokeToken(t *testing.T) {
+ 			},
+ 		},
+ 		{
+-			description: "should fail - refresh token discovery first; both tokens not found",
+-			expectErr:   fosite.ErrNotFound,
++			description: "should pass - refresh token discovery first; both tokens not found",
++			expectErr:   nil,
+ 			client:      &fosite.DefaultClient{ID: "bar"},
+ 			mock: func() {
+ 				token = "foo"
+@@ -148,8 +148,8 @@ func TestRevokeToken(t *testing.T) {
+ 			},
+ 		},
+ 		{
+-			description: "should fail - access token discovery first; both tokens not found",
+-			expectErr:   fosite.ErrNotFound,
++			description: "should pass - access token discovery first; both tokens not found",
++			expectErr:   nil,
+ 			client:      &fosite.DefaultClient{ID: "bar"},
+ 			mock: func() {
+ 				token = "foo"
+@@ -161,8 +161,68 @@ func TestRevokeToken(t *testing.T) {
+ 				store.EXPECT().GetRefreshTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fosite.ErrNotFound)
+ 			},
+ 		},
++		{
++			description: "should fail - store error for access token get",
++			expectErr:   fosite.ErrTemporarilyUnavailable,
++			client:      &fosite.DefaultClient{ID: "bar"},
++			mock: func() {
++				token = "foo"
++				tokenType = fosite.AccessToken
++				atStrat.EXPECT().AccessTokenSignature(token)
++				store.EXPECT().GetAccessTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("random error"))
++
++				rtStrat.EXPECT().RefreshTokenSignature(token)
++				store.EXPECT().GetRefreshTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fosite.ErrNotFound)
++			},
++		},
++		{
++			description: "should fail - store error for refresh token get",
++			expectErr:   fosite.ErrTemporarilyUnavailable,
++			client:      &fosite.DefaultClient{ID: "bar"},
++			mock: func() {
++				token = "foo"
++				tokenType = fosite.RefreshToken
++				atStrat.EXPECT().AccessTokenSignature(token)
++				store.EXPECT().GetAccessTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fosite.ErrNotFound)
++
++				rtStrat.EXPECT().RefreshTokenSignature(token)
++				store.EXPECT().GetRefreshTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("random error"))
++			},
++		},
++		{
++			description: "should fail - store error for access token revoke",
++			expectErr:   fosite.ErrTemporarilyUnavailable,
++			client:      &fosite.DefaultClient{ID: "bar"},
++			mock: func() {
++				token = "foo"
++				tokenType = fosite.AccessToken
++				atStrat.EXPECT().AccessTokenSignature(token)
++				store.EXPECT().GetAccessTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(ar, nil)
++
++				ar.EXPECT().GetID()
++				ar.EXPECT().GetClient().Return(&fosite.DefaultClient{ID: "bar"})
++				store.EXPECT().RevokeRefreshToken(gomock.Any(), gomock.Any()).Return(fosite.ErrNotFound)
++				store.EXPECT().RevokeAccessToken(gomock.Any(), gomock.Any()).Return(fmt.Errorf("random error"))
++			},
++		},
++		{
++			description: "should fail - store error for refresh token revoke",
++			expectErr:   fosite.ErrTemporarilyUnavailable,
++			client:      &fosite.DefaultClient{ID: "bar"},
++			mock: func() {
++				token = "foo"
++				tokenType = fosite.RefreshToken
++				rtStrat.EXPECT().RefreshTokenSignature(token)
++				store.EXPECT().GetRefreshTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(ar, nil)
++
++				ar.EXPECT().GetID()
++				ar.EXPECT().GetClient().Return(&fosite.DefaultClient{ID: "bar"})
++				store.EXPECT().RevokeRefreshToken(gomock.Any(), gomock.Any()).Return(fmt.Errorf("random error"))
++				store.EXPECT().RevokeAccessToken(gomock.Any(), gomock.Any()).Return(fosite.ErrNotFound)
++			},
++		},
+ 	} {
+-		t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
++		t.Run(fmt.Sprintf("case=%d/description=%s", k, c.description), func(t *testing.T) {
+ 			c.mock()
+ 			err := h.RevokeToken(nil, token, tokenType, c.client)
+ 
+diff --git a/handler/openid/helper.go b/handler/openid/helper.go
+index a9357612..3fabfbf2 100644
+--- a/handler/openid/helper.go
++++ b/handler/openid/helper.go
+@@ -39,7 +39,11 @@ func (i *IDTokenHandleHelper) GetAccessTokenHash(ctx context.Context, requester
+ 
+ 	buffer := bytes.NewBufferString(token)
+ 	hash := sha256.New()
+-	hash.Write(buffer.Bytes())
++	// sha256.digest.Write() always returns nil for err, the panic should never happen
++	_, err := hash.Write(buffer.Bytes())
++	if err != nil {
++		panic(err)
++	}
+ 	hashBuf := bytes.NewBuffer(hash.Sum([]byte{}))
+ 	len := hashBuf.Len()
+ 
+diff --git a/revoke_handler.go b/revoke_handler.go
+index 9a691655..4597ca50 100644
+--- a/revoke_handler.go
++++ b/revoke_handler.go
+@@ -112,7 +112,7 @@ func (f *Fosite) WriteRevocationResponse(rw http.ResponseWriter, err error) {
+ 		}
+ 
+ 		rw.WriteHeader(ErrInvalidRequest.Code)
+-		rw.Write(js)
++		_, _ = rw.Write(js)
+ 	} else if errors.Is(err, ErrInvalidClient) {
+ 		rw.Header().Set("Content-Type", "application/json;charset=UTF-8")
+ 
+@@ -123,7 +123,7 @@ func (f *Fosite) WriteRevocationResponse(rw http.ResponseWriter, err error) {
+ 		}
+ 
+ 		rw.WriteHeader(ErrInvalidClient.Code)
+-		rw.Write(js)
++		_, _ = rw.Write(js)
+ 	} else {
+ 		// 200 OK
+ 		rw.WriteHeader(http.StatusOK)
+diff --git a/token/hmac/hmacsha.go b/token/hmac/hmacsha.go
+index e0737459..88dd72be 100644
+--- a/token/hmac/hmacsha.go
++++ b/token/hmac/hmacsha.go
+@@ -169,6 +169,10 @@ func (c *HMACStrategy) Signature(token string) string {
+ 
+ func generateHMAC(data []byte, key *[32]byte) []byte {
+ 	h := hmac.New(sha512.New512_256, key[:])
+-	h.Write(data)
++	// sha512.digest.Write() always returns nil for err, the panic should never happen
++	_, err := h.Write(data)
++	if err != nil {
++		panic(err)
++	}
+ 	return h.Sum(nil)
+ }

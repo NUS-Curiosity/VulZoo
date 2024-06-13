@@ -1,0 +1,201 @@
+diff --git a/extractor/extractor_test.go b/extractor/extractor_test.go
+index 0e57cea..c4cda6e 100644
+--- a/extractor/extractor_test.go
++++ b/extractor/extractor_test.go
+@@ -120,6 +120,24 @@ var _ = Describe("Extractor", func() {
+ 			})
+ 
+ 			It("extracts the ZIP's files, generating directories, and honoring file permissions and symlinks", extractionTest)
++
++			Context("with a bad zip archive", func() {
++				BeforeEach(func() {
++					test_helper.CreateZipArchive(extractionSrc, []test_helper.ArchiveFile{
++						{
++							Name: "../some-file",
++							Body: "file-in-bad-dir-contents",
++						},
++					})
++				})
++
++				It("returns an error", func() {
++					subdir := filepath.Join(extractionDest, "subdir")
++					Expect(os.Mkdir(subdir, 0777)).To(Succeed())
++					err := extractor.Extract(extractionSrc, subdir)
++					Expect(err).To(HaveOccurred())
++				})
++			})
+ 		})
+ 
+ 		Context("when 'unzip' is not in the PATH", func() {
+@@ -138,6 +156,27 @@ var _ = Describe("Extractor", func() {
+ 			})
+ 
+ 			It("extracts the ZIP's files, generating directories, and honoring file permissions and symlinks", extractionTest)
++
++			Context("with a bad zip archive", func() {
++				BeforeEach(func() {
++					test_helper.CreateZipArchive(extractionSrc, []test_helper.ArchiveFile{
++						{
++							Name: "../some-file",
++							Body: "file-in-bad-dir-contents",
++						},
++					})
++				})
++
++				It("does not insecurely extract the file outside of the provided destination", func() {
++					subdir := filepath.Join(extractionDest, "subdir")
++					Expect(os.Mkdir(subdir, 0777)).To(Succeed())
++					err := extractor.Extract(extractionSrc, subdir)
++					Expect(err).NotTo(HaveOccurred())
++
++					Expect(filepath.Join(extractionDest, "some-file")).NotTo(BeAnExistingFile())
++					Expect(filepath.Join(subdir, "some-file")).To(BeAnExistingFile())
++				})
++			})
+ 		})
+ 	})
+ 
+@@ -153,6 +192,24 @@ var _ = Describe("Extractor", func() {
+ 			})
+ 
+ 			It("extracts the TGZ's files, generating directories, and honoring file permissions and symlinks", extractionTest)
++
++			Context("with a bad tgz archive", func() {
++				BeforeEach(func() {
++					test_helper.CreateTarGZArchive(extractionSrc, []test_helper.ArchiveFile{
++						{
++							Name: "../some-file",
++							Body: "file-in-bad-dir-contents",
++						},
++					})
++				})
++
++				It("returns an error", func() {
++					subdir := filepath.Join(extractionDest, "subdir")
++					Expect(os.Mkdir(subdir, 0777)).To(Succeed())
++					err := extractor.Extract(extractionSrc, subdir)
++					Expect(err).To(HaveOccurred())
++				})
++			})
+ 		})
+ 
+ 		Context("when 'tar' is not in the PATH", func() {
+@@ -171,6 +228,26 @@ var _ = Describe("Extractor", func() {
+ 			})
+ 
+ 			It("extracts the TGZ's files, generating directories, and honoring file permissions and symlinks", extractionTest)
++
++			Context("with a bad tgz archive", func() {
++				BeforeEach(func() {
++					test_helper.CreateTarGZArchive(extractionSrc, []test_helper.ArchiveFile{
++						{
++							Name: "../some-file",
++							Body: "file-in-bad-dir-contents",
++						},
++					})
++				})
++
++				It("does not insecurely extract the file outside of the provided destination", func() {
++					subdir := filepath.Join(extractionDest, "subdir")
++					Expect(os.Mkdir(subdir, 0777)).To(Succeed())
++					err := extractor.Extract(extractionSrc, subdir)
++					Expect(err).NotTo(HaveOccurred())
++					Expect(filepath.Join(extractionDest, "some-file")).NotTo(BeAnExistingFile())
++					Expect(filepath.Join(subdir, "some-file")).To(BeAnExistingFile())
++				})
++			})
+ 		})
+ 	})
+ 
+@@ -181,5 +258,25 @@ var _ = Describe("Extractor", func() {
+ 		})
+ 
+ 		It("extracts the TAR's files, generating directories, and honoring file permissions and symlinks", extractionTest)
++
++		Context("with a bad tar archive", func() {
++			BeforeEach(func() {
++				test_helper.CreateTarArchive(extractionSrc, []test_helper.ArchiveFile{
++					{
++						Name: "../some-file",
++						Body: "file-in-bad-dir-contents",
++					},
++				})
++			})
++
++			It("does not insecurely extract the file outside of the provided destination", func() {
++				subdir := filepath.Join(extractionDest, "subdir")
++				Expect(os.Mkdir(subdir, 0777)).To(Succeed())
++				err := extractor.Extract(extractionSrc, subdir)
++				Expect(err).NotTo(HaveOccurred())
++				Expect(filepath.Join(extractionDest, "some-file")).NotTo(BeAnExistingFile())
++				Expect(filepath.Join(subdir, "some-file")).To(BeAnExistingFile())
++			})
++		})
+ 	})
+ })
+diff --git a/extractor/tgz_extractor.go b/extractor/tgz_extractor.go
+index fee53ac..f1a1a70 100644
+--- a/extractor/tgz_extractor.go
++++ b/extractor/tgz_extractor.go
+@@ -8,6 +8,8 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++
++	securejoin "github.com/cyphar/filepath-securejoin"
+ )
+ 
+ type tgzExtractor struct{}
+@@ -87,14 +89,17 @@ func extractTarArchive(tarReader *tar.Reader, dest string) error {
+ }
+ 
+ func extractTarArchiveFile(header *tar.Header, dest string, input io.Reader) error {
+-	filePath := filepath.Join(dest, header.Name)
++	filePath, err := securejoin.SecureJoin(dest, header.Name)
++	if err != nil {
++		return err
++	}
+ 	fileInfo := header.FileInfo()
+ 
+ 	if fileInfo.IsDir() {
+ 		return os.MkdirAll(filePath, fileInfo.Mode())
+ 	}
+ 
+-	err := os.MkdirAll(filepath.Dir(filePath), 0755)
++	err = os.MkdirAll(filepath.Dir(filePath), 0755)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/extractor/zip_extractor.go b/extractor/zip_extractor.go
+index 927644a..d61005c 100644
+--- a/extractor/zip_extractor.go
++++ b/extractor/zip_extractor.go
+@@ -8,6 +8,8 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++
++	securejoin "github.com/cyphar/filepath-securejoin"
+ )
+ 
+ type zipExtractor struct{}
+@@ -77,16 +79,16 @@ func extractZip(src, dest string) error {
+ }
+ 
+ func extractZipArchiveFile(file *zip.File, dest string, input io.Reader) error {
+-	filePath := filepath.Join(dest, file.Name)
++	filePath, err := securejoin.SecureJoin(dest, file.Name)
+ 	fileInfo := file.FileInfo()
+ 
+ 	if fileInfo.IsDir() {
+-		err := os.MkdirAll(filePath, fileInfo.Mode())
++		err = os.MkdirAll(filePath, fileInfo.Mode())
+ 		if err != nil {
+ 			return err
+ 		}
+ 	} else {
+-		err := os.MkdirAll(filepath.Dir(filePath), 0755)
++		err = os.MkdirAll(filepath.Dir(filePath), 0755)
+ 		if err != nil {
+ 			return err
+ 		}

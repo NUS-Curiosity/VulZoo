@@ -1,0 +1,1013 @@
+diff --git a/core/src/main/java/com/linecorp/armeria/common/HttpHeaderNames.java b/core/src/main/java/com/linecorp/armeria/common/HttpHeaderNames.java
+index a020e8ba9cd..dc3cca97e42 100644
+--- a/core/src/main/java/com/linecorp/armeria/common/HttpHeaderNames.java
++++ b/core/src/main/java/com/linecorp/armeria/common/HttpHeaderNames.java
+@@ -32,10 +32,12 @@
+ 
+ import java.lang.reflect.Field;
+ import java.lang.reflect.Modifier;
++import java.util.BitSet;
+ import java.util.Map;
+ 
+ import com.google.common.base.Ascii;
+ import com.google.common.collect.ImmutableMap;
++import com.google.common.math.IntMath;
+ 
+ import io.netty.util.AsciiString;
+ 
+@@ -65,6 +67,35 @@ public final class HttpHeaderNames {
+     //   - Sec-Fetch-User
+     //   - Sec-Metadata
+ 
++    private static final int PROHIBITED_NAME_CHAR_MASK = ~63;
++    private static final BitSet PROHIBITED_NAME_CHARS = new BitSet(~PROHIBITED_NAME_CHAR_MASK + 1);
++    private static final String[] PROHIBITED_NAME_CHAR_NAMES = new String[~PROHIBITED_NAME_CHAR_MASK + 1];
++
++    static {
++        PROHIBITED_NAME_CHARS.set(0);
++        PROHIBITED_NAME_CHARS.set('\t');
++        PROHIBITED_NAME_CHARS.set('\n');
++        PROHIBITED_NAME_CHARS.set(0xB);
++        PROHIBITED_NAME_CHARS.set('\f');
++        PROHIBITED_NAME_CHARS.set('\r');
++        PROHIBITED_NAME_CHARS.set(' ');
++        PROHIBITED_NAME_CHARS.set(',');
++        PROHIBITED_NAME_CHARS.set(':');
++        PROHIBITED_NAME_CHARS.set(';');
++        PROHIBITED_NAME_CHARS.set('=');
++        PROHIBITED_NAME_CHAR_NAMES[0] = "<NUL>";
++        PROHIBITED_NAME_CHAR_NAMES['\t'] = "<TAB>";
++        PROHIBITED_NAME_CHAR_NAMES['\n'] = "<LF>";
++        PROHIBITED_NAME_CHAR_NAMES[0xB] = "<VT>";
++        PROHIBITED_NAME_CHAR_NAMES['\f'] = "<FF>";
++        PROHIBITED_NAME_CHAR_NAMES['\r'] = "<CR>";
++        PROHIBITED_NAME_CHAR_NAMES[' '] = "<SP>";
++        PROHIBITED_NAME_CHAR_NAMES[','] = ",";
++        PROHIBITED_NAME_CHAR_NAMES[':'] = ":";
++        PROHIBITED_NAME_CHAR_NAMES[';'] = ";";
++        PROHIBITED_NAME_CHAR_NAMES['='] = "=";
++    }
++
+     // Pseudo-headers
+ 
+     /**
+@@ -564,10 +595,16 @@ public final class HttpHeaderNames {
+         map = builder.build();
+     }
+ 
++    private static AsciiString create(String name) {
++        return AsciiString.cached(Ascii.toLowerCase(name));
++    }
++
+     /**
+      * Lower-cases and converts the specified header name into an {@link AsciiString}. If {@code "name"} is
+      * a known header name, this method will return a pre-instantiated {@link AsciiString} to reduce
+      * the allocation rate of {@link AsciiString}.
++     *
++     * @throws IllegalArgumentException if the specified {@code name} is not a valid header name.
+      */
+     public static AsciiString of(CharSequence name) {
+         if (name instanceof AsciiString) {
+@@ -576,22 +613,71 @@ public static AsciiString of(CharSequence name) {
+ 
+         final String lowerCased = Ascii.toLowerCase(requireNonNull(name, "name"));
+         final AsciiString cached = map.get(lowerCased);
+-        return cached != null ? cached : AsciiString.cached(lowerCased);
++        if (cached != null) {
++            return cached;
++        }
++
++        return validate(AsciiString.cached(lowerCased));
+     }
+ 
+     /**
+      * Lower-cases and converts the specified header name into an {@link AsciiString}. If {@code "name"} is
+      * a known header name, this method will return a pre-instantiated {@link AsciiString} to reduce
+      * the allocation rate of {@link AsciiString}.
++     *
++     * @throws IllegalArgumentException if the specified {@code name} is not a valid header name.
+      */
+     public static AsciiString of(AsciiString name) {
+         final AsciiString lowerCased = name.toLowerCase();
+         final AsciiString cached = map.get(lowerCased);
+-        return cached != null ? cached : lowerCased;
++        if (cached != null) {
++            return cached;
++        }
++
++        return validate(lowerCased);
+     }
+ 
+-    private static AsciiString create(String name) {
+-        return AsciiString.cached(Ascii.toLowerCase(name));
++    private static AsciiString validate(AsciiString name) {
++        if (name.isEmpty()) {
++            throw new IllegalArgumentException("malformed header name: <EMPTY>");
++        }
++
++        final int lastIndex;
++        try {
++            lastIndex = name.forEachByte(value -> {
++                if ((value & PROHIBITED_NAME_CHAR_MASK) != 0) { // value >= 64
++                    return true;
++                }
++
++                // value < 64
++                return !PROHIBITED_NAME_CHARS.get(value);
++            });
++        } catch (Exception e) {
++            throw new Error(e);
++        }
++
++        if (lastIndex >= 0) {
++            throw new IllegalArgumentException(malformedHeaderNameMessage(name));
++        }
++
++        return name;
++    }
++
++    private static String malformedHeaderNameMessage(AsciiString name) {
++        final StringBuilder buf = new StringBuilder(IntMath.saturatedAdd(name.length(), 64));
++        buf.append("malformed header name: ");
++
++        final int nameLength = name.length();
++        for (int i = 0; i < nameLength; i++) {
++            final char ch = name.charAt(i);
++            if (PROHIBITED_NAME_CHARS.get(ch)) {
++                buf.append(PROHIBITED_NAME_CHAR_NAMES[ch]);
++            } else {
++                buf.append(ch);
++            }
++        }
++
++        return buf.toString();
+     }
+ 
+     private HttpHeaderNames() {}
+diff --git a/core/src/main/java/com/linecorp/armeria/common/HttpHeadersBase.java b/core/src/main/java/com/linecorp/armeria/common/HttpHeadersBase.java
+index 2c05dd0d383..fdefda78026 100644
+--- a/core/src/main/java/com/linecorp/armeria/common/HttpHeadersBase.java
++++ b/core/src/main/java/com/linecorp/armeria/common/HttpHeadersBase.java
+@@ -29,7 +29,6 @@
+  */
+ package com.linecorp.armeria.common;
+ 
+-import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkState;
+ import static com.linecorp.armeria.internal.ArmeriaHttpUtil.isAbsoluteUri;
+ import static io.netty.handler.codec.http2.Http2Headers.PseudoHeaderName.hasPseudoHeaderFormat;
+@@ -41,6 +40,7 @@
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.Arrays;
++import java.util.BitSet;
+ import java.util.Date;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -58,6 +58,7 @@
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Iterators;
++import com.google.common.math.IntMath;
+ 
+ import io.netty.handler.codec.DateFormatter;
+ import io.netty.util.AsciiString;
+@@ -67,6 +68,23 @@
+  */
+ class HttpHeadersBase implements HttpHeaderGetters {
+ 
++    private static final int PROHIBITED_VALUE_CHAR_MASK = ~15;
++    private static final BitSet PROHIBITED_VALUE_CHARS = new BitSet(~PROHIBITED_VALUE_CHAR_MASK + 1);
++    private static final String[] PROHIBITED_VALUE_CHAR_NAMES = new String[~PROHIBITED_VALUE_CHAR_MASK + 1];
++
++    static {
++        PROHIBITED_VALUE_CHARS.set(0);
++        PROHIBITED_VALUE_CHARS.set('\n');
++        PROHIBITED_VALUE_CHARS.set(0xB);
++        PROHIBITED_VALUE_CHARS.set('\f');
++        PROHIBITED_VALUE_CHARS.set('\r');
++        PROHIBITED_VALUE_CHAR_NAMES[0] = "<NUL>";
++        PROHIBITED_VALUE_CHAR_NAMES['\n'] = "<LF>";
++        PROHIBITED_VALUE_CHAR_NAMES[0xB] = "<VT>";
++        PROHIBITED_VALUE_CHAR_NAMES['\f'] = "<FF>";
++        PROHIBITED_VALUE_CHAR_NAMES['\r'] = "<CR>";
++    }
++
+     static final int DEFAULT_SIZE_HINT = 16;
+ 
+     /**
+@@ -545,7 +563,7 @@ final long getTimeMillisAndRemove(CharSequence name, long defaultValue) {
+     }
+ 
+     final void add(CharSequence name, String value) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(value, "value");
+         final int h = normalizedName.hashCode();
+         final int i = index(h);
+@@ -553,7 +571,7 @@ final void add(CharSequence name, String value) {
+     }
+ 
+     final void add(CharSequence name, Iterable<String> values) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(values, "values");
+         final int h = normalizedName.hashCode();
+         final int i = index(h);
+@@ -564,7 +582,7 @@ final void add(CharSequence name, Iterable<String> values) {
+     }
+ 
+     final void add(CharSequence name, String... values) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(values, "values");
+         final int h = normalizedName.hashCode();
+         final int i = index(h);
+@@ -590,7 +608,7 @@ final void addObject(CharSequence name, Object value) {
+     }
+ 
+     final void addObject(CharSequence name, Iterable<?> values) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(values, "values");
+         for (Object v : values) {
+             requireNonNullElement(values, v);
+@@ -599,7 +617,7 @@ final void addObject(CharSequence name, Iterable<?> values) {
+     }
+ 
+     final void addObject(CharSequence name, Object... values) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(values, "values");
+         for (Object v : values) {
+             requireNonNullElement(values, v);
+@@ -638,7 +656,7 @@ final void addTimeMillis(CharSequence name, long value) {
+     }
+ 
+     final void set(CharSequence name, String value) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(value, "value");
+         final int h = normalizedName.hashCode();
+         final int i = index(h);
+@@ -647,7 +665,7 @@ final void set(CharSequence name, String value) {
+     }
+ 
+     final void set(CharSequence name, Iterable<String> values) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(values, "values");
+ 
+         final int h = normalizedName.hashCode();
+@@ -661,7 +679,7 @@ final void set(CharSequence name, Iterable<String> values) {
+     }
+ 
+     final void set(CharSequence name, String... values) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(values, "values");
+ 
+         final int h = normalizedName.hashCode();
+@@ -739,7 +757,7 @@ final void setObject(CharSequence name, Object value) {
+     }
+ 
+     final void setObject(CharSequence name, Iterable<?> values) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(values, "values");
+ 
+         final int h = normalizedName.hashCode();
+@@ -753,7 +771,7 @@ final void setObject(CharSequence name, Iterable<?> values) {
+     }
+ 
+     final void setObject(CharSequence name, Object... values) {
+-        final AsciiString normalizedName = normalizeName(name);
++        final AsciiString normalizedName = HttpHeaderNames.of(name);
+         requireNonNull(values, "values");
+ 
+         final int h = normalizedName.hashCode();
+@@ -813,11 +831,6 @@ final void clear() {
+         size = 0;
+     }
+ 
+-    private static AsciiString normalizeName(CharSequence name) {
+-        checkArgument(requireNonNull(name, "name").length() > 0, "name is empty.");
+-        return HttpHeaderNames.of(name);
+-    }
+-
+     private static void requireNonNullElement(Object values, @Nullable Object e) {
+         if (e == null) {
+             throw new NullPointerException("values contains null: " + values);
+@@ -829,11 +842,44 @@ private int index(int hash) {
+     }
+ 
+     private void add0(int h, int i, AsciiString name, String value) {
++        validateValue(value);
+         // Update the hash table.
+         entries[i] = new HeaderEntry(h, name, value, entries[i]);
+         ++size;
+     }
+ 
++    private static void validateValue(String value) {
++        final int valueLength = value.length();
++        for (int i = 0; i < valueLength; i++) {
++            final char ch = value.charAt(i);
++            if ((ch & PROHIBITED_VALUE_CHAR_MASK) != 0) { // ch >= 16
++                continue;
++            }
++
++            // ch < 16
++            if (PROHIBITED_VALUE_CHARS.get(ch)) {
++                throw new IllegalArgumentException(malformedHeaderValueMessage(value));
++            }
++        }
++    }
++
++    private static String malformedHeaderValueMessage(String value) {
++        final StringBuilder buf = new StringBuilder(IntMath.saturatedAdd(value.length(), 64));
++        buf.append("malformed header value: ");
++
++        final int valueLength = value.length();
++        for (int i = 0; i < valueLength; i++) {
++            final char ch = value.charAt(i);
++            if (PROHIBITED_VALUE_CHARS.get(ch)) {
++                buf.append(PROHIBITED_VALUE_CHAR_NAMES[ch]);
++            } else {
++                buf.append(ch);
++            }
++        }
++
++        return buf.toString();
++    }
++
+     private boolean addFast(Iterable<? extends Entry<? extends CharSequence, ?>> headers) {
+         if (!(headers instanceof HttpHeadersBase)) {
+             return false;
+diff --git a/core/src/main/java/com/linecorp/armeria/internal/ArmeriaHttpUtil.java b/core/src/main/java/com/linecorp/armeria/internal/ArmeriaHttpUtil.java
+index 3b408409615..689affcbc41 100644
+--- a/core/src/main/java/com/linecorp/armeria/internal/ArmeriaHttpUtil.java
++++ b/core/src/main/java/com/linecorp/armeria/internal/ArmeriaHttpUtil.java
+@@ -673,7 +673,7 @@ private static CharSequenceMap toLowercaseMap(Iterator<? extends CharSequence> v
+         final CharSequenceMap result = new CharSequenceMap(arraySizeHint);
+ 
+         while (valuesIter.hasNext()) {
+-            final AsciiString lowerCased = HttpHeaderNames.of(valuesIter.next()).toLowerCase();
++            final AsciiString lowerCased = AsciiString.of(valuesIter.next()).toLowerCase();
+             try {
+                 int index = lowerCased.forEachByte(FIND_COMMA);
+                 if (index != -1) {
+diff --git a/core/src/test/java/com/linecorp/armeria/common/HttpHeaderNamesTest.java b/core/src/test/java/com/linecorp/armeria/common/HttpHeaderNamesTest.java
+index 5a4befcd058..6c23642135c 100644
+--- a/core/src/test/java/com/linecorp/armeria/common/HttpHeaderNamesTest.java
++++ b/core/src/test/java/com/linecorp/armeria/common/HttpHeaderNamesTest.java
+@@ -16,15 +16,16 @@
+ package com.linecorp.armeria.common;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ 
+-import org.junit.Test;
++import org.junit.jupiter.api.Test;
+ 
+ import io.netty.util.AsciiString;
+ 
+-public class HttpHeaderNamesTest {
++class HttpHeaderNamesTest {
+ 
+     @Test
+-    public void testOfAsciiString() {
++    void testOfAsciiString() {
+         // Should produce a lower-cased AsciiString.
+         final AsciiString mixedCased = AsciiString.of("Foo");
+         assertThat((Object) HttpHeaderNames.of(mixedCased)).isNotSameAs(mixedCased);
+@@ -39,11 +40,66 @@ public void testOfAsciiString() {
+     }
+ 
+     @Test
+-    public void testOfCharSequence() {
++    void testOfCharSequence() {
+         // Should produce a lower-cased AsciiString.
+         assertThat((Object) HttpHeaderNames.of("Foo")).isEqualTo(AsciiString.of("foo"));
+ 
+         // Should reuse known header name instances.
+         assertThat((Object) HttpHeaderNames.of("date")).isSameAs(HttpHeaderNames.DATE);
+     }
++
++    @Test
++    void pseudoHeaderNameValidation() {
++        // Known pseudo header names should pass validation.
++        assertThat((Object) HttpHeaderNames.of(":method")).isSameAs(HttpHeaderNames.METHOD);
++        assertThat((Object) HttpHeaderNames.of(":scheme")).isSameAs(HttpHeaderNames.SCHEME);
++        assertThat((Object) HttpHeaderNames.of(":authority")).isSameAs(HttpHeaderNames.AUTHORITY);
++        assertThat((Object) HttpHeaderNames.of(":path")).isSameAs(HttpHeaderNames.PATH);
++        assertThat((Object) HttpHeaderNames.of(":status")).isSameAs(HttpHeaderNames.STATUS);
++
++        // However, any other headers that start with `:` should fail.
++        assertThatThrownBy(() -> HttpHeaderNames.of(":foo"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: :foo");
++    }
++
++    @Test
++    void headerNameValidation() {
++        assertThatThrownBy(() -> HttpHeaderNames.of(""))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <EMPTY>");
++        assertThatThrownBy(() -> HttpHeaderNames.of("\u0000"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <NUL>");
++        assertThatThrownBy(() -> HttpHeaderNames.of("\t"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <TAB>");
++        assertThatThrownBy(() -> HttpHeaderNames.of("\n"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <LF>");
++        assertThatThrownBy(() -> HttpHeaderNames.of("\u000B"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <VT>");
++        assertThatThrownBy(() -> HttpHeaderNames.of("\f"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <FF>");
++        assertThatThrownBy(() -> HttpHeaderNames.of("\r"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <CR>");
++        assertThatThrownBy(() -> HttpHeaderNames.of(" "))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <SP>");
++        assertThatThrownBy(() -> HttpHeaderNames.of(","))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: ,");
++        assertThatThrownBy(() -> HttpHeaderNames.of(":"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: :");
++        assertThatThrownBy(() -> HttpHeaderNames.of(";"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: ;");
++        assertThatThrownBy(() -> HttpHeaderNames.of("="))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: =");
++    }
+ }
+diff --git a/core/src/test/java/com/linecorp/armeria/common/HttpHeadersBaseTest.java b/core/src/test/java/com/linecorp/armeria/common/HttpHeadersBaseTest.java
+index 13c7b1b62a8..d6898077c69 100644
+--- a/core/src/test/java/com/linecorp/armeria/common/HttpHeadersBaseTest.java
++++ b/core/src/test/java/com/linecorp/armeria/common/HttpHeadersBaseTest.java
+@@ -31,7 +31,7 @@
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+-import static org.junit.Assert.fail;
++import static org.junit.jupiter.api.Assertions.fail;
+ 
+ import java.net.URI;
+ import java.util.Iterator;
+@@ -39,17 +39,17 @@
+ import java.util.Map;
+ import java.util.NoSuchElementException;
+ 
+-import org.junit.Test;
++import org.junit.jupiter.api.Test;
+ 
+ import com.google.common.collect.ImmutableList;
+ 
+ import io.netty.handler.codec.http2.Http2Headers.PseudoHeaderName;
+ import io.netty.util.AsciiString;
+ 
+-public class HttpHeadersBaseTest {
++class HttpHeadersBaseTest {
+ 
+     @Test
+-    public void testEqualsInsertionOrderSameHeaderName() {
++    void testEqualsInsertionOrderSameHeaderName() {
+         final HttpHeadersBase h1 = newEmptyHeaders();
+         h1.add("a", "b");
+         h1.add("a", "c");
+@@ -60,7 +60,7 @@ public void testEqualsInsertionOrderSameHeaderName() {
+     }
+ 
+     @Test
+-    public void testEqualsInsertionOrderDifferentHeaderNames() {
++    void testEqualsInsertionOrderDifferentHeaderNames() {
+         final HttpHeadersBase h1 = newEmptyHeaders();
+         h1.add("a", "b");
+         h1.add("c", "d");
+@@ -73,7 +73,7 @@ public void testEqualsInsertionOrderDifferentHeaderNames() {
+     // Tests forked from io.netty.handler.codec.DefaultHeadersTest
+ 
+     @Test
+-    public void addShouldIncreaseAndRemoveShouldDecreaseTheSize() {
++    void addShouldIncreaseAndRemoveShouldDecreaseTheSize() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         assertThat(headers.size()).isEqualTo(0);
+         headers.add("name1", "value1", "value2");
+@@ -93,7 +93,7 @@ public void addShouldIncreaseAndRemoveShouldDecreaseTheSize() {
+     }
+ 
+     @Test
+-    public void afterClearHeadersShouldBeEmpty() {
++    void afterClearHeadersShouldBeEmpty() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1");
+         headers.add("name2", "value2");
+@@ -106,7 +106,7 @@ public void afterClearHeadersShouldBeEmpty() {
+     }
+ 
+     @Test
+-    public void removingANameForASecondTimeShouldReturnFalse() {
++    void removingANameForASecondTimeShouldReturnFalse() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1");
+         headers.add("name2", "value2");
+@@ -115,7 +115,7 @@ public void removingANameForASecondTimeShouldReturnFalse() {
+     }
+ 
+     @Test
+-    public void multipleValuesPerNameShouldBeAllowed() {
++    void multipleValuesPerNameShouldBeAllowed() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name", "value1");
+         headers.add("name", "value2");
+@@ -128,7 +128,7 @@ public void multipleValuesPerNameShouldBeAllowed() {
+     }
+ 
+     @Test
+-    public void multipleValuesPerNameIteratorWithOtherNames() {
++    void multipleValuesPerNameIteratorWithOtherNames() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1");
+         headers.add("name1", "value2");
+@@ -146,7 +146,7 @@ public void multipleValuesPerNameIteratorWithOtherNames() {
+     }
+ 
+     @Test
+-    public void multipleValuesPerNameIterator() {
++    void multipleValuesPerNameIterator() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1");
+         headers.add("name1", "value2");
+@@ -157,7 +157,7 @@ public void multipleValuesPerNameIterator() {
+     }
+ 
+     @Test
+-    public void multipleValuesPerNameIteratorEmpty() {
++    void multipleValuesPerNameIteratorEmpty() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         assertThat(headers.valueIterator("name")).isExhausted();
+         assertThatThrownBy(() -> headers.valueIterator("name").next())
+@@ -165,7 +165,7 @@ public void multipleValuesPerNameIteratorEmpty() {
+     }
+ 
+     @Test
+-    public void testContains() {
++    void testContains() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+ 
+         headers.addLong("long", Long.MAX_VALUE);
+@@ -200,7 +200,7 @@ public void testContains() {
+     }
+ 
+     @Test
+-    public void testCopy() throws Exception {
++    void testCopy() throws Exception {
+         HttpHeadersBase headers = newEmptyHeaders();
+         headers.addLong("long", Long.MAX_VALUE);
+         headers.addInt("int", Integer.MIN_VALUE);
+@@ -239,7 +239,7 @@ public void testCopy() throws Exception {
+     }
+ 
+     @Test
+-    public void canMixConvertedAndNormalValues() {
++    void canMixConvertedAndNormalValues() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name", "value");
+         headers.addInt("name", 100);
+@@ -251,7 +251,7 @@ public void canMixConvertedAndNormalValues() {
+     }
+ 
+     @Test
+-    public void testGetAndRemove() {
++    void testGetAndRemove() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1");
+         headers.add("name2", "value2", "value3");
+@@ -267,14 +267,14 @@ public void testGetAndRemove() {
+     }
+ 
+     @Test
+-    public void whenNameContainsMultipleValuesGetShouldReturnTheFirst() {
++    void whenNameContainsMultipleValuesGetShouldReturnTheFirst() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1", "value2");
+         assertThat(headers.get("name1")).isEqualTo("value1");
+     }
+ 
+     @Test
+-    public void getWithDefaultValueWorks() {
++    void getWithDefaultValueWorks() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1");
+ 
+@@ -283,7 +283,7 @@ public void getWithDefaultValueWorks() {
+     }
+ 
+     @Test
+-    public void setShouldOverWritePreviousValue() {
++    void setShouldOverWritePreviousValue() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.set("name", "value1");
+         headers.set("name", "value2");
+@@ -294,7 +294,7 @@ public void setShouldOverWritePreviousValue() {
+     }
+ 
+     @Test
+-    public void setAllShouldOverwriteSomeAndLeaveOthersUntouched() {
++    void setAllShouldOverwriteSomeAndLeaveOthersUntouched() {
+         final HttpHeadersBase h1 = newEmptyHeaders();
+ 
+         h1.add("name1", "value1");
+@@ -319,7 +319,7 @@ public void setAllShouldOverwriteSomeAndLeaveOthersUntouched() {
+     }
+ 
+     @Test
+-    public void headersWithSameNamesAndValuesShouldBeEquivalent() {
++    void headersWithSameNamesAndValuesShouldBeEquivalent() {
+         final HttpHeadersBase headers1 = newEmptyHeaders();
+         headers1.add("name1", "value1");
+         headers1.add("name2", "value2");
+@@ -340,7 +340,7 @@ public void headersWithSameNamesAndValuesShouldBeEquivalent() {
+     }
+ 
+     @Test
+-    public void emptyHeadersShouldBeEqual() {
++    void emptyHeadersShouldBeEqual() {
+         final HttpHeadersBase headers1 = newEmptyHeaders();
+         final HttpHeadersBase headers2 = newEmptyHeaders();
+         assertThat(headers2).isEqualTo(headers1);
+@@ -348,7 +348,7 @@ public void emptyHeadersShouldBeEqual() {
+     }
+ 
+     @Test
+-    public void headersWithSameNamesButDifferentValuesShouldNotBeEquivalent() {
++    void headersWithSameNamesButDifferentValuesShouldNotBeEquivalent() {
+         final HttpHeadersBase headers1 = newEmptyHeaders();
+         headers1.add("name1", "value1");
+         final HttpHeadersBase headers2 = newEmptyHeaders();
+@@ -357,7 +357,7 @@ public void headersWithSameNamesButDifferentValuesShouldNotBeEquivalent() {
+     }
+ 
+     @Test
+-    public void subsetOfHeadersShouldNotBeEquivalent() {
++    void subsetOfHeadersShouldNotBeEquivalent() {
+         final HttpHeadersBase headers1 = newEmptyHeaders();
+         headers1.add("name1", "value1");
+         headers1.add("name2", "value2");
+@@ -367,7 +367,7 @@ public void subsetOfHeadersShouldNotBeEquivalent() {
+     }
+ 
+     @Test
+-    public void headersWithDifferentNamesAndValuesShouldNotBeEquivalent() {
++    void headersWithDifferentNamesAndValuesShouldNotBeEquivalent() {
+         final HttpHeadersBase h1 = newEmptyHeaders();
+         h1.set("name1", "value1");
+         final HttpHeadersBase h2 = newEmptyHeaders();
+@@ -378,15 +378,15 @@ public void headersWithDifferentNamesAndValuesShouldNotBeEquivalent() {
+         assertThat(h2).isEqualTo(h2);
+     }
+ 
+-    @Test(expected = NoSuchElementException.class)
+-    public void iterateEmptyHeadersShouldThrow() {
++    @Test
++    void iterateEmptyHeadersShouldThrow() {
+         final Iterator<Map.Entry<AsciiString, String>> iterator = newEmptyHeaders().iterator();
+         assertThat(iterator.hasNext()).isFalse();
+-        iterator.next();
++        assertThatThrownBy(iterator::next).isInstanceOf(NoSuchElementException.class);
+     }
+ 
+     @Test
+-    public void iteratorShouldReturnAllNameValuePairs() {
++    void iteratorShouldReturnAllNameValuePairs() {
+         final HttpHeadersBase headers1 = newEmptyHeaders();
+         headers1.add("name1", "value1", "value2");
+         headers1.add("name2", "value3");
+@@ -403,7 +403,7 @@ public void iteratorShouldReturnAllNameValuePairs() {
+     }
+ 
+     @Test
+-    public void iteratorSetShouldFail() {
++    void iteratorSetShouldFail() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1", "value2", "value3");
+         headers.add("name2", "value4");
+@@ -414,7 +414,7 @@ public void iteratorSetShouldFail() {
+     }
+ 
+     @Test
+-    public void testEntryEquals() {
++    void testEntryEquals() {
+         final HttpHeadersBase nameValue = newEmptyHeaders();
+         nameValue.add("name", "value");
+         final HttpHeadersBase nameValueCopy = newEmptyHeaders();
+@@ -444,13 +444,13 @@ public void testEntryEquals() {
+     }
+ 
+     @Test
+-    public void getAllReturnsEmptyListForUnknownName() {
++    void getAllReturnsEmptyListForUnknownName() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         assertThat(headers.getAll("noname").size()).isEqualTo(0);
+     }
+ 
+     @Test
+-    public void setHeadersShouldClearAndOverwrite() {
++    void setHeadersShouldClearAndOverwrite() {
+         final HttpHeadersBase headers1 = newEmptyHeaders();
+         headers1.add("name", "value");
+ 
+@@ -463,7 +463,7 @@ public void setHeadersShouldClearAndOverwrite() {
+     }
+ 
+     @Test
+-    public void setHeadersShouldOnlyOverwriteHeaders() {
++    void setHeadersShouldOnlyOverwriteHeaders() {
+         final HttpHeadersBase headers1 = newEmptyHeaders();
+         headers1.add("name", "value");
+         headers1.add("name1", "value1");
+@@ -481,14 +481,14 @@ public void setHeadersShouldOnlyOverwriteHeaders() {
+         assertThat(expected).isEqualTo(headers1);
+     }
+ 
+-    @Test(expected = IllegalArgumentException.class)
+-    public void testAddSelf() {
++    @Test
++    void testAddSelf() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+-        headers.add(headers);
++        assertThatThrownBy(() -> headers.add(headers)).isInstanceOf(IllegalArgumentException.class);
+     }
+ 
+     @Test
+-    public void testSetSelfIsNoOp() {
++    void testSetSelfIsNoOp() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name", "value");
+         headers.set(headers);
+@@ -496,7 +496,7 @@ public void testSetSelfIsNoOp() {
+     }
+ 
+     @Test
+-    public void testToString() {
++    void testToString() {
+         HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("name1", "value1");
+         headers.add("name1", "value2");
+@@ -527,7 +527,7 @@ public void testToString() {
+     }
+ 
+     @Test
+-    public void testNotThrowWhenConvertFails() {
++    void testNotThrowWhenConvertFails() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.set("name1", "");
+         assertThat(headers.getInt("name1")).isNull();
+@@ -546,10 +546,30 @@ public void testNotThrowWhenConvertFails() {
+         assertThat(headers.getTimeMillis("name1", Long.MAX_VALUE)).isEqualTo(Long.MAX_VALUE);
+     }
+ 
++    @Test
++    void valueValidation() {
++        final HttpHeadersBase headers = newEmptyHeaders();
++        assertThatThrownBy(() -> headers.add("foo", "\u0000"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header value: <NUL>");
++        assertThatThrownBy(() -> headers.add("foo", "\n"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header value: <LF>");
++        assertThatThrownBy(() -> headers.add("foo", "\u000B"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header value: <VT>");
++        assertThatThrownBy(() -> headers.add("foo", "\f"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header value: <FF>");
++        assertThatThrownBy(() -> headers.add("foo", "\r"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header value: <CR>");
++    }
++
+     // Tests forked from io.netty.handler.codec.http.HttpHeadersTest
+ 
+     @Test
+-    public void testGetOperations() {
++    void testGetOperations() {
+         final HttpHeadersBase headers = newEmptyHeaders();
+         headers.add("Foo", "1");
+         headers.add("Foo", "2");
+@@ -560,33 +580,35 @@ public void testGetOperations() {
+         assertThat(values).containsExactly("1", "2");
+     }
+ 
+-    @Test(expected = NullPointerException.class)
+-    public void testSetNullHeaderValue() {
+-        final HttpHeadersBase headers = newEmptyHeaders();
+-        headers.set("test", (String) null);
++    @Test
++    void testSetNullHeaderValue() {
++        assertThatThrownBy(() -> newEmptyHeaders().set("test", (String) null))
++                .isInstanceOf(NullPointerException.class);
+     }
+ 
+     // Tests forked from io.netty.handler.codec.http2.DefaultHttp2HeadersTest
+ 
+-    @Test(expected = NullPointerException.class)
+-    public void nullHeaderNameNotAllowed() {
+-        newEmptyHeaders().add(null, "foo");
++    @Test
++    void nullHeaderNameNotAllowed() {
++        assertThatThrownBy(() -> newEmptyHeaders().add(null, "foo")).isInstanceOf(NullPointerException.class);
+     }
+ 
+-    @Test(expected = IllegalArgumentException.class)
+-    public void emptyHeaderNameNotAllowed() {
+-        newEmptyHeaders().add("", "foo");
++    @Test
++    void emptyHeaderNameNotAllowed() {
++        assertThatThrownBy(() -> newEmptyHeaders().add("", "foo"))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessageContaining("malformed header name: <EMPTY>");
+     }
+ 
+     @Test
+-    public void testPseudoHeadersMustComeFirstWhenIterating() {
++    void testPseudoHeadersMustComeFirstWhenIterating() {
+         final HttpHeadersBase headers = newHttp2Headers();
+         verifyPseudoHeadersFirst(headers);
+         verifyAllPseudoHeadersPresent(headers);
+     }
+ 
+     @Test
+-    public void testPseudoHeadersWithRemovePreservesPseudoIterationOrder() {
++    void testPseudoHeadersWithRemovePreservesPseudoIterationOrder() {
+         final HttpHeadersBase headers = newHttp2Headers();
+         final HttpHeadersBase nonPseudoHeaders = newEmptyHeaders();
+         for (Map.Entry<AsciiString, String> entry : headers) {
+@@ -614,7 +636,7 @@ public void testPseudoHeadersWithRemovePreservesPseudoIterationOrder() {
+     }
+ 
+     @Test
+-    public void testPseudoHeadersWithClearDoesNotLeak() {
++    void testPseudoHeadersWithClearDoesNotLeak() {
+         final HttpHeadersBase headers = newHttp2Headers();
+ 
+         assertThat(headers.isEmpty()).isFalse();
+@@ -643,7 +665,7 @@ public void testPseudoHeadersWithClearDoesNotLeak() {
+     }
+ 
+     @Test
+-    public void testSetOrdersPseudoHeadersCorrectly() {
++    void testSetOrdersPseudoHeadersCorrectly() {
+         final HttpHeadersBase headers = newHttp2Headers();
+         final HttpHeadersBase other = newEmptyHeaders();
+         other.add("name2", "value2");
+@@ -663,7 +685,7 @@ public void testSetOrdersPseudoHeadersCorrectly() {
+     }
+ 
+     @Test
+-    public void testHeaderNameNormalization() {
++    void testHeaderNameNormalization() {
+         final HttpHeadersBase headers = newHttp2Headers();
+         headers.add("Foo", "bar");
+         assertThat(headers.getAll("foo")).containsExactly("bar");
+@@ -673,7 +695,7 @@ public void testHeaderNameNormalization() {
+     }
+ 
+     @Test
+-    public void testClearResetsPseudoHeaderDivision() {
++    void testClearResetsPseudoHeaderDivision() {
+         final HttpHeadersBase http2Headers = newHttp2Headers();
+         http2Headers.method(HttpMethod.POST);
+         http2Headers.set("some", "value");
+@@ -684,7 +706,7 @@ public void testClearResetsPseudoHeaderDivision() {
+     }
+ 
+     @Test
+-    public void testContainsNameAndValue() {
++    void testContainsNameAndValue() {
+         final HttpHeadersBase headers = newHttp2Headers();
+         assertThat(headers.contains("name1", "value2")).isTrue();
+         assertThat(headers.contains("name1", "Value2")).isFalse();
+@@ -693,7 +715,7 @@ public void testContainsNameAndValue() {
+     }
+ 
+     @Test
+-    public void testUri() {
++    void testUri() {
+         final HttpHeadersBase headers = newHttp2Headers();
+         assertThat(headers.uri()).isEqualTo(URI.create("https://netty.io/index.html"));
+     }
+diff --git a/core/src/test/java/com/linecorp/armeria/server/HttpServerHeaderValidationTest.java b/core/src/test/java/com/linecorp/armeria/server/HttpServerHeaderValidationTest.java
+new file mode 100644
+index 00000000000..807102e7b64
+--- /dev/null
++++ b/core/src/test/java/com/linecorp/armeria/server/HttpServerHeaderValidationTest.java
+@@ -0,0 +1,101 @@
++/*
++ * Copyright 2016 LINE Corporation
++ *
++ * LINE Corporation licenses this file to you under the Apache License,
++ * version 2.0 (the "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at:
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++ * License for the specific language governing permissions and limitations
++ * under the License.
++ */
++package com.linecorp.armeria.server;
++
++import static com.linecorp.armeria.common.SessionProtocol.H1;
++import static com.linecorp.armeria.common.SessionProtocol.H1C;
++import static com.linecorp.armeria.common.SessionProtocol.H2;
++import static com.linecorp.armeria.common.SessionProtocol.H2C;
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.util.stream.Stream;
++
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.Timeout;
++import org.junit.jupiter.api.extension.ExtensionContext;
++import org.junit.jupiter.api.extension.RegisterExtension;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.Arguments;
++import org.junit.jupiter.params.provider.ArgumentsProvider;
++import org.junit.jupiter.params.provider.ArgumentsSource;
++
++import com.linecorp.armeria.client.ClientFactory;
++import com.linecorp.armeria.client.WebClient;
++import com.linecorp.armeria.common.AggregatedHttpResponse;
++import com.linecorp.armeria.common.HttpData;
++import com.linecorp.armeria.common.HttpResponse;
++import com.linecorp.armeria.common.HttpStatus;
++import com.linecorp.armeria.common.ResponseHeaders;
++import com.linecorp.armeria.testing.junit.server.ServerExtension;
++
++import io.netty.handler.codec.http.QueryStringDecoder;
++import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
++
++@Timeout(10000)
++class HttpServerHeaderValidationTest {
++
++    static final ClientFactory clientFactory = ClientFactory.builder().sslContextCustomizer(scb -> {
++        scb.trustManager(InsecureTrustManagerFactory.INSTANCE);
++    }).build();
++
++    @RegisterExtension
++    static final ServerExtension server = new ServerExtension() {
++        @Override
++        protected void configure(ServerBuilder sb) throws Exception {
++            sb.http(0);
++            sb.https(0);
++            sb.tlsSelfSigned();
++
++            sb.route().get("/headers-custom")
++              .build((ctx, req) -> {
++                  final String param = new QueryStringDecoder(req.path()).parameters()
++                                                                         .get("param").get(0);
++                  return HttpResponse.of(
++                          ResponseHeaders.of(HttpStatus.OK, "server-header", param),
++                          HttpData.ofUtf8("OK"));
++              });
++        }
++    };
++
++    @AfterAll
++    static void closeClientFactory() {
++        clientFactory.close();
++    }
++
++    @ParameterizedTest
++    @ArgumentsSource(WebClientProvider.class)
++    void malformedHeaderValue(WebClient client) throws Exception {
++        final String payloadRaw = "my-header\r\nnot-a-header: should_be_illegal";
++        final String payload = URLEncoder.encode(payloadRaw, StandardCharsets.US_ASCII.name());
++        final String path = "/headers-custom?param=" + payload;
++        final AggregatedHttpResponse res = client.get(path).aggregate().get();
++        assertThat(res.status()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
++        assertThat(res.headers().get("not-a-header")).isNull();
++    }
++
++    private static class WebClientProvider implements ArgumentsProvider {
++        @Override
++        public Stream<? extends Arguments> provideArguments(ExtensionContext context) {
++            return Stream.of(H1C, H1, H2C, H2)
++                         .map(protocol -> Arguments.of(WebClient.of(
++                                 clientFactory,
++                                 protocol.uriText() + "://127.0.0.1:" +
++                                 (protocol.isTls() ? server.httpsPort() : server.httpPort()))));
++        }
++    }
++}

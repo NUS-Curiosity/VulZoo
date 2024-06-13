@@ -1,0 +1,990 @@
+diff --git a/src/Css/Stylesheet.php b/src/Css/Stylesheet.php
+index 18b210fe1..2720388d4 100644
+--- a/src/Css/Stylesheet.php
++++ b/src/Css/Stylesheet.php
+@@ -325,46 +325,26 @@ function load_css_file($file, $origin = self::ORIG_AUTHOR)
+             $parsed = Helpers::parse_data_uri($file);
+             $css = $parsed["data"];
+         } else {
+-            $parsed_url = Helpers::explode_url($file);
+-
+-            [$this->_protocol, $this->_base_host, $this->_base_path, $filename] = $parsed_url;
++            $options = $this->_dompdf->getOptions();
+ 
+-            $file = Helpers::build_url($this->_protocol, $this->_base_host, $this->_base_path, $filename);
++            $parsed_url = Helpers::explode_url($file);
++            $protocol = $parsed_url["protocol"];
+ 
+-            $options = $this->_dompdf->getOptions();
+-            // Download the remote file
+-            if (!$options->isRemoteEnabled() && ($this->_protocol !== "" && $this->_protocol !== "file://")) {
+-                Helpers::record_warnings(E_USER_WARNING, "Remote CSS resource '$file' referenced, but remote file download is disabled.", __FILE__, __LINE__);
+-                return;
+-            }
+-            if ($this->_protocol === "" || $this->_protocol === "file://") {
+-                $realfile = realpath($file);
+-
+-                $rootDir = realpath($options->getRootDir());
+-                if (strpos($realfile, $rootDir) !== 0) {
+-                    $chroot = $options->getChroot();
+-                    $chrootValid = false;
+-                    foreach ($chroot as $chrootPath) {
+-                        $chrootPath = realpath($chrootPath);
+-                        if ($chrootPath !== false && strpos($realfile, $chrootPath) === 0) {
+-                            $chrootValid = true;
+-                            break;
+-                        }
+-                    }
+-                    if ($chrootValid !== true) {
+-                        Helpers::record_warnings(E_USER_WARNING, "Permission denied on $file. The file could not be found under the paths specified by Options::chroot.", __FILE__, __LINE__);
++            if ($file !== $this->getDefaultStylesheet()) {
++                $allowed_protocols = $options->getAllowedProtocols();
++                if (!array_key_exists($protocol, $allowed_protocols)) {
++                    Helpers::record_warnings(E_USER_WARNING, "Permission denied on $file. The communication protocol is not supported.", __FILE__, __LINE__);
++                    return;
++                }
++                foreach ($allowed_protocols[$protocol]["rules"] as $rule) {
++                    [$result, $message] = $rule($file);
++                    if (!$result) {
++                        Helpers::record_warnings(E_USER_WARNING, "Error loading $file: $message", __FILE__, __LINE__);
+                         return;
+                     }
+                 }
+-
+-                if (!$realfile) {
+-                    Helpers::record_warnings(E_USER_WARNING, "File '$realfile' not found.", __FILE__, __LINE__);
+-                    return;
+-                }
+-
+-                $file = $realfile;
+             }
+-            
++
+             [$css, $http_response_header] = Helpers::getFileContent($file, $this->_dompdf->getHttpContext());
+ 
+             $good_mime_type = true;
+@@ -379,11 +359,12 @@ function load_css_file($file, $origin = self::ORIG_AUTHOR)
+                     }
+                 }
+             }
+-
+             if (!$good_mime_type || $css === null) {
+                 Helpers::record_warnings(E_USER_WARNING, "Unable to load css file $file", __FILE__, __LINE__);
+                 return;
+             }
++
++            [$this->_protocol, $this->_base_host, $this->_base_path] = $parsed_url;
+         }
+ 
+         $this->_parse_css($css);
+@@ -1421,20 +1402,16 @@ public function resolve_url($val): string
+             $val = preg_replace("/url\(\s*['\"]?([^'\")]+)['\"]?\s*\)/", "\\1", trim($val));
+ 
+             // Resolve the url now in the context of the current stylesheet
+-            $parsed_url = Helpers::explode_url($val);
+             $path = Helpers::build_url($this->_protocol,
+                 $this->_base_host,
+                 $this->_base_path,
+                 $val);
+-            if (($parsed_url["protocol"] === "" || $parsed_url["protocol"] === "file://") && ($this->_protocol === "" || $this->_protocol === "file://")) {
+-                $path = realpath($path);
+-                // If realpath returns FALSE then specifically state that there is no background image
+-                if ($path === false) {
+-                    $path = "none";
+-                }
++            if ($path === null) {
++                $path = "none";
+             }
+         }
+         if ($DEBUGCSS) {
++            $parsed_url = Helpers::explode_url($path);
+             print "<pre>[_image\n";
+             print_r($parsed_url);
+             print $this->_protocol . "\n" . $this->_base_path . "\n" . $path . "\n";
+@@ -1483,9 +1460,9 @@ private function _parse_import($url)
+             // Above does not work for subfolders and absolute urls.
+             // Todo: As above, do we need to replace php or file to an empty protocol for local files?
+ 
+-            $url = $this->resolve_url($url);
+-
+-            $this->load_css_file($url);
++            if (($url = $this->resolve_url($url)) !== "none") {
++                $this->load_css_file($url);
++            }
+ 
+             // Restore the current base url
+             $this->_protocol = $protocol;
+@@ -1675,7 +1652,7 @@ public function getDefaultStylesheet()
+     {
+         $options = $this->_dompdf->getOptions();
+         $rootDir = realpath($options->getRootDir());
+-        return $rootDir . self::DEFAULT_STYLESHEET;
++        return Helpers::build_url("file://", "", $rootDir, $rootDir . self::DEFAULT_STYLESHEET);
+     }
+ 
+     /**
+diff --git a/src/Dompdf.php b/src/Dompdf.php
+index 73b1a39b9..7e657af20 100644
+--- a/src/Dompdf.php
++++ b/src/Dompdf.php
+@@ -196,16 +196,6 @@ class Dompdf
+      */
+     private $quirksmode = false;
+ 
+-    /**
+-    * Protocol whitelist
+-    *
+-    * Protocols and PHP wrappers allowed in URLs. Full support is not
+-    * guaranteed for the protocols/wrappers contained in this array.
+-    *
+-    * @var array
+-    */
+-    private $allowedProtocols = ["", "file://", "http://", "https://"];
+-
+     /**
+     * Local file extension whitelist
+     *
+@@ -271,8 +261,11 @@ public function __construct($options = null)
+         }
+ 
+         $versionFile = realpath(__DIR__ . '/../VERSION');
+-        if (file_exists($versionFile) && ($version = trim(file_get_contents($versionFile))) !== false && $version !== '$Format:<%h>$') {
+-            $this->version = sprintf('dompdf %s', $version);
++        if (($version = file_get_contents($versionFile)) !== false) {
++            $version = trim($version);
++            if ($version !== '$Format:<%h>$') {
++                $this->version = sprintf('dompdf %s', $version);
++            }
+         }
+ 
+         $this->setPhpConfig();
+@@ -352,43 +345,25 @@ public function loadHtmlFile($file, $encoding = null)
+             [$this->protocol, $this->baseHost, $this->basePath] = Helpers::explode_url($file);
+         }
+         $protocol = strtolower($this->protocol);
+-        
+         $uri = Helpers::build_url($this->protocol, $this->baseHost, $this->basePath, $file);
+ 
+-        if (!in_array($protocol, $this->allowedProtocols, true)) {
++        $allowed_protocols = $this->options->getAllowedProtocols();
++        if (!array_key_exists($protocol, $allowed_protocols)) {
+             throw new Exception("Permission denied on $file. The communication protocol is not supported.");
+         }
+ 
+-        if (!$this->options->isRemoteEnabled() && ($protocol !== "" && $protocol !== "file://")) {
+-            throw new Exception("Remote file requested, but remote file download is disabled.");
+-        }
+-
+-        if ($protocol === "" || $protocol === "file://") {
+-            $realfile = realpath($uri);
+-
+-            $chroot = $this->options->getChroot();
+-            $chrootValid = false;
+-            foreach ($chroot as $chrootPath) {
+-                $chrootPath = realpath($chrootPath);
+-                if ($chrootPath !== false && strpos($realfile, $chrootPath) === 0) {
+-                    $chrootValid = true;
+-                    break;
+-                }
+-            }
+-            if ($chrootValid !== true) {
+-                throw new Exception("Permission denied on $file. The file could not be found under the paths specified by Options::chroot.");
+-            }
+-
+-            $ext = strtolower(pathinfo($realfile, PATHINFO_EXTENSION));
++        if ($protocol === "file://") {
++            $ext = strtolower(pathinfo($uri, PATHINFO_EXTENSION));
+             if (!in_array($ext, $this->allowedLocalFileExtensions)) {
+-                throw new Exception("Permission denied on $file. This file extension is forbidden");
++                throw new Exception("Permission denied on $file: The file extension is forbidden.");
+             }
++        }
+ 
+-            if (!$realfile) {
+-                throw new Exception("File '$file' not found.");
++        foreach ($allowed_protocols[$protocol]["rules"] as $rule) {
++            [$result, $message] = $rule($uri);
++            if (!$result) {
++                throw new Exception("Error loading $file: $message");
+             }
+-
+-            $uri = $realfile;
+         }
+ 
+         [$contents, $http_response_header] = Helpers::getFileContent($uri, $this->options->getHttpContext());
+@@ -604,7 +579,9 @@ private function processHtml()
+                         $url = $tag->getAttribute("href");
+                         $url = Helpers::build_url($this->protocol, $this->baseHost, $this->basePath, $url);
+ 
+-                        $this->css->load_css_file($url, Stylesheet::ORIG_AUTHOR);
++                        if ($url !== null) {
++                            $this->css->load_css_file($url, Stylesheet::ORIG_AUTHOR);
++                        }
+                     }
+                     break;
+ 
+diff --git a/src/FontMetrics.php b/src/FontMetrics.php
+index 1d0a9c471..83d0c99c7 100644
+--- a/src/FontMetrics.php
++++ b/src/FontMetrics.php
+@@ -214,37 +214,18 @@ public function registerFont($style, $remoteFile, $context = null)
+ 
+         // Download the remote file
+         [$protocol] = Helpers::explode_url($remoteFile);
+-        if (!$this->options->isRemoteEnabled() && ($protocol !== "" && $protocol !== "file://")) {
+-            Helpers::record_warnings(E_USER_WARNING, "Remote font resource $remoteFile referenced, but remote file download is disabled.", __FILE__, __LINE__);
+-            return false;
++        $allowed_protocols = $this->options->getAllowedProtocols();
++        if (!array_key_exists($protocol, $allowed_protocols)) {
++            Helpers::record_warnings(E_USER_WARNING, "Permission denied on $remoteFile. The communication protocol is not supported.", __FILE__, __LINE__);
+         }
+-        if ($protocol === "" || $protocol === "file://") {
+-            $realfile = realpath($remoteFile);
+-
+-            $rootDir = realpath($this->options->getRootDir());
+-            if (strpos($realfile, $rootDir) !== 0) {
+-                $chroot = $this->options->getChroot();
+-                $chrootValid = false;
+-                foreach ($chroot as $chrootPath) {
+-                    $chrootPath = realpath($chrootPath);
+-                    if ($chrootPath !== false && strpos($realfile, $chrootPath) === 0) {
+-                        $chrootValid = true;
+-                        break;
+-                    }
+-                }
+-                if ($chrootValid !== true) {
+-                    Helpers::record_warnings(E_USER_WARNING, "Permission denied on $remoteFile. The file could not be found under the paths specified by Options::chroot.", __FILE__, __LINE__);
+-                    return false;
+-                }
+-            }
+ 
+-            if (!$realfile) {
+-                Helpers::record_warnings(E_USER_WARNING, "File '$realfile' not found.", __FILE__, __LINE__);
+-                return false;
++        foreach ($allowed_protocols[$protocol]["rules"] as $rule) {
++            [$result, $message] = $rule($remoteFile);
++            if ($result !== true) {
++                Helpers::record_warnings(E_USER_WARNING, "Error loading $remoteFile: $message", __FILE__, __LINE__);
+             }
+-
+-            $remoteFile = $realfile;
+         }
++
+         list($remoteFileContent, $http_response_header) = @Helpers::getFileContent($remoteFile, $context);
+         if ($remoteFileContent === null) {
+             return false;
+diff --git a/src/FrameDecorator/Image.php b/src/FrameDecorator/Image.php
+index 61df2bc8a..c52aae803 100644
+--- a/src/FrameDecorator/Image.php
++++ b/src/FrameDecorator/Image.php
+@@ -57,7 +57,7 @@ function __construct(Frame $frame, Dompdf $dompdf)
+             $dompdf->getProtocol(),
+             $dompdf->getBaseHost(),
+             $dompdf->getBasePath(),
+-            $dompdf
++            $dompdf->getOptions()
+         );
+ 
+         if (Cache::is_broken($this->_image_url) &&
+diff --git a/src/Helpers.php b/src/Helpers.php
+index 6b56c58c9..ece05c567 100644
+--- a/src/Helpers.php
++++ b/src/Helpers.php
+@@ -57,28 +57,45 @@ public static function pre_r($mixed, $return = false)
+     public static function build_url($protocol, $host, $base_path, $url)
+     {
+         $protocol = mb_strtolower($protocol);
++        if (empty($protocol)) {
++            $protocol = "file://";
++        }
+         if ($url === "") {
+-            //return $protocol . $host . rtrim($base_path, "/\\") . "/";
+-            return $protocol . $host . $base_path;
++            return null;
+         }
+ 
++        $url_lc = mb_strtolower($url);
++
+         // Is the url already fully qualified, a Data URI, or a reference to a named anchor?
+         // File-protocol URLs may require additional processing (e.g. for URLs with a relative path)
+-        if ((mb_strpos($url, "://") !== false && substr($url, 0, 7) !== "file://") || mb_substr($url, 0, 1) === "#" || mb_strpos($url, "data:") === 0 || mb_strpos($url, "mailto:") === 0 || mb_strpos($url, "tel:") === 0) {
++        if (
++            (
++                mb_strpos($url_lc, "://") !== false
++                && !in_array(substr($url_lc, 0, 7), ["file://", "phar://"], true)
++            )
++            || mb_substr($url_lc, 0, 1) === "#"
++            || mb_strpos($url_lc, "data:") === 0
++            || mb_strpos($url_lc, "mailto:") === 0
++            || mb_strpos($url_lc, "tel:") === 0
++        ) {
+             return $url;
+         }
+ 
+-        if (strpos($url, "file://") === 0) {
++        $res = "";
++        if (strpos($url_lc, "file://") === 0) {
+             $url = substr($url, 7);
+-            $protocol = "";
++            $protocol = "file://";
++        } elseif (strpos($url_lc, "phar://") === 0) {
++            $res = substr($url, strpos($url_lc, ".phar")+5);
++            $url = substr($url, 7, strpos($url_lc, ".phar")-2);
++            $protocol = "phar://";
+         }
+ 
+         $ret = "";
+-        if ($protocol !== "file://") {
+-            $ret = $protocol;
+-        }
+ 
+-        if (!in_array(mb_strtolower($protocol), ["http://", "https://", "ftp://", "ftps://"], true)) {
++        $is_local_path = in_array($protocol, ["file://", "phar://"], true);
++
++        if ($is_local_path) {
+             //On Windows local file, an abs path can begin also with a '\' or a drive letter and colon
+             //drive: followed by a relative path would be a drive specific default folder.
+             //not known in php app code, treat as abs path
+@@ -89,9 +106,18 @@ public static function build_url($protocol, $host, $base_path, $url)
+             }
+             $ret .= $url;
+             $ret = preg_replace('/\?(.*)$/', "", $ret);
++
++            $filepath = realpath($ret);
++            if ($filepath === false) {
++                return null;
++            }
++
++            $ret = "$protocol$filepath$res";
++
+             return $ret;
+         }
+ 
++        $ret = $protocol;
+         // Protocol relative urls (e.g. "//example.org/style.css")
+         if (strpos($url, '//') === 0) {
+             $ret .= substr($url, 2);
+@@ -431,14 +457,14 @@ public static function explode_url($url)
+         $host = "";
+         $path = "";
+         $file = "";
++        $res = "";
+ 
+         $arr = parse_url($url);
+         if ( isset($arr["scheme"]) ) {
+             $arr["scheme"] = mb_strtolower($arr["scheme"]);
+         }
+ 
+-        // Exclude windows drive letters...
+-        if (isset($arr["scheme"]) && $arr["scheme"] !== "file" && strlen($arr["scheme"]) > 1) {
++        if (isset($arr["scheme"]) && $arr["scheme"] !== "file" && $arr["scheme"] !== "phar" && strlen($arr["scheme"]) > 1) {
+             $protocol = $arr["scheme"] . "://";
+ 
+             if (isset($arr["user"])) {
+@@ -480,42 +506,32 @@ public static function explode_url($url)
+ 
+         } else {
+ 
+-            $i = mb_stripos($url, "file://");
+-            if ($i !== false) {
+-                $url = mb_substr($url, $i + 7);
+-            }
+-
+-            $protocol = ""; // "file://"; ? why doesn't this work... It's because of
+-            // network filenames like //COMPU/SHARENAME
+-
++            $protocol = "";
+             $host = ""; // localhost, really
+-            $file = basename($url);
+-
+-            $path = dirname($url);
+-
+-            // Check that the path exists
+-            if ($path !== false) {
+-                $path .= '/';
+ 
++            $i = mb_stripos($url, "://");
++            if ($i !== false) {
++                $protocol = mb_strtolower(mb_substr($url, 0, $i + 3));
++                $url = mb_substr($url, $i + 3);
+             } else {
+-                // generate a url to access the file if no real path found.
+-                $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://';
+-
+-                $host = isset($_SERVER["HTTP_HOST"]) ? $_SERVER["HTTP_HOST"] : php_uname("n");
++                $protocol = "file://";
++            }
+ 
+-                if (substr($arr["path"], 0, 1) === '/') {
+-                    $path = dirname($arr["path"]);
+-                } else {
+-                    $path = '/' . rtrim(dirname($_SERVER["SCRIPT_NAME"]), '/') . '/' . $arr["path"];
+-                }
++            if ($protocol === "phar://") {
++                $res = substr($url, stripos($url, ".phar")+5);
++                $url = substr($url, 7, stripos($url, ".phar")-2);
+             }
++
++            $file = basename($url);
++            $path = dirname($url) . "/";
+         }
+ 
+         $ret = [$protocol, $host, $path, $file,
+             "protocol" => $protocol,
+             "host" => $host,
+             "path" => $path,
+-            "file" => $file];
++            "file" => $file,
++            "resource" => $res];
+         return $ret;
+     }
+ 
+@@ -878,12 +894,13 @@ public static function getFileContent($uri, $context = null, $offset = 0, $maxle
+         $content = null;
+         $headers = null;
+         [$protocol] = Helpers::explode_url($uri);
+-        $is_local_path = ($protocol === "" || $protocol === "file://");
++        $is_local_path = in_array(strtolower($protocol), ["", "file://", "phar://"], true);
++        $can_use_curl = in_array(strtolower($protocol), ["http://", "https://"], true);
+ 
+         set_error_handler([self::class, 'record_warnings']);
+ 
+         try {
+-            if ($is_local_path || ini_get('allow_url_fopen')) {
++            if ($is_local_path || ini_get('allow_url_fopen') || !$can_use_curl) {
+                 if ($is_local_path === false) {
+                     $uri = Helpers::encodeURI($uri);
+                 }
+@@ -899,7 +916,7 @@ public static function getFileContent($uri, $context = null, $offset = 0, $maxle
+                     $headers = $http_response_header;
+                 }
+ 
+-            } elseif (function_exists('curl_exec')) {
++            } elseif ($can_use_curl && function_exists('curl_exec')) {
+                 $curl = curl_init($uri);
+ 
+                 curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+diff --git a/src/Image/Cache.php b/src/Image/Cache.php
+index a6ef0fe5d..7da66a1e1 100644
+--- a/src/Image/Cache.php
++++ b/src/Image/Cache.php
+@@ -9,7 +9,7 @@
+  */
+ namespace Dompdf\Image;
+ 
+-use Dompdf\Dompdf;
++use Dompdf\Options;
+ use Dompdf\Helpers;
+ use Dompdf\Exception\ImageException;
+ 
+@@ -43,13 +43,6 @@ class Cache
+ 
+     public static $error_message = "Image not found or type unknown";
+     
+-    /**
+-     * Current dompdf instance
+-     *
+-     * @var Dompdf
+-     */
+-    protected static $_dompdf;
+-
+     /**
+      * Resolve and fetch an image for use.
+      *
+@@ -57,130 +50,91 @@ class Cache
+      * @param string $protocol  Default protocol if none specified in $url
+      * @param string $host      Default host if none specified in $url
+      * @param string $base_path Default path if none specified in $url
+-     * @param Dompdf $dompdf    The Dompdf instance
++     * @param Options $options  An instance of Dompdf\Options
+      *
+-     * @throws ImageException
+-     * @return array             An array with two elements: The local path to the image and the image extension
++     * @return array            An array with three elements: The local path to the image, the image
++     *                          extension, and an error message if the image could not be cached
+      */
+-    static function resolve_url($url, $protocol, $host, $base_path, Dompdf $dompdf)
++    static function resolve_url($url, $protocol, $host, $base_path, Options $options)
+     {
+-        self::$_dompdf = $dompdf;
+-        
+-        $protocol = mb_strtolower($protocol);
+-        $parsed_url = Helpers::explode_url($url);
++        $tempfile = null;
++        $resolved_url = null;
++        $type = null;
+         $message = null;
+-
+-        $remote = ($protocol && $protocol !== "file://") || ($parsed_url['protocol'] !== "");
+-
+-        $data_uri = strpos($parsed_url['protocol'], "data:") === 0;
+-        $full_url = null;
+-        $enable_remote = $dompdf->getOptions()->getIsRemoteEnabled();
+-        $tempfile = false;
+-
++        
+         try {
++            $full_url = Helpers::build_url($protocol, $host, $base_path, $url);
+ 
+-            // Remote not allowed and is not DataURI
+-            if (!$enable_remote && $remote && !$data_uri) {
+-                throw new ImageException("Remote file access is disabled.", E_WARNING);
++            if ($full_url === null) {
++                throw new ImageException("Unable to parse image URL $url.", E_WARNING);
+             }
+-            
+-            // remote allowed or DataURI
+-            if (($enable_remote && $remote) || $data_uri) {
+-                // Download remote files to a temporary directory
+-                $full_url = Helpers::build_url($protocol, $host, $base_path, $url);
+ 
+-                // From cache
+-                if (isset(self::$_cache[$full_url])) {
+-                    $resolved_url = self::$_cache[$full_url];
+-                } // From remote
+-                else {
+-                    $tmp_dir = $dompdf->getOptions()->getTempDir();
+-                    if (($resolved_url = @tempnam($tmp_dir, "ca_dompdf_img_")) === false) {
+-                        throw new ImageException("Unable to create temporary image in " . $tmp_dir, E_WARNING);
++            $parsed_url = Helpers::explode_url($full_url);
++            $protocol = strtolower($parsed_url["protocol"]);
++            $is_data_uri = strpos($protocol, "data:") === 0;
++            
++            if (!$is_data_uri) {
++                $allowed_protocols = $options->getAllowedProtocols();
++                if (!array_key_exists($protocol, $allowed_protocols)) {
++                    throw new ImageException("Permission denied on $url. The communication protocol is not supported.", E_WARNING);
++                }
++                foreach ($allowed_protocols[$protocol]["rules"] as $rule) {
++                    [$result, $message] = $rule($full_url);
++                    if (!$result) {
++                        throw new ImageException("Error loading $url: $message", E_WARNING);
+                     }
+-                    $tempfile = $resolved_url;
+-                    $image = null;
++                }
++            }
+ 
+-                    if ($data_uri) {
+-                        if ($parsed_data_uri = Helpers::parse_data_uri($url)) {
+-                            $image = $parsed_data_uri['data'];
+-                        }
+-                    } else {
+-                        list($image, $http_response_header) = Helpers::getFileContent($full_url, $dompdf->getHttpContext());
+-                    }
++            if ($protocol === "file://") {
++                $resolved_url = $full_url;
++            } elseif (isset(self::$_cache[$full_url])) {
++                $resolved_url = self::$_cache[$full_url];
++            } else {
++                $tmp_dir = $options->getTempDir();
++                if (($resolved_url = @tempnam($tmp_dir, "ca_dompdf_img_")) === false) {
++                    throw new ImageException("Unable to create temporary image in " . $tmp_dir, E_WARNING);
++                }
++                $tempfile = $resolved_url;
+ 
+-                    // Image not found or invalid
+-                    if ($image === null) {
+-                        $msg = ($data_uri ? "Data-URI could not be parsed" : "Image not found");
+-                        throw new ImageException($msg, E_WARNING);
+-                    } // Image found, put in cache and process
+-                    else {
+-                        //e.g. fetch.php?media=url.jpg&cache=1
+-                        //- Image file name might be one of the dynamic parts of the url, don't strip off!
+-                        //- a remote url does not need to have a file extension at all
+-                        //- local cached file does not have a matching file extension
+-                        //Therefore get image type from the content
+-                        if (@file_put_contents($resolved_url, $image) === false) {
+-                            throw new ImageException("Unable to create temporary image in " . $tmp_dir, E_WARNING);
+-                        }
++                $image = null;
++                if ($is_data_uri) {
++                    if (($parsed_data_uri = Helpers::parse_data_uri($url)) !== false) {
++                        $image = $parsed_data_uri["data"];
+                     }
++                } else {
++                    list($image, $http_response_header) = Helpers::getFileContent($full_url, $options->getHttpContext());
+                 }
+-            } // Not remote, local image
+-            else {
+-                $resolved_url = Helpers::build_url($protocol, $host, $base_path, $url);
+ 
+-                if ($protocol === "" || $protocol === "file://") {
+-                    $realfile = realpath($resolved_url);
+-        
+-                    $rootDir = realpath($dompdf->getOptions()->getRootDir());
+-                    if (strpos($realfile, $rootDir) !== 0) {
+-                        $chroot = $dompdf->getOptions()->getChroot();
+-                        $chrootValid = false;
+-                        foreach ($chroot as $chrootPath) {
+-                            $chrootPath = realpath($chrootPath);
+-                            if ($chrootPath !== false && strpos($realfile, $chrootPath) === 0) {
+-                                $chrootValid = true;
+-                                break;
+-                            }
+-                        }
+-                        if ($chrootValid !== true) {
+-                            throw new ImageException("Permission denied on $resolved_url. The file could not be found under the paths specified by Options::chroot.", E_WARNING);
+-                        }
+-                    }
+-        
+-                    if (!$realfile) {
+-                        throw new ImageException("File '$realfile' not found.", E_WARNING);
+-                    }
+-        
+-                    $resolved_url = $realfile;
++                // Image not found or invalid
++                if ($image === null) {
++                    $msg = ($is_data_uri ? "Data-URI could not be parsed" : "Image not found");
++                    throw new ImageException($msg, E_WARNING);
++                }
++
++                if (@file_put_contents($resolved_url, $image) === false) {
++                    throw new ImageException("Unable to create temporary image in " . $tmp_dir, E_WARNING);
+                 }
++
++                self::$_cache[$full_url] = $resolved_url;
+             }
+ 
+             // Check if the local file is readable
+             if (!is_readable($resolved_url) || !filesize($resolved_url)) {
+                 throw new ImageException("Image not readable or empty", E_WARNING);
+-            } // Check is the file is an image
+-            else {
+-                list($width, $height, $type) = Helpers::dompdf_getimagesize($resolved_url, $dompdf->getHttpContext());
++            }
+ 
+-                // Known image type
+-                if ($width && $height && in_array($type, ["gif", "png", "jpeg", "bmp", "svg","webp"], true)) {
+-                    //Don't put replacement image into cache - otherwise it will be deleted on cache cleanup.
+-                    //Only execute on successful caching of remote image.
+-                    if ($enable_remote && $remote || $data_uri) {
+-                        self::$_cache[$full_url] = $resolved_url;
+-                    }
+-                } // Unknown image type
+-                else {
+-                    throw new ImageException("Image type unknown", E_WARNING);
+-                }
++            list($width, $height, $type) = Helpers::dompdf_getimagesize($resolved_url, $options->getHttpContext());
++
++            if (($width && $height && in_array($type, ["gif", "png", "jpeg", "bmp", "svg","webp"], true)) === false) {
++                throw new ImageException("Image type unknown", E_WARNING);
+             }
+         } catch (ImageException $e) {
+             if ($tempfile) {
+                 unlink($tempfile);
+             }
+             $resolved_url = self::$broken_image;
+-            $type = "png";
++            $type = "svg";
+             $message = self::$error_message;
+             Helpers::record_warnings($e->getCode(), $e->getMessage() . " \n $url", $e->getFile(), $e->getLine());
+             self::$_cache[$full_url] = $resolved_url;
+@@ -229,7 +183,9 @@ static function clear(bool $debugPng = false)
+             if ($debugPng) {
+                 print "[clear unlink $file]";
+             }
+-            unlink($file);
++            if (file_exists($file)) {
++                unlink($file);
++            }
+         }
+ 
+         foreach (self::$tempImages as $versions) {
+diff --git a/src/Options.php b/src/Options.php
+index 69c43bd9d..d3a4da35a 100644
+--- a/src/Options.php
++++ b/src/Options.php
+@@ -62,6 +62,20 @@ class Options
+      */
+     private $chroot;
+ 
++    /**
++    * Protocol whitelist
++    *
++    * Protocols and PHP wrappers allowed in URIs. Full support is not
++    * guaranteed for the protocols/wrappers specified by this array.
++    *
++    * @var array
++    */
++    private $allowedProtocols = [
++        "file://" => ["rules" => []],
++        "http://" => ["rules" => []],
++        "https://" => ["rules" => []]
++    ];
++
+     /**
+      * @var string
+      */
+@@ -299,9 +313,12 @@ public function __construct(array $attributes = null)
+         $this->setFontCache($this->getFontDir());
+ 
+         $ver = "";
+-        $versionFile = realpath(__DIR__ . "/../VERSION");
+-        if (file_exists($versionFile) && ($version = trim(file_get_contents($versionFile))) !== false && $version !== '$Format:<%h>$') {
+-            $ver = "/$version";
++        $versionFile = realpath(__DIR__ . '/../VERSION');
++        if (($version = file_get_contents($versionFile)) !== false) {
++            $version = trim($version);
++            if ($version !== '$Format:<%h>$') {
++                $ver = "/$version";
++            }
+         }
+         $this->setHttpContext([
+             "http" => [
+@@ -310,6 +327,8 @@ public function __construct(array $attributes = null)
+             ]
+         ]);
+ 
++        $this->setAllowedProtocols(["file://", "http://", "https://"]);
++
+         if (null !== $attributes) {
+             $this->set($attributes);
+         }
+@@ -334,6 +353,8 @@ public function set($attributes, $value = null)
+                 $this->setFontCache($value);
+             } elseif ($key === 'chroot') {
+                 $this->setChroot($value);
++            } elseif ($key === 'allowedProtocols') {
++                $this->setAllowedProtocols($value);
+             } elseif ($key === 'logOutputFile' || $key === 'log_output_file') {
+                 $this->setLogOutputFile($value);
+             } elseif ($key === 'defaultMediaType' || $key === 'default_media_type') {
+@@ -399,6 +420,8 @@ public function get($key)
+             return $this->getFontCache();
+         } elseif ($key === 'chroot') {
+             return $this->getChroot();
++        } elseif ($key === 'allowedProtocols') {
++            return $this->getAllowedProtocols();
+         } elseif ($key === 'logOutputFile' || $key === 'log_output_file') {
+             return $this->getLogOutputFile();
+         } elseif ($key === 'defaultMediaType' || $key === 'default_media_type') {
+@@ -499,6 +522,67 @@ public function setChroot($chroot, $delimiter = ',')
+         return $this;
+     }
+ 
++    /**
++     * @return array
++     */
++    public function getAllowedProtocols()
++    {
++        return $this->allowedProtocols;
++    }
++
++    /**
++     * @param array $allowedProtocols The protocols to allow as an array (["protocol://" => ["rules" => [callable]]], ...) or a string list of the protocols
++     * @return $this
++     */
++    public function setAllowedProtocols(array $allowedProtocols)
++    {
++        $protocols = [];
++        foreach ($allowedProtocols as $protocol => $config) {
++            if (is_string($protocol)) {
++                $protocols[$protocol] = [];
++                if (is_array($config)) {
++                    $protocols[$protocol] = $config;
++                }
++            } elseif (is_string($config)) {
++                $protocols[$config] = [];
++            }
++        }
++        $this->allowedProtocols = [];
++        foreach ($protocols as $protocol => $config) {
++            $this->addAllowedProtocol($protocol, ...($config["rules"] ?? []));
++        }
++        return $this;
++    }
++
++    /**
++     * Adds a new protocol to the allowed protocols collection
++     *
++     * @param string $protocol The scheme to add (e.g. "http://")
++     * @param callable $rule A callable that validates the protocol
++     * @return $this
++     */
++    public function addAllowedProtocol(string $protocol, callable ...$rules)
++    {
++        $protocol = strtolower($protocol);
++        if (empty($rules)) {
++            $rules = [];
++            switch ($protocol) {
++                case "file://":
++                    $rules[] = [$this, "validateLocalUri"];
++                    break;
++                case "http://":
++                case "https://":
++                    $rules[] = [$this, "validateRemoteUri"];
++                    break;
++                case "phar://":
++                    $rules[] = [$this, "validatePharUri"];
++                    break;
++            }
++        }
++        $this->allowedProtocols[$protocol] = ["rules" => $rules];
++        return $this;
++    }
++
+     /**
+      * @return array
+      */
+@@ -1011,4 +1095,56 @@ public function getHttpContext()
+     {
+         return $this->httpContext;
+     }
++
++    public function validateLocalUri(string $uri)
++    {
++        if ($uri === null || strlen($uri) === 0) {
++            return [false, "The URI must not be empty."];
++        }
++
++        $realfile = realpath(str_replace("file://", "", $uri));
++
++        $dirs = $this->chroot;
++        $dirs[] = $this->rootDir;
++        $chrootValid = false;
++        foreach ($dirs as $chrootPath) {
++            $chrootPath = realpath($chrootPath);
++            if ($chrootPath !== false && strpos($realfile, $chrootPath) === 0) {
++                $chrootValid = true;
++                break;
++            }
++        }
++        if ($chrootValid !== true) {
++            return [false, "Permission denied. The file could not be found under the paths specified by Options::chroot."];
++        }
++
++        if (!$realfile) {
++            return [false, "File not found."];
++        }
++
++        return [true, null];
++    }
++
++    public function validatePharUri(string $uri)
++    {
++        if ($uri === null || strlen($uri) === 0) {
++            return [false, "The URI must not be empty."];
++        }
++
++        $file = substr(substr($uri, 0, strpos($uri, ".phar") + 5), 7);
++        return $this->validateLocalUri($file);
++    }
++
++    public function validateRemoteUri(string $uri)
++    {
++        if ($uri === null || strlen($uri) === 0) {
++            return [false, "The URI must not be empty."];
++        }
++
++        if (!$this->isRemoteEnabled) {
++            return [false, "Remote file requested, but remote file download is disabled."];
++        }
++
++        return [true, null];
++    }
+ }
+diff --git a/src/Renderer/AbstractRenderer.php b/src/Renderer/AbstractRenderer.php
+index 4ba61c612..27dc365b2 100644
+--- a/src/Renderer/AbstractRenderer.php
++++ b/src/Renderer/AbstractRenderer.php
+@@ -97,7 +97,7 @@ protected function _background_image($url, $x, $y, $width, $height, $style)
+             $sheet->get_protocol(),
+             $sheet->get_host(),
+             $sheet->get_base_path(),
+-            $this->_dompdf
++            $this->_dompdf->getOptions()
+         );
+ 
+         // Bail if the image is no good
+diff --git a/tests/Css/StyleTest.php b/tests/Css/StyleTest.php
+index b09d1bd9e..45929fcb3 100644
+--- a/tests/Css/StyleTest.php
++++ b/tests/Css/StyleTest.php
+@@ -53,8 +53,8 @@ public function cssImageNoBaseHrefProvider(): array
+     {
+         $basePath = realpath(__DIR__ . "/..");
+         return [
+-            "local absolute" => ["url($basePath/_files/jamaica.jpg)", $basePath . DIRECTORY_SEPARATOR . "_files" . DIRECTORY_SEPARATOR . "jamaica.jpg"],
+-            "local relative" => ["url(../_files/jamaica.jpg)", $basePath . DIRECTORY_SEPARATOR . "_files" . DIRECTORY_SEPARATOR . "jamaica.jpg"]
++            "local absolute" => ["url($basePath/_files/jamaica.jpg)", "file://" . $basePath . DIRECTORY_SEPARATOR . "_files" . DIRECTORY_SEPARATOR . "jamaica.jpg"],
++            "local relative" => ["url(../_files/jamaica.jpg)", "file://" . $basePath . DIRECTORY_SEPARATOR . "_files" . DIRECTORY_SEPARATOR . "jamaica.jpg"]
+         ];
+     }
+ 
+@@ -62,8 +62,8 @@ public function cssImageWithBaseHrefProvider(): array
+     {
+         $basePath = realpath(__DIR__ . "/..");
+         return [
+-            "local absolute" => ["url($basePath/_files/jamaica.jpg)", $basePath . DIRECTORY_SEPARATOR . "_files" . DIRECTORY_SEPARATOR . "jamaica.jpg"],
+-            "local relative" => ["url(../_files/jamaica.jpg)", $basePath . DIRECTORY_SEPARATOR . "_files" . DIRECTORY_SEPARATOR . "jamaica.jpg"]
++            "local absolute" => ["url($basePath/_files/jamaica.jpg)", "file://" . $basePath . DIRECTORY_SEPARATOR . "_files" . DIRECTORY_SEPARATOR . "jamaica.jpg"],
++            "local relative" => ["url(../_files/jamaica.jpg)", "file://" . $basePath . DIRECTORY_SEPARATOR . "_files" . DIRECTORY_SEPARATOR . "jamaica.jpg"]
+         ];
+     }
+ 
+diff --git a/tests/HelpersTest.php b/tests/HelpersTest.php
+index aa2352d44..e69f2143b 100644
+--- a/tests/HelpersTest.php
++++ b/tests/HelpersTest.php
+@@ -101,4 +101,11 @@ public function testLengthEqual(float $a, float $b, bool $expected): void
+         $this->assertSame($expected, Helpers::lengthEqual(-$a, -$b));
+         $this->assertSame($expected, Helpers::lengthEqual(-$b, -$a));
+     }
++
++    
++    public function testCustomProtocolParsing(): void
++    {
++        $uri = "mock://path/to/resource";
++        $this->assertSame($uri, Helpers::build_url("", "", "", $uri));
++    }
+ }
+diff --git a/tests/OptionsTest.php b/tests/OptionsTest.php
+index 2f051558b..5147ddee4 100644
+--- a/tests/OptionsTest.php
++++ b/tests/OptionsTest.php
+@@ -95,4 +95,44 @@ public function testSetters()
+         $option->setChroot(['test11']);
+         $this->assertEquals(['test11'], $option->getChroot());
+     }
++
++    public function testAllowedProtocols()
++    {
++        $options = new Options(["isRemoteEnabled" => false]);
++        $options->setAllowedProtocols(["http://"]);
++        $allowedProtocols = $options->getAllowedProtocols();
++        $this->assertIsArray($allowedProtocols);
++        $this->assertEquals(1, count($allowedProtocols));
++        $this->assertArrayHasKey("http://", $allowedProtocols);
++        $this->assertIsArray($allowedProtocols["http://"]);
++        $this->assertArrayHasKey("rules", $allowedProtocols["http://"]);
++        $this->assertIsArray($allowedProtocols["http://"]["rules"]);
++        $this->assertEquals(1, count($allowedProtocols["http://"]["rules"]));
++        $this->assertEquals([$options, "validateRemoteUri"], $allowedProtocols["http://"]["rules"][0]);
++
++        [$validation_result] = $allowedProtocols["http://"]["rules"][0]("http://example.com/");
++        $this->assertFalse($validation_result);
++
++        
++        $mock_protocol = [
++            "mock://" => [
++                "rules" => [
++                    function ($uri) { return [true, null]; }
++                ]
++            ]
++        ];
++        $options->setAllowedProtocols($mock_protocol);
++        $allowedProtocols = $options->getAllowedProtocols();
++        $this->assertIsArray($allowedProtocols);
++        $this->assertEquals(1, count($allowedProtocols));
++        $this->assertArrayHasKey("mock://", $allowedProtocols);
++        $this->assertIsArray($allowedProtocols["mock://"]);
++        $this->assertArrayHasKey("rules", $allowedProtocols["mock://"]);
++        $this->assertIsArray($allowedProtocols["mock://"]["rules"]);
++        $this->assertEquals(1, count($allowedProtocols["mock://"]["rules"]));
++        $this->assertEquals($mock_protocol["mock://"]["rules"][0], $allowedProtocols["mock://"]["rules"][0]);
++
++        [$validation_result] = $allowedProtocols["mock://"]["rules"][0]("mock://example.com/");
++        $this->assertTrue($validation_result);
++    }
+ }

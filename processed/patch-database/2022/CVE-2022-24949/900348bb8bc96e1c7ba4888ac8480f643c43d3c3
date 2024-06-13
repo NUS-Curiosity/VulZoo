@@ -1,0 +1,138 @@
+diff --git a/.gitmodules b/.gitmodules
+index 35255ebe1..84de1b92d 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -12,7 +12,7 @@
+ 	url = https://github.com/progschj/ThreadPool.git
+ [submodule "external/easyloggingpp"]
+ 	path = external/easyloggingpp
+-	url = https://github.com/zuhd-org/easyloggingpp.git
++	url = https://github.com/MisterTea/easyloggingpp.git
+ [submodule "external/sanitizers-cmake"]
+ 	path = external/sanitizers-cmake
+ 	url = https://github.com/arsenm/sanitizers-cmake.git
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 65d9fa97b..1cc9e8156 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -163,7 +163,7 @@ add_definitions(-DET_VERSION="${PROJECT_VERSION}")
+ # For easylogging, disable default log file, enable crash log, ensure thread
+ # safe, and catch c++ exceptions
+ set(CMAKE_CXX_FLAGS
+-    "${CMAKE_CXX_FLAGS} -DELPP_NO_DEFAULT_LOG_FILE -DELPP_FEATURE_CRASH_LOG -DELPP_THREAD_SAFE -DSENTRY_BUILD_STATIC"
++    "${CMAKE_CXX_FLAGS} -DELPP_NO_DEFAULT_LOG_FILE -DELPP_FEATURE_CRASH_LOG -DELPP_THREAD_SAFE -DELPP_STRICT_PERMISSIONS -DSENTRY_BUILD_STATIC"
+ )
+ IF(WIN32)
+   SET(CMAKE_CXX_FLAGS "-DSODIUM_STATIC")
+diff --git a/external/easyloggingpp b/external/easyloggingpp
+index 5181b4039..532df6a32 160000
+--- a/external/easyloggingpp
++++ b/external/easyloggingpp
+@@ -1 +1 @@
+-Subproject commit 5181b4039c04697aac7eac0bde44352cd8901567
++Subproject commit 532df6a32c6d743ac54f1d65dd220fb3249d4b8e
+diff --git a/src/base/LogHandler.cpp b/src/base/LogHandler.cpp
+index d016e0ebc..ad0cde429 100644
+--- a/src/base/LogHandler.cpp
++++ b/src/base/LogHandler.cpp
+@@ -48,6 +48,10 @@ string LogHandler::stderrToFile(const string &pathPrefix) {
+   string current_time(buffer);
+   string stderrFilename = pathPrefix + "_stderr_" + current_time;
+   FILE *stderr_stream = freopen(stderrFilename.c_str(), "w", stderr);
++  fs::permissions(
++      stderrFilename,
++      fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read,
++      fs::perm_options::replace);
+   if (!stderr_stream) {
+     STFATAL << "Invalid filename " << stderrFilename;
+   }
+diff --git a/src/base/PipeSocketHandler.cpp b/src/base/PipeSocketHandler.cpp
+index af605560e..509a05d65 100644
+--- a/src/base/PipeSocketHandler.cpp
++++ b/src/base/PipeSocketHandler.cpp
+@@ -13,7 +13,7 @@ int PipeSocketHandler::connect(const SocketEndpoint& endpoint) {
+   FATAL_FAIL(sockFd);
+   initSocket(sockFd);
+   remote.sun_family = AF_UNIX;
+-  strcpy(remote.sun_path, pipePath.c_str());
++  strncpy(remote.sun_path, pipePath.c_str(), sizeof(remote.sun_path));
+ 
+   VLOG(3) << "Connecting to " << endpoint << " with fd " << sockFd;
+   int result =
+@@ -104,7 +104,7 @@ set<int> PipeSocketHandler::listen(const SocketEndpoint& endpoint) {
+   FATAL_FAIL(fd);
+   initServerSocket(fd);
+   local.sun_family = AF_UNIX; /* local is declared before socket() ^ */
+-  strcpy(local.sun_path, pipePath.c_str());
++  strncpy(local.sun_path, pipePath.c_str(), sizeof(local.sun_path));
+   unlink(local.sun_path);
+ 
+   FATAL_FAIL(::bind(fd, (struct sockaddr*)&local, sizeof(sockaddr_un)));
+diff --git a/src/terminal/TerminalClient.cpp b/src/terminal/TerminalClient.cpp
+index b8cb79885..d3ab089f2 100644
+--- a/src/terminal/TerminalClient.cpp
++++ b/src/terminal/TerminalClient.cpp
+@@ -14,7 +14,7 @@ vector<PortForwardSourceRequest> parseRangesToRequests(const string& input) {
+           sourceDestination[1].find_first_not_of("0123456789-") !=
+               string::npos) {
+         PortForwardSourceRequest pfsr;
+-        pfsr.mutable_source()->set_name(sourceDestination[0]);
++        pfsr.set_environmentvariable(sourceDestination[0]);
+         pfsr.mutable_destination()->set_name(sourceDestination[1]);
+         pfsrs.push_back(pfsr);
+       } else if (sourceDestination[0].find('-') != string::npos &&
+diff --git a/src/terminal/UserTerminalRouter.cpp b/src/terminal/UserTerminalRouter.cpp
+index 53eeb7d89..a4513f932 100644
+--- a/src/terminal/UserTerminalRouter.cpp
++++ b/src/terminal/UserTerminalRouter.cpp
+@@ -16,6 +16,7 @@ UserTerminalRouter::UserTerminalRouter(
+ }
+ 
+ IdKeyPair UserTerminalRouter::acceptNewConnection() {
++  lock_guard<recursive_mutex> guard(routerMutex);
+   LOG(INFO) << "Listening to id/key FIFO";
+   int terminalFd = socketHandler->accept(serverFd);
+   if (terminalFd < 0) {
+@@ -49,6 +50,7 @@ IdKeyPair UserTerminalRouter::acceptNewConnection() {
+ }
+ 
+ TerminalUserInfo UserTerminalRouter::getInfoForId(const string &id) {
++  lock_guard<recursive_mutex> guard(routerMutex);
+   auto it = idInfoMap.find(id);
+   if (it == idInfoMap.end()) {
+     STFATAL << " Tried to read from an id that no longer exists";
+diff --git a/src/terminal/UserTerminalRouter.hpp b/src/terminal/UserTerminalRouter.hpp
+index adf4ad1c8..5fd7e27df 100644
+--- a/src/terminal/UserTerminalRouter.hpp
++++ b/src/terminal/UserTerminalRouter.hpp
+@@ -2,7 +2,6 @@
+ #define __ET_USER_TERMINAL_ROUTER__
+ 
+ #include "Headers.hpp"
+-
+ #include "PipeSocketHandler.hpp"
+ #include "ServerConnection.hpp"
+ 
+@@ -24,6 +23,7 @@ class UserTerminalRouter {
+   int serverFd;
+   unordered_map<string, TerminalUserInfo> idInfoMap;
+   shared_ptr<PipeSocketHandler> socketHandler;
++  recursive_mutex routerMutex;
+ };
+ }  // namespace et
+ 
+diff --git a/src/terminal/forwarding/PortForwardHandler.cpp b/src/terminal/forwarding/PortForwardHandler.cpp
+index df70c01c1..45e1a0bc8 100644
+--- a/src/terminal/forwarding/PortForwardHandler.cpp
++++ b/src/terminal/forwarding/PortForwardHandler.cpp
+@@ -45,6 +45,10 @@ PortForwardSourceResponse PortForwardHandler::createSource(
+     SocketEndpoint source;
+     if (pfsr.has_source()) {
+       source = pfsr.source();
++      if (source.has_name()) {
++        throw runtime_error(
++            "Named socket tunneling is only allowed with temporary filenames.");
++      }
+     } else {
+       // Make a random file to forward the pipe
+       string sourcePattern =

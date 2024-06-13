@@ -1,0 +1,78 @@
+diff --git a/zerver/tests/test_bots.py b/zerver/tests/test_bots.py
+index 2c10e7d64956d..9004eacee93d1 100644
+--- a/zerver/tests/test_bots.py
++++ b/zerver/tests/test_bots.py
+@@ -8,6 +8,7 @@
+ from django.test import override_settings
+ from zulip_bots.custom_exceptions import ConfigValidationError
+ 
++from zerver.actions.bots import do_change_bot_owner
+ from zerver.actions.realm_settings import do_set_realm_property
+ from zerver.actions.streams import do_change_stream_permission
+ from zerver.actions.users import do_change_can_create_users, do_change_user_role, do_deactivate_user
+@@ -1190,9 +1191,26 @@ def test_patch_bot_role(self) -> None:
+ 
+         req = dict(role=UserProfile.ROLE_REALM_OWNER)
+ 
+-        result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", req)
++        result = self.client_patch(f"/json/users/{user_profile.id}", req)
++        self.assert_json_error(result, "Must be an organization owner")
++
++        result = self.client_patch(f"/json/bots/{user_profile.id}", req)
+         self.assert_json_error(result, "Must be an organization owner")
+ 
++        # Test for not allowing a non-administrator user to assign a bot an administrator role
++        shiva = self.example_user("shiva")
++        self.assertEqual(shiva.role, UserProfile.ROLE_MODERATOR)
++        self.login_user(shiva)
++        do_change_bot_owner(user_profile, shiva, acting_user=None)
++
++        req = dict(role=UserProfile.ROLE_REALM_ADMINISTRATOR)
++
++        result = self.client_patch(f"/json/users/{user_profile.id}", req)
++        self.assert_json_error(result, "Must be an organization administrator")
++
++        result = self.client_patch(f"/json/bots/{user_profile.id}", req)
++        self.assert_json_error(result, "Must be an organization administrator")
++
+     def test_patch_bot_to_stream_private_allowed(self) -> None:
+         self.login("hamlet")
+         user_profile = self.example_user("hamlet")
+diff --git a/zerver/views/users.py b/zerver/views/users.py
+index f80ba7a6e3a1c..1fae6f40e1632 100644
+--- a/zerver/views/users.py
++++ b/zerver/views/users.py
+@@ -40,6 +40,7 @@
+     CannotDeactivateLastUserError,
+     JsonableError,
+     MissingAuthenticationError,
++    OrganizationAdministratorRequired,
+     OrganizationOwnerRequired,
+     RateLimited,
+ )
+@@ -191,13 +192,13 @@ def update_user_backend(
+ 
+     if role is not None and target.role != role:
+         # Require that the current user has permissions to
+-        # grant/remove the role in question.  access_user_by_id has
+-        # already verified we're an administrator; here we enforce
+-        # that only owners can toggle the is_realm_owner flag.
++        # grant/remove the role in question.
+         #
+         # Logic replicated in patch_bot_backend.
+         if UserProfile.ROLE_REALM_OWNER in [role, target.role] and not user_profile.is_realm_owner:
+             raise OrganizationOwnerRequired()
++        elif not user_profile.is_realm_admin:
++            raise OrganizationAdministratorRequired()
+ 
+         if target.role == UserProfile.ROLE_REALM_OWNER and check_last_owner(target):
+             raise JsonableError(
+@@ -331,6 +332,8 @@ def patch_bot_backend(
+         # Logic duplicated from update_user_backend.
+         if UserProfile.ROLE_REALM_OWNER in [role, bot.role] and not user_profile.is_realm_owner:
+             raise OrganizationOwnerRequired()
++        elif not user_profile.is_realm_admin:
++            raise OrganizationAdministratorRequired()
+ 
+         do_change_user_role(bot, role, acting_user=user_profile)
+ 

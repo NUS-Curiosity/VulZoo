@@ -1,0 +1,223 @@
+diff --git a/src/commands/registration/eprt.js b/src/commands/registration/eprt.js
+index 4ced2efb..2607a2a9 100644
+--- a/src/commands/registration/eprt.js
++++ b/src/commands/registration/eprt.js
+@@ -8,14 +8,18 @@ const FAMILY = {
+ 
+ module.exports = {
+   directive: 'EPRT',
+-  handler: function ({command} = {}) {
++  handler: function ({log, command} = {}) {
+     const [, protocol, ip, port] = _.chain(command).get('arg', '').split('|').value();
+     const family = FAMILY[protocol];
+     if (!family) return this.reply(504, 'Unknown network protocol');
+ 
+     this.connector = new ActiveConnector(this);
+     return this.connector.setupConnection(ip, port, family)
+-    .then(() => this.reply(200));
++    .then(() => this.reply(200))
++    .catch((err) => {
++      log.error(err);
++      return this.reply(err.code || 425, err.message);
++    });
+   },
+   syntax: '{{cmd}} |<protocol>|<address>|<port>|',
+   description: 'Specifies an address and port to which the server should connect'
+diff --git a/src/commands/registration/epsv.js b/src/commands/registration/epsv.js
+index 7e524b84..f60fffd9 100644
+--- a/src/commands/registration/epsv.js
++++ b/src/commands/registration/epsv.js
+@@ -2,13 +2,17 @@ const PassiveConnector = require('../../connector/passive');
+ 
+ module.exports = {
+   directive: 'EPSV',
+-  handler: function () {
++  handler: function ({log}) {
+     this.connector = new PassiveConnector(this);
+     return this.connector.setupServer()
+     .then((server) => {
+       const {port} = server.address();
+ 
+       return this.reply(229, `EPSV OK (|||${port}|)`);
++    })
++    .catch((err) => {
++      log.error(err);
++      return this.reply(err.code || 425, err.message);
+     });
+   },
+   syntax: '{{cmd}} [<protocol>]',
+diff --git a/src/commands/registration/pasv.js b/src/commands/registration/pasv.js
+index 73ee4973..c03e1d5b 100644
+--- a/src/commands/registration/pasv.js
++++ b/src/commands/registration/pasv.js
+@@ -25,7 +25,7 @@ module.exports = {
+     })
+     .catch((err) => {
+       log.error(err);
+-      return this.reply(425);
++      return this.reply(err.code || 425, err.message);
+     });
+   },
+   syntax: '{{cmd}}',
+diff --git a/src/commands/registration/port.js b/src/commands/registration/port.js
+index 248f1850..a183a74c 100644
+--- a/src/commands/registration/port.js
++++ b/src/commands/registration/port.js
+@@ -17,7 +17,7 @@ module.exports = {
+     .then(() => this.reply(200))
+     .catch((err) => {
+       log.error(err);
+-      return this.reply(425);
++      return this.reply(err.code || 425, err.message);
+     });
+   },
+   syntax: '{{cmd}} <x>,<x>,<x>,<x>,<y>,<y>',
+diff --git a/src/connector/active.js b/src/connector/active.js
+index 93726cfa..b9c3d863 100644
+--- a/src/connector/active.js
++++ b/src/connector/active.js
+@@ -1,7 +1,9 @@
+ const {Socket} = require('net');
+ const tls = require('tls');
++const ip = require('ip');
+ const Promise = require('bluebird');
+ const Connector = require('./base');
++const {SocketError} = require('../errors');
+ 
+ class Active extends Connector {
+   constructor(connection) {
+@@ -27,6 +29,10 @@ class Active extends Connector {
+ 
+     return closeExistingServer()
+     .then(() => {
++      if (!ip.isEqual(this.connection.commandSocket.remoteAddress, host)) {
++        throw new SocketError('The given address is not yours', 500);
++      }
++
+       this.dataSocket = new Socket();
+       this.dataSocket.on('error', (err) => this.server && this.server.emit('client-error', {connection: this.connection, context: 'dataSocket', error: err}));
+       this.dataSocket.connect({host, port, family}, () => {
+diff --git a/src/connector/base.js b/src/connector/base.js
+index eed99377..33707a31 100644
+--- a/src/connector/base.js
++++ b/src/connector/base.js
+@@ -29,7 +29,7 @@ class Connector {
+   closeSocket() {
+     if (this.dataSocket) {
+       const socket = this.dataSocket;
+-      this.dataSocket.end(() => socket.destroy());
++      this.dataSocket.end(() => socket && socket.destroy());
+       this.dataSocket = null;
+     }
+   }
+diff --git a/test/commands/registration/eprt.spec.js b/test/commands/registration/eprt.spec.js
+index 6fc119f8..4c3990e0 100644
+--- a/test/commands/registration/eprt.spec.js
++++ b/test/commands/registration/eprt.spec.js
+@@ -23,7 +23,7 @@ describe(CMD, function () {
+   });
+ 
+   it('// unsuccessful | no argument', () => {
+-    return cmdFn()
++    return cmdFn({})
+     .then(() => {
+       expect(mockClient.reply.args[0][0]).to.equal(504);
+     });
+diff --git a/test/commands/registration/epsv.spec.js b/test/commands/registration/epsv.spec.js
+index 00c4561a..5ab7a5a4 100644
+--- a/test/commands/registration/epsv.spec.js
++++ b/test/commands/registration/epsv.spec.js
+@@ -25,7 +25,7 @@ describe(CMD, function () {
+   });
+ 
+   it('// successful IPv4', () => {
+-    return cmdFn()
++    return cmdFn({})
+     .then(() => {
+       const [code, message] = mockClient.reply.args[0];
+       expect(code).to.equal(229);
+diff --git a/test/commands/registration/opts.spec.js b/test/commands/registration/opts.spec.js
+index 99171e33..d95ada43 100644
+--- a/test/commands/registration/opts.spec.js
++++ b/test/commands/registration/opts.spec.js
+@@ -29,7 +29,7 @@ describe(CMD, function () {
+   it('BAD // unsuccessful', () => {
+     return cmdFn({command: {arg: 'BAD', directive: CMD}})
+     .then(() => {
+-      expect(mockClient.reply.args[0][0]).to.equal(500);
++      expect(mockClient.reply.args[0][0]).to.equal(501);
+     });
+   });
+ 
+diff --git a/test/connector/active.spec.js b/test/connector/active.spec.js
+index 827505f5..dc36b2f3 100644
+--- a/test/connector/active.spec.js
++++ b/test/connector/active.spec.js
+@@ -13,14 +13,16 @@ describe('Connector - Active //', function () {
+   let getNextPort = getNextPortFactory(host, 1024);
+   let PORT;
+   let active;
+-  let mockConnection = {};
++  let mockConnection = {
++    commandSocket: {
++      remoteAddress: '::ffff:127.0.0.1'
++    }
++  };
+   let sandbox;
+   let server;
+ 
+-  before(() => {
+-    active = new ActiveConnector(mockConnection);
+-  });
+   beforeEach((done) => {
++    active = new ActiveConnector(mockConnection);
+     sandbox = sinon.sandbox.create().usingPromise(Promise);
+ 
+     getNextPort()
+@@ -31,9 +33,12 @@ describe('Connector - Active //', function () {
+       .listen(PORT, () => done());
+     });
+   });
+-  afterEach((done) => {
++
++  afterEach(() => {
+     sandbox.restore();
+-    server.close(done);
++    server.close();
++    active.end();
++
+   });
+ 
+   it('sets up a connection', function () {
+@@ -43,13 +48,27 @@ describe('Connector - Active //', function () {
+     });
+   });
+ 
+-  it('destroys existing connection, then sets up a connection', function () {
+-    const destroyFnSpy = sandbox.spy(active.dataSocket, 'destroy');
++  it('rejects alternative host', function () {
++    return active.setupConnection('123.45.67.89', PORT)
++    .catch((err) => {
++      expect(err.code).to.equal(500);
++      expect(err.message).to.equal('The given address is not yours');
++    })
++    .finally(() => {
++      expect(active.dataSocket).not.to.exist;
++    });
++  });
+ 
++  it('destroys existing connection, then sets up a connection', function () {
+     return active.setupConnection(host, PORT)
+     .then(() => {
+-      expect(destroyFnSpy.callCount).to.equal(1);
+-      expect(active.dataSocket).to.exist;
++      const destroyFnSpy = sandbox.spy(active.dataSocket, 'destroy');
++
++      return active.setupConnection(host, PORT)
++      .then(() => {
++        expect(destroyFnSpy.callCount).to.equal(1);
++        expect(active.dataSocket).to.exist;
++      });
+     });
+   });
+ 

@@ -1,0 +1,276 @@
+diff --git a/libyara/arena.c b/libyara/arena.c
+index 48faa4255c..f53775da8e 100644
+--- a/libyara/arena.c
++++ b/libyara/arena.c
+@@ -316,7 +316,7 @@ void yr_arena_destroy(
+ //    YR_ARENA* arena  - Pointer to the arena.
+ //
+ // Returns:
+-//    A pointer to the arena's data. NULL if the no data has been written to
++//    A pointer to the arena's data. NULL if no data has been written to
+ //    the arena yet.
+ //
+ 
+diff --git a/libyara/exec.c b/libyara/exec.c
+index d42c1b03eb..8037991161 100644
+--- a/libyara/exec.c
++++ b/libyara/exec.c
+@@ -34,6 +34,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include <time.h>
+ #include <math.h>
+ 
++#include <yara/arena.h>
+ #include <yara/endian.h>
+ #include <yara/exec.h>
+ #include <yara/limits.h>
+@@ -177,6 +178,8 @@ int yr_execute_code(
+   YR_RULE* rule;
+   YR_MATCH* match;
+   YR_OBJECT_FUNCTION* function;
++  YR_OBJECT** obj_ptr;
++  YR_ARENA* obj_arena;
+ 
+   char* identifier;
+   char* args_fmt;
+@@ -201,6 +204,10 @@ int yr_execute_code(
+   if (stack == NULL)
+     return ERROR_INSUFFICIENT_MEMORY;
+ 
++  FAIL_ON_ERROR_WITH_CLEANUP(
++      yr_arena_create(1024, 0, &obj_arena),
++      yr_free(stack));
++
+   while(!stop)
+   {
+     switch(*ip)
+@@ -437,6 +444,8 @@ int yr_execute_code(
+         rule->clock_ticks += clock() - start;
+         start = clock();
+         #endif
++
++        assert(sp == 0);
+         break;
+ 
+       case OP_OBJ_LOAD:
+@@ -577,18 +586,26 @@ int yr_execute_code(
+           }
+         }
+ 
++        // if i == MAX_OVERLOADED_FUNCTIONS at this point no matching
++        // prototype was found, but this shouldn't happen.
++
+         assert(i < MAX_OVERLOADED_FUNCTIONS);
+ 
++        // make a copy of the returned object and push the copy into the stack
++        // function->return_obj can't be pushed because it can change in
++        // subsequent calls to the same function.
++
+         if (result == ERROR_SUCCESS)
+-        {
+-          r1.o = function->return_obj;
+-          push(r1);
+-        }
+-        else
+-        {
+-          stop = TRUE;
+-        }
++          result = yr_object_copy(function->return_obj, &r1.o);
++
++        // a pointer to the copied object is stored in a arena in order to
++        // free the object before exiting yr_execute_code
+ 
++        if (result == ERROR_SUCCESS)
++          result = yr_arena_write_data(obj_arena, &r1.o, sizeof(r1.o), NULL);
++
++        stop = (result != ERROR_SUCCESS);
++        push(r1);
+         break;
+ 
+       case OP_FOUND:
+@@ -1146,6 +1163,17 @@ int yr_execute_code(
+     ip++;
+   }
+ 
++  obj_ptr = (YR_OBJECT**) yr_arena_base_address(obj_arena);
++
++  while (obj_ptr != NULL)
++  {
++    yr_object_destroy(*obj_ptr);
++
++    obj_ptr = (YR_OBJECT**) yr_arena_next_address(
++        obj_arena, obj_ptr, sizeof(YR_OBJECT*));
++  }
++
++  yr_arena_destroy(obj_arena);
+   yr_modules_unload_all(context);
+   yr_free(stack);
+ 
+diff --git a/libyara/include/yara/object.h b/libyara/include/yara/object.h
+index 0fbf311bbc..5f412931ce 100644
+--- a/libyara/include/yara/object.h
++++ b/libyara/include/yara/object.h
+@@ -86,6 +86,11 @@ void yr_object_destroy(
+     YR_OBJECT* object);
+ 
+ 
++int yr_object_copy(
++    YR_OBJECT* object,
++    YR_OBJECT** object_copy);
++
++
+ YR_OBJECT* yr_object_lookup_field(
+     YR_OBJECT* object,
+     const char* field_name);
+diff --git a/libyara/include/yara/sizedstr.h b/libyara/include/yara/sizedstr.h
+index 9e29ec6aaf..da4b98d38e 100644
+--- a/libyara/include/yara/sizedstr.h
++++ b/libyara/include/yara/sizedstr.h
+@@ -51,7 +51,7 @@ typedef struct _SIZED_STRING
+ {
+   uint32_t length;
+   uint32_t flags;
+-  
++
+   char c_string[1];
+ 
+ } SIZED_STRING;
+@@ -60,7 +60,11 @@ typedef struct _SIZED_STRING
+ 
+ 
+ int sized_string_cmp(
+-  SIZED_STRING* s1,
+-  SIZED_STRING* s2);
++    SIZED_STRING* s1,
++    SIZED_STRING* s2);
++
++
++SIZED_STRING* sized_string_dup(
++    SIZED_STRING* s);
+ 
+ #endif
+diff --git a/libyara/modules/tests.c b/libyara/modules/tests.c
+index 55fd2f30d3..a152638328 100644
+--- a/libyara/modules/tests.c
++++ b/libyara/modules/tests.c
+@@ -88,6 +88,23 @@ define_function(match)
+ }
+ 
+ 
++define_function(foobar)
++{
++  int64_t arg = integer_argument(1);
++
++  switch (arg)
++  {
++    case 1:
++      return_string("foo");
++      break;
++    case 2:
++      return_string("bar");
++      break;
++  }
++
++  return_string("oops")
++}
++
+ begin_declarations;
+ 
+   begin_struct("constants");
+@@ -125,6 +142,7 @@ begin_declarations;
+   declare_function("fsum", "fff", "f", fsum_3);
+   declare_function("length", "s", "i", length);
+   declare_function("empty", "", "s", empty);
++  declare_function("foobar", "i", "s", foobar);
+ 
+ end_declarations;
+ 
+diff --git a/libyara/object.c b/libyara/object.c
+index d2d84f587d..5b5b26555e 100644
+--- a/libyara/object.c
++++ b/libyara/object.c
+@@ -573,11 +573,23 @@ int yr_object_copy(
+   switch(object->type)
+   {
+     case OBJECT_TYPE_INTEGER:
+-      ((YR_OBJECT_INTEGER*) copy)->value = UNDEFINED;
++      ((YR_OBJECT_INTEGER*) copy)->value = ((YR_OBJECT_INTEGER*) object)->value;
+       break;
+ 
+     case OBJECT_TYPE_STRING:
+-      ((YR_OBJECT_STRING*) copy)->value = NULL;
++      if (((YR_OBJECT_STRING*) object)->value != NULL)
++      {
++        ((YR_OBJECT_STRING*) copy)->value = sized_string_dup(
++            ((YR_OBJECT_STRING*) object)->value);
++      }
++      else
++      {
++        ((YR_OBJECT_STRING*) copy)->value = NULL;
++      }
++      break;
++
++    case OBJECT_TYPE_FLOAT:
++      ((YR_OBJECT_DOUBLE*) copy)->value = ((YR_OBJECT_DOUBLE*) object)->value;
+       break;
+ 
+     case OBJECT_TYPE_FUNCTION:
+diff --git a/libyara/sizedstr.c b/libyara/sizedstr.c
+index 767aa7e032..3bf058aca7 100644
+--- a/libyara/sizedstr.c
++++ b/libyara/sizedstr.c
+@@ -27,6 +27,8 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+ 
++#include <string.h>
++#include <yara/mem.h>
+ #include <yara/sizedstr.h>
+ 
+ 
+@@ -54,3 +56,21 @@ int sized_string_cmp(
+   else
+     return 1;
+ }
++
++
++SIZED_STRING* sized_string_dup(
++    SIZED_STRING* s)
++{
++  SIZED_STRING* result = (SIZED_STRING*) yr_malloc(
++      sizeof(SIZED_STRING) + s->length);
++
++  if (result == NULL)
++    return NULL;
++
++  result->length = s->length;
++  result->flags = s->flags;
++
++  strncpy(result->c_string, s->c_string, s->length + 1);
++
++  return result;
++}
+diff --git a/tests/test-rules.c b/tests/test-rules.c
+index 63433e0815..2a28c00506 100644
+--- a/tests/test-rules.c
++++ b/tests/test-rules.c
+@@ -1439,6 +1439,20 @@ static void test_modules()
+       }",
+       NULL);
+ 
++  assert_true_rule(
++      "import \"tests\" \
++       rule test { \
++        condition: tests.foobar(1) == tests.foobar(1) \
++      }",
++      NULL);
++
++  assert_true_rule(
++      "import \"tests\" \
++       rule test { \
++        condition: tests.foobar(1) != tests.foobar(2) \
++      }",
++      NULL);
++
+   assert_true_rule(
+       "import \"tests\" \
+        rule test { \

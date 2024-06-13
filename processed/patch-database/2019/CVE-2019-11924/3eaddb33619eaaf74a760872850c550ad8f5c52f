@@ -1,0 +1,50 @@
+diff --git a/fizz/record/EncryptedRecordLayer.cpp b/fizz/record/EncryptedRecordLayer.cpp
+index a56b7625b32..377ae5b33fe 100644
+--- a/fizz/record/EncryptedRecordLayer.cpp
++++ b/fizz/record/EncryptedRecordLayer.cpp
+@@ -113,7 +113,7 @@ folly::Optional<TLSMessage> EncryptedReadRecordLayer::read(
+     return folly::none;
+   }
+ 
+-  TLSMessage msg;
++  TLSMessage msg{};
+   // Iterate over the buffers while trying to find
+   // the first non-zero octet. This is much faster than
+   // first iterating and then trimming.
+diff --git a/fizz/record/RecordLayer.cpp b/fizz/record/RecordLayer.cpp
+index 0e8136c11dc..f608d907e33 100644
+--- a/fizz/record/RecordLayer.cpp
++++ b/fizz/record/RecordLayer.cpp
+@@ -49,7 +49,31 @@ folly::Optional<Param> ReadRecordLayer::readEvent(
+         }
+       }
+       case ContentType::handshake: {
+-        unparsedHandshakeData_.append(std::move(message->fragment));
++        std::unique_ptr<folly::IOBuf> handshakeMessage =
++            unparsedHandshakeData_.move();
++        // It is possible that a peer might send us records in a manner such
++        // that there is a 16KB record and only 1 byte of handshake message in
++        // each record. Since we normally just trim the IOBuf, we would end up
++        // holding 16K of data. To prevent this we allocate a contiguous
++        // buffer to copy over these bytes. We supply kExtraAlloc bytes in
++        // order to avoid needing to re-allocate a lot of times if we receive
++        // a lot of small messages. There might be more optimal reallocation
++        // policies, but this should be fine.
++        message->fragment->coalesce();
++        constexpr size_t kExtraAlloc = 1024;
++        if (!handshakeMessage) {
++          handshakeMessage =
++              folly::IOBuf::create(message->fragment->length() + kExtraAlloc);
++        } else if (handshakeMessage->tailroom() < message->fragment->length()) {
++          handshakeMessage->reserve(
++              0, message->fragment->length() + kExtraAlloc);
++        }
++        memcpy(
++            handshakeMessage->writableTail(),
++            message->fragment->data(),
++            message->fragment->length());
++        handshakeMessage->append(message->fragment->length());
++        unparsedHandshakeData_.append(std::move(handshakeMessage));
+         auto param = decodeHandshakeMessage(unparsedHandshakeData_);
+         if (param) {
+           VLOG(8) << "Received handshake message "

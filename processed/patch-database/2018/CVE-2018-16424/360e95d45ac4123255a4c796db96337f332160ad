@@ -1,0 +1,208 @@
+diff --git a/src/libopensc/card-cac.c b/src/libopensc/card-cac.c
+index a30a04385f..756788a0fb 100644
+--- a/src/libopensc/card-cac.c
++++ b/src/libopensc/card-cac.c
+@@ -794,7 +794,7 @@ static int cac_get_serial_nr_from_CUID(sc_card_t* card, sc_serial_number_t* seri
+         }
+ 	if (priv->cac_id_len) {
+ 		serial->len = MIN(priv->cac_id_len, SC_MAX_SERIALNR);
+-		memcpy(serial->value, priv->cac_id, priv->cac_id_len);
++		memcpy(serial->value, priv->cac_id, serial->len);
+ 		SC_FUNC_RETURN(card->ctx, SC_LOG_DEBUG_NORMAL, SC_SUCCESS);
+ 	}
+ 	SC_FUNC_RETURN(card->ctx, SC_LOG_DEBUG_NORMAL, SC_ERROR_FILE_NOT_FOUND);
+diff --git a/src/libopensc/card-epass2003.c b/src/libopensc/card-epass2003.c
+index cbe417cf78..65a58f6740 100644
+--- a/src/libopensc/card-epass2003.c
++++ b/src/libopensc/card-epass2003.c
+@@ -951,7 +951,7 @@ decrypt_response(struct sc_card *card, unsigned char *in, size_t inlen, unsigned
+ 	while (0x80 != plaintext[cipher_len - 2] && (cipher_len - 2 > 0))
+ 		cipher_len--;
+ 
+-	if (2 == cipher_len)
++	if (2 == cipher_len || *out_len < cipher_len - 2)
+ 		return -1;
+ 
+ 	memcpy(out, plaintext, cipher_len - 2);
+@@ -977,6 +977,7 @@ epass2003_sm_unwrap_apdu(struct sc_card *card, struct sc_apdu *sm, struct sc_apd
+ 	r = sc_check_sw(card, sm->sw1, sm->sw2);
+ 	if (r == SC_SUCCESS) {
+ 		if (exdata->sm) {
++			len = plain->resplen;
+ 			if (0 != decrypt_response(card, sm->resp, sm->resplen, plain->resp, &len))
+ 				return SC_ERROR_CARD_CMD_FAILED;
+ 		}
+diff --git a/src/libopensc/card-muscle.c b/src/libopensc/card-muscle.c
+index fd148e3039..d247efabc9 100644
+--- a/src/libopensc/card-muscle.c
++++ b/src/libopensc/card-muscle.c
+@@ -518,7 +518,9 @@ static int muscle_list_files(sc_card_t *card, u8 *buf, size_t bufLen)
+ 	mscfs_check_cache(priv->fs);
+ 
+ 	for(x = 0; x < fs->cache.size; x++) {
+-		u8* oid= fs->cache.array[x].objectId.id;
++		u8* oid = fs->cache.array[x].objectId.id;
++		if (bufLen < 2)
++			break;
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_NORMAL,
+ 			"FILE: %02X%02X%02X%02X\n",
+ 			oid[0],oid[1],oid[2],oid[3]);
+@@ -527,7 +529,8 @@ static int muscle_list_files(sc_card_t *card, u8 *buf, size_t bufLen)
+ 			buf[1] = oid[3];
+ 			if(buf[0] == 0x00 && buf[1] == 0x00) continue; /* No directories/null names outside of root */
+ 			buf += 2;
+-			count+=2;
++			count += 2;
++			bufLen -= 2;
+ 		}
+ 	}
+ 	return count;
+diff --git a/src/libopensc/card-tcos.c b/src/libopensc/card-tcos.c
+index 40eac877de..3c86b1f483 100644
+--- a/src/libopensc/card-tcos.c
++++ b/src/libopensc/card-tcos.c
+@@ -408,7 +408,7 @@ static int tcos_select_file(sc_card_t *card,
+ 	file->path = *in_path;
+ 
+ 	for(i=2; i+1<apdu.resplen && i+1+apdu.resp[i+1]<apdu.resplen; i+=2+apdu.resp[i+1]){
+-		int j, len=apdu.resp[i+1];
++		size_t j, len=apdu.resp[i+1];
+ 		unsigned char type=apdu.resp[i], *d=apdu.resp+i+2;
+ 
+ 		switch (type) {
+@@ -432,8 +432,8 @@ static int tcos_select_file(sc_card_t *card,
+ 			file->id = (d[0]<<8) | d[1];
+ 			break;
+ 		case 0x84:
+-			memcpy(file->name, d, len);
+-			file->namelen = len;
++			file->namelen = MIN(sizeof file->name, len);
++			memcpy(file->name, d, file->namelen);
+ 			break;
+ 		case 0x86:
+ 			sc_file_set_sec_attr(file, d, len); 
+diff --git a/src/libopensc/pkcs15-esteid.c b/src/libopensc/pkcs15-esteid.c
+index b3cf5178fc..2b8d66b913 100644
+--- a/src/libopensc/pkcs15-esteid.c
++++ b/src/libopensc/pkcs15-esteid.c
+@@ -79,7 +79,7 @@ sc_pkcs15emu_esteid_init (sc_pkcs15_card_t * p15card)
+ 	/* read the serial (document number) */
+ 	r = sc_read_record (card, SC_ESTEID_PD_DOCUMENT_NR, buff, sizeof(buff), SC_RECORD_BY_REC_NR);
+ 	SC_TEST_RET(card->ctx, SC_LOG_DEBUG_NORMAL, r, "read document number failed");
+-	buff[r] = '\0';
++	buff[MIN((size_t) r, (sizeof buff)-1)] = '\0';
+ 	set_string (&p15card->tokeninfo->serial_number, (const char *) buff);
+ 
+ 	p15card->tokeninfo->flags = SC_PKCS15_TOKEN_PRN_GENERATION
+diff --git a/src/libopensc/pkcs15-gemsafeV1.c b/src/libopensc/pkcs15-gemsafeV1.c
+index a8162b9d01..3b220f7a5b 100644
+--- a/src/libopensc/pkcs15-gemsafeV1.c
++++ b/src/libopensc/pkcs15-gemsafeV1.c
+@@ -208,7 +208,7 @@ static int gemsafe_get_cert_len(sc_card_t *card)
+ 	 * the private key.
+ 	 */
+ 	ind = 2; /* skip length */
+-	while (ibuf[ind] == 0x01) {
++	while (ibuf[ind] == 0x01 && i < gemsafe_cert_max) {
+ 		if (ibuf[ind+1] == 0xFE) {
+ 			gemsafe_prkeys[i].ref = ibuf[ind+4];
+ 			sc_log(card->ctx, "Key container %d is allocated and uses key_ref %d",
+diff --git a/src/libopensc/pkcs15-sc-hsm.c b/src/libopensc/pkcs15-sc-hsm.c
+index 305572cb6c..1391bea153 100644
+--- a/src/libopensc/pkcs15-sc-hsm.c
++++ b/src/libopensc/pkcs15-sc-hsm.c
+@@ -837,12 +837,14 @@ static int sc_pkcs15emu_sc_hsm_init (sc_pkcs15_card_t * p15card)
+ 		r = read_file(p15card, (u8 *) "\x2F\x02", efbin, &len, 1);
+ 		LOG_TEST_RET(card->ctx, r, "Skipping optional EF.C_DevAut");
+ 
+-		/* save EF_C_DevAut for further use */
+-		ptr = realloc(priv->EF_C_DevAut, len);
+-		if (ptr) {
+-			memcpy(ptr, efbin, len);
+-			priv->EF_C_DevAut = ptr;
+-			priv->EF_C_DevAut_len = len;
++		if (len > 0) {
++			/* save EF_C_DevAut for further use */
++			ptr = realloc(priv->EF_C_DevAut, len);
++			if (ptr) {
++				memcpy(ptr, efbin, len);
++				priv->EF_C_DevAut = ptr;
++				priv->EF_C_DevAut_len = len;
++			}
+ 		}
+ 
+ 		ptr = efbin;
+diff --git a/src/libopensc/sc.c b/src/libopensc/sc.c
+index af71cafa9b..53fefb3e68 100644
+--- a/src/libopensc/sc.c
++++ b/src/libopensc/sc.c
+@@ -628,7 +628,7 @@ int sc_file_set_sec_attr(sc_file_t *file, const u8 *sec_attr,
+ 		return SC_ERROR_INVALID_ARGUMENTS;
+ 	}
+ 
+-	if (sec_attr == NULL) {
++	if (sec_attr == NULL || sec_attr_len) {
+ 		if (file->sec_attr != NULL)
+ 			free(file->sec_attr);
+ 		file->sec_attr = NULL;
+diff --git a/src/tools/cryptoflex-tool.c b/src/tools/cryptoflex-tool.c
+index 21b0baa16d..662a028222 100644
+--- a/src/tools/cryptoflex-tool.c
++++ b/src/tools/cryptoflex-tool.c
+@@ -21,6 +21,7 @@
+ #include "config.h"
+ 
+ #include "libopensc/sc-ossl-compat.h"
++#include "libopensc/internal.h"
+ #include <openssl/bn.h>
+ #include <openssl/rsa.h>
+ #include <openssl/x509.h>
+@@ -331,7 +332,7 @@ static int read_public_key(RSA *rsa)
+ 		fprintf(stderr, "Unable to select public key file: %s\n", sc_strerror(r));
+ 		return 2;
+ 	}
+-	bufsize = file->size;
++	bufsize = MIN(file->size, sizeof buf);
+ 	sc_file_free(file);
+ 	r = sc_read_binary(card, 0, buf, bufsize, 0);
+ 	if (r < 0) {
+@@ -382,7 +383,7 @@ static int read_private_key(RSA *rsa)
+ 	e = sc_file_get_acl_entry(file, SC_AC_OP_READ);
+ 	if (e == NULL || e->method == SC_AC_NEVER)
+ 		return 10;
+-	bufsize = file->size;
++	bufsize = MIN(file->size, sizeof buf);
+ 	sc_file_free(file);
+ 	r = sc_read_binary(card, 0, buf, bufsize, 0);
+ 	if (r < 0) {
+diff --git a/src/tools/egk-tool.c b/src/tools/egk-tool.c
+index 0a8834b6f7..31360833b5 100644
+--- a/src/tools/egk-tool.c
++++ b/src/tools/egk-tool.c
+@@ -149,7 +149,7 @@ int read_file(struct sc_card *card, char *str_path, unsigned char **data, size_t
+ 		goto err;
+ 	}
+ 
+-	len = file ? file->size : 4096;
++	len = file && file->size > 0 ? file->size : 4096;
+ 	p = realloc(*data, len);
+ 	if (!p) {
+ 		goto err;
+diff --git a/src/tools/util.c b/src/tools/util.c
+index 6b8743e2d0..e49647a472 100644
+--- a/src/tools/util.c
++++ b/src/tools/util.c
+@@ -339,10 +339,11 @@ const char * util_acl_to_str(const sc_acl_entry_t *e)
+ 			strcpy(buf, "????");
+ 			break;
+ 		}
+-		strcat(line, buf);
+-		strcat(line, " ");
++		strncat(line, buf, sizeof line);
++		strncat(line, " ", sizeof line);
+ 		e = e->next;
+ 	}
++	line[(sizeof line)-1] = '\0'; /* make sure it's NUL terminated */
+ 	line[strlen(line)-1] = 0; /* get rid of trailing space */
+ 	return line;
+ }

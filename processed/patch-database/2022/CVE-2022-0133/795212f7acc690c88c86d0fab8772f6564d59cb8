@@ -1,0 +1,243 @@
+diff --git a/server/controllers/api/videos/captions.ts b/server/controllers/api/videos/captions.ts
+index 2d2213327ce..aa7259ee9c9 100644
+--- a/server/controllers/api/videos/captions.ts
++++ b/server/controllers/api/videos/captions.ts
+@@ -48,7 +48,7 @@ export {
+ // ---------------------------------------------------------------------------
+ 
+ async function listVideoCaptions (req: express.Request, res: express.Response) {
+-  const data = await VideoCaptionModel.listVideoCaptions(res.locals.videoId.id)
++  const data = await VideoCaptionModel.listVideoCaptions(res.locals.onlyVideo.id)
+ 
+   return res.json(getFormattedObjects(data, data.length))
+ }
+diff --git a/server/controllers/api/videos/files.ts b/server/controllers/api/videos/files.ts
+index a8b32411d5e..0fbda280e83 100644
+--- a/server/controllers/api/videos/files.ts
++++ b/server/controllers/api/videos/files.ts
+@@ -10,13 +10,15 @@ import {
+   ensureUserHasRight,
+   videoFileMetadataGetValidator,
+   videoFilesDeleteHLSValidator,
+-  videoFilesDeleteWebTorrentValidator
++  videoFilesDeleteWebTorrentValidator,
++  videosGetValidator
+ } from '../../../middlewares'
+ 
+ const lTags = loggerTagsFactory('api', 'video')
+ const filesRouter = express.Router()
+ 
+ filesRouter.get('/:id/metadata/:videoFileId',
++  asyncMiddleware(videosGetValidator),
+   asyncMiddleware(videoFileMetadataGetValidator),
+   asyncMiddleware(getVideoFileMetadata)
+ )
+diff --git a/server/middlewares/validators/shared/videos.ts b/server/middlewares/validators/shared/videos.ts
+index 71b81654f58..fc978b63ad4 100644
+--- a/server/middlewares/validators/shared/videos.ts
++++ b/server/middlewares/validators/shared/videos.ts
+@@ -1,16 +1,20 @@
+-import { Response } from 'express'
++import { Request, Response } from 'express'
+ import { loadVideo, VideoLoadType } from '@server/lib/model-loaders'
++import { authenticatePromiseIfNeeded } from '@server/middlewares/auth'
++import { VideoModel } from '@server/models/video/video'
+ import { VideoChannelModel } from '@server/models/video/video-channel'
+ import { VideoFileModel } from '@server/models/video/video-file'
+ import {
+   MUser,
+   MUserAccountId,
++  MVideo,
+   MVideoAccountLight,
+   MVideoFormattableDetails,
+   MVideoFullLight,
+   MVideoId,
+   MVideoImmutable,
+-  MVideoThumbnail
++  MVideoThumbnail,
++  MVideoWithRights
+ } from '@server/types/models'
+ import { HttpStatusCode, UserRight } from '@shared/models'
+ 
+@@ -89,6 +93,27 @@ async function doesVideoChannelOfAccountExist (channelId: number, user: MUserAcc
+   return true
+ }
+ 
++async function checkCanSeeVideoIfPrivate (req: Request, res: Response, video: MVideo, authenticateInQuery = false) {
++  if (!video.requiresAuth()) return true
++
++  const videoWithRights = await VideoModel.loadAndPopulateAccountAndServerAndTags(video.id)
++
++  return checkCanSeePrivateVideo(req, res, videoWithRights, authenticateInQuery)
++}
++
++async function checkCanSeePrivateVideo (req: Request, res: Response, video: MVideoWithRights, authenticateInQuery = false) {
++  await authenticatePromiseIfNeeded(req, res, authenticateInQuery)
++
++  const user = res.locals.oauth ? res.locals.oauth.token.User : null
++
++  // Only the owner or a user that have blocklist rights can see the video
++  if (!user || !user.canGetVideo(video)) {
++    return false
++  }
++
++  return true
++}
++
+ function checkUserCanManageVideo (user: MUser, video: MVideoAccountLight, right: UserRight, res: Response, onlyOwned = true) {
+   // Retrieve the user who did the request
+   if (onlyOwned && video.isOwned() === false) {
+@@ -120,5 +145,7 @@ export {
+   doesVideoChannelOfAccountExist,
+   doesVideoExist,
+   doesVideoFileOfVideoExist,
+-  checkUserCanManageVideo
++  checkUserCanManageVideo,
++  checkCanSeeVideoIfPrivate,
++  checkCanSeePrivateVideo
+ }
+diff --git a/server/middlewares/validators/videos/video-captions.ts b/server/middlewares/validators/videos/video-captions.ts
+index 38321ccf9a5..4fc4c8ec5fb 100644
+--- a/server/middlewares/validators/videos/video-captions.ts
++++ b/server/middlewares/validators/videos/video-captions.ts
+@@ -1,11 +1,18 @@
+ import express from 'express'
+ import { body, param } from 'express-validator'
+-import { UserRight } from '../../../../shared'
++import { HttpStatusCode, UserRight } from '../../../../shared'
+ import { isVideoCaptionFile, isVideoCaptionLanguageValid } from '../../../helpers/custom-validators/video-captions'
+ import { cleanUpReqFiles } from '../../../helpers/express-utils'
+ import { logger } from '../../../helpers/logger'
+ import { CONSTRAINTS_FIELDS, MIMETYPES } from '../../../initializers/constants'
+-import { areValidationErrors, checkUserCanManageVideo, doesVideoCaptionExist, doesVideoExist, isValidVideoIdParam } from '../shared'
++import {
++  areValidationErrors,
++  checkCanSeeVideoIfPrivate,
++  checkUserCanManageVideo,
++  doesVideoCaptionExist,
++  doesVideoExist,
++  isValidVideoIdParam
++} from '../shared'
+ 
+ const addVideoCaptionValidator = [
+   isValidVideoIdParam('videoId'),
+@@ -64,7 +71,16 @@ const listVideoCaptionsValidator = [
+     logger.debug('Checking listVideoCaptions parameters', { parameters: req.params })
+ 
+     if (areValidationErrors(req, res)) return
+-    if (!await doesVideoExist(req.params.videoId, res, 'id')) return
++    if (!await doesVideoExist(req.params.videoId, res, 'only-video')) return
++
++    const video = res.locals.onlyVideo
++
++    if (!await checkCanSeeVideoIfPrivate(req, res, video)) {
++      return res.fail({
++        status: HttpStatusCode.FORBIDDEN_403,
++        message: 'Cannot list captions of private/internal/blocklisted video'
++      })
++    }
+ 
+     return next()
+   }
+diff --git a/server/middlewares/validators/videos/videos.ts b/server/middlewares/validators/videos/videos.ts
+index 3ebdbc33d11..782f495e832 100644
+--- a/server/middlewares/validators/videos/videos.ts
++++ b/server/middlewares/validators/videos/videos.ts
+@@ -51,9 +51,9 @@ import { CONSTRAINTS_FIELDS, OVERVIEWS } from '../../../initializers/constants'
+ import { isLocalVideoAccepted } from '../../../lib/moderation'
+ import { Hooks } from '../../../lib/plugins/hooks'
+ import { VideoModel } from '../../../models/video/video'
+-import { authenticatePromiseIfNeeded } from '../../auth'
+ import {
+   areValidationErrors,
++  checkCanSeePrivateVideo,
+   checkUserCanManageVideo,
+   doesVideoChannelOfAccountExist,
+   doesVideoExist,
+@@ -317,19 +317,12 @@ const videosCustomGetValidator = (
+ 
+       // Video private or blacklisted
+       if (video.requiresAuth()) {
+-        await authenticatePromiseIfNeeded(req, res, authenticateInQuery)
++        if (await checkCanSeePrivateVideo(req, res, video, authenticateInQuery)) return next()
+ 
+-        const user = res.locals.oauth ? res.locals.oauth.token.User : null
+-
+-        // Only the owner or a user that have blocklist rights can see the video
+-        if (!user || !user.canGetVideo(video)) {
+-          return res.fail({
+-            status: HttpStatusCode.FORBIDDEN_403,
+-            message: 'Cannot get this private/internal or blocklisted video'
+-          })
+-        }
+-
+-        return next()
++        return res.fail({
++          status: HttpStatusCode.FORBIDDEN_403,
++          message: 'Cannot get this private/internal or blocklisted video'
++        })
+       }
+ 
+       // Video is public, anyone can access it
+diff --git a/server/tests/api/check-params/video-captions.ts b/server/tests/api/check-params/video-captions.ts
+index 90f42931454..84c6c1355c1 100644
+--- a/server/tests/api/check-params/video-captions.ts
++++ b/server/tests/api/check-params/video-captions.ts
+@@ -11,7 +11,7 @@ import {
+   PeerTubeServer,
+   setAccessTokensToServers
+ } from '@shared/extra-utils'
+-import { HttpStatusCode, VideoCreateResult } from '@shared/models'
++import { HttpStatusCode, VideoCreateResult, VideoPrivacy } from '@shared/models'
+ 
+ describe('Test video captions API validator', function () {
+   const path = '/api/v1/videos/'
+@@ -19,6 +19,7 @@ describe('Test video captions API validator', function () {
+   let server: PeerTubeServer
+   let userAccessToken: string
+   let video: VideoCreateResult
++  let privateVideo: VideoCreateResult
+ 
+   // ---------------------------------------------------------------
+ 
+@@ -30,6 +31,7 @@ describe('Test video captions API validator', function () {
+     await setAccessTokensToServers([ server ])
+ 
+     video = await server.videos.upload()
++    privateVideo = await server.videos.upload({ attributes: { privacy: VideoPrivacy.PRIVATE } })
+ 
+     {
+       const user = {
+@@ -204,8 +206,32 @@ describe('Test video captions API validator', function () {
+       })
+     })
+ 
++    it('Should fail with a private video without token', async function () {
++      await makeGetRequest({
++        url: server.url,
++        path: path + privateVideo.shortUUID + '/captions',
++        expectedStatus: HttpStatusCode.UNAUTHORIZED_401
++      })
++    })
++
++    it('Should fail with another user token', async function () {
++      await makeGetRequest({
++        url: server.url,
++        token: userAccessToken,
++        path: path + privateVideo.shortUUID + '/captions',
++        expectedStatus: HttpStatusCode.FORBIDDEN_403
++      })
++    })
++
+     it('Should success with the correct parameters', async function () {
+       await makeGetRequest({ url: server.url, path: path + video.shortUUID + '/captions', expectedStatus: HttpStatusCode.OK_200 })
++
++      await makeGetRequest({
++        url: server.url,
++        path: path + privateVideo.shortUUID + '/captions',
++        token: server.accessToken,
++        expectedStatus: HttpStatusCode.OK_200
++      })
+     })
+   })
+ 

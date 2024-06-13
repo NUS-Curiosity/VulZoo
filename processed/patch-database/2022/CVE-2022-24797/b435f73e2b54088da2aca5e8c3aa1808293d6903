@@ -1,0 +1,712 @@
+diff --git a/config/config.go b/config/config.go
+index ec76f64e312..14cdacb4bd0 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -18,6 +18,10 @@ type Config struct {
+ 	HTTPPort string
+ 	// OutboundPort is the port the outbound gRPC listener is running on.
+ 	OutboundPort string
++	// MetricsPort is the port the metrics listener is running on.
++	MetricsPort string
++	// DebugPort is the port the debug listener is running on.
++	DebugPort string
+ }
+ 
+ // Clone creates a clone of the config.
+@@ -32,6 +36,8 @@ func (cfg *Config) Clone() *Config {
+ 		GRPCPort:     cfg.GRPCPort,
+ 		HTTPPort:     cfg.HTTPPort,
+ 		OutboundPort: cfg.OutboundPort,
++		MetricsPort:  cfg.MetricsPort,
++		DebugPort:    cfg.DebugPort,
+ 	}
+ }
+ 
+diff --git a/config/config_source.go b/config/config_source.go
+index ac39b3750a7..2d9a1e0ca3c 100644
+--- a/config/config_source.go
++++ b/config/config_source.go
+@@ -110,13 +110,15 @@ func NewFileOrEnvironmentSource(
+ 		return nil, err
+ 	}
+ 
+-	ports, err := netutil.AllocatePorts(3)
++	ports, err := netutil.AllocatePorts(5)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	grpcPort := ports[0]
+ 	httpPort := ports[1]
+ 	outboundPort := ports[2]
++	metricsPort := ports[3]
++	debugPort := ports[4]
+ 
+ 	cfg := &Config{
+ 		Options:      options,
+@@ -125,6 +127,8 @@ func NewFileOrEnvironmentSource(
+ 		GRPCPort:     grpcPort,
+ 		HTTPPort:     httpPort,
+ 		OutboundPort: outboundPort,
++		MetricsPort:  metricsPort,
++		DebugPort:    debugPort,
+ 	}
+ 	metrics.SetConfigInfo(ctx, cfg.Options.Services, "local", cfg.Checksum(), true)
+ 
+diff --git a/config/envoyconfig/bootstrap_test.go b/config/envoyconfig/bootstrap_test.go
+index 82b29b0c2cb..885980b92d7 100644
+--- a/config/envoyconfig/bootstrap_test.go
++++ b/config/envoyconfig/bootstrap_test.go
+@@ -11,7 +11,7 @@ import (
+ )
+ 
+ func TestBuilder_BuildBootstrapAdmin(t *testing.T) {
+-	b := New("local-grpc", "local-http", filemgr.NewManager(), nil)
++	b := New("local-grpc", "local-http", "local-metrics", filemgr.NewManager(), nil)
+ 	t.Run("valid", func(t *testing.T) {
+ 		adminCfg, err := b.BuildBootstrapAdmin(&config.Config{
+ 			Options: &config.Options{
+@@ -41,7 +41,7 @@ func TestBuilder_BuildBootstrapAdmin(t *testing.T) {
+ }
+ 
+ func TestBuilder_BuildBootstrapLayeredRuntime(t *testing.T) {
+-	b := New("localhost:1111", "localhost:2222", filemgr.NewManager(), nil)
++	b := New("localhost:1111", "localhost:2222", "localhost:3333", filemgr.NewManager(), nil)
+ 	staticCfg, err := b.BuildBootstrapLayeredRuntime()
+ 	assert.NoError(t, err)
+ 	testutil.AssertProtoJSONEqual(t, `
+@@ -58,7 +58,7 @@ func TestBuilder_BuildBootstrapLayeredRuntime(t *testing.T) {
+ 
+ func TestBuilder_BuildBootstrapStaticResources(t *testing.T) {
+ 	t.Run("valid", func(t *testing.T) {
+-		b := New("localhost:1111", "localhost:2222", filemgr.NewManager(), nil)
++		b := New("localhost:1111", "localhost:2222", "localhost:3333", filemgr.NewManager(), nil)
+ 		staticCfg, err := b.BuildBootstrapStaticResources()
+ 		assert.NoError(t, err)
+ 		testutil.AssertProtoJSONEqual(t, `
+@@ -90,14 +90,14 @@ func TestBuilder_BuildBootstrapStaticResources(t *testing.T) {
+ 		`, staticCfg)
+ 	})
+ 	t.Run("bad gRPC address", func(t *testing.T) {
+-		b := New("xyz:zyx", "localhost:2222", filemgr.NewManager(), nil)
++		b := New("xyz:zyx", "localhost:2222", "localhost:3333", filemgr.NewManager(), nil)
+ 		_, err := b.BuildBootstrapStaticResources()
+ 		assert.Error(t, err)
+ 	})
+ }
+ 
+ func TestBuilder_BuildBootstrapStatsConfig(t *testing.T) {
+-	b := New("local-grpc", "local-http", filemgr.NewManager(), nil)
++	b := New("local-grpc", "local-http", "local-metrics", filemgr.NewManager(), nil)
+ 	t.Run("valid", func(t *testing.T) {
+ 		statsCfg, err := b.BuildBootstrapStatsConfig(&config.Config{
+ 			Options: &config.Options{
+diff --git a/config/envoyconfig/builder.go b/config/envoyconfig/builder.go
+index c0ec627ef7d..2609e181db4 100644
+--- a/config/envoyconfig/builder.go
++++ b/config/envoyconfig/builder.go
+@@ -7,23 +7,26 @@ import (
+ 
+ // A Builder builds envoy config from pomerium config.
+ type Builder struct {
+-	localGRPCAddress string
+-	localHTTPAddress string
+-	filemgr          *filemgr.Manager
+-	reproxy          *reproxy.Handler
++	localGRPCAddress    string
++	localHTTPAddress    string
++	localMetricsAddress string
++	filemgr             *filemgr.Manager
++	reproxy             *reproxy.Handler
+ }
+ 
+ // New creates a new Builder.
+ func New(
+ 	localGRPCAddress string,
+ 	localHTTPAddress string,
++	localMetricsAddress string,
+ 	fileManager *filemgr.Manager,
+ 	reproxyHandler *reproxy.Handler,
+ ) *Builder {
+ 	return &Builder{
+-		localGRPCAddress: localGRPCAddress,
+-		localHTTPAddress: localHTTPAddress,
+-		filemgr:          fileManager,
+-		reproxy:          reproxyHandler,
++		localGRPCAddress:    localGRPCAddress,
++		localHTTPAddress:    localHTTPAddress,
++		localMetricsAddress: localMetricsAddress,
++		filemgr:             fileManager,
++		reproxy:             reproxyHandler,
+ 	}
+ }
+diff --git a/config/envoyconfig/clusters.go b/config/envoyconfig/clusters.go
+index 90d1dd869ef..0e5dc525975 100644
+--- a/config/envoyconfig/clusters.go
++++ b/config/envoyconfig/clusters.go
+@@ -34,6 +34,10 @@ func (b *Builder) BuildClusters(ctx context.Context, cfg *config.Config) ([]*env
+ 		Scheme: "http",
+ 		Host:   b.localHTTPAddress,
+ 	}
++	metricsURL := &url.URL{
++		Scheme: "http",
++		Host:   b.localMetricsAddress,
++	}
+ 	authorizeURLs, err := cfg.Options.GetInternalAuthorizeURLs()
+ 	if err != nil {
+ 		return nil, err
+@@ -53,6 +57,11 @@ func (b *Builder) BuildClusters(ctx context.Context, cfg *config.Config) ([]*env
+ 		return nil, err
+ 	}
+ 
++	controlMetrics, err := b.buildInternalCluster(ctx, cfg.Options, "pomerium-control-plane-metrics", []*url.URL{metricsURL}, upstreamProtocolAuto)
++	if err != nil {
++		return nil, err
++	}
++
+ 	authorizeCluster, err := b.buildInternalCluster(ctx, cfg.Options, "pomerium-authorize", authorizeURLs, upstreamProtocolHTTP2)
+ 	if err != nil {
+ 		return nil, err
+@@ -74,6 +83,7 @@ func (b *Builder) BuildClusters(ctx context.Context, cfg *config.Config) ([]*env
+ 	clusters := []*envoy_config_cluster_v3.Cluster{
+ 		controlGRPC,
+ 		controlHTTP,
++		controlMetrics,
+ 		authorizeCluster,
+ 		databrokerCluster,
+ 	}
+diff --git a/config/envoyconfig/clusters_test.go b/config/envoyconfig/clusters_test.go
+index 4e173324397..f6f71d4ba2a 100644
+--- a/config/envoyconfig/clusters_test.go
++++ b/config/envoyconfig/clusters_test.go
+@@ -25,7 +25,7 @@ func Test_buildPolicyTransportSocket(t *testing.T) {
+ 	cacheDir, _ := os.UserCacheDir()
+ 	customCA := filepath.Join(cacheDir, "pomerium", "envoy", "files", "custom-ca-32484c314b584447463735303142374c31414145374650305a525539554938594d524855353757313942494d473847535231.pem")
+ 
+-	b := New("local-grpc", "local-http", filemgr.NewManager(), nil)
++	b := New("local-grpc", "local-http", "local-metrics", filemgr.NewManager(), nil)
+ 	rootCABytes, _ := getCombinedCertificateAuthority("", "")
+ 	rootCA := b.filemgr.BytesDataSource("ca.pem", rootCABytes).GetFilename()
+ 
+@@ -379,7 +379,7 @@ func Test_buildPolicyTransportSocket(t *testing.T) {
+ 
+ func Test_buildCluster(t *testing.T) {
+ 	ctx := context.Background()
+-	b := New("local-grpc", "local-http", filemgr.NewManager(), nil)
++	b := New("local-grpc", "local-http", "local-metrics", filemgr.NewManager(), nil)
+ 	rootCABytes, _ := getCombinedCertificateAuthority("", "")
+ 	rootCA := b.filemgr.BytesDataSource("ca.pem", rootCABytes).GetFilename()
+ 	o1 := config.NewDefaultOptions()
+@@ -858,7 +858,7 @@ func Test_bindConfig(t *testing.T) {
+ 	ctx, clearTimeout := context.WithTimeout(context.Background(), time.Second*10)
+ 	defer clearTimeout()
+ 
+-	b := New("local-grpc", "local-http", filemgr.NewManager(), nil)
++	b := New("local-grpc", "local-http", "local-metrics", filemgr.NewManager(), nil)
+ 	t.Run("no bind config", func(t *testing.T) {
+ 		cluster, err := b.buildPolicyCluster(ctx, &config.Options{}, &config.Policy{
+ 			From: "https://from.example.com",
+diff --git a/config/envoyconfig/listeners.go b/config/envoyconfig/listeners.go
+index 8d0f31340c8..8c88415a695 100644
+--- a/config/envoyconfig/listeners.go
++++ b/config/envoyconfig/listeners.go
+@@ -486,7 +486,7 @@ func (b *Builder) buildMetricsHTTPConnectionManagerFilter() (*envoy_config_liste
+ 			Action: &envoy_config_route_v3.Route_Route{
+ 				Route: &envoy_config_route_v3.RouteAction{
+ 					ClusterSpecifier: &envoy_config_route_v3.RouteAction_Cluster{
+-						Cluster: "pomerium-control-plane-http",
++						Cluster: "pomerium-control-plane-metrics",
+ 					},
+ 				},
+ 			},
+diff --git a/config/envoyconfig/listeners_test.go b/config/envoyconfig/listeners_test.go
+index 3f7cc328661..5114ad9d07e 100644
+--- a/config/envoyconfig/listeners_test.go
++++ b/config/envoyconfig/listeners_test.go
+@@ -25,7 +25,7 @@ func Test_buildMetricsHTTPConnectionManagerFilter(t *testing.T) {
+ 	certFileName := filepath.Join(cacheDir, "pomerium", "envoy", "files", "tls-crt-354e49305a5a39414a545530374e58454e48334148524c4e324258463837364355564c4e4532464b54355139495547514a38.pem")
+ 	keyFileName := filepath.Join(cacheDir, "pomerium", "envoy", "files", "tls-key-3350415a38414e4e4a4655424e55393430474147324651433949384e485341334b5157364f424b4c5856365a545937383735.pem")
+ 
+-	b := New("local-grpc", "local-http", filemgr.NewManager(), nil)
++	b := New("local-grpc", "local-http", "local-metrics", filemgr.NewManager(), nil)
+ 	li, err := b.buildMetricsListener(&config.Config{
+ 		Options: &config.Options{
+ 			MetricsAddr:           "127.0.0.1:9902",
+@@ -65,7 +65,7 @@ func Test_buildMetricsHTTPConnectionManagerFilter(t *testing.T) {
+ 								"prefix": "/"
+ 							},
+ 							"route": {
+-								"cluster": "pomerium-control-plane-http"
++								"cluster": "pomerium-control-plane-metrics"
+ 							}
+ 						}]
+ 					}]
+@@ -108,7 +108,7 @@ func Test_buildMetricsHTTPConnectionManagerFilter(t *testing.T) {
+ }
+ 
+ func Test_buildMainHTTPConnectionManagerFilter(t *testing.T) {
+-	b := New("local-grpc", "local-http", nil, nil)
++	b := New("local-grpc", "local-http", "local-metrics", nil, nil)
+ 
+ 	options := config.NewDefaultOptions()
+ 	options.SkipXffAppend = true
+@@ -523,7 +523,7 @@ func Test_buildMainHTTPConnectionManagerFilter(t *testing.T) {
+ }
+ 
+ func Test_buildDownstreamTLSContext(t *testing.T) {
+-	b := New("local-grpc", "local-http", filemgr.NewManager(), nil)
++	b := New("local-grpc", "local-http", "local-metrics", filemgr.NewManager(), nil)
+ 
+ 	cacheDir, _ := os.UserCacheDir()
+ 	certFileName := filepath.Join(cacheDir, "pomerium", "envoy", "files", "tls-crt-354e49305a5a39414a545530374e58454e48334148524c4e324258463837364355564c4e4532464b54355139495547514a38.pem")
+@@ -805,7 +805,7 @@ func Test_hostMatchesDomain(t *testing.T) {
+ }
+ 
+ func Test_buildRouteConfiguration(t *testing.T) {
+-	b := New("local-grpc", "local-http", nil, nil)
++	b := New("local-grpc", "local-http", "local-metrics", nil, nil)
+ 	virtualHosts := make([]*envoy_config_route_v3.VirtualHost, 10)
+ 	routeConfig, err := b.buildRouteConfiguration("test-route-configuration", virtualHosts)
+ 	require.NoError(t, err)
+@@ -815,7 +815,7 @@ func Test_buildRouteConfiguration(t *testing.T) {
+ }
+ 
+ func Test_requireProxyProtocol(t *testing.T) {
+-	b := New("local-grpc", "local-http", nil, nil)
++	b := New("local-grpc", "local-http", "local-metrics", nil, nil)
+ 	t.Run("required", func(t *testing.T) {
+ 		li, err := b.buildMainListener(context.Background(), &config.Config{Options: &config.Options{
+ 			UseProxyProtocol: true,
+diff --git a/config/envoyconfig/routes.go b/config/envoyconfig/routes.go
+index 347933723ec..be702eb741a 100644
+--- a/config/envoyconfig/routes.go
++++ b/config/envoyconfig/routes.go
+@@ -57,51 +57,20 @@ func (b *Builder) buildPomeriumHTTPRoutes(options *config.Options, domain string
+ 		return nil, err
+ 	}
+ 	if !isFrontingAuthenticate {
+-		// enable ext_authz
+-		r, err := b.buildControlPlanePathRoute("/.pomerium/jwt", true)
+-		if err != nil {
+-			return nil, err
+-		}
+-		routes = append(routes, r)
+-
+-		// disable ext_authz and passthrough to proxy handlers
+-		r, err = b.buildControlPlanePathRoute("/ping", false)
+-		if err != nil {
+-			return nil, err
+-		}
+-		routes = append(routes, r)
+-		r, err = b.buildControlPlanePathRoute("/healthz", false)
+-		if err != nil {
+-			return nil, err
+-		}
+-		routes = append(routes, r)
+-		r, err = b.buildControlPlanePathRoute("/.pomerium", false)
+-		if err != nil {
+-			return nil, err
+-		}
+-		routes = append(routes, r)
+-		r, err = b.buildControlPlanePrefixRoute("/.pomerium/", false)
+-		if err != nil {
+-			return nil, err
+-		}
+-		routes = append(routes, r)
+-		r, err = b.buildControlPlanePathRoute("/.well-known/pomerium", false)
+-		if err != nil {
+-			return nil, err
+-		}
+-		routes = append(routes, r)
+-		r, err = b.buildControlPlanePrefixRoute("/.well-known/pomerium/", false)
+-		if err != nil {
+-			return nil, err
+-		}
+-		routes = append(routes, r)
++		routes = append(routes,
++			// enable ext_authz
++			b.buildControlPlanePathRoute("/.pomerium/jwt", true),
++			// disable ext_authz and passthrough to proxy handlers
++			b.buildControlPlanePathRoute("/ping", false),
++			b.buildControlPlanePathRoute("/healthz", false),
++			b.buildControlPlanePathRoute("/.pomerium", false),
++			b.buildControlPlanePrefixRoute("/.pomerium/", false),
++			b.buildControlPlanePathRoute("/.well-known/pomerium", false),
++			b.buildControlPlanePrefixRoute("/.well-known/pomerium/", false),
++		)
+ 		// per #837, only add robots.txt if there are no unauthenticated routes
+ 		if !hasPublicPolicyMatchingURL(options, url.URL{Scheme: "https", Host: domain, Path: "/robots.txt"}) {
+-			r, err := b.buildControlPlanePathRoute("/robots.txt", false)
+-			if err != nil {
+-				return nil, err
+-			}
+-			routes = append(routes, r)
++			routes = append(routes, b.buildControlPlanePathRoute("/robots.txt", false))
+ 		}
+ 	}
+ 	// if we're handling authentication, add the oauth2 callback url
+@@ -110,11 +79,10 @@ func (b *Builder) buildPomeriumHTTPRoutes(options *config.Options, domain string
+ 		return nil, err
+ 	}
+ 	if config.IsAuthenticate(options.Services) && hostMatchesDomain(authenticateURL, domain) {
+-		r, err := b.buildControlPlanePrefixRoute("/", false)
+-		if err != nil {
+-			return nil, err
+-		}
+-		routes = append(routes, r)
++		routes = append(routes,
++			b.buildControlPlanePathRoute(options.AuthenticateCallbackPath, false),
++			b.buildControlPlanePathRoute("/", false),
++		)
+ 	}
+ 	// if we're the proxy and this is the forward-auth url
+ 	forwardAuthURL, err := options.GetForwardAuthURL()
+@@ -196,7 +164,7 @@ func (b *Builder) buildControlPlanePathAndQueryRoute(path string, queryparams []
+ 	}, nil
+ }
+ 
+-func (b *Builder) buildControlPlanePathRoute(path string, protected bool) (*envoy_config_route_v3.Route, error) {
++func (b *Builder) buildControlPlanePathRoute(path string, protected bool) *envoy_config_route_v3.Route {
+ 	r := &envoy_config_route_v3.Route{
+ 		Name: "pomerium-path-" + path,
+ 		Match: &envoy_config_route_v3.RouteMatch{
+@@ -215,10 +183,10 @@ func (b *Builder) buildControlPlanePathRoute(path string, protected bool) (*envo
+ 			"envoy.filters.http.ext_authz": disableExtAuthz,
+ 		}
+ 	}
+-	return r, nil
++	return r
+ }
+ 
+-func (b *Builder) buildControlPlanePrefixRoute(prefix string, protected bool) (*envoy_config_route_v3.Route, error) {
++func (b *Builder) buildControlPlanePrefixRoute(prefix string, protected bool) *envoy_config_route_v3.Route {
+ 	r := &envoy_config_route_v3.Route{
+ 		Name: "pomerium-prefix-" + prefix,
+ 		Match: &envoy_config_route_v3.RouteMatch{
+@@ -237,7 +205,7 @@ func (b *Builder) buildControlPlanePrefixRoute(prefix string, protected bool) (*
+ 			"envoy.filters.http.ext_authz": disableExtAuthz,
+ 		}
+ 	}
+-	return r, nil
++	return r
+ }
+ 
+ // getClusterID returns a cluster ID
+diff --git a/config/envoyconfig/routes_test.go b/config/envoyconfig/routes_test.go
+index 44985e1441a..3830ac66e6d 100644
+--- a/config/envoyconfig/routes_test.go
++++ b/config/envoyconfig/routes_test.go
+@@ -96,7 +96,8 @@ func Test_buildPomeriumHTTPRoutes(t *testing.T) {
+ 			`+routeString("path", "/.well-known/pomerium", false)+`,
+ 			`+routeString("prefix", "/.well-known/pomerium/", false)+`,
+ 			`+routeString("path", "/robots.txt", false)+`,
+-			`+routeString("prefix", "/", false)+`
++			`+routeString("path", "/oauth2/callback", false)+`,
++			`+routeString("path", "/", false)+`
+ 		]`, routes)
+ 	})
+ 	t.Run("proxy fronting authenticate", func(t *testing.T) {
+@@ -167,8 +168,7 @@ func Test_buildPomeriumHTTPRoutes(t *testing.T) {
+ 
+ func Test_buildControlPlanePathRoute(t *testing.T) {
+ 	b := &Builder{filemgr: filemgr.NewManager()}
+-	route, err := b.buildControlPlanePathRoute("/hello/world", false)
+-	require.NoError(t, err)
++	route := b.buildControlPlanePathRoute("/hello/world", false)
+ 	testutil.AssertProtoJSONEqual(t, `
+ 		{
+ 			"name": "pomerium-path-/hello/world",
+@@ -190,8 +190,7 @@ func Test_buildControlPlanePathRoute(t *testing.T) {
+ 
+ func Test_buildControlPlanePrefixRoute(t *testing.T) {
+ 	b := &Builder{filemgr: filemgr.NewManager()}
+-	route, err := b.buildControlPlanePrefixRoute("/hello/world/", false)
+-	require.NoError(t, err)
++	route := b.buildControlPlanePrefixRoute("/hello/world/", false)
+ 	testutil.AssertProtoJSONEqual(t, `
+ 		{
+ 			"name": "pomerium-prefix-/hello/world/",
+diff --git a/config/metrics.go b/config/metrics.go
+index fdf291a6703..f671c2af91f 100644
+--- a/config/metrics.go
++++ b/config/metrics.go
+@@ -3,6 +3,7 @@ package config
+ import (
+ 	"context"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"sync"
+ 
+@@ -16,12 +17,13 @@ import (
+ 
+ // A MetricsManager manages metrics for a given configuration.
+ type MetricsManager struct {
+-	mu             sync.RWMutex
+-	installationID string
+-	serviceName    string
+-	addr           string
+-	basicAuth      string
+-	handler        http.Handler
++	mu                sync.RWMutex
++	installationID    string
++	serviceName       string
++	addr              string
++	basicAuth         string
++	envoyAdminAddress string
++	handler           http.Handler
+ }
+ 
+ // NewMetricsManager creates a new MetricsManager.
+@@ -46,8 +48,8 @@ func (mgr *MetricsManager) OnConfigChange(ctx context.Context, cfg *Config) {
+ 	mgr.mu.Lock()
+ 	defer mgr.mu.Unlock()
+ 
+-	mgr.updateInfo(cfg)
+-	mgr.updateServer(cfg)
++	mgr.updateInfo(ctx, cfg)
++	mgr.updateServer(ctx, cfg)
+ }
+ 
+ func (mgr *MetricsManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -61,7 +63,7 @@ func (mgr *MetricsManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	mgr.handler.ServeHTTP(w, r)
+ }
+ 
+-func (mgr *MetricsManager) updateInfo(cfg *Config) {
++func (mgr *MetricsManager) updateInfo(ctx context.Context, cfg *Config) {
+ 	serviceName := telemetry.ServiceName(cfg.Options.Services)
+ 	if serviceName == mgr.serviceName {
+ 		return
+@@ -69,7 +71,7 @@ func (mgr *MetricsManager) updateInfo(cfg *Config) {
+ 
+ 	hostname, err := os.Hostname()
+ 	if err != nil {
+-		log.Error(context.TODO()).Err(err).Msg("telemetry/metrics: failed to get OS hostname")
++		log.Error(ctx).Err(err).Msg("telemetry/metrics: failed to get OS hostname")
+ 		hostname = "__unknown__"
+ 	}
+ 
+@@ -77,26 +79,34 @@ func (mgr *MetricsManager) updateInfo(cfg *Config) {
+ 	mgr.serviceName = serviceName
+ }
+ 
+-func (mgr *MetricsManager) updateServer(cfg *Config) {
++func (mgr *MetricsManager) updateServer(ctx context.Context, cfg *Config) {
+ 	if cfg.Options.MetricsAddr == mgr.addr &&
+ 		cfg.Options.MetricsBasicAuth == mgr.basicAuth &&
+-		cfg.Options.InstallationID == mgr.installationID {
++		cfg.Options.InstallationID == mgr.installationID &&
++		cfg.Options.EnvoyAdminAddress == mgr.envoyAdminAddress {
+ 		return
+ 	}
+ 
+ 	mgr.addr = cfg.Options.MetricsAddr
+ 	mgr.basicAuth = cfg.Options.MetricsBasicAuth
+ 	mgr.installationID = cfg.Options.InstallationID
++	mgr.envoyAdminAddress = cfg.Options.EnvoyAdminAddress
+ 	mgr.handler = nil
+ 
+ 	if mgr.addr == "" {
+-		log.Info(context.TODO()).Msg("metrics: http server disabled")
++		log.Info(ctx).Msg("metrics: http server disabled")
+ 		return
+ 	}
+ 
+-	handler, err := metrics.PrometheusHandler(EnvoyAdminURL, mgr.installationID)
++	envoyURL, err := url.Parse("http://" + cfg.Options.EnvoyAdminAddress)
+ 	if err != nil {
+-		log.Error(context.TODO()).Err(err).Msg("metrics: failed to create prometheus handler")
++		log.Error(ctx).Err(err).Msg("metrics: invalid envoy admin address, disabling")
++		return
++	}
++
++	handler, err := metrics.PrometheusHandler(envoyURL, mgr.installationID)
++	if err != nil {
++		log.Error(ctx).Err(err).Msg("metrics: failed to create prometheus handler")
+ 		return
+ 	}
+ 
+diff --git a/config/options.go b/config/options.go
+index 9d855844173..8fb7ea92a5c 100644
+--- a/config/options.go
++++ b/config/options.go
+@@ -49,9 +49,6 @@ const (
+ // gRPC server, or is used for healthchecks (authorize only service)
+ const DefaultAlternativeAddr = ":5443"
+ 
+-// EnvoyAdminURL indicates where the envoy control plane is listening
+-var EnvoyAdminURL = &url.URL{Host: "127.0.0.1:9901", Scheme: "http"}
+-
+ // The randomSharedKey is used if no shared key is supplied in all-in-one mode.
+ var randomSharedKey = cryptutil.NewBase64Key()
+ 
+diff --git a/internal/cmd/pomerium/pomerium.go b/internal/cmd/pomerium/pomerium.go
+index 851921b27b8..3662d50f9c8 100644
+--- a/internal/cmd/pomerium/pomerium.go
++++ b/internal/cmd/pomerium/pomerium.go
+@@ -86,6 +86,8 @@ func Run(ctx context.Context, configFile string) error {
+ 		Str("grpc-port", src.GetConfig().GRPCPort).
+ 		Str("http-port", src.GetConfig().HTTPPort).
+ 		Str("outbound-port", src.GetConfig().OutboundPort).
++		Str("metrics-port", src.GetConfig().MetricsPort).
++		Str("debug-port", src.GetConfig().DebugPort).
+ 		Msg("server started")
+ 
+ 	// create envoy server
+diff --git a/internal/controlplane/http.go b/internal/controlplane/http.go
+index cbb8c36b409..e76cbba2222 100644
+--- a/internal/controlplane/http.go
++++ b/internal/controlplane/http.go
+@@ -49,12 +49,12 @@ func (srv *Server) addHTTPMiddleware() {
+ 	root.HandleFunc("/ping", httputil.HealthCheck)
+ 
+ 	// pprof
+-	root.Path("/debug/pprof/cmdline").HandlerFunc(pprof.Cmdline)
+-	root.Path("/debug/pprof/profile").HandlerFunc(pprof.Profile)
+-	root.Path("/debug/pprof/symbol").HandlerFunc(pprof.Symbol)
+-	root.Path("/debug/pprof/trace").HandlerFunc(pprof.Trace)
+-	root.PathPrefix("/debug/pprof/").HandlerFunc(pprof.Index)
++	srv.DebugRouter.Path("/debug/pprof/cmdline").HandlerFunc(pprof.Cmdline)
++	srv.DebugRouter.Path("/debug/pprof/profile").HandlerFunc(pprof.Profile)
++	srv.DebugRouter.Path("/debug/pprof/symbol").HandlerFunc(pprof.Symbol)
++	srv.DebugRouter.Path("/debug/pprof/trace").HandlerFunc(pprof.Trace)
++	srv.DebugRouter.PathPrefix("/debug/pprof/").HandlerFunc(pprof.Index)
+ 
+ 	// metrics
+-	root.Handle("/metrics", srv.metricsMgr)
++	srv.MetricsRouter.Handle("/metrics", srv.metricsMgr)
+ }
+diff --git a/internal/controlplane/server.go b/internal/controlplane/server.go
+index 9db363ad64e..ed056ebc90b 100644
+--- a/internal/controlplane/server.go
++++ b/internal/controlplane/server.go
+@@ -50,11 +50,15 @@ func (avo *atomicVersionedConfig) Store(cfg versionedConfig) {
+ 
+ // A Server is the control-plane gRPC and HTTP servers.
+ type Server struct {
+-	GRPCListener net.Listener
+-	GRPCServer   *grpc.Server
+-	HTTPListener net.Listener
+-	HTTPRouter   *mux.Router
+-	Builder      *envoyconfig.Builder
++	GRPCListener    net.Listener
++	GRPCServer      *grpc.Server
++	HTTPListener    net.Listener
++	HTTPRouter      *mux.Router
++	MetricsListener net.Listener
++	MetricsRouter   *mux.Router
++	DebugListener   net.Listener
++	DebugRouter     *mux.Router
++	Builder         *envoyconfig.Builder
+ 
+ 	currentConfig atomicVersionedConfig
+ 	name          string
+@@ -106,7 +110,25 @@ func NewServer(cfg *config.Config, metricsMgr *config.MetricsManager) (*Server,
+ 		_ = srv.GRPCListener.Close()
+ 		return nil, err
+ 	}
++
++	srv.MetricsListener, err = net.Listen("tcp4", net.JoinHostPort("127.0.0.1", cfg.MetricsPort))
++	if err != nil {
++		_ = srv.GRPCListener.Close()
++		_ = srv.HTTPListener.Close()
++		return nil, err
++	}
++
++	srv.DebugListener, err = net.Listen("tcp4", net.JoinHostPort("127.0.0.1", cfg.DebugPort))
++	if err != nil {
++		_ = srv.GRPCListener.Close()
++		_ = srv.HTTPListener.Close()
++		_ = srv.DebugListener.Close()
++		return nil, err
++	}
++
+ 	srv.HTTPRouter = mux.NewRouter()
++	srv.DebugRouter = mux.NewRouter()
++	srv.MetricsRouter = mux.NewRouter()
+ 	srv.addHTTPMiddleware()
+ 
+ 	srv.filemgr = filemgr.NewManager()
+@@ -115,6 +137,7 @@ func NewServer(cfg *config.Config, metricsMgr *config.MetricsManager) (*Server,
+ 	srv.Builder = envoyconfig.New(
+ 		srv.GRPCListener.Addr().String(),
+ 		srv.HTTPListener.Addr().String(),
++		srv.MetricsListener.Addr().String(),
+ 		srv.filemgr,
+ 		srv.reproxy,
+ 	)
+@@ -175,28 +198,41 @@ func (srv *Server) Run(ctx context.Context) error {
+ 		return nil
+ 	})
+ 
+-	hsrv := (&http.Server{
+-		BaseContext: func(li net.Listener) context.Context {
+-			return ctx
+-		},
+-		Handler: srv.HTTPRouter,
+-	})
++	for _, entry := range []struct {
++		Name     string
++		Listener net.Listener
++		Handler  *mux.Router
++	}{
++		{"http", srv.HTTPListener, srv.HTTPRouter},
++		{"debug", srv.DebugListener, srv.DebugRouter},
++		{"metrics", srv.MetricsListener, srv.MetricsRouter},
++	} {
++		entry := entry
++		hsrv := (&http.Server{
++			BaseContext: func(li net.Listener) context.Context {
++				return ctx
++			},
++			Handler: entry.Handler,
++		})
+ 
+-	// start the HTTP server
+-	eg.Go(func() error {
+-		log.Info(ctx).Str("addr", srv.HTTPListener.Addr().String()).Msg("starting control-plane HTTP server")
+-		return hsrv.Serve(srv.HTTPListener)
+-	})
++		// start the HTTP server
++		eg.Go(func() error {
++			log.Info(ctx).
++				Str("addr", entry.Listener.Addr().String()).
++				Msgf("starting control-plane %s server", entry.Name)
++			return hsrv.Serve(entry.Listener)
++		})
+ 
+-	// gracefully stop the HTTP server on context cancellation
+-	eg.Go(func() error {
+-		<-ctx.Done()
++		// gracefully stop the HTTP server on context cancellation
++		eg.Go(func() error {
++			<-ctx.Done()
+ 
+-		ctx, cleanup := context.WithTimeout(ctx, time.Second*5)
+-		defer cleanup()
++			ctx, cleanup := context.WithTimeout(ctx, time.Second*5)
++			defer cleanup()
+ 
+-		return hsrv.Shutdown(ctx)
+-	})
++			return hsrv.Shutdown(ctx)
++		})
++	}
+ 
+ 	return eg.Wait()
+ }
+diff --git a/internal/registry/reporter.go b/internal/registry/reporter.go
+index 3121f61b9a9..7168f8b834e 100644
+--- a/internal/registry/reporter.go
++++ b/internal/registry/reporter.go
+@@ -66,6 +66,10 @@ func (r *Reporter) OnConfigChange(ctx context.Context, cfg *config.Config) {
+ }
+ 
+ func getReportedServices(cfg *config.Config) ([]*pb.Service, error) {
++	if cfg.Options.MetricsAddr == "" {
++		return nil, nil
++	}
++
+ 	mu, err := metricsURL(*cfg.Options)
+ 	if err != nil {
+ 		return nil, err

@@ -1,0 +1,986 @@
+diff --git a/Gemfile b/Gemfile
+index 455fda30..57dbf290 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -2,4 +2,4 @@ source 'http://rubygems.org'
+ 
+ gemspec
+ 
+-gem 'codecov', :require => false, :group => :test
+\ No newline at end of file
++gem 'codecov', :require => false, :group => :test
+diff --git a/Guardfile b/Guardfile
+new file mode 100644
+index 00000000..f505b992
+--- /dev/null
++++ b/Guardfile
+@@ -0,0 +1,30 @@
++# A sample Guardfile
++# More info at https://github.com/guard/guard#readme
++
++directories %w(lib spec) \
++ .select{|d| Dir.exists?(d) ? d : UI.warning("Directory #{d} does not exist")}
++
++## Note: if you are using the `directories` clause above and you are not
++## watching the project directory ('.'), then you will want to move
++## the Guardfile to a watched dir and symlink it back, e.g.
++#
++#  $ mkdir config
++#  $ mv Guardfile config/
++#  $ ln -s config/Guardfile .
++#
++# and, you'll have to watch "config/Guardfile" instead of "Guardfile"
++
++# Note: The cmd option is now required due to the increasing number of ways
++#       rspec may be run, below are examples of the most common uses.
++#  * bundler: 'bundle exec rspec'
++#  * bundler binstubs: 'bin/rspec'
++#  * spring: 'bin/rsspec' (This will use spring if running and you have
++#                          installed the spring binstubs per the docs)
++#  * zeus: 'zeus rspec' (requires the server to be started separetly)
++#  * 'just' rspec: 'rspec'
++guard :rspec, cmd: 'bundle exec rspec', failed_mode: :focus do
++  watch(%r{^spec/.+_spec\.rb$})
++  watch(%r{^lib/mini_profiler/(.+)\.rb$})     { |m| "spec/lib/#{m[1]}_spec.rb" }
++  watch('spec/spec_helper.rb')  { "spec" }
++end
++
+diff --git a/autotest/discover.rb b/autotest/discover.rb
+deleted file mode 100644
+index de32a012..00000000
+--- a/autotest/discover.rb
++++ /dev/null
+@@ -1,2 +0,0 @@
+-Autotest.add_discovery { "rspec2" }
+-
+diff --git a/lib/mini_profiler/client_settings.rb b/lib/mini_profiler/client_settings.rb
+index 130cda03..acf14d3b 100644
+--- a/lib/mini_profiler/client_settings.rb
++++ b/lib/mini_profiler/client_settings.rb
+@@ -12,39 +12,90 @@ class ClientSettings
+       attr_accessor :backtrace_level
+ 
+ 
+-      def initialize(env)
++      def initialize(env, store, start)
+         request = ::Rack::Request.new(env)
+         @cookie = request.cookies[COOKIE_NAME]
++        @store = store
++        @start = start
++
++        @allowed_tokens, @orig_auth_tokens = nil
++
+         if @cookie
+           @cookie.split(",").map{|pair| pair.split("=")}.each do |k,v|
+             @orig_disable_profiling = @disable_profiling = (v=='t') if k == "dp"
+             @backtrace_level = v.to_i if k == "bt"
++            @orig_auth_tokens = v.to_s.split("|") if k == "a"
+           end
+         end
+ 
+-        @backtrace_level = nil if !@backtrace_level.nil? && (@backtrace_level == 0 || @backtrace_level > BACKTRACE_NONE)
++        if !@backtrace_level.nil? && (@backtrace_level == 0 || @backtrace_level > BACKTRACE_NONE)
++          @backtrace_level = nil
++        end
++
+         @orig_backtrace_level = @backtrace_level
+ 
+       end
+ 
++      def handle_cookie(result)
++        status,headers,_body = result
++
++        if (MiniProfiler.config.authorization_mode == :whitelist && !MiniProfiler.request_authorized?)
++          # this is non-obvious, don't kill the profiling cookie on errors or short requests
++          # this ensures that stuff that never reaches the rails stack does not kill profiling
++          if status.to_i >= 200 && status.to_i < 300 && ((Time.now - @start) > 0.1)
++            discard_cookie!(headers)
++          end
++        else
++          write!(headers)
++        end
++
++        result
++      end
++
+       def write!(headers)
+-        if @orig_disable_profiling != @disable_profiling || @orig_backtrace_level != @backtrace_level || @cookie.nil?
++
++        tokens_changed = false
++
++        if MiniProfiler.request_authorized? && MiniProfiler.config.authorization_mode == :whitelist
++          @allowed_tokens ||= @store.allowed_tokens
++          tokens_changed = !@orig_auth_tokens || ((@allowed_tokens - @orig_auth_tokens).length > 0)
++        end
++
++        if  @orig_disable_profiling != @disable_profiling ||
++            @orig_backtrace_level != @backtrace_level ||
++            @cookie.nil? ||
++            tokens_changed
++
+           settings = {"p" =>  "t" }
+-          settings["dp"] = "t"              if @disable_profiling
+-          settings["bt"] = @backtrace_level if @backtrace_level
++          settings["dp"] = "t"                  if @disable_profiling
++          settings["bt"] = @backtrace_level     if @backtrace_level
++          settings["a"] = @allowed_tokens.join("|") if @allowed_tokens && MiniProfiler.request_authorized?
++
+           settings_string = settings.map{|k,v| "#{k}=#{v}"}.join(",")
+           Rack::Utils.set_cookie_header!(headers, COOKIE_NAME, :value => settings_string, :path => '/')
+         end
+       end
+ 
+       def discard_cookie!(headers)
+-        Rack::Utils.delete_cookie_header!(headers, COOKIE_NAME, :path => '/')
++        if @cookie
++          Rack::Utils.delete_cookie_header!(headers, COOKIE_NAME, :path => '/')
++        end
+       end
+ 
+-      def has_cookie?
+-        !@cookie.nil?
++      def has_valid_cookie?
++        valid_cookie = !@cookie.nil?
++
++        if (MiniProfiler.config.authorization_mode == :whitelist)
++          @allowed_tokens ||= @store.allowed_tokens
++
++          valid_cookie = (Array === @orig_auth_tokens) &&
++            ((@allowed_tokens & @orig_auth_tokens).length > 0)
++        end
++
++        valid_cookie
+       end
+ 
++
+       def disable_profiling?
+         @disable_profiling
+       end
+diff --git a/lib/mini_profiler/context.rb b/lib/mini_profiler/context.rb
+index 8a81f530..1d9c2112 100644
+--- a/lib/mini_profiler/context.rb
++++ b/lib/mini_profiler/context.rb
+@@ -1,5 +1,6 @@
+ class Rack::MiniProfiler::Context
+-  attr_accessor :inject_js,:current_timer,:page_struct,:skip_backtrace,:full_backtrace,:discard, :mpt_init, :measure
++  attr_accessor :inject_js,:current_timer,:page_struct,:skip_backtrace,
++                :full_backtrace,:discard, :mpt_init, :measure
+ 
+   def initialize(opts = {})
+     opts["measure"] = true unless opts.key? "measure"
+diff --git a/lib/mini_profiler/profiler.rb b/lib/mini_profiler/profiler.rb
+index 5bf8b3d1..2be578c9 100644
+--- a/lib/mini_profiler/profiler.rb
++++ b/lib/mini_profiler/profiler.rb
+@@ -149,7 +149,9 @@ def config
+ 
+     def call(env)
+ 
+-      client_settings = ClientSettings.new(env)
++      start = Time.now
++      client_settings = ClientSettings.new(env, @storage, start)
++      MiniProfiler.deauthorize_request if @config.authorization_mode == :whitelist
+ 
+       status = headers = body = nil
+       query_string = env['QUERY_STRING']
+@@ -162,18 +164,15 @@ def call(env)
+                 (@config.skip_paths && @config.skip_paths.any?{ |p| path.start_with?(p) }) ||
+                 query_string =~ /pp=skip/
+ 
+-      has_profiling_cookie = client_settings.has_cookie?
+-
+-      if skip_it || (@config.authorization_mode == :whitelist && !has_profiling_cookie)
+-        status,headers,body = @app.call(env)
+-        if !skip_it && @config.authorization_mode == :whitelist && !has_profiling_cookie && MiniProfiler.request_authorized?
+-          client_settings.write!(headers)
+-        end
+-        return [status,headers,body]
++      if skip_it || (
++        @config.authorization_mode == :whitelist &&
++        !client_settings.has_valid_cookie?
++      )
++        return client_settings.handle_cookie(@app.call(env))
+       end
+ 
+       # handle all /mini-profiler requests here
+-      return serve_html(env) if path.start_with? @config.base_url_path
++      return client_settings.handle_cookie(serve_html(env)) if path.start_with? @config.base_url_path
+ 
+       has_disable_cookie = client_settings.disable_profiling?
+       # manual session disable / enable
+@@ -181,7 +180,7 @@ def call(env)
+         skip_it = true
+       end
+ 
+-      if query_string =~ /pp=enable/ && (@config.authorization_mode != :whitelist || MiniProfiler.request_authorized?)
++      if query_string =~ /pp=enable/
+         skip_it = false
+         config.enabled = true
+       end
+@@ -189,8 +188,7 @@ def call(env)
+       if skip_it || !config.enabled
+         status,headers,body = @app.call(env)
+         client_settings.disable_profiling = true
+-        client_settings.write!(headers)
+-        return [status,headers,body]
++        return client_settings.handle_cookie([status,headers,body])
+       else
+         client_settings.disable_profiling = false
+       end
+@@ -198,7 +196,7 @@ def call(env)
+       # profile gc
+       if query_string =~ /pp=profile-gc/
+         current.measure = false if current
+-        return Rack::MiniProfiler::GCProfiler.new.profile_gc(@app, env)
++        return client_settings.handle_cookie(Rack::MiniProfiler::GCProfiler.new.profile_gc(@app, env))
+       end
+ 
+       # profile memory
+@@ -215,11 +213,10 @@ def call(env)
+           body.close if body.respond_to? :close
+         end
+         report.pretty_print(result)
+-        return text_result(result.string)
++        return client_settings.handle_cookie(text_result(result.string))
+       end
+ 
+       MiniProfiler.create_current(env, @config)
+-      MiniProfiler.deauthorize_request if @config.authorization_mode == :whitelist
+ 
+       if query_string =~ /pp=normal-backtrace/
+         client_settings.backtrace_level = ClientSettings::BACKTRACE_DEFAULT
+@@ -238,7 +235,6 @@ def call(env)
+       trace_exceptions = query_string =~ /pp=trace-exceptions/ && defined? TracePoint
+       status, headers, body, exceptions,trace = nil
+ 
+-      start = Time.now
+ 
+       if trace_exceptions
+         exceptions = []
+@@ -281,7 +277,6 @@ def call(env)
+         else
+           status,headers,body = @app.call(env)
+         end
+-        client_settings.write!(headers)
+       ensure
+         trace.disable if trace
+       end
+@@ -289,35 +284,30 @@ def call(env)
+       skip_it = current.discard
+ 
+       if (config.authorization_mode == :whitelist && !MiniProfiler.request_authorized?)
+-        # this is non-obvious, don't kill the profiling cookie on errors or short requests
+-        # this ensures that stuff that never reaches the rails stack does not kill profiling
+-        if status.to_i >= 200 && status.to_i < 300 && ((Time.now - start) > 0.1)
+-          client_settings.discard_cookie!(headers)
+-        end
+         skip_it = true
+       end
+ 
+-      return [status,headers,body] if skip_it
++      return client_settings.handle_cookie([status,headers,body]) if skip_it
+ 
+       # we must do this here, otherwise current[:discard] is not being properly treated
+       if trace_exceptions
+         body.close if body.respond_to? :close
+-        return dump_exceptions exceptions
++        return client_settings.handle_cookie(dump_exceptions exceptions)
+       end
+ 
+       if query_string =~ /pp=env/ && !config.disable_env_dump
+         body.close if body.respond_to? :close
+-        return dump_env env
++        return client_settings.handle_cookie(dump_env env)
+       end
+ 
+       if query_string =~ /pp=analyze-memory/
+         body.close if body.respond_to? :close
+-        return analyze_memory
++        return client_settings.handle_cookie(analyze_memory)
+       end
+ 
+       if query_string =~ /pp=help/
+         body.close if body.respond_to? :close
+-        return help(client_settings, env)
++        return client_settings.handle_cookie(help(client_settings, env))
+       end
+ 
+       page_struct = current.page_struct
+@@ -326,7 +316,7 @@ def call(env)
+ 
+       if flamegraph
+         body.close if body.respond_to? :close
+-        return self.flamegraph(flamegraph)
++        return client_settings.handle_cookie(self.flamegraph(flamegraph))
+       end
+ 
+ 
+@@ -337,9 +327,8 @@ def call(env)
+ 
+         # inject headers, script
+         if status >= 200 && status < 300
+-          client_settings.write!(headers)
+           result = inject_profiler(env,status,headers,body)
+-          return result if result
++          return client_settings.handle_cookie(result) if result
+         end
+       rescue Exception => e
+         if @config.storage_failure != nil
+@@ -347,8 +336,7 @@ def call(env)
+         end
+       end
+ 
+-      client_settings.write!(headers)
+-      [status, headers, body]
++      client_settings.handle_cookie([status, headers, body])
+ 
+     ensure
+       # Make sure this always happens
+@@ -543,7 +531,6 @@ def help(client_settings, env)
+ </html>
+ "
+ 
+-      client_settings.write!(headers)
+       [200, headers, [body]]
+     end
+ 
+diff --git a/lib/mini_profiler/storage/abstract_store.rb b/lib/mini_profiler/storage/abstract_store.rb
+index f295d6bc..02f5192d 100644
+--- a/lib/mini_profiler/storage/abstract_store.rb
++++ b/lib/mini_profiler/storage/abstract_store.rb
+@@ -2,6 +2,9 @@ module Rack
+   class MiniProfiler
+     class AbstractStore
+ 
++      # maximum age of allowed tokens before cycling in seconds
++      MAX_TOKEN_AGE = 1800
++
+       def save(page_struct)
+         raise NotImplementedError.new("save is not implemented")
+       end
+@@ -31,6 +34,11 @@ def diagnostics(user)
+         ""
+       end
+ 
++      # a list of tokens that are permitted to access profiler in whitelist mode
++      def allowed_tokens
++        raise NotImplementedError.new("allowed_tokens is not implemented")
++      end
++
+     end
+   end
+ end
+diff --git a/lib/mini_profiler/storage/file_store.rb b/lib/mini_profiler/storage/file_store.rb
+index 972648eb..54633640 100644
+--- a/lib/mini_profiler/storage/file_store.rb
++++ b/lib/mini_profiler/storage/file_store.rb
+@@ -51,6 +51,9 @@ def initialize(args = nil)
+         @user_view_cache    = FileCache.new(@path, "mp_views")
+         @user_view_lock     = Mutex.new
+ 
++        @auth_token_cache    = FileCache.new(@path, "tokens")
++        @auth_token_lock     = Mutex.new
++
+         me = self
+         t = CacheCleanupThread.new do
+           interval = 10
+@@ -126,6 +129,28 @@ def get_unviewed_ids(user)
+         }
+       end
+ 
++      def flush_tokens
++        @auth_token_lock.synchronize {
++          @auth_token_cache[""] = nil
++        }
++      end
++
++      def allowed_tokens
++        @auth_token_lock.synchronize {
++          token1, token2, cycle_at = @auth_token_cache[""]
++
++          unless cycle_at && (Time === cycle_at) && (cycle_at > Time.now)
++            token2 = token1
++            token1 = SecureRandom.hex
++            cycle_at = Time.now + Rack::MiniProfiler::AbstractStore::MAX_TOKEN_AGE
++          end
++
++          @auth_token_cache[""] = [token1, token2, cycle_at]
++
++          [token1, token2].compact
++        }
++      end
++
+       def cleanup_cache
+         files = Dir.entries(@path)
+         @timer_struct_lock.synchronize {
+diff --git a/lib/mini_profiler/storage/memcache_store.rb b/lib/mini_profiler/storage/memcache_store.rb
+index 59e64e93..2804c746 100644
+--- a/lib/mini_profiler/storage/memcache_store.rb
++++ b/lib/mini_profiler/storage/memcache_store.rb
+@@ -51,6 +51,39 @@ def get_unviewed_ids(user)
+         @client.get("#{@prefix}-#{user}-v") || []
+       end
+ 
++      def flush_tokens
++        @client.set("#{@prefix}-tokens", nil)
++      end
++
++      def allowed_tokens
++
++        token_info = @client.get("#{@prefix}-tokens")
++        key1, key2, cycle_at = nil
++
++
++        if token_info
++           key1, key2, cycle_at = Marshal::load(token_info)
++
++           key1 = nil unless key1 && key1.length == 32
++           key2 = nil unless key2 && key2.length == 32
++
++           if key1 && cycle_at && (cycle_at > Time.now)
++              return [key1,key2].compact
++           end
++        end
++
++        timeout = Rack::MiniProfiler::AbstractStore::MAX_TOKEN_AGE
++
++        # cycle keys
++        key2 = key1
++        key1 = SecureRandom.hex
++        cycle_at = Time.now + timeout
++
++        @client.set("#{@prefix}-tokens", Marshal::dump([key1, key2, cycle_at]))
++
++        [key1, key2].compact
++      end
++
+     end
+   end
+ end
+diff --git a/lib/mini_profiler/storage/memory_store.rb b/lib/mini_profiler/storage/memory_store.rb
+index bd140b37..51411d7a 100644
+--- a/lib/mini_profiler/storage/memory_store.rb
++++ b/lib/mini_profiler/storage/memory_store.rb
+@@ -49,11 +49,15 @@ def increment_cycle
+       def initialize(args = nil)
+         args ||= {}
+         @expires_in_seconds = args.fetch(:expires_in) { EXPIRES_IN_SECONDS }
++
++        @token1, @token2, @cycle_tokens_at = nil
++
+         initialize_locks
+         initialize_cleanup_thread(args)
+       end
+ 
+       def initialize_locks
++        @token_lock = Mutex.new
+         @timer_struct_lock  = Mutex.new
+         @user_view_lock     = Mutex.new
+         @timer_struct_cache = {}
+@@ -116,6 +120,20 @@ def cleanup_cache
+           @timer_struct_cache.delete_if { |k, v| v[:started] < expire_older_than }
+         }
+       end
++
++      def allowed_tokens
++        @token_lock.synchronize do
++
++          unless @cycle_at && (@cycle_at > Time.now)
++            @token2 = @token1
++            @token1 = SecureRandom.hex
++            @cycle_at = Time.now + Rack::MiniProfiler::AbstractStore::MAX_TOKEN_AGE
++          end
++
++          [@token1, @token2].compact
++
++        end
++      end
+     end
+   end
+ end
+diff --git a/lib/mini_profiler/storage/redis_store.rb b/lib/mini_profiler/storage/redis_store.rb
+index a3e7f095..7ce0398b 100644
+--- a/lib/mini_profiler/storage/redis_store.rb
++++ b/lib/mini_profiler/storage/redis_store.rb
+@@ -2,6 +2,8 @@ module Rack
+   class MiniProfiler
+     class RedisStore < AbstractStore
+ 
++      attr_reader :prefix
++
+       EXPIRES_IN_SECONDS = 60 * 60 * 24
+ 
+       def initialize(args = nil)
+@@ -55,6 +57,43 @@ def diagnostics(user)
+ "
+       end
+ 
++      def flush_tokens
++        redis.del("#{@prefix}-key1", "#{@prefix}-key1_old", "#{@prefix}-key2")
++      end
++
++      # Only used for testing
++      def simulate_expire
++        redis.del("#{@prefix}-key1")
++      end
++
++      def allowed_tokens
++        key1, key1_old, key2 = redis.mget("#{@prefix}-key1", "#{@prefix}-key1_old", "#{@prefix}-key2")
++
++        if key1 && (key1.length == 32)
++          return [key1, key2].compact
++        end
++
++        timeout = Rack::MiniProfiler::AbstractStore::MAX_TOKEN_AGE
++
++        # TODO  this could be moved to lua to correct a concurrency flaw
++        # it is not critical cause worse case some requests will miss profiling info
++
++        # no key so go ahead and set it
++        key1 = SecureRandom.hex
++
++        if key1_old && (key1_old.length == 32)
++          key2 = key1_old
++          redis.setex "#{@prefix}-key2", timeout, key2
++        else
++          key2 = nil
++        end
++
++        redis.setex "#{@prefix}-key1", timeout, key1
++        redis.setex "#{@prefix}-key1_old", timeout*2, key1
++
++        [key1, key2].compact
++      end
++
+       private
+ 
+       def redis
+diff --git a/lib/rack-mini-profiler.rb b/lib/rack-mini-profiler.rb
+index 3fd7fa1b..beed4508 100644
+--- a/lib/rack-mini-profiler.rb
++++ b/lib/rack-mini-profiler.rb
+@@ -1,6 +1,7 @@
+ require 'json'
+ require 'timeout'
+ require 'thread'
++require 'securerandom'
+ 
+ require 'mini_profiler/version'
+ require 'mini_profiler/asset_version'
+diff --git a/rack-mini-profiler.gemspec b/rack-mini-profiler.gemspec
+index b9806d4f..187f00df 100644
+--- a/rack-mini-profiler.gemspec
++++ b/rack-mini-profiler.gemspec
+@@ -26,12 +26,12 @@ Gem::Specification.new do |s|
+   s.add_development_dependency 'activerecord', '~> 3.0'
+   s.add_development_dependency 'dalli'
+   s.add_development_dependency 'rspec', '~> 2.14.1'
+-  s.add_development_dependency 'ZenTest'
+-  s.add_development_dependency 'autotest'
+   s.add_development_dependency 'redis'
+   s.add_development_dependency 'therubyracer'
+   s.add_development_dependency 'less'
+   s.add_development_dependency 'flamegraph'
++  s.add_development_dependency 'guard'
++  s.add_development_dependency 'guard-rspec'
+ 
+   s.require_paths = ["lib"]
+ end
+diff --git a/spec/components/client_settings_spec.rb b/spec/components/client_settings_spec.rb
+deleted file mode 100644
+index 5093aa8f..00000000
+--- a/spec/components/client_settings_spec.rb
++++ /dev/null
+@@ -1,42 +0,0 @@
+-require 'spec_helper'
+-
+-describe Rack::MiniProfiler::ClientSettings do
+-
+-  describe "with settings" do
+-    before do
+-      settings = URI.encode_www_form_component("dp=t,bt=1")
+-      @settings = Rack::MiniProfiler::ClientSettings.new({"HTTP_COOKIE" => "__profilin=#{settings};" })
+-    end
+-
+-    it 'has the cookies' do
+-      @settings.has_cookie?.should be_true
+-    end
+-
+-    it 'has profiling disabled' do
+-      @settings.disable_profiling?.should be_true
+-    end
+-
+-    it 'has backtrace set to full' do
+-      @settings.backtrace_full?.should be_true
+-    end
+-
+-    it 'should not write cookie changes if no change' do
+-      hash = {}
+-      @settings.write!(hash)
+-      hash.should == {}
+-    end
+-
+-    it 'should correctly write cookie changes if changed' do
+-      @settings.disable_profiling = false
+-      hash = {}
+-      @settings.write!(hash)
+-      hash.should_not == {}
+-    end
+-  end
+-
+-  it "should not have settings by default" do
+-    Rack::MiniProfiler::ClientSettings.new({}).has_cookie?.should == false
+-  end
+-
+-
+-end
+diff --git a/spec/integration/mini_profiler_spec.rb b/spec/integration/mini_profiler_spec.rb
+index 1147c1ac..2fa7fe6f 100644
+--- a/spec/integration/mini_profiler_spec.rb
++++ b/spec/integration/mini_profiler_spec.rb
+@@ -30,6 +30,12 @@ def app
+       map '/html' do
+         run lambda { |env| [200, {'Content-Type' => 'text/html'}, "<html><BODY><h1>Hi</h1></BODY>\n \t</html>"] }
+       end
++      map '/whitelisted-html' do
++        run lambda { |env|
++          Rack::MiniProfiler.authorize_request
++          [200, {'Content-Type' => 'text/html'}, "<html><BODY><h1>Hi</h1></BODY>\n \t</html>"]
++        }
++      end
+       map '/implicitbody' do
+         run lambda { |env| [200, {'Content-Type' => 'text/html'}, "<html><h1>Hi</h1></html>"] }
+       end
+@@ -107,7 +113,7 @@ def app
+ 
+     it 'avoids xss attacks' do
+       h = last_response.headers['X-MiniProfiler-Ids']
+-      id = ::JSON.parse(h)[0]
++      _id = ::JSON.parse(h)[0]
+       get "/mini-profiler-resources/results?id=%22%3E%3Cqss%3E"
+       last_response.should_not be_ok
+       last_response.body.should_not =~ /<qss>/
+@@ -280,13 +286,14 @@ def load_prof(response)
+       it "does not re-enable functionality if not whitelisted" do
+         Rack::MiniProfiler.config.authorization_mode = :whitelist
+         get '/html?pp=enable'
++        get '/html?pp=enable'
+         last_response.body.should_not include('/mini-profiler-resources/includes.js')
+       end
+ 
+       it "re-enabled functionality if whitelisted" do
+         Rack::MiniProfiler.config.authorization_mode = :whitelist
+-        expect(Rack::MiniProfiler).to receive(:request_authorized?) { true }.twice
+-        get '/html?pp=enable'
++        get '/whitelisted-html?pp=enable'
++        get '/whitelisted-html?pp=enable'
+         last_response.body.should include('/mini-profiler-resources/includes.js')
+       end
+     end
+@@ -334,7 +341,9 @@ def load_prof(response)
+     end
+ 
+     it "should allow requests that are whitelisted" do
+-      set_cookie("__profilin=stylin")
++      get '/whitelisted'
++      # second time will ensure cookie is set
++      # first time around there is no cookie, so no profiling
+       get '/whitelisted'
+       last_response.headers['X-MiniProfiler-Ids'].should_not be_nil
+     end
+diff --git a/spec/lib/client_settings_spec.rb b/spec/lib/client_settings_spec.rb
+new file mode 100644
+index 00000000..5c6732f1
+--- /dev/null
++++ b/spec/lib/client_settings_spec.rb
+@@ -0,0 +1,77 @@
++require 'spec_helper'
++require 'rack'
++
++describe Rack::MiniProfiler::ClientSettings do
++
++  describe "with settings" do
++    before do
++      @store = Rack::MiniProfiler::MemoryStore.new
++      settings = URI.encode_www_form_component("dp=t,bt=1")
++      @settings = Rack::MiniProfiler::ClientSettings.new(
++        {"HTTP_COOKIE" => "__profilin=#{settings};" },
++        @store,
++        Time.now
++      )
++    end
++
++    it 'has the cookies' do
++      @settings.has_valid_cookie?.should be_true
++    end
++
++    it 'has profiling disabled' do
++      @settings.disable_profiling?.should be_true
++    end
++
++    it 'has backtrace set to full' do
++      @settings.backtrace_full?.should be_true
++    end
++
++    it 'should not write cookie changes if no change' do
++      hash = {}
++      @settings.write!(hash)
++      hash.should == {}
++    end
++
++    it 'should correctly write cookie changes if changed' do
++      @settings.disable_profiling = false
++      hash = {}
++      @settings.write!(hash)
++      hash.should_not == {}
++    end
++
++    it 'writes auth token for authorized reqs' do
++      Rack::MiniProfiler.config.authorization_mode = :whitelist
++      Rack::MiniProfiler.authorize_request
++      hash = {}
++      @settings.write!(hash)
++      hash["Set-Cookie"].should include(@store.allowed_tokens.join("|"))
++    end
++
++    it 'does nothing on short unauthed requests' do
++      Rack::MiniProfiler.config.authorization_mode = :whitelist
++      Rack::MiniProfiler.deauthorize_request
++      hash = {}
++      @settings.handle_cookie([200, hash, []])
++
++      hash.should == {}
++    end
++
++    it 'discards on long unauthed requests' do
++      Rack::MiniProfiler.config.authorization_mode = :whitelist
++      Rack::MiniProfiler.deauthorize_request
++      hash = {}
++      Time.travel(Time.now + 1) do
++        @settings.handle_cookie([200, hash, []])
++      end
++
++      hash["Set-Cookie"].should include("max-age=0")
++    end
++  end
++
++  it "should not have settings by default" do
++    Rack::MiniProfiler::ClientSettings.new({}, Rack::MiniProfiler::MemoryStore.new, Time.now)
++      .has_valid_cookie?.should == false
++  end
++
++
++end
+diff --git a/spec/components/config_spec.rb b/spec/lib/config_spec.rb
+similarity index 100%
+rename from spec/components/config_spec.rb
+rename to spec/lib/config_spec.rb
+diff --git a/spec/components/gc_profiler_spec.rb b/spec/lib/gc_profiler_spec.rb
+similarity index 100%
+rename from spec/components/gc_profiler_spec.rb
+rename to spec/lib/gc_profiler_spec.rb
+diff --git a/spec/components/profiler_spec.rb b/spec/lib/profiler_spec.rb
+similarity index 100%
+rename from spec/components/profiler_spec.rb
+rename to spec/lib/profiler_spec.rb
+diff --git a/spec/components/sql_patches_spec.rb b/spec/lib/sql_patches_spec.rb
+similarity index 100%
+rename from spec/components/sql_patches_spec.rb
+rename to spec/lib/sql_patches_spec.rb
+diff --git a/spec/components/storage/file_store_spec.rb b/spec/lib/storage/file_store_spec.rb
+similarity index 69%
+rename from spec/components/storage/file_store_spec.rb
+rename to spec/lib/storage/file_store_spec.rb
+index 175cbf26..690c3b10 100644
+--- a/spec/components/storage/file_store_spec.rb
++++ b/spec/lib/storage/file_store_spec.rb
+@@ -9,6 +9,31 @@
+       @store = Rack::MiniProfiler::FileStore.new(:path => tmp)
+     end
+ 
++
++    describe 'allowed_tokens' do
++
++      it 'should return tokens' do
++        @store.flush_tokens
++
++        tokens = @store.allowed_tokens
++        tokens.length.should == 1
++        tokens.should == @store.allowed_tokens
++
++        Time.travel(Time.now + 1) do
++          new_tokens = @store.allowed_tokens
++          new_tokens.length.should == 1
++          new_tokens.should == tokens
++        end
++
++        Time.travel(Time.now + Rack::MiniProfiler::AbstractStore::MAX_TOKEN_AGE + 1) do
++          new_tokens = @store.allowed_tokens
++          new_tokens.length.should == 2
++          (new_tokens - tokens).length.should == 1
++        end
++
++      end
++    end
++
+     describe 'storage' do
+ 
+       it 'can store a PageStruct and retrieve it' do
+diff --git a/spec/components/storage/memcache_store_spec.rb b/spec/lib/storage/memcache_store_spec.rb
+similarity index 72%
+rename from spec/components/storage/memcache_store_spec.rb
+rename to spec/lib/storage/memcache_store_spec.rb
+index f6083d8a..8cf2ee2f 100644
+--- a/spec/components/storage/memcache_store_spec.rb
++++ b/spec/lib/storage/memcache_store_spec.rb
+@@ -46,6 +46,34 @@
+ 
+   end
+ 
++
++  describe 'allowed_tokens' do
++    before do
++      @store = Rack::MiniProfiler::MemcacheStore.new
++    end
++
++    it 'should return tokens' do
++
++      @store.flush_tokens
++
++      tokens = @store.allowed_tokens
++      tokens.length.should == 1
++      tokens.should == @store.allowed_tokens
++
++      Time.travel(Time.now + 1) do
++        new_tokens = @store.allowed_tokens
++        new_tokens.length.should == 1
++        new_tokens.should == tokens
++      end
++
++      Time.travel(Time.now + Rack::MiniProfiler::AbstractStore::MAX_TOKEN_AGE + 1) do
++        new_tokens = @store.allowed_tokens
++        new_tokens.length.should == 2
++        (new_tokens - tokens).length.should == 1
++      end
++    end
++  end
++
+   context 'passing in a Memcache client' do
+     describe 'client' do
+       it 'uses the passed in object rather than creating a new one' do
+diff --git a/spec/components/storage/memory_store_spec.rb b/spec/lib/storage/memory_store_spec.rb
+similarity index 82%
+rename from spec/components/storage/memory_store_spec.rb
+rename to spec/lib/storage/memory_store_spec.rb
+index ac348c82..054d7ee0 100644
+--- a/spec/components/storage/memory_store_spec.rb
++++ b/spec/lib/storage/memory_store_spec.rb
+@@ -60,6 +60,31 @@
+     end
+   end
+ 
++  describe 'allowed_tokens' do
++    before do
++      @store = Rack::MiniProfiler::MemoryStore.new
++    end
++
++    it 'should return tokens' do
++
++      tokens = @store.allowed_tokens
++      tokens.length.should == 1
++      tokens.should == @store.allowed_tokens
++
++      Time.travel(Time.now + 1) do
++        new_tokens = @store.allowed_tokens
++        new_tokens.length.should == 1
++        new_tokens.should == tokens
++      end
++
++      Time.travel(Time.now + Rack::MiniProfiler::AbstractStore::MAX_TOKEN_AGE + 1) do
++        new_tokens = @store.allowed_tokens
++        new_tokens.length.should == 2
++        (new_tokens - tokens).length.should == 1
++      end
++
++    end
++  end
+ 
+   describe 'cache cleanup thread' do
+     let(:described){Rack::MiniProfiler::MemoryStore::CacheCleanupThread}
+diff --git a/spec/components/storage/redis_store_spec.rb b/spec/lib/storage/redis_store_spec.rb
+similarity index 86%
+rename from spec/components/storage/redis_store_spec.rb
+rename to spec/lib/storage/redis_store_spec.rb
+index cfa9b643..257be107 100644
+--- a/spec/components/storage/redis_store_spec.rb
++++ b/spec/lib/storage/redis_store_spec.rb
+@@ -80,6 +80,27 @@
+ 
+   end
+ 
++  describe 'allowed_tokens' do
++    before do
++      @store = Rack::MiniProfiler::RedisStore.new(:db=>2)
++    end
++
++    it 'should return tokens' do
++
++      @store.flush_tokens
++
++      tokens = @store.allowed_tokens
++      tokens.length.should == 1
++
++      @store.simulate_expire
++
++      new_tokens = @store.allowed_tokens
++
++      new_tokens.length.should == 2
++      (new_tokens - tokens).length.should == 1
++    end
++  end
++
+ 
+   describe 'diagnostics' do
+     before do
+diff --git a/spec/components/timer_struct/client_timer_struct_spec.rb b/spec/lib/timer_struct/client_timer_struct_spec.rb
+similarity index 100%
+rename from spec/components/timer_struct/client_timer_struct_spec.rb
+rename to spec/lib/timer_struct/client_timer_struct_spec.rb
+diff --git a/spec/components/timer_struct/custom_spec.rb b/spec/lib/timer_struct/custom_spec.rb
+similarity index 100%
+rename from spec/components/timer_struct/custom_spec.rb
+rename to spec/lib/timer_struct/custom_spec.rb
+diff --git a/spec/components/timer_struct/page_timer_struct_spec.rb b/spec/lib/timer_struct/page_timer_struct_spec.rb
+similarity index 100%
+rename from spec/components/timer_struct/page_timer_struct_spec.rb
+rename to spec/lib/timer_struct/page_timer_struct_spec.rb
+diff --git a/spec/components/timer_struct/request_timer_struct_spec.rb b/spec/lib/timer_struct/request_timer_struct_spec.rb
+similarity index 100%
+rename from spec/components/timer_struct/request_timer_struct_spec.rb
+rename to spec/lib/timer_struct/request_timer_struct_spec.rb
+diff --git a/spec/components/timer_struct/sql_timer_struct_spec.rb b/spec/lib/timer_struct/sql_timer_struct_spec.rb
+similarity index 100%
+rename from spec/components/timer_struct/sql_timer_struct_spec.rb
+rename to spec/lib/timer_struct/sql_timer_struct_spec.rb
+diff --git a/spec/components/timer_struct/timer_struct_spec.rb b/spec/lib/timer_struct/timer_struct_spec.rb
+similarity index 100%
+rename from spec/components/timer_struct/timer_struct_spec.rb
+rename to spec/lib/timer_struct/timer_struct_spec.rb
+diff --git a/spec/spec_helper.rb b/spec/spec_helper.rb
+index 5b821335..eae13cf4 100644
+--- a/spec/spec_helper.rb
++++ b/spec/spec_helper.rb
+@@ -22,6 +22,13 @@ class << self
+       alias_method :old_new, :new
+       alias_method :old_now, :now
+ 
++      def travel(to)
++        @now = to
++        yield
++      ensure
++        @now = nil
++      end
++
+       def new
+         @now || old_new
+       end

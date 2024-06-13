@@ -1,0 +1,550 @@
+diff --git a/core/src/cli/cli.ts b/core/src/cli/cli.ts
+index de3595946e..90f8e62c04 100644
+--- a/core/src/cli/cli.ts
++++ b/core/src/cli/cli.ts
+@@ -435,7 +435,11 @@ ${renderCommands(commands)}
+               namespace: garden.namespace,
+             })
+ 
+-            command.server.showUrl(dashboardProcess?.serverHost || undefined)
++            let url: string | undefined
++            if (dashboardProcess) {
++              url = `${dashboardProcess.serverHost}?key=${dashboardProcess.serverAuthKey}`
++            }
++            command.server.showUrl(url)
+           }
+         }
+ 
+diff --git a/core/src/constants.ts b/core/src/constants.ts
+index 97ceb547ff..4a5f9e5cf3 100644
+--- a/core/src/constants.ts
++++ b/core/src/constants.ts
+@@ -71,6 +71,7 @@ export const gardenEnv = {
+   GARDEN_LOGGER_TYPE: env.get("GARDEN_LOGGER_TYPE").required(false).asString(),
+   GARDEN_PROXY_DEFAULT_ADDRESS: env.get("GARDEN_PROXY_DEFAULT_ADDRESS").required(false).asString(),
+   GARDEN_SERVER_PORT: env.get("GARDEN_SERVER_PORT").required(false).asPortNumber(),
++  GARDEN_SERVER_HOSTNAME: env.get("GARDEN_SERVER_HOSTNAME").required(false).asUrlString(),
+   GARDEN_SKIP_TESTS: env.get("GARDEN_SKIP_TESTS").required(false).default("").asString(),
+   GARDEN_HARD_CONCURRENCY_LIMIT: env.get("GARDEN_HARD_CONCURRENCY_LIMIT").required(false).default(50).asInt(),
+   GARDEN_TASK_CONCURRENCY_LIMIT: env.get("GARDEN_TASK_CONCURRENCY_LIMIT").required(false).default(6).asInt(),
+diff --git a/core/src/events.ts b/core/src/events.ts
+index 38962e93cd..2c8b222a62 100644
+--- a/core/src/events.ts
++++ b/core/src/events.ts
+@@ -98,7 +98,7 @@ export interface Events extends LoggerEvents {
+ 
+   // Process events
+   serversUpdated: {
+-    servers: { host: string; command: string }[]
++    servers: { host: string; command: string; serverAuthKey: string }[]
+   }
+   receivedToken: AuthTokenResponse
+ 
+diff --git a/core/src/server/dashboard-event-stream.ts b/core/src/server/dashboard-event-stream.ts
+index e5aa4b6988..3e3dec080b 100644
+--- a/core/src/server/dashboard-event-stream.ts
++++ b/core/src/server/dashboard-event-stream.ts
+@@ -62,7 +62,11 @@ export class DashboardEventStream extends BufferedEventStream {
+       this.log.debug(`Updated list of running dashboard servers: ${servers.map((p) => p.serverHost).join(", ")}`)
+ 
+       this.garden.events.emit("serversUpdated", {
+-        servers: servers.map((p) => ({ command: p.command!, host: p.serverHost! })),
++        servers: servers.map((p) => ({
++          command: p.command!,
++          host: p.serverHost!,
++          serverAuthKey: p.serverAuthKey || "",
++        })),
+       })
+     }
+ 
+diff --git a/core/src/server/server.ts b/core/src/server/server.ts
+index a9e934f045..88ac2a92dc 100644
+--- a/core/src/server/server.ts
++++ b/core/src/server/server.ts
+@@ -79,15 +79,15 @@ export class GardenServer {
+     this.debugLog = this.log.placeholder({ level: LogLevel.debug, childEntriesInheritLevel: true })
+     this.garden = undefined
+     this.port = port
+-    this.authKey = randomString(64)
++    this.authKey = randomString(24)
+     this.incomingEvents = new EventBus()
+     this.activePersistentRequests = {}
+ 
+     this.serversUpdatedListener = ({ servers }) => {
+       // Update status log line with new `garden dashboard` server, if any
+-      for (const { host, command } of servers) {
++      for (const { host, command, serverAuthKey } of servers) {
+         if (command === "dashboard") {
+-          this.showUrl(host)
++          this.showUrl(`${host}?key=${serverAuthKey}`)
+           return
+         }
+       }
+@@ -104,13 +104,15 @@ export class GardenServer {
+ 
+     this.app = await this.createApp()
+ 
++    const hostname = gardenEnv.GARDEN_SERVER_HOSTNAME || "localhost"
++
+     if (this.port) {
+-      this.server = this.app.listen(this.port)
++      this.server = this.app.listen(this.port, hostname)
+     } else {
+       do {
+         try {
+           this.port = await getPort({ port: defaultWatchServerPort })
+-          this.server = this.app.listen(this.port)
++          this.server = this.app.listen(this.port, hostname)
+         } catch {}
+       } while (!this.server)
+     }
+@@ -119,10 +121,14 @@ export class GardenServer {
+     this.statusLog = this.log.placeholder()
+   }
+ 
+-  getUrl() {
++  getBaseUrl() {
+     return `http://localhost:${this.port}`
+   }
+ 
++  getUrl() {
++    return `${this.getBaseUrl()}?key=${this.authKey}`
++  }
++
+   showUrl(url?: string) {
+     this.statusLog.setState({
+       emoji: "sunflower",
+@@ -156,6 +162,16 @@ export class GardenServer {
+     const app = websockify(new Koa())
+     const http = new Router()
+ 
++    http.use((ctx, next) => {
++      const authToken = ctx.header[authTokenHeader] || ctx.query.key
++
++      if (authToken !== this.authKey) {
++        ctx.throw(401, `Unauthorized request`)
++        return
++      }
++      return next()
++    })
++
+     /**
+      * HTTP API endpoint (POST /api)
+      *
+@@ -164,7 +180,6 @@ export class GardenServer {
+      * means we can keep a consistent format across mechanisms.
+      */
+     http.post("/api", async (ctx) => {
+-      // TODO: require auth key here from 0.13.0 onwards
+       if (!this.garden) {
+         return this.notReady(ctx)
+       }
+@@ -239,15 +254,7 @@ export class GardenServer {
+      * The API matches that of the Garden Cloud /events endpoint.
+      */
+     http.post("/events", async (ctx) => {
+-      const authHeader = ctx.header[authTokenHeader]
+-
+-      if (authHeader !== this.authKey) {
+-        ctx.status = 401
+-        return
+-      }
+-
+       // TODO: validate the input
+-
+       const batch = ctx.request.body as ApiEventBatch
+       this.debugLog.debug(`Received ${batch.events.length} events from session ${batch.sessionId}`)
+ 
+@@ -258,6 +265,7 @@ export class GardenServer {
+     })
+ 
+     app.use(bodyParser())
++
+     app.use(http.routes())
+     app.use(http.allowedMethods())
+ 
+@@ -277,7 +285,7 @@ export class GardenServer {
+     return app
+   }
+ 
+-  private notReady(ctx: Router.IRouterContext) {
++  private notReady(ctx: Router.IRouterContext | Koa.ParameterizedContext) {
+     ctx.status = 503
+     ctx.response.body = notReadyMessage
+   }
+@@ -297,8 +305,6 @@ export class GardenServer {
+ 
+       const connId = uuidv4()
+ 
+-      // TODO: require auth key on connections here, from 0.13.0 onwards
+-
+       // The typing for koa-websocket isn't working currently
+       const websocket: Koa.Context["ws"] = ctx["websocket"]
+ 
+@@ -318,6 +324,13 @@ export class GardenServer {
+         return send("error", { message, requestId })
+       }
+ 
++      // TODO: Only allow auth key authentication
++      if (ctx.query.sessionId !== `${this.garden.sessionId}` && ctx.query.key !== `${this.authKey}`) {
++        error(`401 Unauthorized`)
++        websocket.terminate()
++        return
++      }
++
+       // Set up heartbeat to detect dead connections
+       let isAlive = true
+ 
+diff --git a/core/test/unit/src/cli/cli.ts b/core/test/unit/src/cli/cli.ts
+index c18eae80e7..4c60282903 100644
+--- a/core/test/unit/src/cli/cli.ts
++++ b/core/test/unit/src/cli/cli.ts
+@@ -420,7 +420,7 @@ describe("cli", () => {
+         command: "dashboard",
+         sessionId: serverGarden.sessionId,
+         persistent: true,
+-        serverHost: server.getUrl(),
++        serverHost: server.getBaseUrl(),
+         serverAuthKey: server.authKey,
+         projectRoot: serverGarden.projectRoot,
+         projectName: serverGarden.projectName,
+@@ -527,7 +527,7 @@ describe("cli", () => {
+         command: "dashboard",
+         sessionId: serverGarden.sessionId,
+         persistent: true,
+-        serverHost: server.getUrl(),
++        serverHost: server.getBaseUrl(),
+         serverAuthKey: server.authKey,
+         projectRoot: serverGarden.projectRoot,
+         projectName: serverGarden.projectName,
+diff --git a/core/test/unit/src/server/dashboard-event-stream.ts b/core/test/unit/src/server/dashboard-event-stream.ts
+index 6739568f1b..515798cddf 100644
+--- a/core/test/unit/src/server/dashboard-event-stream.ts
++++ b/core/test/unit/src/server/dashboard-event-stream.ts
+@@ -70,8 +70,8 @@ describe("DashboardEventStream", () => {
+       streamEvents: true,
+       streamLogEntries: true,
+       targets: [
+-        { host: serverA.getUrl(), clientAuthToken: serverA.authKey, enterprise: false },
+-        { host: serverB.getUrl(), clientAuthToken: serverB.authKey, enterprise: false },
++        { host: serverA.getBaseUrl(), clientAuthToken: serverA.authKey, enterprise: false },
++        { host: serverB.getBaseUrl(), clientAuthToken: serverB.authKey, enterprise: false },
+       ],
+     })
+ 
+@@ -193,7 +193,9 @@ describe("DashboardEventStream", () => {
+       await record.setCommand(values)
+       await streamer.updateTargets()
+ 
+-      garden.events.expectEvent("serversUpdated", { servers: [{ host: values.serverHost, command: "dashboard" }] })
++      garden.events.expectEvent("serversUpdated", {
++        servers: [{ host: values.serverHost, command: "dashboard", serverAuthKey: "foo" }],
++      })
+     })
+ 
+     it("ignores servers matching ignoreHost", async () => {
+diff --git a/core/test/unit/src/server/server.ts b/core/test/unit/src/server/server.ts
+index 7147a1ed07..6b16294802 100644
+--- a/core/test/unit/src/server/server.ts
++++ b/core/test/unit/src/server/server.ts
+@@ -58,40 +58,75 @@ describe("GardenServer", () => {
+   it("should update dashboard URL with new one if another is started", async () => {
+     gardenServer.showUrl("http://foo")
+     garden.events.emit("serversUpdated", {
+-      servers: [{ host: "http://localhost:9800", command: "dashboard" }],
++      servers: [{ host: "http://localhost:9800", command: "dashboard", serverAuthKey: "foo" }],
+     })
+     const line = gardenServer["statusLog"]
+     await sleep(1) // This is enough to let go of the control loop
+     const status = stripAnsi(line.getLatestMessage().msg || "")
+-    expect(status).to.equal(`Garden dashboard running at http://localhost:9800`)
++    expect(status).to.equal(`Garden dashboard running at http://localhost:9800?key=foo`)
+   })
+ 
+   describe("GET /", () => {
+     it("should return the dashboard index page", async () => {
+-      await request(server).get("/").expect(200)
++      await request(server)
++        .get("/")
++        .set({ [authTokenHeader]: gardenServer.authKey })
++        .expect(200)
+     })
+   })
+ 
+   describe("POST /api", () => {
++    it("returns 401 if missing auth header", async () => {
++      await request(server).post("/api").send({}).expect(401)
++    })
++
++    it("returns 401 if auth header doesn't match auth key", async () => {
++      await request(server)
++        .post("/api")
++        .set({ [authTokenHeader]: "foo" })
++        .send({})
++        .expect(401)
++    })
++
+     it("should 400 on non-JSON body", async () => {
+-      await request(server).post("/api").send("foo").expect(400)
++      await request(server)
++        .post("/api")
++        .set({ [authTokenHeader]: gardenServer.authKey })
++        .send("foo")
++        .expect(400)
+     })
+ 
+     it("should 400 on invalid payload", async () => {
+-      await request(server).post("/api").send({ foo: "bar" }).expect(400)
++      await request(server)
++        .post("/api")
++        .set({ [authTokenHeader]: gardenServer.authKey })
++        .send({ foo: "bar" })
++        .expect(400)
+     })
+ 
+     it("should 404 on invalid command", async () => {
+-      await request(server).post("/api").send({ command: "foo" }).expect(404)
++      await request(server)
++        .post("/api")
++        .set({ [authTokenHeader]: gardenServer.authKey })
++        .send({ command: "foo" })
++        .expect(404)
+     })
+ 
+     it("should 503 when Garden instance is not set", async () => {
+       gardenServer["garden"] = undefined
+-      await request(server).post("/api").send({ command: "get.config" }).expect(503)
++      await request(server)
++        .post("/api")
++        .set({ [authTokenHeader]: gardenServer.authKey })
++        .send({ command: "get.config" })
++        .expect(503)
+     })
+ 
+     it("should execute a command and return its results", async () => {
+-      const res = await request(server).post("/api").send({ command: "get.config" }).expect(200)
++      const res = await request(server)
++        .post("/api")
++        .set({ [authTokenHeader]: gardenServer.authKey })
++        .send({ command: "get.config" })
++        .expect(200)
+       const config = await garden.dumpConfig({ log: garden.log })
+       expect(res.body.result).to.eql(deepOmitUndefined(config))
+     })
+@@ -99,6 +134,7 @@ describe("GardenServer", () => {
+     it("should correctly map arguments and options to commands", async () => {
+       const res = await request(server)
+         .post("/api")
++        .set({ [authTokenHeader]: gardenServer.authKey })
+         .send({
+           command: "build",
+           parameters: {
+@@ -119,8 +155,23 @@ describe("GardenServer", () => {
+   })
+ 
+   describe("/dashboardPages", () => {
++    it("returns 401 if missing auth header", async () => {
++      await request(server).get("/dashboardPages/test-plugin/test").expect(401)
++    })
++
++    it("returns 401 if auth header doesn't match auth key", async () => {
++      await request(server)
++        .get("/dashboardPages/test-plugin/test")
++        .set({ [authTokenHeader]: "foo" })
++        .send({})
++        .expect(401)
++    })
++
+     it("should resolve the URL for the given dashboard page and redirect", async () => {
+-      const res = await request(server).get("/dashboardPages/test-plugin/test").expect(302)
++      const res = await request(server)
++        .get("/dashboardPages/test-plugin/test")
++        .set({ [authTokenHeader]: gardenServer.authKey })
++        .expect(302)
+ 
+       expect(res.header.location).to.equal("http://localhost:12345/test")
+     })
+@@ -162,7 +213,7 @@ describe("GardenServer", () => {
+     let ws: WebSocket
+ 
+     beforeEach((done) => {
+-      ws = new WebSocket(`ws://localhost:${port}/ws`)
++      ws = new WebSocket(`ws://localhost:${port}/ws?sessionId=${garden.sessionId}`)
+       ws.on("open", () => {
+         done()
+       })
+@@ -177,6 +228,34 @@ describe("GardenServer", () => {
+       ws.on("message", (msg) => cb(JSON.parse(msg.toString())))
+     }
+ 
++    it("terminates the connection if auth query params are missing", (done) => {
++      const badWs = new WebSocket(`ws://localhost:${port}/ws`)
++      badWs.on("close", () => {
++        done()
++      })
++    })
++
++    it("terminates the connection if key doesn't match and sessionId is missing", (done) => {
++      const badWs = new WebSocket(`ws://localhost:${port}/ws?key=foo`)
++      badWs.on("close", () => {
++        done()
++      })
++    })
++
++    it("terminates the connection if sessionId doesn't match and key is missing", (done) => {
++      const badWs = new WebSocket(`ws://localhost:${port}/ws?sessionId=foo`)
++      badWs.on("close", () => {
++        done()
++      })
++    })
++
++    it("terminates the connection if both sessionId and key are bad", (done) => {
++      const badWs = new WebSocket(`ws://localhost:${port}/ws?sessionId=foo&key=bar`)
++      badWs.on("close", () => {
++        done()
++      })
++    })
++
+     it("should emit events from the Garden event bus", (done) => {
+       onMessage((req) => {
+         expect(req).to.eql({ type: "event", name: "_test", payload: "foo" })
+diff --git a/dashboard/src/api/actions.ts b/dashboard/src/api/actions.ts
+index f8eb9a48d5..6afdc55258 100644
+--- a/dashboard/src/api/actions.ts
++++ b/dashboard/src/api/actions.ts
+@@ -36,7 +36,7 @@ import {
+   FetchTaskResultParams,
+   FetchTestResultParams,
+ } from "./api"
+-import { getTestKey } from "../util/helpers"
++import { getAuthKey, getTestKey } from "../util/helpers"
+ import { ProviderMap } from "@garden-io/core/build/src/config/provider"
+ import { DashboardPage } from "@garden-io/core/build/src/types/plugin/provider/getDashboardPage"
+ 
+@@ -113,7 +113,7 @@ function processConfigInitResult(entities: Entities, config: ConfigDump) {
+         path: `/provider/${provider.name}/${page.name}`,
+         description: page.description + ` (from provider ${provider.name})`,
+         // Use static URL if provided, otherwise we'll request a redirect from this API endpoint
+-        url: page.url || `/dashboardPages/${provider.name}/${page.name}`,
++        url: page.url || `/dashboardPages/${provider.name}/${page.name}?key=${getAuthKey()}`,
+       }))
+     })
+ 
+diff --git a/dashboard/src/api/api.ts b/dashboard/src/api/api.ts
+index ea123a1cf7..a72af5e50b 100644
+--- a/dashboard/src/api/api.ts
++++ b/dashboard/src/api/api.ts
+@@ -15,6 +15,7 @@ import { ServiceLogEntry } from "@garden-io/core/build/src/types/plugin/service/
+ import { CommandResult } from "@garden-io/core/build/src/commands/base"
+ import { ConfigDump } from "@garden-io/core/build/src/garden"
+ import { StatusCommandResult } from "@garden-io/core/build/src/commands/get/get-status"
++import { getAuthKey } from "../util/helpers"
+ 
+ export interface ApiRequest {
+   command: string
+@@ -64,7 +65,8 @@ export async function fetchTestResult({ name, moduleName }: FetchTestResultParam
+ async function apiCommand<T>(command: string, parameters: {} = {}): Promise<T> {
+   const url = "/api"
+   const method = "POST"
+-  const headers = { "Content-Type": "application/json" }
++  const headers = { "Content-Type": "application/json", "x-access-auth-token": getAuthKey() }
++
+   const data: ApiRequest = { command, parameters }
+ 
+   const res = await axios.request<CommandResult<T>>({ url, method, headers, data })
+diff --git a/dashboard/src/components/menu.tsx b/dashboard/src/components/menu.tsx
+index 980ed6225a..fd4cbb8873 100644
+--- a/dashboard/src/components/menu.tsx
++++ b/dashboard/src/components/menu.tsx
+@@ -9,13 +9,14 @@
+ import { css } from "emotion"
+ import styled from "@emotion/styled"
+ import React from "react"
+-import { NavLink as ReactRouterNavLink } from "react-router-dom"
++import { NavLink as ReactRouterNavLink, NavLinkProps as ReactRouterNavLinkProps } from "react-router-dom"
+ 
+ import logo from "../assets/logo.png"
+ 
+ import { colors } from "../styles/variables"
+ import { useUiState } from "../hooks"
+ import { Page } from "../contexts/api"
++import { getAuthKey } from "../util/helpers"
+ 
+ interface Props {
+   pages: Page[]
+@@ -46,7 +47,28 @@ const Nav = styled.nav`
+   width: 100%;
+ `
+ 
+-const NavLink = (props: any) => <ReactRouterNavLink {...props} activeStyle={{ color: colors.gardenGreenDark }} />
++type NavLinkProps = Omit<ReactRouterNavLinkProps, "to"> & {
++  to: {
++    pathname: string
++    search?: string
++    hash?: string
++    state?: any
++  }
++}
++
++/**
++ * Helper class for ensuring that the auth key param is set on routes.
++ */
++const NavLink = (props: NavLinkProps) => {
++  const urlParams = new URLSearchParams(props.to.search)
++  urlParams.set("key", getAuthKey() || "")
++  const to = {
++    ...props.to,
++    search: urlParams.toString(),
++  }
++
++  return <ReactRouterNavLink {...props} to={to} activeStyle={{ color: colors.gardenGreenDark }} />
++}
+ 
+ const A = styled.a(linkStyle)
+ const Link = styled(NavLink)(linkStyle)
+@@ -77,7 +99,7 @@ const Menu: React.FC<Props> = ({ pages }) => {
+     <>
+       <MenuContainer visible={isMenuOpen}>
+         <Nav>
+-          <NavLink to="/">
++          <NavLink to={{ pathname: "/" }}>
+             <Logo src={logo} alt="Home" />
+           </NavLink>
+           {pages.map((page) => (
+diff --git a/dashboard/src/hooks.ts b/dashboard/src/hooks.ts
+index fd175480ac..01a5c9f05e 100644
+--- a/dashboard/src/hooks.ts
++++ b/dashboard/src/hooks.ts
+@@ -11,6 +11,7 @@ import { useState, useEffect, useCallback, useRef, useContext } from "react"
+ import getApiUrl from "./api/get-api-url"
+ import { ApiContext } from "./contexts/api"
+ import { UiContext } from "./contexts/ui"
++import { getAuthKey } from "./util/helpers"
+ 
+ const wsRetryInterval = 2000
+ 
+@@ -36,7 +37,7 @@ export const useWebsocket = (
+ 
+   const initWs = () => {
+     const url = getApiUrl()
+-    const ws = new WebSocket(`ws://${url}/ws`)
++    const ws = new WebSocket(`ws://${url}/ws?key=${getAuthKey()}`)
+     ws.onopen = (_event) => {
+       if (wsStateRef.current === "closed") {
+         handleWsOpened()
+diff --git a/dashboard/src/util/helpers.ts b/dashboard/src/util/helpers.ts
+index 88562e93bd..36724b3c54 100644
+--- a/dashboard/src/util/helpers.ts
++++ b/dashboard/src/util/helpers.ts
+@@ -96,3 +96,11 @@ export function getTextWidth(text: string, font: string) {
+   const metrics = context.measureText(text)
+   return metrics.width
+ }
++
++/**
++ * Returns the auth key from the current page's URL params.
++ */
++export function getAuthKey() {
++  const urlParams = new URLSearchParams(window.location.search)
++  return urlParams.get("key")
++}

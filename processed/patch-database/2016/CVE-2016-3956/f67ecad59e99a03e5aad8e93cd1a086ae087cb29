@@ -1,0 +1,368 @@
+diff --git a/doc/cli/npm-adduser.md b/doc/cli/npm-adduser.md
+index 5625541cc5b..9afece598fa 100644
+--- a/doc/cli/npm-adduser.md
++++ b/doc/cli/npm-adduser.md
+@@ -59,9 +59,11 @@ registries. Can be used with `--registry` and / or `--scope`, e.g.
+     npm adduser --registry=http://private-registry.example.com --always-auth
+ 
+ This will ensure that all requests to that registry (including for tarballs)
+-include an authorization header. See `always-auth` in `npm-config(7)` for more
+-details on always-auth. Registry-specific configuration of `always-auth` takes
+-precedence over any global configuration.
++include an authorization header. This setting may be necessary for use with
++private registries where metadata and package tarballs are stored on hosts with
++different hostnames. See `always-auth` in `npm-config(7)` for more details on
++always-auth. Registry-specific configuration of `always-auth` takes precedence
++over any global configuration.
+ 
+ ## SEE ALSO
+ 
+diff --git a/lib/cache.js b/lib/cache.js
+index 057972c03d3..757ba6e79df 100644
+--- a/lib/cache.js
++++ b/lib/cache.js
+@@ -285,7 +285,7 @@ function add (args, where, cb) {
+         break
+       case 'remote':
+         // get auth, if possible
+-        mapToRegistry(spec, npm.config, function (err, uri, auth) {
++        mapToRegistry(p.raw, npm.config, function (err, uri, auth) {
+           if (err) return cb(err)
+ 
+           addRemoteTarball(p.spec, { name: p.name }, null, auth, cb)
+diff --git a/lib/config/get-credentials-by-uri.js b/lib/config/get-credentials-by-uri.js
+index a073a594a5b..19779c41372 100644
+--- a/lib/config/get-credentials-by-uri.js
++++ b/lib/config/get-credentials-by-uri.js
+@@ -20,6 +20,14 @@ function getCredentialsByURI (uri) {
+     alwaysAuth: undefined
+   }
+ 
++  // used to override scope matching for tokens as well as legacy auth
++  if (this.get(nerfed + ':always-auth') !== undefined) {
++    var val = this.get(nerfed + ':always-auth')
++    c.alwaysAuth = val === 'false' ? false : !!val
++  } else if (this.get('always-auth') !== undefined) {
++    c.alwaysAuth = this.get('always-auth')
++  }
++
+   if (this.get(nerfed + ':_authToken')) {
+     c.token = this.get(nerfed + ':_authToken')
+     // the bearer token is enough, don't confuse things
+@@ -58,13 +66,6 @@ function getCredentialsByURI (uri) {
+     c.email = this.get('email')
+   }
+ 
+-  if (this.get(nerfed + ':always-auth') !== undefined) {
+-    var val = this.get(nerfed + ':always-auth')
+-    c.alwaysAuth = val === 'false' ? false : !!val
+-  } else if (this.get('always-auth') !== undefined) {
+-    c.alwaysAuth = this.get('always-auth')
+-  }
+-
+   if (c.username && c.password) {
+     c.auth = new Buffer(c.username + ':' + c.password).toString('base64')
+   }
+diff --git a/lib/utils/map-to-registry.js b/lib/utils/map-to-registry.js
+index 34046d19176..9e7ce674904 100644
+--- a/lib/utils/map-to-registry.js
++++ b/lib/utils/map-to-registry.js
+@@ -49,8 +49,52 @@ function mapToRegistry (name, config, cb) {
+ 
+   // normalize registry URL so resolution doesn't drop a piece of registry URL
+   var normalized = registry.slice(-1) !== '/' ? registry + '/' : registry
+-  var uri = url.resolve(normalized, name)
++  var uri
++  log.silly('mapToRegistry', 'data', data)
++  if (data.type === 'remote') {
++    uri = data.spec
++  } else {
++    uri = url.resolve(normalized, name)
++  }
++
+   log.silly('mapToRegistry', 'uri', uri)
+ 
+-  cb(null, uri, auth, normalized)
++  cb(null, uri, scopeAuth(uri, registry, auth), normalized)
++}
++
++function scopeAuth (uri, registry, auth) {
++  var cleaned = {
++    scope: auth.scope,
++    email: auth.email,
++    alwaysAuth: auth.alwaysAuth,
++    token: undefined,
++    username: undefined,
++    password: undefined,
++    auth: undefined
++  }
++
++  var requestHost
++  var registryHost
++
++  if (auth.token || auth.auth || (auth.username && auth.password)) {
++    requestHost = url.parse(uri).hostname
++    registryHost = url.parse(registry).hostname
++
++    if (requestHost === registryHost) {
++      cleaned.token = auth.token
++      cleaned.auth = auth.auth
++      cleaned.username = auth.username
++      cleaned.password = auth.password
++    } else if (auth.alwaysAuth) {
++      log.verbose('scopeAuth', 'alwaysAuth set for', registry)
++      cleaned.token = auth.token
++      cleaned.auth = auth.auth
++      cleaned.username = auth.username
++      cleaned.password = auth.password
++    } else {
++      log.silly('scopeAuth', uri, "doesn't share host with registry", registry)
++    }
++  }
++
++  return cleaned
+ }
+diff --git a/test/tap/bearer-token-check.js b/test/tap/bearer-token-check.js
+new file mode 100644
+index 00000000000..8ddbec29a4c
+--- /dev/null
++++ b/test/tap/bearer-token-check.js
+@@ -0,0 +1,118 @@
++var resolve = require('path').resolve
++var writeFileSync = require('graceful-fs').writeFileSync
++
++var mkdirp = require('mkdirp')
++var mr = require('npm-registry-mock')
++var osenv = require('osenv')
++var rimraf = require('rimraf')
++var test = require('tap').test
++
++var common = require('../common-tap.js')
++var toNerfDart = require('../../lib/config/nerf-dart.js')
++
++var pkg = resolve(__dirname, 'install-bearer-check')
++var outfile = resolve(pkg, '_npmrc')
++var modules = resolve(pkg, 'node_modules')
++var tarballPath = '/scoped-underscore/-/scoped-underscore-1.3.1.tgz'
++// needs to be a different hostname to verify tokens (not) being sent correctly
++var tarballURL = 'http://lvh.me:' + common.port + tarballPath
++var tarball = resolve(__dirname, '../fixtures/scoped-underscore-1.3.1.tgz')
++
++var server
++
++var EXEC_OPTS = { cwd: pkg }
++
++function mocks (server) {
++  var auth = 'Bearer 0xabad1dea'
++  server.get(tarballPath, { authorization: auth }).reply(403, {
++    error: 'token leakage',
++    reason: 'This token should not be sent.'
++  })
++  server.get(tarballPath).replyWithFile(200, tarball)
++}
++
++test('setup', function (t) {
++  mr({ port: common.port, plugin: mocks }, function (er, s) {
++    server = s
++    t.ok(s, 'set up mock registry')
++    setup()
++    t.end()
++  })
++})
++
++test('authed npm install with tarball not on registry', function (t) {
++  common.npm(
++    [
++      'install',
++      '--loglevel', 'silent',
++      '--json',
++      '--fetch-retries', 0,
++      '--userconfig', outfile
++    ],
++    EXEC_OPTS,
++    function (err, code, stdout, stderr) {
++      t.ifError(err, 'test runner executed without error')
++      t.equal(code, 0, 'npm install exited OK')
++      t.notOk(stderr, 'no output on stderr')
++      try {
++        var results = JSON.parse(stdout)
++      } catch (ex) {
++        console.error('#', ex)
++        t.ifError(ex, 'stdout was valid JSON')
++      }
++
++      if (results) {
++        var installedversion = {
++          'version': '1.3.1',
++          'from': '>=1.3.1 <2',
++          'resolved': 'http://lvh.me:1337/scoped-underscore/-/scoped-underscore-1.3.1.tgz'
++        }
++        t.isDeeply(results.dependencies['@scoped/underscore'], installedversion, '@scoped/underscore installed')
++      }
++
++      t.end()
++    }
++  )
++})
++
++test('cleanup', function (t) {
++  server.close()
++  cleanup()
++  t.end()
++})
++
++var contents = '@scoped:registry=' + common.registry + '\n' +
++               toNerfDart(common.registry) + ':_authToken=0xabad1dea\n'
++
++var json = {
++  name: 'test-package-install',
++  version: '1.0.0'
++}
++
++var shrinkwrap = {
++  name: 'test-package-install',
++  version: '1.0.0',
++  dependencies: {
++    '@scoped/underscore': {
++      resolved: tarballURL,
++      from: '>=1.3.1 <2',
++      version: '1.3.1'
++    }
++  }
++}
++
++function setup () {
++  cleanup()
++  mkdirp.sync(modules)
++  writeFileSync(resolve(pkg, 'package.json'), JSON.stringify(json, null, 2) + '\n')
++  writeFileSync(outfile, contents)
++  writeFileSync(
++    resolve(pkg, 'npm-shrinkwrap.json'),
++    JSON.stringify(shrinkwrap, null, 2) + '\n'
++  )
++}
++
++function cleanup () {
++  process.chdir(osenv.tmpdir())
++  rimraf.sync(pkg)
++}
+diff --git a/test/tap/config-credentials.js b/test/tap/config-credentials.js
+index c1b981d0a51..f6f00ee0e65 100644
+--- a/test/tap/config-credentials.js
++++ b/test/tap/config-credentials.js
+@@ -79,7 +79,7 @@ test('set with token', function (t) {
+       password: undefined,
+       email: undefined,
+       auth: undefined,
+-      alwaysAuth: undefined
++      alwaysAuth: false
+     }
+ 
+     t.same(conf.getCredentialsByURI(URI), expected, 'got bearer token and scope')
+diff --git a/test/tap/map-to-registry.js b/test/tap/map-to-registry.js
+index 9f6673b92c0..d9677bd7e0f 100644
+--- a/test/tap/map-to-registry.js
++++ b/test/tap/map-to-registry.js
+@@ -48,7 +48,7 @@ test('mapRegistryToURI', function (t) {
+       password: undefined,
+       email: undefined,
+       auth: undefined,
+-      alwaysAuth: undefined
++      alwaysAuth: false
+     })
+     t.equal(registry, 'http://reg.npm/design/-/rewrite/')
+   })
+@@ -66,7 +66,7 @@ test('mapRegistryToURI', function (t) {
+       password: undefined,
+       email: undefined,
+       auth: undefined,
+-      alwaysAuth: undefined
++      alwaysAuth: false
+     })
+     t.equal(registry, 'http://reg.npm/-/rewrite/')
+   })
+@@ -84,8 +84,83 @@ test('mapRegistryToURI', function (t) {
+       password: undefined,
+       email: undefined,
+       auth: undefined,
+-      alwaysAuth: undefined
++      alwaysAuth: false
+     })
+     t.equal(registry, 'http://reg.npm/design/-/rewrite/relative/')
+   })
+ })
++
++test('mapToRegistry token scoping', function (t) {
++  npm.config.set('scope', '')
++  npm.config.set('registry', 'https://reg.npm/')
++  npm.config.set('//reg.npm/:_authToken', 'r-token')
++
++  t.test('pass token to registry host', function (t) {
++    mapRegistry(
++      'https://reg.npm/packages/e/easy-1.0.0.tgz',
++      npm.config,
++      function (er, uri, auth, registry) {
++        t.ifError(er, 'mapRegistryToURI worked')
++        t.equal(uri, 'https://reg.npm/packages/e/easy-1.0.0.tgz')
++        t.deepEqual(auth, {
++          scope: '//reg.npm/',
++          token: 'r-token',
++          username: undefined,
++          password: undefined,
++          email: undefined,
++          auth: undefined,
++          alwaysAuth: false
++        })
++        t.equal(registry, 'https://reg.npm/')
++      }
++    )
++    t.end()
++  })
++
++  t.test("don't pass token to non-registry host", function (t) {
++    mapRegistry(
++      'https://butts.lol/packages/e/easy-1.0.0.tgz',
++      npm.config,
++      function (er, uri, auth, registry) {
++        t.ifError(er, 'mapRegistryToURI worked')
++        t.equal(uri, 'https://butts.lol/packages/e/easy-1.0.0.tgz')
++        t.deepEqual(auth, {
++          scope: '//reg.npm/',
++          token: undefined,
++          username: undefined,
++          password: undefined,
++          email: undefined,
++          auth: undefined,
++          alwaysAuth: false
++        })
++        t.equal(registry, 'https://reg.npm/')
++      }
++    )
++    t.end()
++  })
++
++  t.test('pass token to non-registry host with always-auth', function (t) {
++    npm.config.set('always-auth', true)
++    mapRegistry(
++      'https://butts.lol/packages/e/easy-1.0.0.tgz',
++      npm.config,
++      function (er, uri, auth, registry) {
++        t.ifError(er, 'mapRegistryToURI worked')
++        t.equal(uri, 'https://butts.lol/packages/e/easy-1.0.0.tgz')
++        t.deepEqual(auth, {
++          scope: '//reg.npm/',
++          token: 'r-token',
++          username: undefined,
++          password: undefined,
++          email: undefined,
++          auth: undefined,
++          alwaysAuth: true
++        })
++        t.equal(registry, 'https://reg.npm/')
++      }
++    )
++    t.end()
++  })
++
++  t.end()
++})

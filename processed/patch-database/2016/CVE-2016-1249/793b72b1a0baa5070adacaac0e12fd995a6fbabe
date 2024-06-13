@@ -1,0 +1,284 @@
+diff --git a/Changes b/Changes
+index a5c1b55c..703f2503 100644
+--- a/Changes
++++ b/Changes
+@@ -1,3 +1,6 @@
++2016-11-15 Patrick Galbraith, Michiel Beijen, DBI/DBD community (4.039)
++* Fix for security issue Out-of-bounds read by DBD::mysql CVE-2016-1249 (pali)
++
+ 2016-10-30 Patrick Galbraith, Michiel Beijen, DBI/DBD community (4.038_01)
+ * Fix compilation of embedded server (pali)
+   (https://github.com/perl5-dbi/DBD-mysql/pull/68)
+diff --git a/dbdimp.c b/dbdimp.c
+index bbc96221..c1ef3ffe 100644
+--- a/dbdimp.c
++++ b/dbdimp.c
+@@ -2750,7 +2750,7 @@ dbd_st_prepare(
+   int limit_flag=0;
+ #endif
+ #endif
+-  int col_type, prepare_retval;
++  int prepare_retval;
+   MYSQL_BIND *bind, *bind_end;
+   imp_sth_phb_t *fbind;
+ #endif
+@@ -2946,7 +2946,6 @@ dbd_st_prepare(
+ 
+       if (DBIc_NUM_PARAMS(imp_sth) > 0)
+       {
+-        int has_statement_fields= imp_sth->stmt->fields != 0;
+         /* Allocate memory for bind variables */
+         imp_sth->bind=            alloc_bind(DBIc_NUM_PARAMS(imp_sth));
+         imp_sth->fbind=           alloc_fbind(DBIc_NUM_PARAMS(imp_sth));
+@@ -2960,20 +2959,7 @@ dbd_st_prepare(
+              bind < bind_end ;
+              bind++, fbind++, i++ )
+         {
+-          /*
+-            if this statement has a result set, field types will be
+-            correctly identified. If there is no result set, such as
+-            with an INSERT, fields will not be defined, and all buffer_type
+-            will default to MYSQL_TYPE_VAR_STRING
+-          */
+-          col_type= (has_statement_fields ?
+-                     imp_sth->stmt->fields[i].type : MYSQL_TYPE_STRING);
+-
+-          bind->buffer_type=  mysql_to_perl_type(col_type);
+-
+-          if (DBIc_TRACE_LEVEL(imp_xxh) >= 2)
+-            PerlIO_printf(DBIc_LOGPIO(imp_xxh), "\t\tmysql_to_perl_type returned %d\n", col_type);
+-
++          bind->buffer_type=  MYSQL_TYPE_STRING;
+           bind->buffer=       NULL;
+           bind->length=       &(fbind->length);
+           bind->is_null=      (char*) &(fbind->is_null);
+diff --git a/lib/Bundle/DBD/mysql.pm b/lib/Bundle/DBD/mysql.pm
+index b28e1d52..2bd5f32d 100644
+--- a/lib/Bundle/DBD/mysql.pm
++++ b/lib/Bundle/DBD/mysql.pm
+@@ -3,7 +3,7 @@ package Bundle::DBD::mysql;
+ use strict;
+ use warnings;
+ 
+-our $VERSION = '4.038_01';
++our $VERSION = '4.039';
+ 
+ 1;
+ 
+diff --git a/lib/DBD/mysql.pm b/lib/DBD/mysql.pm
+index fb86937b..b74e66da 100644
+--- a/lib/DBD/mysql.pm
++++ b/lib/DBD/mysql.pm
+@@ -15,7 +15,7 @@ our @ISA = qw(DynaLoader);
+ # SQL_DRIVER_VER is formatted as dd.dd.dddd
+ # for version 5.x please switch to 5.00(_00) version numbering
+ # keep $VERSION in Bundle/DBD/mysql.pm in sync
+-our $VERSION = '4.038_01';
++our $VERSION = '4.039';
+ 
+ bootstrap DBD::mysql $VERSION;
+ 
+diff --git a/mysql.xs b/mysql.xs
+index 9343b750..462eb2ab 100644
+--- a/mysql.xs
++++ b/mysql.xs
+@@ -266,15 +266,11 @@ do(dbh, statement, attr=Nullsv, ...)
+   STRLEN slen;
+   char            *str_ptr, *buffer;
+   int             has_binded;
+-  int             col_type= MYSQL_TYPE_STRING;
+-  int             buffer_is_null= 0;
+   int             buffer_length= slen;
+   int             buffer_type= 0;
+-  int             param_type= SQL_VARCHAR;
+   int             use_server_side_prepare= 0;
+   MYSQL_STMT      *stmt= NULL;
+   MYSQL_BIND      *bind= NULL;
+-  imp_sth_phb_t   *fbind= NULL;
+ #endif
+     ASYNC_CHECK_XS(dbh);
+ #if MYSQL_VERSION_ID >= MULTIPLE_RESULT_SET_VERSION
+@@ -367,142 +363,36 @@ do(dbh, statement, attr=Nullsv, ...)
+         */
+         int i;
+         num_params= items - 3;
+-        /*num_params = mysql_stmt_param_count(stmt);*/
+-        Newz(0, params, sizeof(*params)*num_params, struct imp_sth_ph_st);
+         Newz(0, bind, (unsigned int) num_params, MYSQL_BIND);
+-        Newz(0, fbind, (unsigned int) num_params, imp_sth_phb_t);
+ 
+         for (i = 0; i < num_params; i++)
+         {
+           int defined= 0;
+-          params[i].value= ST(i+3);
++          SV *param= ST(i+3);
+ 
+-          if (params[i].value)
++          if (param)
+           {
+-            if (SvMAGICAL(params[i].value))
+-              mg_get(params[i].value);
+-            if (SvOK(params[i].value))
++            if (SvMAGICAL(param))
++              mg_get(param);
++            if (SvOK(param))
+               defined= 1;
+           }
+           if (defined)
+           {
+-            buffer= SvPV(params[i].value, slen);
+-            buffer_is_null= 0;
++            buffer= SvPV(param, slen);
+             buffer_length= slen;
++            buffer_type= MYSQL_TYPE_STRING;
+           }
+           else
+           {
+             buffer= NULL;
+-            buffer_is_null= 1;
+             buffer_length= 0;
+-          }
+-
+-          /*
+-            if this statement has a result set, field types will be
+-            correctly identified. If there is no result set, such as
+-            with an INSERT, fields will not be defined, and all
+-            buffer_type will default to MYSQL_TYPE_VAR_STRING
+-          */
+-          col_type= (stmt->fields) ? stmt->fields[i].type : MYSQL_TYPE_STRING;
+-
+-          switch (col_type) {
+-#if MYSQL_VERSION_ID > 50003
+-          case MYSQL_TYPE_NEWDECIMAL:
+-#endif
+-          case MYSQL_TYPE_DECIMAL:
+-            param_type= SQL_DECIMAL;
+-            buffer_type= MYSQL_TYPE_DOUBLE;
+-            break;
+-
+-          case MYSQL_TYPE_DOUBLE:
+-            param_type= SQL_DOUBLE;
+-            buffer_type= MYSQL_TYPE_DOUBLE;
+-            break;
+-
+-          case MYSQL_TYPE_FLOAT:
+-            buffer_type= MYSQL_TYPE_DOUBLE;
+-            param_type= SQL_FLOAT;
+-            break;
+-
+-          case MYSQL_TYPE_SHORT:
+-            buffer_type= MYSQL_TYPE_DOUBLE;
+-            param_type= SQL_FLOAT;
+-            break;
+-
+-          case MYSQL_TYPE_TINY:
+-            buffer_type= MYSQL_TYPE_DOUBLE;
+-            param_type= SQL_FLOAT;
+-            break;
+-
+-          case MYSQL_TYPE_LONG:
+-            buffer_type= MYSQL_TYPE_LONG;
+-            param_type= SQL_BIGINT;
+-            break;
+-
+-          case MYSQL_TYPE_INT24:
+-          case MYSQL_TYPE_YEAR:
+-            buffer_type= MYSQL_TYPE_LONG;
+-            param_type= SQL_INTEGER; 
+-            break;
+-
+-          case MYSQL_TYPE_LONGLONG:
+-#if IVSIZE < 8
+-            /* perl handles long long as double
+-             * so we'll set this to string */
+-            buffer_type= MYSQL_TYPE_STRING;
+-            param_type= SQL_VARCHAR;
+-#else
+-            buffer_type= MYSQL_TYPE_LONG;
+-            param_type= SQL_BIGINT;
+-#endif
+-            break;
+-
+-          case MYSQL_TYPE_NEWDATE:
+-          case MYSQL_TYPE_DATE:
+-            buffer_type= MYSQL_TYPE_STRING;
+-            param_type= SQL_DATE;
+-            break;
+-
+-          case MYSQL_TYPE_TIME:
+-            buffer_type= MYSQL_TYPE_STRING;
+-            param_type= SQL_TIME;
+-            break;
+-
+-          case MYSQL_TYPE_TIMESTAMP:
+-            buffer_type= MYSQL_TYPE_STRING;
+-            param_type= SQL_TIMESTAMP;
+-            break;
+-
+-          case MYSQL_TYPE_VAR_STRING:
+-          case MYSQL_TYPE_STRING:
+-          case MYSQL_TYPE_DATETIME:
+-            buffer_type= MYSQL_TYPE_STRING;
+-            param_type= SQL_VARCHAR;
+-            break;
+-
+-          case MYSQL_TYPE_BLOB:
+-            buffer_type= MYSQL_TYPE_BLOB;
+-            param_type= SQL_BINARY;
+-            break;
+-
+-          case MYSQL_TYPE_GEOMETRY:
+-            buffer_type= MYSQL_TYPE_BLOB;
+-            param_type= SQL_BINARY;
+-            break;
+-
+-
+-          default:
+-            buffer_type= MYSQL_TYPE_STRING;
+-            param_type= SQL_VARCHAR;
+-            break;
++            buffer_type= MYSQL_TYPE_NULL;
+           }
+ 
+           bind[i].buffer_type = buffer_type;
+           bind[i].buffer_length= buffer_length;
+           bind[i].buffer= buffer;
+-          fbind[i].length= buffer_length;
+-          fbind[i].is_null= buffer_is_null;
+-          params[i].type= param_type;
+         }
+         has_binded= 0;
+       }
+@@ -514,8 +404,6 @@ do(dbh, statement, attr=Nullsv, ...)
+                                            &has_binded);
+       if (bind)
+         Safefree(bind);
+-      if (fbind)
+-        Safefree(fbind);
+ 
+       if(mysql_stmt_close(stmt))
+       {
+diff --git a/t/40server_prepare_crash.t b/t/40server_prepare_crash.t
+index ea732f71..99a06e1b 100644
+--- a/t/40server_prepare_crash.t
++++ b/t/40server_prepare_crash.t
+@@ -10,7 +10,7 @@ require "t/lib.pl";
+ my $dbh = eval { DBI->connect($test_dsn, $test_user, $test_password, { PrintError => 1, RaiseError => 1, AutoCommit => 0, mysql_server_prepare => 1 }) };
+ plan skip_all => "no database connection" if $@ or not $dbh;
+ 
+-plan tests => 13;
++plan tests => 17;
+ 
+ ok $dbh->do("CREATE TEMPORARY TABLE t (i INTEGER NOT NULL, n TEXT)");
+ 
+@@ -30,4 +30,10 @@ ok $sth = $dbh->prepare("SELECT * FROM t WHERE i=? AND n=?");
+ ok $sth->execute();
+ ok $sth->finish();
+ 
++ok $sth = $dbh->prepare("SELECT 1 FROM t WHERE i = ?" . (" OR i = ?" x 10000));
++ok $sth->execute((1) x (10001));
++ok $sth->finish();
++
++ok $dbh->do("SELECT 1 FROM t WHERE i = ?" . (" OR i = ?" x 10000), {}, (1) x (10001));
++
+ ok $dbh->disconnect();

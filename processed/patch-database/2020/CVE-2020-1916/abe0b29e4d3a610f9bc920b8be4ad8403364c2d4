@@ -1,0 +1,577 @@
+diff --git a/hphp/runtime/base/preg.cpp b/hphp/runtime/base/preg.cpp
+index 7e55c5873c80e..b766a8bc20eeb 100644
+--- a/hphp/runtime/base/preg.cpp
++++ b/hphp/runtime/base/preg.cpp
+@@ -49,6 +49,7 @@
+ #include "hphp/util/logger.h"
+ #include "hphp/util/concurrent-scalable-cache.h"
+ 
++#include <folly/FileUtil.h>
+ #include <folly/json.h>
+ 
+ /* Only defined in pcre >= 8.32 */
+@@ -217,7 +218,7 @@ struct PCRECache {
+             TempKeyCache& keyCache);
+   void insert(Accessor& accessor, const StringData* regex,
+               TempKeyCache& keyCache, const pcre_cache_entry* ent);
+-  void dump(const std::string& filename);
++  void dump(folly::File& file);
+   size_t size() const;
+ 
+ private:
+@@ -512,12 +513,12 @@ void PCRECache::insert(
+   }
+ }
+ 
+-void PCRECache::dump(const std::string& filename) {
+-  std::ofstream out(filename.c_str());
++void PCRECache::dump(folly::File& file) {
+   switch (m_kind) {
+     case CacheKind::Static:
+       for (auto& it : *m_staticCache) {
+-        out << it.first->data() << "\n";
++        folly::writeFull(file.fd(), it.first->data(), it.first->size());
++        folly::writeFull(file.fd(), "\n", 1);
+       }
+       break;
+     case CacheKind::Lru:
+@@ -530,12 +531,12 @@ void PCRECache::dump(const std::string& filename) {
+           m_scalableCache->snapshotKeys(keys);
+         }
+         for (auto& key: keys) {
+-          out << key.c_str() << "\n";
++          folly::writeFull(file.fd(), key.data(), key.size());
++          folly::writeFull(file.fd(), "\n", 1);
+         }
+       }
+       break;
+   }
+-  out.close();
+ }
+ 
+ size_t PCRECache::size() const {
+@@ -572,8 +573,8 @@ void pcre_reinit() {
+ void pcre_init() {
+ }
+ 
+-void pcre_dump_cache(const std::string& filename) {
+-  s_pcreCache.dump(filename);
++void pcre_dump_cache(folly::File& file) {
++  s_pcreCache.dump(file);
+ }
+ 
+ static pcre_jit_stack* alloc_jit_stack(void* /*data*/) {
+diff --git a/hphp/runtime/base/preg.h b/hphp/runtime/base/preg.h
+index b2818790554a5..b3b6035678853 100644
+--- a/hphp/runtime/base/preg.h
++++ b/hphp/runtime/base/preg.h
+@@ -18,6 +18,7 @@
+ 
+ #include "hphp/runtime/base/type-string.h"
+ 
++#include <folly/File.h>
+ #include <folly/Optional.h>
+ 
+ #include <cstdint>
+@@ -111,9 +112,9 @@ void pcre_reinit();
+ void pcre_session_exit();
+ 
+ /*
+- * Dump the contents of the PCRE cache to filename.
++ * Dump the contents of the PCRE cache to the given file.
+  */
+-void pcre_dump_cache(const std::string& filename);
++void pcre_dump_cache(folly::File& file);
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ // PHP API
+diff --git a/hphp/runtime/base/runtime-option.cpp b/hphp/runtime/base/runtime-option.cpp
+index 8e249627065f3..529061e236f65 100644
+--- a/hphp/runtime/base/runtime-option.cpp
++++ b/hphp/runtime/base/runtime-option.cpp
+@@ -54,6 +54,7 @@
+ #include "hphp/util/gzip.h"
+ #include "hphp/util/hardware-counter.h"
+ #include "hphp/util/hdf.h"
++#include "hphp/util/light-process.h"
+ #include "hphp/util/log-file-flusher.h"
+ #include "hphp/util/logger.h"
+ #include "hphp/util/network.h"
+@@ -754,6 +755,7 @@ bool RuntimeOption::AdminServerStatsNeedPassword = true;
+ std::string RuntimeOption::AdminPassword;
+ std::set<std::string> RuntimeOption::AdminPasswords;
+ std::set<std::string> RuntimeOption::HashedAdminPasswords;
++std::string RuntimeOption::AdminDumpPath;
+ 
+ std::string RuntimeOption::ProxyOriginRaw;
+ int RuntimeOption::ProxyPercentageRaw = 0;
+@@ -2398,6 +2400,8 @@ void RuntimeOption::Load(
+                  "Server.LightProcessFilePrefix", "./lightprocess");
+     Config::Bind(LightProcessCount, ini, config,
+                  "Server.LightProcessCount", 0);
++    Config::Bind(LightProcess::g_strictUser, ini, config,
++                 "Server.LightProcessStrictUser", false);
+     Config::Bind(ForceServerNameToHeader, ini, config,
+                  "Server.ForceServerNameToHeader");
+     Config::Bind(AllowDuplicateCookies, ini, config,
+@@ -2513,6 +2517,8 @@ void RuntimeOption::Load(
+     AdminPasswords = Config::GetSet(ini, config, "AdminServer.Passwords");
+     HashedAdminPasswords =
+       Config::GetSet(ini, config, "AdminServer.HashedPasswords");
++    Config::Bind(AdminDumpPath, ini, config,
++                 "AdminServer.DumpPath", "/tmp/hhvm_admin_dump");
+   }
+   {
+     // Proxy
+diff --git a/hphp/runtime/base/runtime-option.h b/hphp/runtime/base/runtime-option.h
+index 8b76768c94223..80845c6065e26 100644
+--- a/hphp/runtime/base/runtime-option.h
++++ b/hphp/runtime/base/runtime-option.h
+@@ -496,6 +496,8 @@ struct RuntimeOption {
+   static std::set<std::string> AdminPasswords;
+   static std::set<std::string> HashedAdminPasswords;
+ 
++  static std::string AdminDumpPath;
++
+   /*
+    * Options related to reverse proxying. ProxyOriginRaw and ProxyPercentageRaw
+    * may be mutated by background threads and should only be read or written
+diff --git a/hphp/runtime/base/string-util.cpp b/hphp/runtime/base/string-util.cpp
+index 55130bbc916b3..3a346487c2c2e 100644
+--- a/hphp/runtime/base/string-util.cpp
++++ b/hphp/runtime/base/string-util.cpp
+@@ -435,7 +435,8 @@ String StringUtil::ROT13(const String& input) {
+ }
+ 
+ String StringUtil::Crypt(const String& input, const char *salt /* = "" */) {
+-  if (salt && salt[0] == '\0') {
++  assertx(salt);
++  if (salt[0] == '\0') {
+     raise_notice("crypt(): No salt parameter was specified."
+       " You must use a randomly generated salt and a strong"
+       " hash function to produce a secure hash.");
+diff --git a/hphp/runtime/ext/domdocument/ext_domdocument.h b/hphp/runtime/ext/domdocument/ext_domdocument.h
+index 8709719bc1b5d..6b5580f18b1ca 100644
+--- a/hphp/runtime/ext/domdocument/ext_domdocument.h
++++ b/hphp/runtime/ext/domdocument/ext_domdocument.h
+@@ -51,7 +51,9 @@ struct DOMNode {
+   // for __clone
+   DOMNode& operator=(const DOMNode& copy);
+ 
+-  req::ptr<XMLDocumentData> doc() const { return m_node->doc(); }
++  req::ptr<XMLDocumentData> doc() const {
++    return m_node ? m_node->doc() : nullptr;
++  }
+   XMLNode node() const { return m_node; }
+   xmlNodePtr nodep() const {
+     return m_node ? m_node->nodep() : nullptr;
+diff --git a/hphp/runtime/ext/gd/libgd/gd.cpp b/hphp/runtime/ext/gd/libgd/gd.cpp
+index 3b7a1786d2b9b..2a1f20a65091f 100644
+--- a/hphp/runtime/ext/gd/libgd/gd.cpp
++++ b/hphp/runtime/ext/gd/libgd/gd.cpp
+@@ -185,8 +185,8 @@ gdImagePtr gdImageCreateTrueColor (int sx, int sy)
+ 
+   // Check for OOM before doing a potentially large allocation.
+   auto allocsz = sizeof(gdImage)
+-    + sy * (sizeof(int *) + sizeof(unsigned char *))
+-    + sx * sy * (sizeof(int) + sizeof(unsigned char));
++    + (sizeof(int *) + sizeof(unsigned char *)) * sy
++    + (sizeof(int) + sizeof(unsigned char)) * sx * sy;
+   if (UNLIKELY(precheckOOM(allocsz))) {
+     // Don't throw here because GD might need to do its own cleanup.
+     return NULL;
+diff --git a/hphp/runtime/ext/ldap/ext_ldap.cpp b/hphp/runtime/ext/ldap/ext_ldap.cpp
+index f323bb898e788..54d128b5d62b9 100644
+--- a/hphp/runtime/ext/ldap/ext_ldap.cpp
++++ b/hphp/runtime/ext/ldap/ext_ldap.cpp
+@@ -2139,7 +2139,7 @@ String HHVM_FUNCTION(ldap_escape,
+ 
+   char hex[] = "0123456789abcdef";
+ 
+-  String result(3 * value.size(), ReserveString);
++  String result(3UL * value.size(), ReserveString);
+   char *rdata = result.get()->mutableData(), *r = rdata;
+ 
+   for (int i = 0; i < value.size(); i++) {
+diff --git a/hphp/runtime/ext/xmlreader/ext_xmlreader.cpp b/hphp/runtime/ext/xmlreader/ext_xmlreader.cpp
+index e23e7242cdb3d..09a6d3cf3bc53 100644
+--- a/hphp/runtime/ext/xmlreader/ext_xmlreader.cpp
++++ b/hphp/runtime/ext/xmlreader/ext_xmlreader.cpp
+@@ -598,11 +598,11 @@ Variant HHVM_METHOD(XMLReader, expand,
+   if (!basenode.isNull()) {
+     auto dombasenode = Native::data<DOMNode>(basenode.toObject());
+     doc = dombasenode->doc();
+-    docp = doc->docp();
+-    if (docp == nullptr) {
++    if (doc == nullptr || doc->docp() == nullptr) {
+       raise_warning("Invalid State Error");
+       return false;
+     }
++    docp = doc->docp();
+   }
+ 
+   if (data->m_ptr) {
+diff --git a/hphp/runtime/server/admin-request-handler.cpp b/hphp/runtime/server/admin-request-handler.cpp
+index 4aa13497ca234..1c0a00c0c2b77 100644
+--- a/hphp/runtime/server/admin-request-handler.cpp
++++ b/hphp/runtime/server/admin-request-handler.cpp
+@@ -76,6 +76,9 @@
+ #endif
+ 
+ #include <folly/Conv.h>
++#include <folly/File.h>
++#include <folly/FileUtil.h>
++#include <folly/Optional.h>
+ #include <folly/Random.h>
+ #include <folly/portability/Unistd.h>
+ 
+@@ -254,6 +257,34 @@ void AdminRequestHandler::teardownRequest(Transport* transport) noexcept {
+   WarnIfNotOK(transport);
+ }
+ 
++namespace {
++
++// When this struct is destroyed, it will close the file.
++struct DumpFile {
++  std::string path;
++  folly::File file;
++};
++
++folly::Optional<DumpFile> dump_file(const char* name) {
++  auto const path = folly::sformat("{}/{}", RO::AdminDumpPath, name);
++
++  // mkdir -p the directory prefix of `path`
++  if (FileUtil::mkdir(path) != 0) return folly::none;
++
++  // If remove fails because of a permissions issue, then we won't be
++  // able to open the file for exclusive write below.
++  remove(path.c_str());
++
++  // Create the file, failing if it already exists. Doing so ensures
++  // that we have write access to the file and that no other user does.
++  auto const fd = open(path.c_str(), O_CREAT|O_EXCL|O_RDWR, 0666);
++  if (fd < 0) return folly::none;
++
++  return DumpFile{path, folly::File(fd, /*owns=*/true)};
++}
++
++}
++
+ void AdminRequestHandler::handleRequest(Transport *transport) {
+   transport->addHeader("Content-Type", "text/plain");
+   std::string cmd = transport->getCommand();
+@@ -714,10 +745,12 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
+       break;
+     }
+     if (strncmp(cmd.c_str(), "dump-static-strings", 19) == 0) {
+-      auto filename = transport->getParam("file");
+-      if (filename == "") filename = "/tmp/static_strings";
+-      handleDumpStaticStringsRequest(cmd, filename);
+-      transport->sendString("OK\n");
++      if (auto file = dump_file("static_strings")) {
++        handleDumpStaticStringsRequest(file->file);
++        transport->sendString(folly::sformat("dumped to {}\n", file->path));
++      } else {
++        transport->sendString("Unable to mkdir or file already exists.\n");
++      }
+       break;
+     }
+     if (strncmp(cmd.c_str(), "random-static-strings", 21) == 0) {
+@@ -746,10 +779,12 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
+     }
+ 
+     if (cmd == "dump-pcre-cache") {
+-      auto filename = transport->getParam("file");
+-      if (filename == "") filename = "/tmp/pcre_cache";
+-      pcre_dump_cache(filename);
+-      transport->sendString("OK\n");
++      if (auto file = dump_file("pcre_cache")) {
++        pcre_dump_cache(file->file);
++        transport->sendString(folly::sformat("dumped to {}\n", file->path));
++      } else {
++        transport->sendString("Unable to mkdir or file already exists.\n");
++      }
+       break;
+     }
+ 
+@@ -1368,13 +1403,11 @@ std::string formatStaticString(StringData* str) {
+       "----\n{} bytes\n{}\n", str->size(), str->toCppString());
+ }
+ 
+-bool AdminRequestHandler::handleDumpStaticStringsRequest(
+-  const std::string& /*cmd*/, const std::string& filename) {
++bool AdminRequestHandler::handleDumpStaticStringsRequest(folly::File& file) {
+   auto const& list = lookupDefinedStaticStrings();
+-  std::ofstream out(filename.c_str());
+-  SCOPE_EXIT { out.close(); };
+   for (auto item : list) {
+-    out << formatStaticString(item);
++    auto const line = formatStaticString(item);
++    folly::writeFull(file.fd(), line.data(), line.size());
+     if (RuntimeOption::EvalPerfDataMap) {
+       auto const len = std::min<size_t>(item->size(), 255);
+       std::string str(item->data(), len);
+diff --git a/hphp/runtime/server/admin-request-handler.h b/hphp/runtime/server/admin-request-handler.h
+index f042ed7f69874..4e582096a50b0 100644
+--- a/hphp/runtime/server/admin-request-handler.h
++++ b/hphp/runtime/server/admin-request-handler.h
+@@ -19,6 +19,8 @@
+ #include "hphp/runtime/server/access-log.h"
+ #include "hphp/runtime/server/server.h"
+ 
++#include <folly/File.h>
++
+ namespace HPHP {
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+@@ -72,8 +74,7 @@ struct AdminRequestHandler : RequestHandler {
+                                    Transport *transport);
+   bool handleStaticStringsRequest(const std::string &cmd,
+                                   Transport *transport);
+-  bool handleDumpStaticStringsRequest(const std::string &cmd,
+-                                      const std::string &filename);
++  bool handleDumpStaticStringsRequest(folly::File& file);
+   bool handleRandomStaticStringsRequest(const std::string &cmd,
+                                         Transport *transport);
+   bool handleVMRequest      (const std::string &cmd, Transport *transport);
+diff --git a/hphp/test/slow/ext_ldap/t78806688.php b/hphp/test/slow/ext_ldap/t78806688.php
+new file mode 100644
+index 0000000000000..e6b6d388b9082
+--- /dev/null
++++ b/hphp/test/slow/ext_ldap/t78806688.php
+@@ -0,0 +1,9 @@
++<?hh
++
++<<__EntryPoint>>
++function main(): void {
++  $multiplier = 1431655769;
++  $s = str_repeat("a", $multiplier);
++  ldap_escape($s);
++  echo "FAIL!\n";
++}
+diff --git a/hphp/test/slow/ext_ldap/t78806688.php.expectf b/hphp/test/slow/ext_ldap/t78806688.php.expectf
+new file mode 100644
+index 0000000000000..c95c560e4a321
+--- /dev/null
++++ b/hphp/test/slow/ext_ldap/t78806688.php.expectf
+@@ -0,0 +1 @@
++Fatal error: String length exceeded: 4294967307 > %d in %s/t78806688.php on line 7
+diff --git a/hphp/test/slow/ext_string/t76103217.php b/hphp/test/slow/ext_string/t76103217.php
+new file mode 100644
+index 0000000000000..085629f965b65
+--- /dev/null
++++ b/hphp/test/slow/ext_string/t76103217.php
+@@ -0,0 +1,11 @@
++<?hh
++
++<<__EntryPoint>>
++function main(): void {
++  $key = "\x26\xbd\xbd\xbd\xff\x60\xbf\xff\xff\x60";
++  $salt1 = "\x24\x32\x78\x24\x31\x30\x24\x24\x35\x24\xad\x20\x20\x26\xff\x60\xbf\xff\xff\x60\x24\x31\x78\xa8\xa8\xa0\x01\x01\x01\x01\x01\x01";
++  $salt2 = "\x24\x32\x78\x24\x31\x30\x24\x24\x35";
++
++  var_dump(base64_encode(crypt($key, $salt1)));
++  var_dump(base64_encode(crypt($key, $salt2)));
++}
+diff --git a/hphp/test/slow/ext_string/t76103217.php.expect b/hphp/test/slow/ext_string/t76103217.php.expect
+new file mode 100644
+index 0000000000000..e4cff2a4627b9
+--- /dev/null
++++ b/hphp/test/slow/ext_string/t76103217.php.expect
+@@ -0,0 +1,2 @@
++string(4) "KjA="
++string(12) "JDJ4JDEwJCQ1"
+diff --git a/hphp/test/slow/ext_xml/xmlreader_empty_expand.php b/hphp/test/slow/ext_xml/xmlreader_empty_expand.php
+new file mode 100644
+index 0000000000000..32e707ef2183e
+--- /dev/null
++++ b/hphp/test/slow/ext_xml/xmlreader_empty_expand.php
+@@ -0,0 +1,9 @@
++<?hh
++
++<<__EntryPoint>>
++function main(): void {
++    $a = new XMLReader();
++    $b = new DOMNode();
++    $a->expand($b);
++    $a->expand($a);
++}
+diff --git a/hphp/test/slow/ext_xml/xmlreader_empty_expand.php.expectf b/hphp/test/slow/ext_xml/xmlreader_empty_expand.php.expectf
+new file mode 100644
+index 0000000000000..cbf2c8c318daa
+--- /dev/null
++++ b/hphp/test/slow/ext_xml/xmlreader_empty_expand.php.expectf
+@@ -0,0 +1,3 @@
++Warning: Invalid State Error in %s on line %d
++
++Warning: Invalid State Error in %s on line %d
+diff --git a/hphp/util/light-process.cpp b/hphp/util/light-process.cpp
+index c7d23ae1d1486..db30f8fc46ca3 100644
+--- a/hphp/util/light-process.cpp
++++ b/hphp/util/light-process.cpp
+@@ -46,6 +46,7 @@
+ #include "hphp/util/hugetlb.h"
+ #include "hphp/util/logger.h"
+ #include "hphp/util/process.h"
++#include "hphp/util/struct-log.h"
+ #include "hphp/util/timer.h"
+ #include "hphp/util/user-info.h"
+ 
+@@ -54,6 +55,8 @@ namespace HPHP {
+ ///////////////////////////////////////////////////////////////////////////////
+ // helper functions
+ 
++bool LightProcess::g_strictUser = false;
++
+ namespace {
+ 
+ __thread LightProcess* tl_proc;
+@@ -436,23 +439,63 @@ void do_change_user(int afdt_fd) {
+   lwp_read(afdt_fd, uname);
+   if (!uname.length()) return;
+ 
++  StructuredLogEntry* log = nullptr;
++  int err = 0;
++  SCOPE_EXIT {
++    if (log) {
++      log->setInt("errno", err);
++      log->setStr("new_user", uname);
++      StructuredLog::log("hhvm_lightprocess_error", *log);
++      delete log;
++    }
++  };
+   auto buf = PasswdBuffer{};
+   struct passwd *pw;
+   if (getpwnam_r(uname.c_str(), &buf.ent, buf.data.get(), buf.size, &pw)) {
+-    // TODO(alexeyt) should we log something and/or fail to start?
++    err = errno;
++    log = new StructuredLogEntry();
++    log->setStr("function", "getpwnam_r");
++    if (LightProcess::g_strictUser) {
++      throw std::runtime_error{"getpwnam_r(): " + folly::errnoStr(err)};
++    }
+     return;
+   }
+   if (!pw) {
+-    // TODO(alexeyt) should we log something and/or fail to start?
++    log = new StructuredLogEntry();
++    log->setStr("function", "getpwnam_r");
++    if (LightProcess::g_strictUser) {
++      throw std::runtime_error{"getpwnam_r(): not found"};
++    }
+     return;
+   }
+-
+   if (pw->pw_gid) {
+-    initgroups(pw->pw_name, pw->pw_gid);
+-    setgid(pw->pw_gid);
++    if (initgroups(pw->pw_name, pw->pw_gid)) {
++      err = errno;
++      log = new StructuredLogEntry();
++      log->setStr("function", "initgroups");
++    }
++    if (setgid(pw->pw_gid)) {
++      if (!log) {
++        err = errno;
++        log = new StructuredLogEntry();
++        log->setStr("function", "setgid");
++        if (LightProcess::g_strictUser) {
++          throw std::runtime_error{"setgid():" + folly::errnoStr(err)};
++        }
++      }
++    }
+   }
+   if (pw->pw_uid) {
+-    setuid(pw->pw_uid);
++    if (setuid(pw->pw_uid)) {
++      if (!log) {
++        err = errno;
++        log = new StructuredLogEntry();
++        log->setStr("function", "setuid");
++        if (LightProcess::g_strictUser) {
++          throw std::runtime_error{"setuid():" + folly::errnoStr(err)};
++        }
++      }
++    }
+   }
+ }
+ 
+diff --git a/hphp/util/light-process.h b/hphp/util/light-process.h
+index dfe8eccb9a2e3..e5378852a79d2 100644
+--- a/hphp/util/light-process.h
++++ b/hphp/util/light-process.h
+@@ -129,6 +129,10 @@ struct LightProcess {
+   Mutex m_procMutex;
+   int m_afdt_fd;
+   std::map<FILE*, pid_t> m_popenMap;
++
++ public:
++  // whether to abort when user change fails.
++  static bool g_strictUser;
+ };
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/hphp/zend/crypt-blowfish.cpp b/hphp/zend/crypt-blowfish.cpp
+index 310e2555fc790..80d72ea3f18ca 100644
+--- a/hphp/zend/crypt-blowfish.cpp
++++ b/hphp/zend/crypt-blowfish.cpp
+@@ -696,7 +696,10 @@ static char *BF_crypt(const char *key, const char *setting,
+   }
+ 
+   count = (BF_word)1 << ((setting[4] - '0') * 10 + (setting[5] - '0'));
+-  if (count < min || BF_decode(data.binary.salt, &setting[7], 16)) {
++  if (count < min ||
++      BF_decode(data.binary.salt, &setting[7], 16) ||
++      ((unsigned int)(setting[7 + 22 - 1] - 0x20) >= 0x60)
++     ) {
+     __set_errno(EINVAL);
+     return NULL;
+   }
+@@ -914,4 +917,3 @@ char *_crypt_gensalt_blowfish_rn(const char *prefix, unsigned long count,
+   return output;
+ }
+ #endif
+-
+diff --git a/hphp/zend/zend-string.cpp b/hphp/zend/zend-string.cpp
+index 9adc79f1b6eb7..6ba0c21f07760 100644
+--- a/hphp/zend/zend-string.cpp
++++ b/hphp/zend/zend-string.cpp
+@@ -396,8 +396,8 @@ static void ito64(char *s, long v, int n) {
+ }
+ 
+ char *string_crypt(const char *key, const char *salt) {
+-  assert(key);
+-  assert(salt);
++  assertx(key);
++  assertx(salt);
+ 
+   char random_salt[12];
+   if (!*salt) {
+@@ -407,7 +407,8 @@ char *string_crypt(const char *key, const char *salt) {
+     return string_crypt(key, random_salt);
+   }
+ 
+-  if ((strlen(salt) > sizeof("$2X$00$")) &&
++  auto const saltLen = strlen(salt);
++  if ((saltLen > sizeof("$2X$00$")) &&
+     (salt[0] == '$') &&
+     (salt[1] == '2') &&
+     (salt[2] >= 'a') && (salt[2] <= 'z') &&
+@@ -417,7 +418,16 @@ char *string_crypt(const char *key, const char *salt) {
+     (salt[6] == '$')) {
+     // Bundled blowfish crypt()
+     char output[61];
+-    if (php_crypt_blowfish_rn(key, salt, output, sizeof(output))) {
++
++    static constexpr size_t maxSaltLength = 123;
++    char paddedSalt[maxSaltLength + 1];
++    paddedSalt[0] = paddedSalt[maxSaltLength] = '\0';
++
++    memset(&paddedSalt[1], '$', maxSaltLength - 1);
++    memcpy(paddedSalt, salt, std::min(maxSaltLength, saltLen));
++    paddedSalt[saltLen] = '\0';
++
++    if (php_crypt_blowfish_rn(key, paddedSalt, output, sizeof(output))) {
+       return strdup(output);
+     }
+ 

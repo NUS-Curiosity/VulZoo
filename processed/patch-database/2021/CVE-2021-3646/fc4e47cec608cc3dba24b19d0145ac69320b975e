@@ -1,0 +1,484 @@
+diff --git a/BTCPayServer.Tests/BTCPayServerTester.cs b/BTCPayServer.Tests/BTCPayServerTester.cs
+index 949ac53d34..d6d7e51ff1 100644
+--- a/BTCPayServer.Tests/BTCPayServerTester.cs
++++ b/BTCPayServer.Tests/BTCPayServerTester.cs
+@@ -134,7 +134,7 @@ public async Task StartAsync()
+             config.AppendLine($"torrcfile={TestUtils.GetTestDataFullPath("Tor/torrc")}");
+             config.AppendLine($"socksendpoint={SocksEndpoint}");
+             config.AppendLine($"debuglog=debug.log");
+-
++            config.AppendLine($"nocsp={NoCSP.ToString().ToLowerInvariant()}");
+ 
+             if (!string.IsNullOrEmpty(SSHPassword) && string.IsNullOrEmpty(SSHKeyFile))
+                 config.AppendLine($"sshpassword={SSHPassword}");
+@@ -283,6 +283,8 @@ public T GetService<T>()
+         public string SSHPassword { get; internal set; }
+         public string SSHKeyFile { get; internal set; }
+         public string SSHConnection { get; set; }
++        public bool NoCSP { get; set; }
++
+         public T GetController<T>(string userId = null, string storeId = null, bool isAdmin = false) where T : Controller
+         {
+             var context = new DefaultHttpContext();
+diff --git a/BTCPayServer.Tests/SeleniumTester.cs b/BTCPayServer.Tests/SeleniumTester.cs
+index 868671fff6..0b3e98d70f 100644
+--- a/BTCPayServer.Tests/SeleniumTester.cs
++++ b/BTCPayServer.Tests/SeleniumTester.cs
+@@ -38,6 +38,7 @@ public class SeleniumTester : IDisposable
+ 
+         public async Task StartAsync()
+         {
++            Server.PayTester.NoCSP = true;
+             await Server.StartAsync();
+ 
+             var windowSize = (Width: 1200, Height: 1000);
+diff --git a/BTCPayServer/Components/NotificationsDropdown/Default.cshtml b/BTCPayServer/Components/NotificationsDropdown/Default.cshtml
+index a2fef15099..6dcf907f79 100644
+--- a/BTCPayServer/Components/NotificationsDropdown/Default.cshtml
++++ b/BTCPayServer/Components/NotificationsDropdown/Default.cshtml
+@@ -67,7 +67,7 @@ else
+ @if (!disabled)
+ {
+ 
+-    <script type="text/javascript">
++    <script type="text/javascript" csp-sha256>
+ 
+     var supportsWebSockets = 'WebSocket' in window && window.WebSocket.CLOSING === 2;
+ 
+diff --git a/BTCPayServer/Configuration/DefaultConfiguration.cs b/BTCPayServer/Configuration/DefaultConfiguration.cs
+index 99edafb821..91ec195512 100644
+--- a/BTCPayServer/Configuration/DefaultConfiguration.cs
++++ b/BTCPayServer/Configuration/DefaultConfiguration.cs
+@@ -28,6 +28,7 @@ protected override CommandLineApplication CreateCommandLineApplicationCore()
+             app.Option("--chains | -c", $"Chains to support as a comma separated (default: btc; available: {chains})", CommandOptionType.SingleValue);
+             app.Option("--postgres", $"Connection string to a PostgreSQL database", CommandOptionType.SingleValue);
+             app.Option("--mysql", $"Connection string to a MySQL database", CommandOptionType.SingleValue);
++            app.Option("--nocsp", $"Disable CSP (default false)", CommandOptionType.BoolValue);
+             app.Option("--sqlitefile", $"File name to an SQLite database file inside the data directory", CommandOptionType.SingleValue);
+             app.Option("--externalservices", $"Links added to external services inside Server Settings / Services under the format service1:path2;service2:path2.(default: empty)", CommandOptionType.SingleValue);
+             app.Option("--bundlejscss", $"Bundle JavaScript and CSS files for better performance (default: true)", CommandOptionType.SingleValue);
+diff --git a/BTCPayServer/Filters/ContentSecurityPolicyAttribute.cs b/BTCPayServer/Filters/ContentSecurityPolicyAttribute.cs
+index 1d5f7e576c..7f303ca5d0 100644
+--- a/BTCPayServer/Filters/ContentSecurityPolicyAttribute.cs
++++ b/BTCPayServer/Filters/ContentSecurityPolicyAttribute.cs
+@@ -7,13 +7,32 @@
+ namespace BTCPayServer.Filters
+ {
+     public interface IContentSecurityPolicy : IFilterMetadata { }
++    public enum CSPTemplate
++    {
++        AntiXSS
++    }
+     public class ContentSecurityPolicyAttribute : Attribute, IActionFilter, IContentSecurityPolicy
+     {
+-        public void OnActionExecuted(ActionExecutedContext context)
++        public ContentSecurityPolicyAttribute()
+         {
+ 
+         }
++        public ContentSecurityPolicyAttribute(CSPTemplate template)
++        {
++            if (template == CSPTemplate.AntiXSS)
++            {
++                AutoSelf = false;
++                FixWebsocket = false;
++                UnsafeInline = false;
++                ScriptSrc = "'self' 'unsafe-eval'"; // unsafe-eval needed for vue
++            }
++        }
++
++        public void OnActionExecuted(ActionExecutedContext context)
++        {
+ 
++        }
++        public bool Enabled { get; set; } = true;
+         public bool AutoSelf { get; set; } = true;
+         public bool UnsafeInline { get; set; } = true;
+         public bool FixWebsocket { get; set; } = true;
+@@ -22,83 +41,79 @@ public void OnActionExecuted(ActionExecutedContext context)
+         public string DefaultSrc { get; set; }
+         public string StyleSrc { get; set; }
+         public string ScriptSrc { get; set; }
++        public string ManifestSrc { get; set; }
+ 
+         public void OnActionExecuting(ActionExecutingContext context)
+         {
+-            if (context.IsEffectivePolicy<IContentSecurityPolicy>(this))
++            if (!context.IsEffectivePolicy<IContentSecurityPolicy>(this) || !Enabled)
++                return;
++            var policies = context.HttpContext.RequestServices.GetService(typeof(ContentSecurityPolicies)) as ContentSecurityPolicies;
++            if (policies == null)
++                return;
++            if (DefaultSrc != null)
+             {
+-                var policies = context.HttpContext.RequestServices.GetService(typeof(ContentSecurityPolicies)) as ContentSecurityPolicies;
+-                if (policies == null)
+-                    return;
+-                if (DefaultSrc != null)
+-                {
+-                    policies.Add(new ConsentSecurityPolicy("default-src", DefaultSrc));
+-                }
+-                if (UnsafeInline)
+-                {
+-                    policies.Add(new ConsentSecurityPolicy("script-src", "'unsafe-inline'"));
+-                }
+-                if (!string.IsNullOrEmpty(FontSrc))
+-                {
+-                    policies.Add(new ConsentSecurityPolicy("font-src", FontSrc));
+-                }
++                policies.Add(new ConsentSecurityPolicy("default-src", DefaultSrc));
++            }
++            if (UnsafeInline)
++            {
++                policies.Add(new ConsentSecurityPolicy("script-src", "'unsafe-inline'"));
++            }
++            if (!string.IsNullOrEmpty(FontSrc))
++            {
++                policies.Add(new ConsentSecurityPolicy("font-src", FontSrc));
++            }
++            if (!string.IsNullOrEmpty(ManifestSrc))
++            {
++                policies.Add(new ConsentSecurityPolicy("manifest-src", FontSrc));
++            }
+ 
+-                if (!string.IsNullOrEmpty(ImgSrc))
+-                {
+-                    policies.Add(new ConsentSecurityPolicy("img-src", ImgSrc));
+-                }
++            if (!string.IsNullOrEmpty(ImgSrc))
++            {
++                policies.Add(new ConsentSecurityPolicy("img-src", ImgSrc));
++            }
+ 
+-                if (!string.IsNullOrEmpty(StyleSrc))
+-                {
+-                    policies.Add(new ConsentSecurityPolicy("style-src", StyleSrc));
+-                }
++            if (!string.IsNullOrEmpty(StyleSrc))
++            {
++                policies.Add(new ConsentSecurityPolicy("style-src", StyleSrc));
++            }
+ 
+-                if (!string.IsNullOrEmpty(ScriptSrc))
+-                {
+-                    policies.Add(new ConsentSecurityPolicy("script-src", ScriptSrc));
+-                }
++            if (!string.IsNullOrEmpty(ScriptSrc))
++            {
++                policies.Add(new ConsentSecurityPolicy("script-src", ScriptSrc));
++            }
+ 
+-                if (FixWebsocket && AutoSelf) // Self does not match wss:// and ws:// :(
+-                {
+-                    var request = context.HttpContext.Request;
++            if (FixWebsocket && AutoSelf) // Self does not match wss:// and ws:// :(
++            {
++                var request = context.HttpContext.Request;
+ 
+-                    var url = string.Concat(
+-                            request.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) ? "ws" : "wss",
+-                            "://",
+-                            request.Host.ToUriComponent(),
+-                            request.PathBase.ToUriComponent());
+-                    policies.Add(new ConsentSecurityPolicy("connect-src", url));
+-                }
++                var url = string.Concat(
++                        request.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) ? "ws" : "wss",
++                        "://",
++                        request.Host.ToUriComponent(),
++                        request.PathBase.ToUriComponent());
++                policies.Add(new ConsentSecurityPolicy("connect-src", url));
++            }
+ 
+-                context.HttpContext.Response.OnStarting(() =>
++            context.HttpContext.Response.OnStarting(() =>
++            {
++                if (!policies.HasRules)
++                    return Task.CompletedTask;
++                if (AutoSelf)
+                 {
+-                    if (!policies.HasRules)
+-                        return Task.CompletedTask;
+-                    if (AutoSelf)
++                    bool hasSelf = false;
++                    foreach (var group in policies.Rules.GroupBy(p => p.Name))
+                     {
+-                        bool hasSelf = false;
+-                        foreach (var group in policies.Rules.GroupBy(p => p.Name))
++                        hasSelf = group.Any(g => g.Value.Contains("'self'", StringComparison.OrdinalIgnoreCase));
++                        if (!hasSelf && !group.Any(g => g.Value.Contains("'none'", StringComparison.OrdinalIgnoreCase) ||
++                                           g.Value.Contains("*", StringComparison.OrdinalIgnoreCase)))
+                         {
+-                            hasSelf = group.Any(g => g.Value.Contains("'self'", StringComparison.OrdinalIgnoreCase));
+-                            if (!hasSelf && !group.Any(g => g.Value.Contains("'none'", StringComparison.OrdinalIgnoreCase) ||
+-                                               g.Value.Contains("*", StringComparison.OrdinalIgnoreCase)))
+-                            {
+-                                policies.Add(new ConsentSecurityPolicy(group.Key, "'self'"));
+-                                hasSelf = true;
+-                            }
+-                            if (hasSelf)
+-                            {
+-                                foreach (var authorized in policies.Authorized)
+-                                {
+-                                    policies.Add(new ConsentSecurityPolicy(group.Key, authorized));
+-                                }
+-                            }
++                            policies.Add(new ConsentSecurityPolicy(group.Key, "'self'"));
+                         }
+                     }
+-                    context.HttpContext.Response.SetHeader("Content-Security-Policy", policies.ToString());
+-                    return Task.CompletedTask;
+-                });
+-            }
++                }
++                context.HttpContext.Response.SetHeader("Content-Security-Policy", policies.ToString());
++                return Task.CompletedTask;
++            });
+         }
+     }
+ }
+diff --git a/BTCPayServer/Hosting/Startup.cs b/BTCPayServer/Hosting/Startup.cs
+index 224e5455db..abc83a8018 100644
+--- a/BTCPayServer/Hosting/Startup.cs
++++ b/BTCPayServer/Hosting/Startup.cs
+@@ -114,14 +114,8 @@ public void ConfigureServices(IServiceCollection services)
+                 o.Filters.Add(new XXSSProtectionAttribute());
+                 o.Filters.Add(new ReferrerPolicyAttribute("same-origin"));
+                 o.ModelBinderProviders.Insert(0, new ModelBinders.DefaultModelBinderProvider());
+-                //o.Filters.Add(new ContentSecurityPolicyAttribute()
+-                //{
+-                //    FontSrc = "'self' https://fonts.gstatic.com/",
+-                //    ImgSrc = "'self' data:",
+-                //    DefaultSrc = "'none'",
+-                //    StyleSrc = "'self' 'unsafe-inline'",
+-                //    ScriptSrc = "'self' 'unsafe-inline'"
+-                //});
++                if (!Configuration.GetOrDefault<bool>("nocsp", false))
++                    o.Filters.Add(new ContentSecurityPolicyAttribute(CSPTemplate.AntiXSS));
+         })
+             .ConfigureApiBehaviorOptions(options =>
+             {
+diff --git a/BTCPayServer/Security/ContentSecurityPolicies.cs b/BTCPayServer/Security/ContentSecurityPolicies.cs
+index 9a83b15f45..7f88a430bf 100644
+--- a/BTCPayServer/Security/ContentSecurityPolicies.cs
++++ b/BTCPayServer/Security/ContentSecurityPolicies.cs
+@@ -9,6 +9,8 @@ public class ConsentSecurityPolicy
+     {
+         public ConsentSecurityPolicy(string name, string value)
+         {
++            if (value.Contains(';', StringComparison.OrdinalIgnoreCase))
++                throw new FormatException();
+             _Value = value;
+             _Name = name;
+         }
+@@ -67,6 +69,10 @@ public ContentSecurityPolicies()
+         }
+ 
+         readonly HashSet<ConsentSecurityPolicy> _Policies = new HashSet<ConsentSecurityPolicy>();
++        public void Add(string name, string value)
++        {
++            Add(new ConsentSecurityPolicy(name, value));
++        }
+         public void Add(ConsentSecurityPolicy policy)
+         {
+             if (_Policies.Any(p => p.Name == policy.Name && p.Value == policy.Name))
+@@ -87,16 +93,12 @@ public override string ToString()
+                 {
+                     value.Append(';');
+                 }
+-                List<string> values = new List<string>();
++                HashSet<string> values = new HashSet<string>();
+                 values.Add(group.Key);
+                 foreach (var v in group)
+                 {
+                     values.Add(v.Value);
+                 }
+-                foreach (var i in authorized)
+-                {
+-                    values.Add(i);
+-                }
+                 value.Append(String.Join(" ", values.OfType<object>().ToArray()));
+                 firstGroup = false;
+             }
+@@ -105,16 +107,7 @@ public override string ToString()
+ 
+         internal void Clear()
+         {
+-            authorized.Clear();
+             _Policies.Clear();
+         }
+-
+-        readonly HashSet<string> authorized = new HashSet<string>();
+-        internal void AddAllAuthorized(string v)
+-        {
+-            authorized.Add(v);
+-        }
+-
+-        public IEnumerable<string> Authorized => authorized;
+     }
+ }
+diff --git a/BTCPayServer/TagHelpers.cs b/BTCPayServer/TagHelpers.cs
+new file mode 100644
+index 0000000000..4056e3b1c9
+--- /dev/null
++++ b/BTCPayServer/TagHelpers.cs
+@@ -0,0 +1,128 @@
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using BTCPayServer.Security;
++using BTCPayServer.Services;
++using Microsoft.AspNetCore.Razor.TagHelpers;
++using NBitcoin;
++using NBitcoin.Crypto;
++
++namespace BTCPayServer.TagHelpers
++{
++    [HtmlTargetElement("srv-model")]
++    public class SrvModel : TagHelper
++    {
++        private readonly Safe _safe;
++        private readonly ContentSecurityPolicies _csp;
++
++        public SrvModel(Safe safe, ContentSecurityPolicies csp)
++        {
++            _safe = safe;
++            _csp = csp;
++        }
++        public string VarName { get; set; } = "srvModel";
++        public object Model { get; set; }
++        public override void Process(TagHelperContext context, TagHelperOutput output)
++        {
++            output.TagName = "script";
++            output.TagMode = TagMode.StartTagAndEndTag;
++            output.Attributes.Add(new TagHelperAttribute("type", "text/javascript"));
++            var nonce = RandomUtils.GetUInt256().ToString().Substring(0, 32);
++            output.Attributes.Add(new TagHelperAttribute("nonce", nonce));
++            _csp.Add("script-src", $"'nonce-{nonce}'");
++            output.Content.SetHtmlContent($"var {VarName} = {_safe.Json(Model)};");
++        }
++    }
++
++    /// <summary>
++    /// Add a nonce-* so the inline-script can pass CSP rule when they are rendered server-side
++    /// </summary>
++    [HtmlTargetElement("script")]
++    public class CSPInlineScriptTagHelper : TagHelper
++    {
++        private readonly ContentSecurityPolicies _csp;
++
++        public CSPInlineScriptTagHelper(ContentSecurityPolicies csp)
++        {
++            _csp = csp;
++        }
++
++        public override async Task ProcessAsync(TagHelperContext context, TagHelperOutput output)
++        {
++            if (output.Attributes.ContainsName("src"))
++                return;
++            if (output.Attributes.TryGetAttribute("type", out var attr))
++            {
++                if (attr.Value?.ToString() != "text/javascript")
++                    return;
++            }
++            if (output.Attributes.ContainsName("csp-sha256"))
++            {
++                var sha = CSPEventTagHelper.GetSha256((await output.GetChildContentAsync(true)).GetContent());
++                _csp.Add("script-src", $"'sha256-{sha}'");
++                output.Attributes.RemoveAll("csp-sha256");
++            }
++            else
++            {
++                var nonce = RandomUtils.GetUInt256().ToString().Substring(0, 32);
++                output.Attributes.Add(new TagHelperAttribute("nonce", nonce));
++                _csp.Add("script-src", $"'nonce-{nonce}'");
++            }
++        }
++    }
++
++    /// <summary>
++    /// Add 'unsafe-hashes' and sha256- to allow inline event handlers in CSP
++    /// </summary>
++    [HtmlTargetElement(Attributes = "onclick")]
++    [HtmlTargetElement(Attributes = "onkeypress")]
++    [HtmlTargetElement(Attributes = "onchange")]
++    [HtmlTargetElement(Attributes = "onsubmit")]
++    [HtmlTargetElement(Attributes = "href")]
++    public class CSPEventTagHelper : TagHelper
++    {
++        public const string EventNames = "onclick,onkeypress,onchange,onsubmit";
++        private readonly ContentSecurityPolicies _csp;
++
++        readonly static HashSet<string> EventSet = EventNames.Split(',')
++                                                    .ToHashSet();
++        public CSPEventTagHelper(ContentSecurityPolicies csp)
++        {
++            _csp = csp;
++        }
++        public override void Process(TagHelperContext context, TagHelperOutput output)
++        {
++            foreach (var attr in output.Attributes)
++            {
++                var n = attr.Name.ToLowerInvariant();
++                if (EventSet.Contains(n))
++                {
++                    Allow(attr.Value.ToString());
++                }
++                else if (n == "href")
++                {
++                    var v = attr.Value.ToString();
++                    if (v.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase))
++                    {
++                        Allow(v);
++                    }
++                }
++            }
++        }
++
++        private void Allow(string v)
++        {
++            var sha = GetSha256(v);
++            _csp.Add("script-src", $"'unsafe-hashes'");
++            _csp.Add("script-src", $"'sha256-{sha}'");
++        }
++
++        public static string GetSha256(string script)
++        {
++            return Convert.ToBase64String(Hashes.SHA256(Encoding.UTF8.GetBytes(script.Replace("\r\n", "\n", StringComparison.Ordinal))));
++        }
++    }
++}
+diff --git a/BTCPayServer/Views/Invoice/PosData.cshtml b/BTCPayServer/Views/Invoice/PosData.cshtml
+index ed08211c7e..3b36c4d202 100644
+--- a/BTCPayServer/Views/Invoice/PosData.cshtml
++++ b/BTCPayServer/Views/Invoice/PosData.cshtml
+@@ -1,7 +1,7 @@
+ @model (Dictionary<string, object> Items, int Level)
+ 
+ @functions{
+-    void DisplayValue(object value)
++    async Task DisplayValue(object value)
+     {
+         if (value is string str && str.StartsWith("http"))
+         {
+@@ -25,7 +25,7 @@
+                     <th class="w-150px">@key</th>
+                 }
+                 <td>
+-                    @{ DisplayValue(value); }
++                    @{ await DisplayValue(value); }
+                 </td>
+             }
+             else if (value is Dictionary<string, object>subItems)
+@@ -35,7 +35,7 @@
+                 {
+                     <th class="w-150px">@key</th>
+                     <td>
+-                        @{ DisplayValue(subItems.First().Value); }
++                        @{ await DisplayValue(subItems.First().Value); }
+                     </td>
+                 }
+                 else

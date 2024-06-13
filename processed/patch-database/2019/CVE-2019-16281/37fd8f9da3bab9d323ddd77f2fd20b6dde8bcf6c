@@ -1,0 +1,524 @@
+diff --git a/ptarmapi/.env-sample b/ptarmapi/.env-sample
+index e2fe0dce2..da8a13568 100644
+--- a/ptarmapi/.env-sample
++++ b/ptarmapi/.env-sample
+@@ -6,3 +6,4 @@ BITCOIND_RPC_PORT=18332
+ BITCOIND_HOST="localhost"
+ BITCOIND_USER="bitcoinuser"
+ BITCOIND_PASS="bitcoinpassword"
++API_TOKEN="ptarmigan"
+diff --git a/ptarmapi/package.json b/ptarmapi/package.json
+index b3429cd64..06e5303b9 100644
+--- a/ptarmapi/package.json
++++ b/ptarmapi/package.json
+@@ -26,6 +26,7 @@
+     "@nestjs/common": "^6.4.1",
+     "@nestjs/core": "^6.4.1",
+     "@nestjs/microservices": "^6.4.1",
++    "@nestjs/passport": "^6.1.0",
+     "@nestjs/platform-express": "^6.4.1",
+     "@nestjs/platform-socket.io": "^6.4.1",
+     "@nestjs/platform-ws": "^6.4.1",
+@@ -37,6 +38,8 @@
+     "jayson": "^2.1.2",
+     "lru-cache": "^5.1.1",
+     "nestjs-config": "^1.3.21",
++    "passport": "^0.4.0",
++    "passport-http-bearer": "^1.0.1",
+     "reflect-metadata": "^0.1.13",
+     "request-promise": "^4.2.4",
+     "rimraf": "^2.6.2",
+@@ -76,4 +79,4 @@
+     "coverageDirectory": "../coverage",
+     "testEnvironment": "node"
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/ptarmapi/script/addfinal.sh b/ptarmapi/script/addfinal.sh
+index bb6b6145c..41084f660 100755
+--- a/ptarmapi/script/addfinal.sh
++++ b/ptarmapi/script/addfinal.sh
+@@ -25,13 +25,17 @@ json=$(cat << EOS
+ EOS
+ )
+ 
++if [ "${API_TOKEN:-unknown}" == unknown ]; then
++  API_TOKEN=ptarmigan
++fi
++
+ curl=`cat <<EOS
+ curl
+  -s -o
+- --verbose
+  --request POST
+  http://0.0.0.0:3000/notification/addfinal
+  --header 'Content-Type: application/json'
++ --header "Authorization: Bearer $API_TOKEN"
+  --data '$json'
+ EOS`
+ eval ${curl}
+\ No newline at end of file
+diff --git a/ptarmapi/script/htlcchanged.sh b/ptarmapi/script/htlcchanged.sh
+index 6a81142e9..4190f3e4a 100755
+--- a/ptarmapi/script/htlcchanged.sh
++++ b/ptarmapi/script/htlcchanged.sh
+@@ -16,12 +16,16 @@ cat << EOS | jq -e '.'
+ }
+ EOS
+ 
++if [ "${API_TOKEN:-unknown}" == unknown ]; then
++  API_TOKEN=ptarmigan
++fi
++
+ curl=`cat <<EOS
+ curl
+  -s -o
+- --verbose
+  --request POST
+  http://0.0.0.0:3000/notification/htlcchanged
+  --header 'Content-Type: application/json'
++ --header "Authorization: Bearer $API_TOKEN"
+ EOS`
+ eval ${curl}
+\ No newline at end of file
+diff --git a/ptarmapi/src/app.module.ts b/ptarmapi/src/app.module.ts
+index 87cf1721f..9b2bfd191 100644
+--- a/ptarmapi/src/app.module.ts
++++ b/ptarmapi/src/app.module.ts
+@@ -7,13 +7,14 @@ import { ConfigModule } from 'nestjs-config';
+ import { BitcoinService } from './bitcoin/bitcoin.service';
+ import { CacheService } from './cache/cache.servies';
+ import { InvoicesGateway } from './notifications/invoices.gateway';
+-
++import { AuthModule } from './auth/auth.module';
+ import * as path from 'path';
+ 
+ @Module({
+   controllers: [AppController, PtarmiganController],
+   providers: [AppService, PtarmiganService, BitcoinService, CacheService, InvoicesGateway],
+   imports: [
++    AuthModule,
+     ConfigModule.load(path.resolve(__dirname, 'config', '**/!(*.d).{ts,js}')),
+   ],
+ })
+diff --git a/ptarmapi/src/auth/auth.module.ts b/ptarmapi/src/auth/auth.module.ts
+new file mode 100644
+index 000000000..54a951a44
+--- /dev/null
++++ b/ptarmapi/src/auth/auth.module.ts
+@@ -0,0 +1,13 @@
++import { Module } from '@nestjs/common';
++import { AuthService } from './auth.service';
++import { HttpStrategy } from './http.strategy';
++import { PassportModule } from '@nestjs/passport';
++
++@Module({
++ imports: [
++  PassportModule.register({ defaultStrategy: 'bearer' }),
++ ],
++ providers: [AuthService, HttpStrategy],
++ exports: [PassportModule, AuthService],
++})
++export class AuthModule {}
+diff --git a/ptarmapi/src/auth/auth.service.ts b/ptarmapi/src/auth/auth.service.ts
+new file mode 100644
+index 000000000..5d8075fbc
+--- /dev/null
++++ b/ptarmapi/src/auth/auth.service.ts
+@@ -0,0 +1,16 @@
++import { Injectable } from '@nestjs/common';
++import { ConfigService } from 'nestjs-config';
++
++@Injectable()
++export class AuthService {
++
++  constructor() { }
++
++  async validateApiToken(token: string): Promise<any> {
++    const apiToken = ConfigService.get('ptarmigan.apiToken');
++    if (token === apiToken) {
++      return true;
++    }
++    return false;
++  }
++}
+diff --git a/ptarmapi/src/auth/http.strategy.ts b/ptarmapi/src/auth/http.strategy.ts
+new file mode 100644
+index 000000000..4f1234aac
+--- /dev/null
++++ b/ptarmapi/src/auth/http.strategy.ts
+@@ -0,0 +1,19 @@
++import { Strategy } from 'passport-http-bearer';
++import { PassportStrategy } from '@nestjs/passport';
++import { Injectable, UnauthorizedException } from '@nestjs/common';
++import { AuthService } from './auth.service';
++
++@Injectable()
++export class HttpStrategy extends PassportStrategy(Strategy) {
++  constructor(private readonly authService: AuthService) {
++    super();
++  }
++
++  async validate(token: string) {
++    const apiToken = await this.authService.validateApiToken(token);
++    if (!apiToken) {
++      throw new UnauthorizedException();
++    }
++    return apiToken;
++  }
++}
+diff --git a/ptarmapi/src/config/ptarmigan.ts b/ptarmapi/src/config/ptarmigan.ts
+index 978b7c29d..df6104b0a 100644
+--- a/ptarmapi/src/config/ptarmigan.ts
++++ b/ptarmapi/src/config/ptarmigan.ts
+@@ -7,4 +7,5 @@ export default {
+     bitcoindHost: process.env.BITCOIND_HOST || 'localhost',
+     bitcoindUser: process.env.BITCOIND_USER || 'bitcoinuser',
+     bitcoindPassword: process.env.BITCOIND_PASSWORD || 'bitcoinpassword',
++    apiToken: process.env.API_TOKEN || 'ptarmigan',
+ };
+diff --git a/ptarmapi/src/main.ts b/ptarmapi/src/main.ts
+index 37e26fdef..55fd74b80 100644
+--- a/ptarmapi/src/main.ts
++++ b/ptarmapi/src/main.ts
+@@ -1,5 +1,5 @@
+ import { NestFactory } from '@nestjs/core';
+-import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
++import { SwaggerModule, DocumentBuilder, SwaggerBaseConfig } from '@nestjs/swagger';
+ import { AppModule } from './app.module';
+ import { Logger } from '@nestjs/common';
+ import { ConfigService } from 'nestjs-config';
+@@ -14,6 +14,7 @@ async function bootstrap() {
+   const options = new DocumentBuilder()
+     .setTitle('ptarmigan REST-API')
+     .setDescription('Lightning Network implementation ptarmigan REST-API')
++    .addBearerAuth('Authorization', 'header')
+     .setVersion('0.2')
+     .build();
+   const document = SwaggerModule.createDocument(app, options);
+@@ -24,6 +25,7 @@ async function bootstrap() {
+   Logger.log('ptarmdHost: + ' + config.get('ptarmigan.ptarmdHost'));
+   Logger.log('bitcoindRpcPort: ' + config.get('ptarmigan.bitcoindRpcPort'));
+   Logger.log('bitcoindHost: ' + config.get('ptarmigan.bitcoindHost'));
++  Logger.log('bitcoindHost: ' + config.get('ptarmigan.apiToken'));
+ 
+   await app.listen(3000);
+ }
+diff --git a/ptarmapi/src/notifications/invoices.gateway.ts b/ptarmapi/src/notifications/invoices.gateway.ts
+index 193e53895..3934c3c55 100644
+--- a/ptarmapi/src/notifications/invoices.gateway.ts
++++ b/ptarmapi/src/notifications/invoices.gateway.ts
+@@ -8,7 +8,8 @@ import {
+     OnGatewayDisconnect,
+ } from '@nestjs/websockets';
+ import { Server, Socket } from 'ws';
+-import { Logger } from '@nestjs/common';
++import { Logger, UseGuards } from '@nestjs/common';
++import { AuthGuard } from '@nestjs/passport';
+ 
+ @WebSocketGateway({ path: '/ws' })
+ export class InvoicesGateway implements OnGatewayConnection, OnGatewayInit, OnGatewayDisconnect {
+@@ -16,6 +17,7 @@ export class InvoicesGateway implements OnGatewayConnection, OnGatewayInit, OnGa
+     private logger = new Logger('InvoicesGateway');
+     clients: Socket[] = [];
+ 
++    @UseGuards(AuthGuard())
+     @WebSocketServer()
+     server: Server;
+ 
+diff --git a/ptarmapi/src/ptarmigan/ptarmigan.controller.ts b/ptarmapi/src/ptarmigan/ptarmigan.controller.ts
+index e29ab6675..d46bb8ef4 100644
+--- a/ptarmapi/src/ptarmigan/ptarmigan.controller.ts
++++ b/ptarmapi/src/ptarmigan/ptarmigan.controller.ts
+@@ -1,8 +1,8 @@
+-import { Controller, Get, Patch, Put, Param, Post, Body, Delete, Logger, Query, Next } from '@nestjs/common';
++import { Controller, Get, Patch, Put, Param, Post, Body, Delete, Logger, Query, Next, UseGuards } from '@nestjs/common';
+ import { exec, execSync } from 'child_process';
+ import { PtarmiganService } from './ptarmigan.service';
+ import { BitcoinService } from '../bitcoin/bitcoin.service';
+-import { ApiUseTags, ApiModelProperty, ApiImplicitQuery, ApiCreatedResponse, ApiForbiddenResponse } from '@nestjs/swagger';
++import { ApiUseTags, ApiModelProperty, ApiImplicitQuery, ApiCreatedResponse, ApiForbiddenResponse, ApiBearerAuth } from '@nestjs/swagger';
+ import { Validate, Matches } from 'class-validator';
+ import { FeeDto } from 'src/model/fee';
+ import { InvoiceDto } from 'src/model/invoice';
+@@ -21,6 +21,7 @@ import { AddFinalDto } from 'src/model/addfinal';
+ import { ListInvoiceResponseDto } from 'src/model/list-invoice-response';
+ import { CacheService } from '../cache/cache.servies'
+ import { InvoicesGateway } from '../notifications/invoices.gateway';
++import { AuthGuard } from '@nestjs/passport';
+ 
+ @ApiUseTags('ptarmigan')
+ @Controller('/')
+@@ -30,50 +31,68 @@ export class PtarmiganController {
+         private readonly ptarmiganService: PtarmiganService,
+         private readonly bitcoinService: BitcoinService,
+         private readonly cacheService: CacheService,
+-        private readonly invoicesGateway: InvoicesGateway
++        private readonly invoicesGateway: InvoicesGateway,
+     ) {
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('stop') // stop -> stop
+     async executeStop() {
+         return await this.ptarmiganService.requestTCP('stop', []);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('getinfo') // getinfo -> getinfo
+     async executeGetInfo(): Promise<string> {
+         return await this.ptarmiganService.requestTCP('getinfo', []);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('setfeerate') // setfeerate -> setfeerate
+     async executeSetFeerate(@Body() dto: FeeDto) {
+         return await this.ptarmiganService.requestTCP('setfeerate', [dto.feeratePerKw]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('estimatefundingfee') // estimatefundingfee -> dev-estimatefundingfee
+     async executeEstimateFundingFee(@Body() dto: FeeDto) {
+         return await this.ptarmiganService.requestTCP('estimatefundingfee', [dto.feeratePerKw]);
+     }
+-
++    
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('createinvoice') // createinvoice -> invoice
+     async executeCreateInvoice(@Body() dto: InvoiceDto) {
+         return await this.ptarmiganService.requestTCP('invoice', [dto.amountMsat, dto.minFinalCltvExpiry, dto.description, dto.invoiceExpiry]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('removeinvoice') // eraseinvoice -> removeinvoice
+     async executeEraseInvoice(@Body() dto: PaymentHashDto) {
+         return await this.ptarmiganService.requestTCP('eraseinvoice', [dto.paymentHash]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('removeallinvoices') // eraseinvoice -> removeallinvoices
+     async executeRemoveAllInvoices() {
+         return await this.ptarmiganService.requestTCP('eraseinvoice', ['']);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('listinvoices') // listinvoice -> listinvoices
+     async executeListInvoice(@Body() dto: ListInvoiceDto) {
+         return await this.ptarmiganService.requestTCP('listinvoice', [dto.paymentHash]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('decodeinvoice') // none -> decodeinvoice
+     async executeDecodeInvoice(@Body() dto: Bolt11Dto) {
+         return await this.ptarmiganService.requestTCP('decodeinvoice', [dto.bolt11]);
+@@ -82,21 +101,30 @@ export class PtarmiganController {
+     // ------------------------------------------------------------------------------
+     // peer
+     // ------------------------------------------------------------------------------
++
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('connect') // connect -> connectpeer
+     async executeConnect(@Body() dto: PeerDto) {
+         return await this.ptarmiganService.requestTCP('connect', [dto.peerNodeId, dto.peerAddr, dto.peerPort]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('disconnect') // disconnect -> disconnectpeer
+     async executeDisconnect(@Body() dto: PeerNodeDto) {
+         return await this.ptarmiganService.requestTCP('disconnect', [dto.peerNodeId, '0.0.0.0', 0]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('getlasterror') // getlasterror -> getlasterror
+     async executeGetLastErrort(@Body() dto: PeerNodeDto) {
+         return await this.ptarmiganService.requestTCP('getlasterror', [dto.peerNodeId, '0.0.0.0', 0]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('dev-disautoconn') // disautoconn -> dev-disableautoconnect
+     @ApiImplicitQuery({
+         name: 'enable',
+@@ -106,6 +134,8 @@ export class PtarmiganController {
+         return await this.ptarmiganService.requestTCP('disautoconn', [enable.toString(10)]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('dev-listtransactions') // getcommittx -> dev-listtransactions
+     async executeGetCommitTx(@Body() dto: PeerNodeDto) {
+         return await this.ptarmiganService.requestTCP('getcommittx', [dto.peerNodeId, '0.0.0.0', 0]);
+@@ -114,26 +144,37 @@ export class PtarmiganController {
+     // ------------------------------------------------------------------------------
+     // channel
+     // ------------------------------------------------------------------------------
++    
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('openchannel') // fund -> openchannel
+     async executeOpenChannel(@Body() dto: FundDto) {
+         return await this.ptarmiganService.commandExecuteOpenChannel(dto.peerNodeId, dto.fundingSat, dto.pushMsat, dto.feeratePerKw);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('close') // close -> closechannel
+     async executeCloseChannel(@Body() dto: PeerNodeDto) {
+         return await this.ptarmiganService.requestTCP('close', [dto.peerNodeId, '0.0.0.0', 0]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('forceclose') // close -> closechannel
+     async executeForceCloseChannel(@Body() dto: PeerNodeDto) {
+         return await this.ptarmiganService.requestTCP('close', [dto.peerNodeId, '0.0.0.0', 0, 'force']);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('dev-removechannel/:channelId') // removechannel -> dev-removechannel
+     async executeRemoveChannel(@Param('channelId') channelId: string) {
+         return await this.ptarmiganService.requestTCP('removechannel', [channelId]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('resetroutestate') // removechannel -> dev-removechannel
+     async executeResetRouteState() {
+         return await this.ptarmiganService.requestTCP('resetroutestate', []);
+@@ -142,21 +183,30 @@ export class PtarmiganController {
+     // ------------------------------------------------------------------------------
+     // payment
+     // ------------------------------------------------------------------------------
++   
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('sendpayment') // routepay -> sendpayment
+     async executeSendPayment(@Body() dto: SendPaymentDto) {
+         return await this.ptarmiganService.requestTCP('routepay', [dto.bolt11, dto.addAmountMsat]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('listpayments') // listpayment -> listpayments
+     async executeListPaymentsState() {
+         return await this.ptarmiganService.requestTCP('listpayment', []);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('listpayment') // listpayment -> listpayment=0
+     async executeListPaymentState(@Body() dto: ListPaymentDto) {
+         return await this.ptarmiganService.requestTCP('listpayment', [dto.listpayment]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('removepayment') // removepayment -> removepayment
+     async executeRemovePaymentState(@Body() dto: PaymentIdDto) {
+         return await this.ptarmiganService.requestTCP('removepayment', [dto.paymentId]);
+@@ -165,21 +215,30 @@ export class PtarmiganController {
+     // ------------------------------------------------------------------------------
+     // fund
+     // ------------------------------------------------------------------------------
++    
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('getwalletinfo') // getnewaddress
+     async executeGetWalletInfo(): Promise<string> {
+         return await this.bitcoinService.requestHTTP('getwalletinfo', []);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('getnewaddress') // getnewaddress
+     async executeGetNewAddress(): Promise<string> {
+         return await this.bitcoinService.requestHTTP('getnewaddress', ['', 'p2sh-segwit']);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('listunspent') // listunspent
+     async executeListUnspent(@Body() dto: ListUnspentDto): Promise<string> {
+         return await this.bitcoinService.requestHTTP('listunspent', [dto.minconf, dto.maxconf, dto.addresses]);
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('listchannels')
+     async executeListChannels(): Promise<string> {
+         try {
+@@ -189,6 +248,8 @@ export class PtarmiganController {
+         }
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('listnodes')
+     async executeListNodes(): Promise<string> {
+         try {
+@@ -198,6 +259,8 @@ export class PtarmiganController {
+         }
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('getroute')
+     async executeGetRoute(@Body() dto: RouteNodeDto): Promise<string> {
+         try {
+@@ -211,6 +274,8 @@ export class PtarmiganController {
+     // invoice notifications
+     // ------------------------------------------------------------------------------
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('notification/htlcchanged') // addfinal.sh -> websocket
+     async executeHtlcChangedNotification() {
+         try {
+@@ -234,16 +299,18 @@ export class PtarmiganController {
+                 }
+             }
+         } catch (error) {
+-            return 'error';
++            return error;
+         }
+     }
+ 
++    @ApiBearerAuth()
++    @UseGuards(AuthGuard())
+     @Post('notification/addfinal') // addfinal.sh -> lru-cache
+     async executeAddFinalNotification(@Body() dto: AddFinalDto) {
+         try {
+             await this.cacheService.write(dto);
+         } catch (error) {
+-            return 'error';
++            return error;
+         }
+     }
+ 
+diff --git a/ptarmapi/test/client/index.html b/ptarmapi/test/client/index.html
+index c935b7ac6..b31b371a4 100644
+--- a/ptarmapi/test/client/index.html
++++ b/ptarmapi/test/client/index.html
+@@ -15,7 +15,7 @@ <h3>status</h3>
+   </div>
+   <script>
+     // websocket url
+-    const url = 'ws://127.0.0.1:3001/ws';
++    const url = 'ws://127.0.0.1:3000/ws';
+ 
+     document.getElementById('title').insertAdjacentHTML('afterend', '<p>url: ' + url + '</p>');
+ 

@@ -1,0 +1,376 @@
+diff --git a/backend/src/models/user.js b/backend/src/models/user.js
+index 84c0f57e..3a2e802e 100644
+--- a/backend/src/models/user.js
++++ b/backend/src/models/user.js
+@@ -98,7 +98,7 @@ UserSchema.statics.updateProfile = function (username, user) {
+                 throw({fn: 'Unauthorized', message: 'Current password is invalid'});
+         })
+         .then(function() {
+-            var token = jwt.sign(payload, auth.jwtSecret, {expiresIn: '24h'});
++            var token = jwt.sign(payload, auth.jwtSecret, {expiresIn: '15 minutes'});
+             resolve({token: `JWT ${token}`});
+         })
+         .catch(function(err) {
+@@ -139,7 +139,7 @@ UserSchema.statics.updateRefreshToken = function (refreshToken, userAgent) {
+         var newRefreshToken = ""
+         try {
+             var decoded = jwt.verify(refreshToken, auth.jwtRefreshSecret)
+-            var username = decoded.username
++            var userId = decoded.userId
+             var sessionId = decoded.sessionId
+             var expiration = decoded.exp
+         }
+@@ -149,7 +149,7 @@ UserSchema.statics.updateRefreshToken = function (refreshToken, userAgent) {
+             else
+                 throw({fn: 'Unauthorized', message: 'Invalid refreshToken'})
+         }
+-        var query = this.findOne({username: username})
++        var query = this.findById(userId)
+         query.exec()
+         .then(row => {
+             if (row) {
+@@ -185,17 +185,17 @@ UserSchema.statics.updateRefreshToken = function (refreshToken, userAgent) {
+                 var foundIndex = row.refreshTokens.findIndex(e => e.sessionId === sessionId)
+                 if (foundIndex === -1) { // Not found
+                     sessionId = generateUUID()
+-                    newRefreshToken = jwt.sign({sessionId: sessionId, username: username}, auth.jwtRefreshSecret, {expiresIn: '7 days'})
++                    newRefreshToken = jwt.sign({sessionId: sessionId, userId: userId}, auth.jwtRefreshSecret, {expiresIn: '7 days'})
+                     row.refreshTokens.push({sessionId: sessionId, userAgent: userAgent, token:newRefreshToken})
+                  }
+                 else {
+-                    newRefreshToken = jwt.sign({sessionId: sessionId, username: username, exp: expiration}, auth.jwtRefreshSecret)
++                    newRefreshToken = jwt.sign({sessionId: sessionId, userId: userId, exp: expiration}, auth.jwtRefreshSecret)
+                     row.refreshTokens[foundIndex].token = newRefreshToken
+                 }
+                 return row.save()
+             }
+             else
+-                reject({fn: 'NotFound', message: 'User not found'})
++                reject({fn: 'NotFound', message: 'Session not found'})
+         })
+         .then(() => {
+             resolve({token: token, refreshToken: newRefreshToken})
+@@ -210,9 +210,9 @@ UserSchema.statics.updateRefreshToken = function (refreshToken, userAgent) {
+ }
+ 
+ // Remove session
+-UserSchema.statics.removeSession = function (username, sessionId) {
++UserSchema.statics.removeSession = function (userId, sessionId) {
+     return new Promise((resolve, reject) => {
+-        var query = this.findOne({username: username})
++        var query = this.findById(userId)
+         query.exec()
+         .then(row => {
+             if (row) {
+@@ -243,12 +243,11 @@ UserSchema.statics.removeSession = function (username, sessionId) {
+ UserSchema.methods.getToken = function (userAgent) {
+     return new Promise((resolve, reject) => {
+         var user = this;
+-        var token = ""
+         var query = User.findOne({username: user.username});
+         query.exec()
+         .then(function(row) {
+             if (row && bcrypt.compareSync(user.password, row.password)) {
+-                var refreshToken = jwt.sign({sessionId: null, username: row.username}, auth.jwtRefreshSecret)
++                var refreshToken = jwt.sign({sessionId: null, userId: row._id}, auth.jwtRefreshSecret)
+                 return User.updateRefreshToken(refreshToken, userAgent)
+             }
+             else
+diff --git a/backend/src/routes/user.js b/backend/src/routes/user.js
+index e6d057a5..1d9572fb 100644
+--- a/backend/src/routes/user.js
++++ b/backend/src/routes/user.js
+@@ -32,7 +32,7 @@ module.exports = function(app) {
+     });
+ 
+     // Remove token cookie
+-    app.get("/api/users/destroytoken", function(req, res) {
++    app.delete("/api/users/refreshtoken", function(req, res) {
+         var token = req.cookies['refreshToken']
+         try {
+             var decoded = jwt.verify(token, jwtRefreshSecret)
+@@ -46,7 +46,7 @@ module.exports = function(app) {
+                 Response.Unauthorized(res, 'Invalid refreshToken')
+             return
+         }
+-        User.removeSession(decoded.username, decoded.sessionId)
++        User.removeSession(decoded.userId, decoded.sessionId)
+         .then(msg => {
+             res.clearCookie('token')
+             res.clearCookie('refreshToken')
+@@ -150,9 +150,10 @@ module.exports = function(app) {
+                     newUser.username = req.body.username;
+                     newUser.password = req.body.password;
+ 
+-                    newUser.getToken()
++                    newUser.getToken(req.headers['user-agent'])
+                     .then(msg => {
+-                        res.cookie('token', msg.token, {secure: true, httpOnly: true})
++                        res.cookie('token', `JWT ${msg.token}`, {secure: true, httpOnly: true})
++                        res.cookie('refreshToken', msg.refreshToken, {secure: true, httpOnly: true, path: '/api/users/refreshtoken'})
+                         Response.Created(res, msg)
+                     })
+                     .catch(err => Response.Internal(res, err))
+diff --git a/frontend/src/boot/auth.js b/frontend/src/boot/auth.js
+index 37c625af..9410b2df 100644
+--- a/frontend/src/boot/auth.js
++++ b/frontend/src/boot/auth.js
+@@ -1,15 +1,37 @@
+ import User from '@/services/user';
+ 
+-export default ({ app, router, Vue }) => {
++export default async ({ urlPath, router, redirect }) => {
++  // Launch refresh token countdown 840000=14min if not on login page
++  setInterval(() => {
++    User.refreshToken()
++    .then()
++    .catch(err => {
++      if (!router.currentRoute.path.startsWith('/login'))
++        if (err === 'Expired refreshToken')
++          redirect('/login?tokenError=2')
++        else
++          redirect('/login')
++    })
++  }, 840000)
++
++  // Call refreshToken when loading app and redirect to login if error
++  try {
++    await User.refreshToken()
++  }
++  catch(err) {
++    if (!urlPath.startsWith('/login'))
++      if (err === 'Expired refreshToken')
++        redirect('/login?tokenError=2')
++      else
++        redirect('/login')
++  }
++
+   router.beforeEach((to, from, next) => {
+     if (to.path === '/login') {
+-      User.checkToken()
+-      .then(() => {
++      if (User.isAuth())
+         next('/')
+-      })
+-      .catch((error) => {
++      else
+         next()
+-      })
+     }
+     else {
+       next()
+diff --git a/frontend/src/boot/axios.js b/frontend/src/boot/axios.js
+index 7a5a3142..c7f8a605 100755
+--- a/frontend/src/boot/axios.js
++++ b/frontend/src/boot/axios.js
+@@ -1,23 +1,59 @@
+ import axios from 'axios'
+ import User from '@/services/user'
++import Router from '../router'
+ 
+ const axiosInstance = axios.create({
+   baseURL: `${window.location.origin}/api`
+ })
+ 
+-export default ({ Vue }) => {
++var refreshPending = false
++var requestsQueue = []
+ 
+-  // Redirect to login if response is 401 (Unauthenticated)
+-  axiosInstance.interceptors.response.use(response => {
++// Redirect to login if response is 401 (Unauthenticated)
++axiosInstance.interceptors.response.use(
++  response => {
+     return response
+-  }, error => {
+-   if (error.response.status === 401) {
+-     if (window.location.pathname !== '/login')
+-      window.location = '/login'
+-   }
+-  return error
+-  })
++  }, 
++  error => {
++    const originalRequest = error.config
++
++    // 401 after User.refreshToken function call
++    if (error.response.status === 401 && originalRequest.url.endsWith('/users/refreshtoken')) {
++      User.clear()
++      return Promise.reject(error)
++    }
++
++    // 401 after login request
++    if (error.response.status === 401 && originalRequest.url.endsWith('/users/token')) {
++      return Promise.reject(error)
++    }
+ 
++    // All other 401 calls
++    if (error.response.status === 401) {
++      if (!refreshPending) {
++        refreshPending = true
++        axiosInstance.get('/users/refreshtoken')
++        .then(() => {
++          requestsQueue.forEach(e => e())
++          requestsQueue = []
++        })
++        .catch(err => {
++          Router.push('/login')
++          return Promise.reject(error)
++          
++        })
++        .finally(() => {
++          refreshPending = false
++        })
++      }
++      return new Promise((resolve) => {
++        requestsQueue.push(() => resolve(axiosInstance.request(originalRequest)))
++      })
++    }
++    return Promise.reject(error)
++  }
++)
++
++export default ({ Vue }) => {
+   Vue.prototype.$axios = axiosInstance
+-  User.refreshToken()
+ }
+diff --git a/frontend/src/pages/profile/profile.js b/frontend/src/pages/profile/profile.js
+index 71e497a8..d1c2cf82 100755
+--- a/frontend/src/pages/profile/profile.js
++++ b/frontend/src/pages/profile/profile.js
+@@ -44,7 +44,7 @@ export default {
+ 
+             UserService.updateProfile(this.user)
+             .then((data) => {
+-                UserService.checkToken()
++                UserService.refreshToken()
+                 Notify.create({
+                     message: 'Profile updated successfully',
+                     color: 'positive',
+diff --git a/frontend/src/services/user.js b/frontend/src/services/user.js
+index f20a82c0..8c9a8cf4 100644
+--- a/frontend/src/services/user.js
++++ b/frontend/src/services/user.js
+@@ -1,10 +1,17 @@
+ var jwtDecode = require('jwt-decode');
+ import Vue from 'vue';
++import User from '@/services/user';
+ 
+-import Router from '../router'
++import Router from '@/router'
+ 
+ export default {
+-    user: null,
++    user: {
++        username: "",
++        role: "",
++        firstname: "",
++        lastname: "",
++        roles: ""
++    },
+ 
+     getToken(username, password) {
+         return new Promise((resolve, reject) => {
+@@ -13,63 +20,39 @@ export default {
+             .then((response) => {
+                 var token = response.data.datas.token;
+                 this.user = jwtDecode(token);
+-                var countdown = this.user.exp*1000 - Date.now() - 60000 // Countdown to expiration less 1 minute
+-                setTimeout(() => {
+-                    this.refreshToken()
+-                }, countdown)
+                 resolve();
+             })
+             .catch((error) => {
+-                console.log(error)
+                 reject(error);
+             })
+         })
+     },
+ 
+     refreshToken() {
+-        Vue.prototype.$axios.get('users/refreshtoken')
+-        .then((response) => {
+-            var token = response.data.datas.token;
+-            this.user = jwtDecode(token);
+-            var countdown = this.user.exp*1000 - Date.now() - 60000 // Countdown to expiration less 1 minute
+-            setTimeout(() => {
+-                this.refreshToken()
+-            }, countdown)
+-        })
+-        .catch(err => {
+-            console.log(err)
+-            if (err.response && err.response.data.datas.includes('Expired'))
+-                Router.push('/login?tokenError=2')
+-            else
+-                Router.push('/login')
++        return new Promise((resolve, reject) => {
++            Vue.prototype.$axios.get('users/refreshtoken')
++            .then((response) => {
++                var token = response.data.datas.token;
++                this.user = jwtDecode(token);
++                resolve()
++            })
++            .catch(err => {
++                if (err.response && err.response.data)
++                    reject(err.response.data.datas)
++                else 
++                    reject('Invalid Token')
++            })
+         })
+     },
+ 
+     destroyToken() {
+-        Vue.prototype.$axios.get('users/destroytoken')
++        Vue.prototype.$axios.delete('users/refreshtoken')
+         .then(() => {
++            User.clear()
+             Router.push('/login');
+         })
+-        .catch(err => Router.push('/login'))
+-    },
+-
+-    checkToken() {
+-        return new Promise((resolve, reject) => {
+-            Vue.prototype.$axios.get(`users/checktoken`)
+-            .then(data => {
+-                var token = data.data.datas
+-                var decoded = jwtDecode(token);
+-                if (decoded) {
+-                    this.user = decoded;
+-                    resolve();
+-                }
+-                else
+-                    reject('InvalidToken');
+-                resolve()
+-            })
+-            .catch((error) => {
+-                reject(error);
+-            })
++        .catch(err => {
++            console.log(err)
+         })
+     },
+ 
+@@ -94,7 +77,20 @@ export default {
+     },
+ 
+     isAuth() {
+-        return (this.user !== null);
++        if (this.user && this.user.username)
++            return true
++        return false
++    },
++
++    // Reset user variable to default empty
++    clear() {
++        this.user = {
++            username: "",
++            role: "",
++            firstname: "",
++            lastname: "",
++            roles: ""
++        }
+     },
+ 
+     isAllowed(role) {

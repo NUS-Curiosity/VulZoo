@@ -1,0 +1,189 @@
+diff --git a/include/dwg.h b/include/dwg.h
+index 4070f4ae33..5fb603df05 100644
+--- a/include/dwg.h
++++ b/include/dwg.h
+@@ -5456,7 +5456,6 @@ typedef struct _dwg_object
+   {
+     Dwg_Object_Entity *entity;
+     Dwg_Object_Object *object;
+-    char *unknown; /* i.e. unhandled class as raw bits */
+   } tio;
+ 
+   Dwg_Handle handle;
+diff --git a/src/decode.c b/src/decode.c
+index 4ed8d35926..c69c57b895 100644
+--- a/src/decode.c
++++ b/src/decode.c
+@@ -5011,10 +5011,7 @@ dwg_decode_add_object (Dwg_Data *restrict dwg, Bit_Chain *dat,
+           // LOG_HANDLE("common_size: %lu\n", obj->common_size); // needed for
+           // unknown
+           bit_set_position (dat, restartpos);
+-
+-          // obj->unknown_off = obj->unknown_pos - restartpos;
+-          // LOG_TRACE("Unknown pos %lu, offset %lu\n", obj->unknown_pos,
+-          // obj->unknown_off);
++          obj->supertype = DWG_SUPERTYPE_UNKNOWN;
+ 
+           if (i >= 0 && i < (int)dwg->num_classes)
+             {
+@@ -5032,67 +5029,20 @@ dwg_decode_add_object (Dwg_Data *restrict dwg, Bit_Chain *dat,
+                   LOG_ERROR ("Invalid class index %d >%d", i,
+                              (int)dwg->num_classes);
+                 }
+-              obj->supertype = DWG_SUPERTYPE_UNKNOWN;
+               obj->type = 0;
+               *dat = abs_dat;
+               return error | DWG_ERR_VALUEOUTOFBOUNDS;
+             }
+           // properly dwg_decode_object/_entity for eed, reactors, xdic
+-          if (klass && !is_entity)
+-            {
+-              int err = dwg_decode_UNKNOWN_OBJ (dat, obj);
+-              error |= err;
+-              obj->supertype = DWG_SUPERTYPE_UNKNOWN;
+-              if (!dat)
+-                return error;
+-              if (err >= DWG_ERR_CRITICAL)
+-                *dat = abs_dat;
+-            }
+-          else if (klass) // is_entity
+-            {
+-              int err;
+-#if 0 && !defined(IS_RELEASE)
+-              if (strEQc(klass->dxfname, "MULTILEADER")) { //debug CED
+-                char *mleader = bit_read_TF(dat, obj->size);
+-                LOG_INSANE_TF(mleader, (int)obj->size)
+-                bit_set_position(dat, restartpos);
+-                free (mleader);
+-              }
+-#endif
+-              err = dwg_decode_UNKNOWN_ENT (dat, obj);
+-              error |= err;
+-              obj->supertype = DWG_SUPERTYPE_UNKNOWN;
+-              if (!dat)
+-                return error;
+-              if (err >= DWG_ERR_CRITICAL)
+-                *dat = abs_dat;
+-            }
+-          else // not a class
+-            {
+-              LOG_WARN ("Unknown object, skipping eed/reactors/xdic");
+-              SINCE (R_2000)
+-              {
+-                obj->bitsize = bit_read_RL (dat);
+-                LOG_TRACE ("bitsize: " FORMAT_RL " [RL] @%lu.%u\n",
+-                           obj->bitsize, dat->byte-2, dat->bit);
+-                if (obj->bitsize > obj->size * 8)
+-                  {
+-                    LOG_ERROR ("Invalid bitsize " FORMAT_RL " => " FORMAT_RL,
+-                               obj->bitsize, obj->size * 8);
+-                    obj->bitsize = obj->size * 8;
+-                    error |= DWG_ERR_VALUEOUTOFBOUNDS;
+-                  }
+-              }
+-              if (!bit_read_H (dat, &obj->handle))
+-                {
+-                  LOG_TRACE ("handle: " FORMAT_H " [H 5]\n",
+-                             ARGS_H (obj->handle));
+-                }
+-              restartpos = dat->byte;
+-              obj->supertype = DWG_SUPERTYPE_UNKNOWN;
+-              obj->tio.unknown = bit_read_TF (dat, obj->size);
+-              dat->byte = restartpos;
+-            }
++          if (is_entity)
++              error |= dwg_decode_UNKNOWN_ENT (dat, obj);
++          else
++              error |= dwg_decode_UNKNOWN_OBJ (dat, obj);
++
++          if (!dat)
++            return error;
++          if (error >= DWG_ERR_CRITICAL)
++            *dat = abs_dat;
+         }
+     }
+ 
+diff --git a/src/encode.c b/src/encode.c
+index 10f54b2108..d29d637494 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -1970,26 +1970,10 @@ dwg_encode_add_object (Dwg_Object *restrict obj, Bit_Chain *restrict dat,
+           else
+             is_entity = obj->supertype == DWG_SUPERTYPE_ENTITY;
+           // properly dwg_decode_object/_entity for eed, reactors, xdic
+-          if (klass && !is_entity)
+-            error = dwg_encode_UNKNOWN_OBJ (dat, obj);
+-          else if (klass)
++          if (is_entity)
+             error = dwg_encode_UNKNOWN_ENT (dat, obj);
+-          else // not a class
+-            {
+-              LOG_WARN ("Unknown object, skipping eed/reactors/xdic");
+-              error = DWG_ERR_UNHANDLEDCLASS;
+-              SINCE (R_2000)
+-              {
+-                bit_write_RL (dat, obj->bitsize);
+-                LOG_INFO ("bitsize: " FORMAT_RL " [RL] (@%lu.%u)\n", obj->bitsize,
+-                          dat->byte - 4, dat->bit);
+-              }
+-              bit_write_H (dat, &obj->handle);
+-              LOG_INFO ("handle: " FORMAT_H " [H 5]\n", ARGS_H (obj->handle));
+-              // write obj->size bytes, excl. bitsize and handle.
+-              // overshoot the bitsize and handle size.
+-              bit_write_TF (dat, obj->tio.unknown, obj->size);
+-            }
++          else
++            error = dwg_encode_UNKNOWN_OBJ (dat, obj);
+         }
+     }
+ 
+diff --git a/src/free.c b/src/free.c
+index cc17ace87a..d9206d3014 100644
+--- a/src/free.c
++++ b/src/free.c
+@@ -731,43 +731,11 @@ dwg_free_object (Dwg_Object *obj)
+       else if ((error = dwg_free_variable_type (obj->parent, obj))
+                & DWG_ERR_UNHANDLEDCLASS)
+         {
+-          int is_entity;
+-          int i;
+-          Dwg_Class *klass;
+-
+         unhandled:
+-          is_entity = 0;
+-          i = obj->type - 500;
+-          klass = NULL;
+-
+-          dwg = obj->parent;
+-          if (dwg->dwg_class && i >= 0 && i < (int)dwg->num_classes)
+-            {
+-              klass = &dwg->dwg_class[i];
+-              is_entity = klass ? dwg_class_is_entity (klass) : 0;
+-            }
+-          // indxf (and later injson) already creates some DEBUGGING classes
+-          if (obj->fixedtype == DWG_TYPE_TABLE)
+-            {
+-              // just the preview, i.e. common. plus some colors: leak
++          if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT)
+               dwg_free_UNKNOWN_ENT (dat, obj);
+-            }
+-          else if (obj->fixedtype == DWG_TYPE_DATATABLE)
+-            {
+-              dwg_free_UNKNOWN_OBJ (dat, obj);
+-            }
+-          else if (klass && !is_entity)
+-            {
++          else if (obj->fixedtype == DWG_TYPE_UNKNOWN_OBJ)
+               dwg_free_UNKNOWN_OBJ (dat, obj);
+-            }
+-          else if (klass && is_entity)
+-            {
+-              dwg_free_UNKNOWN_ENT (dat, obj);
+-            }
+-          else // not a class
+-            {
+-              FREE_IF (obj->tio.unknown);
+-            }
+         }
+     }
+   /* With this importer the dxfname is dynamic, just the name is const */

@@ -1,0 +1,171 @@
+diff --git a/NetKVM/Common/ParaNdis-Common.cpp b/NetKVM/Common/ParaNdis-Common.cpp
+index 799fb913..9024ba63 100644
+--- a/NetKVM/Common/ParaNdis-Common.cpp
++++ b/NetKVM/Common/ParaNdis-Common.cpp
+@@ -2219,7 +2219,8 @@ tChecksumCheckResult ParaNdis_CheckRxChecksum(
+                                             ULONG virtioFlags,
+                                             tCompletePhysicalAddress *pPacketPages,
+                                             ULONG ulPacketLength,
+-                                            ULONG ulDataOffset)
++                                            ULONG ulDataOffset,
++                                            BOOLEAN verifyLength)
+ {
+     tOffloadSettingsFlags f = pContext->Offload.flags;
+     tChecksumCheckResult res;
+@@ -2247,7 +2248,8 @@ tChecksumCheckResult ParaNdis_CheckRxChecksum(
+         }
+     }
+ 
+-    ppr = ParaNdis_CheckSumVerify(pPacketPages, ulPacketLength - ETH_HEADER_SIZE, ulDataOffset + ETH_HEADER_SIZE, flagsToCalculate, __FUNCTION__);
++    ppr = ParaNdis_CheckSumVerify(pPacketPages, ulPacketLength - ETH_HEADER_SIZE, ulDataOffset + ETH_HEADER_SIZE, flagsToCalculate,
++        verifyLength, __FUNCTION__);
+ 
+     if (ppr.ipCheckSum == ppresIPTooShort || ppr.xxpStatus == ppresXxpIncomplete)
+     {
+diff --git a/NetKVM/Common/ParaNdis-TX.cpp b/NetKVM/Common/ParaNdis-TX.cpp
+index ad265bbf..2820db2a 100644
+--- a/NetKVM/Common/ParaNdis-TX.cpp
++++ b/NetKVM/Common/ParaNdis-TX.cpp
+@@ -649,6 +649,7 @@ void CNB::SetupLSO(virtio_net_hdr_basic *VirtioHeader, PVOID IpHeader, ULONG Eth
+     tTcpIpPacketParsingResult packetReview;
+     packetReview = ParaNdis_CheckSumVerifyFlat(reinterpret_cast<IPv4Header*>(IpHeader), EthPayloadLength,
+                                                pcrIpChecksum | pcrFixIPChecksum | pcrTcpChecksum | pcrFixPHChecksum,
++                                               FALSE,
+                                                __FUNCTION__);
+ 
+     if (packetReview.xxpCheckSum == ppresPCSOK || packetReview.fixedXxpCS)
+@@ -670,7 +671,7 @@ USHORT CNB::QueryL4HeaderOffset(PVOID PacketData, ULONG IpHeaderOffset) const
+ {
+     USHORT Res;
+     auto ppr = ParaNdis_ReviewIPPacket(RtlOffsetToPointer(PacketData, IpHeaderOffset),
+-                                       GetDataLength(), __FUNCTION__);
++                                       GetDataLength(), FALSE, __FUNCTION__);
+     if (ppr.ipStatus != ppresNotIP)
+     {
+         Res = static_cast<USHORT>(IpHeaderOffset + ppr.ipHeaderSize);
+@@ -696,7 +697,7 @@ void CNB::DoIPHdrCSO(PVOID IpHeader, ULONG EthPayloadLength) const
+ {
+     ParaNdis_CheckSumVerifyFlat(IpHeader,
+                                 EthPayloadLength,
+-                                pcrIpChecksum | pcrFixIPChecksum,
++                                pcrIpChecksum | pcrFixIPChecksum, FALSE,
+                                 __FUNCTION__);
+ }
+ 
+diff --git a/NetKVM/Common/ndis56common.h b/NetKVM/Common/ndis56common.h
+index e660d829..e61e0216 100644
+--- a/NetKVM/Common/ndis56common.h
++++ b/NetKVM/Common/ndis56common.h
+@@ -744,7 +744,8 @@ tChecksumCheckResult ParaNdis_CheckRxChecksum(
+                                             ULONG virtioFlags,
+                                             tCompletePhysicalAddress *pPacketPages,
+                                             ULONG ulPacketLength,
+-                                            ULONG ulDataOffset);
++                                            ULONG ulDataOffset,
++                                            BOOLEAN verifyLength);
+ 
+ void ParaNdis_CallOnBugCheck(PARANDIS_ADAPTER *pContext);
+ 
+@@ -917,6 +918,7 @@ tTcpIpPacketParsingResult ParaNdis_CheckSumVerify(
+                                                 ULONG ulDataLength,
+                                                 ULONG ulStartOffset,
+                                                 ULONG flags,
++                                                BOOLEAN verifyLength,
+                                                 LPCSTR caller);
+ 
+ static __inline
+@@ -924,15 +926,16 @@ tTcpIpPacketParsingResult ParaNdis_CheckSumVerifyFlat(
+                                                 PVOID pBuffer,
+                                                 ULONG ulDataLength,
+                                                 ULONG flags,
++                                                BOOLEAN verifyLength,
+                                                 LPCSTR caller)
+ {
+     tCompletePhysicalAddress SGBuffer;
+     SGBuffer.Virtual = pBuffer;
+     SGBuffer.size = ulDataLength;
+-    return ParaNdis_CheckSumVerify(&SGBuffer, ulDataLength, 0, flags, caller);
++    return ParaNdis_CheckSumVerify(&SGBuffer, ulDataLength, 0, flags, verifyLength, caller);
+ }
+ 
+-tTcpIpPacketParsingResult ParaNdis_ReviewIPPacket(PVOID buffer, ULONG size, LPCSTR caller);
++tTcpIpPacketParsingResult ParaNdis_ReviewIPPacket(PVOID buffer, ULONG size, BOOLEAN verityLength, LPCSTR caller);
+ 
+ BOOLEAN ParaNdis_AnalyzeReceivedPacket(PVOID headersBuffer, ULONG dataLength, PNET_PACKET_INFO packetInfo);
+ ULONG ParaNdis_StripVlanHeaderMoveHead(PNET_PACKET_INFO packetInfo);
+diff --git a/NetKVM/Common/sw-offload.cpp b/NetKVM/Common/sw-offload.cpp
+index 2be3d80e..f2129459 100644
+--- a/NetKVM/Common/sw-offload.cpp
++++ b/NetKVM/Common/sw-offload.cpp
+@@ -200,7 +200,7 @@ ProcessUDPHeader(tTcpIpPacketParsingResult _res, PVOID pIpHeader, ULONG len, USH
+ }
+ 
+ static __inline tTcpIpPacketParsingResult
+-QualifyIpPacket(IPHeader *pIpHeader, ULONG len)
++QualifyIpPacket(IPHeader *pIpHeader, ULONG len, BOOLEAN verifyLength)
+ {
+     tTcpIpPacketParsingResult res;
+     res.value = 0;
+@@ -235,10 +235,10 @@ QualifyIpPacket(IPHeader *pIpHeader, ULONG len)
+             return res;
+         }
+ 
+-        if (ipHeaderSize >= fullLength || len < fullLength)
++        if (ipHeaderSize >= fullLength || ( verifyLength && len < fullLength))
+         {
+-            DPrintf(2, ("[%s] - truncated packet - ip_version %d, ipHeaderSize %d, protocol %d, iplen %d, L2 payload length %d\n", __FUNCTION__,
+-                ip_version, ipHeaderSize, pIpHeader->v4.ip_protocol, fullLength, len));
++            DPrintf(2, ("[%s] - truncated packet - ip_version %d, ipHeaderSize %d, protocol %d, iplen %d, L2 payload length %d, verify = %s\n", __FUNCTION__,
++                ip_version, ipHeaderSize, pIpHeader->v4.ip_protocol, fullLength, len, (verifyLength ? "true" : "false")));
+             res.ipCheckSum = ppresIPTooShort;
+             return res;
+         }
+@@ -258,7 +258,8 @@ QualifyIpPacket(IPHeader *pIpHeader, ULONG len)
+         res.ipCheckSum = ppresCSOK;
+         fullLength = swap_short(pIpHeader->v6.ip6_payload_len);
+         fullLength += ipHeaderSize;
+-        if (len < fullLength)
++
++        if (verifyLength && (len < fullLength))
+         {
+             res.ipStatus = ppresNotIP;
+             return res;
+@@ -648,11 +649,12 @@ tTcpIpPacketParsingResult ParaNdis_CheckSumVerify(
+                                                 ULONG ulDataLength,
+                                                 ULONG ulStartOffset,
+                                                 ULONG flags,
++                                                BOOLEAN verifyLength,
+                                                 LPCSTR caller)
+ {
+     IPHeader *pIpHeader = (IPHeader *) RtlOffsetToPointer(pDataPages[0].Virtual, ulStartOffset);
+ 
+-    tTcpIpPacketParsingResult res = QualifyIpPacket(pIpHeader, ulDataLength);
++    tTcpIpPacketParsingResult res = QualifyIpPacket(pIpHeader, ulDataLength, verifyLength);
+     if (res.ipStatus == ppresNotIP || res.ipCheckSum == ppresIPTooShort)
+         return res;
+ 
+@@ -702,9 +704,9 @@ tTcpIpPacketParsingResult ParaNdis_CheckSumVerify(
+     return res;
+ }
+ 
+-tTcpIpPacketParsingResult ParaNdis_ReviewIPPacket(PVOID buffer, ULONG size, LPCSTR caller)
++tTcpIpPacketParsingResult ParaNdis_ReviewIPPacket(PVOID buffer, ULONG size, BOOLEAN verifyLength, LPCSTR caller)
+ {
+-    tTcpIpPacketParsingResult res = QualifyIpPacket((IPHeader *) buffer, size);
++    tTcpIpPacketParsingResult res = QualifyIpPacket((IPHeader *) buffer, size, verifyLength);
+     PrintOutParsingResult(res, 1, caller);
+     return res;
+ }
+diff --git a/NetKVM/wlh/ParaNdis6-Impl.cpp b/NetKVM/wlh/ParaNdis6-Impl.cpp
+index 8b207d5d..f7cfd62c 100644
+--- a/NetKVM/wlh/ParaNdis6-Impl.cpp
++++ b/NetKVM/wlh/ParaNdis6-Impl.cpp
+@@ -866,7 +866,7 @@ tPacketIndicationType ParaNdis_PrepareReceivedPacket(
+                     pHeader->flags,
+                     &pBuffersDesc->PhysicalPages[PARANDIS_FIRST_RX_DATA_PAGE],
+                     pPacketInfo->dataLength,
+-                    nBytesStripped);
++                    nBytesStripped, TRUE);
+                 if (csRes.value)
+                 {
+                     NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO qCSInfo;

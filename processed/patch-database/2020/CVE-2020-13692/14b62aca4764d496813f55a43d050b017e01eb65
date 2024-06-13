@@ -1,0 +1,691 @@
+diff --git a/pgjdbc/src/main/java/org/postgresql/PGProperty.java b/pgjdbc/src/main/java/org/postgresql/PGProperty.java
+index 49018891f2..f94b387896 100644
+--- a/pgjdbc/src/main/java/org/postgresql/PGProperty.java
++++ b/pgjdbc/src/main/java/org/postgresql/PGProperty.java
+@@ -661,6 +661,17 @@ public enum PGProperty {
+     "false",
+     "Use SPNEGO in SSPI authentication requests"),
+ 
++  /**
++   * Factory class to instantiate factories for XML processing.
++   * The default factory disables external entity processing.
++   * Legacy behavior with external entity processing can be enabled by specifying a value of LEGACY_INSECURE.
++   * Or specify a custom class that implements {@code org.postgresql.xml.PGXmlFactoryFactory}.
++   */
++  XML_FACTORY_FACTORY(
++    "xmlFactoryFactory",
++    "",
++    "Factory class to instantiate factories for XML processing"),
++
+   ;
+ 
+   private final String name;
+diff --git a/pgjdbc/src/main/java/org/postgresql/core/BaseConnection.java b/pgjdbc/src/main/java/org/postgresql/core/BaseConnection.java
+index 2dbba9648d..56fb4b871d 100644
+--- a/pgjdbc/src/main/java/org/postgresql/core/BaseConnection.java
++++ b/pgjdbc/src/main/java/org/postgresql/core/BaseConnection.java
+@@ -10,6 +10,7 @@
+ import org.postgresql.jdbc.FieldMetadata;
+ import org.postgresql.jdbc.TimestampUtils;
+ import org.postgresql.util.LruCache;
++import org.postgresql.xml.PGXmlFactoryFactory;
+ 
+ import java.sql.Connection;
+ import java.sql.ResultSet;
+@@ -212,4 +213,12 @@ CachedQuery createQuery(String sql, boolean escapeProcessing, boolean isParamete
+    * @see PGProperty#READ_ONLY_MODE
+    */
+   boolean hintReadOnly();
++
++  /**
++   * Retrieve the factory to instantiate XML processing factories.
++   *
++   * @return The factory to use to instantiate XML processing factories
++   * @throws SQLException if the class cannot be found or instantiated.
++   */
++  PGXmlFactoryFactory getXmlFactoryFactory() throws SQLException;
+ }
+diff --git a/pgjdbc/src/main/java/org/postgresql/ds/common/BaseDataSource.java b/pgjdbc/src/main/java/org/postgresql/ds/common/BaseDataSource.java
+index bf596b9e02..e4e2bb324b 100644
+--- a/pgjdbc/src/main/java/org/postgresql/ds/common/BaseDataSource.java
++++ b/pgjdbc/src/main/java/org/postgresql/ds/common/BaseDataSource.java
+@@ -1526,6 +1526,14 @@ public java.util.logging.Logger getParentLogger() {
+     return Logger.getLogger("org.postgresql");
+   }
+ 
++  public String getXmlFactoryFactory() {
++    return PGProperty.XML_FACTORY_FACTORY.get(properties);
++  }
++
++  public void setXmlFactoryFactory(String xmlFactoryFactory) {
++    PGProperty.XML_FACTORY_FACTORY.set(properties, xmlFactoryFactory);
++  }
++
+   /*
+    * Alias methods below, these are to help with ease-of-use with other database tools / frameworks
+    * which expect normal java bean getters / setters to exist for the property names.
+diff --git a/pgjdbc/src/main/java/org/postgresql/jdbc/PgConnection.java b/pgjdbc/src/main/java/org/postgresql/jdbc/PgConnection.java
+index 17aa898516..e7afc93180 100644
+--- a/pgjdbc/src/main/java/org/postgresql/jdbc/PgConnection.java
++++ b/pgjdbc/src/main/java/org/postgresql/jdbc/PgConnection.java
+@@ -37,6 +37,9 @@
+ import org.postgresql.util.PGobject;
+ import org.postgresql.util.PSQLException;
+ import org.postgresql.util.PSQLState;
++import org.postgresql.xml.DefaultPGXmlFactoryFactory;
++import org.postgresql.xml.LegacyInsecurePGXmlFactoryFactory;
++import org.postgresql.xml.PGXmlFactoryFactory;
+ 
+ import java.io.IOException;
+ import java.sql.Array;
+@@ -156,6 +159,9 @@ private enum ReadOnlyBehavior {
+ 
+   private final LruCache<FieldMetadata.Key, FieldMetadata> fieldMetadataCache;
+ 
++  private final String xmlFactoryFactoryClass;
++  private PGXmlFactoryFactory xmlFactoryFactory;
++
+   final CachedQuery borrowQuery(String sql) throws SQLException {
+     return queryExecutor.borrowQuery(sql);
+   }
+@@ -311,6 +317,8 @@ public TimeZone get() {
+         false);
+ 
+     replicationConnection = PGProperty.REPLICATION.get(info) != null;
++
++    xmlFactoryFactoryClass = PGProperty.XML_FACTORY_FACTORY.get(info);
+   }
+ 
+   private static ReadOnlyBehavior getReadOnlyBehavior(String property) {
+@@ -1823,4 +1831,36 @@ public final String getParameterStatus(String parameterName) {
+     return queryExecutor.getParameterStatus(parameterName);
+   }
+ 
++  @Override
++  public PGXmlFactoryFactory getXmlFactoryFactory() throws SQLException {
++    if (xmlFactoryFactory == null) {
++      if (xmlFactoryFactoryClass == null || xmlFactoryFactoryClass.equals("")) {
++        xmlFactoryFactory = DefaultPGXmlFactoryFactory.INSTANCE;
++      } else if (xmlFactoryFactoryClass.equals("LEGACY_INSECURE")) {
++        xmlFactoryFactory = LegacyInsecurePGXmlFactoryFactory.INSTANCE;
++      } else {
++        Class<?> clazz;
++        try {
++          clazz = Class.forName(xmlFactoryFactoryClass);
++        } catch (ClassNotFoundException ex) {
++          throw new PSQLException(
++              GT.tr("Could not instantiate xmlFactoryFactory: {0}", xmlFactoryFactoryClass),
++              PSQLState.INVALID_PARAMETER_VALUE, ex);
++        }
++        if (!clazz.isAssignableFrom(PGXmlFactoryFactory.class)) {
++          throw new PSQLException(
++              GT.tr("Connection property xmlFactoryFactory must implement PGXmlFactoryFactory: {0}", xmlFactoryFactoryClass),
++              PSQLState.INVALID_PARAMETER_VALUE);
++        }
++        try {
++          xmlFactoryFactory = (PGXmlFactoryFactory) clazz.newInstance();
++        } catch (Exception ex) {
++          throw new PSQLException(
++              GT.tr("Could not instantiate xmlFactoryFactory: {0}", xmlFactoryFactoryClass),
++              PSQLState.INVALID_PARAMETER_VALUE, ex);
++        }
++      }
++    }
++    return xmlFactoryFactory;
++  }
+ }
+diff --git a/pgjdbc/src/main/java/org/postgresql/jdbc/PgSQLXML.java b/pgjdbc/src/main/java/org/postgresql/jdbc/PgSQLXML.java
+index 525ac146c7..f919d7fd96 100644
+--- a/pgjdbc/src/main/java/org/postgresql/jdbc/PgSQLXML.java
++++ b/pgjdbc/src/main/java/org/postgresql/jdbc/PgSQLXML.java
+@@ -9,10 +9,11 @@
+ import org.postgresql.util.GT;
+ import org.postgresql.util.PSQLException;
+ import org.postgresql.util.PSQLState;
++import org.postgresql.xml.DefaultPGXmlFactoryFactory;
++import org.postgresql.xml.PGXmlFactoryFactory;
+ 
+-import org.xml.sax.ErrorHandler;
+ import org.xml.sax.InputSource;
+-import org.xml.sax.SAXParseException;
++import org.xml.sax.XMLReader;
+ 
+ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+@@ -27,7 +28,6 @@
+ import java.sql.SQLXML;
+ 
+ import javax.xml.parsers.DocumentBuilder;
+-import javax.xml.parsers.DocumentBuilderFactory;
+ import javax.xml.stream.XMLInputFactory;
+ import javax.xml.stream.XMLOutputFactory;
+ import javax.xml.stream.XMLStreamException;
+@@ -77,6 +77,13 @@ private PgSQLXML(BaseConnection conn, String data, boolean initialized) {
+     this.freed = false;
+   }
+ 
++  private PGXmlFactoryFactory getXmlFactoryFactory() throws SQLException {
++    if (conn != null) {
++      return conn.getXmlFactoryFactory();
++    }
++    return DefaultPGXmlFactoryFactory.INSTANCE;
++  }
++
+   @Override
+   public synchronized void free() {
+     freed = true;
+@@ -132,18 +139,17 @@ public synchronized <T extends Source> T getSource(Class<T> sourceClass) throws
+ 
+     try {
+       if (sourceClass == null || DOMSource.class.equals(sourceClass)) {
+-        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+-        DocumentBuilder builder = factory.newDocumentBuilder();
+-        builder.setErrorHandler(new NonPrintingErrorHandler());
++        DocumentBuilder builder = getXmlFactoryFactory().newDocumentBuilder();
+         InputSource input = new InputSource(new StringReader(data));
+         return (T) new DOMSource(builder.parse(input));
+       } else if (SAXSource.class.equals(sourceClass)) {
++        XMLReader reader = getXmlFactoryFactory().createXMLReader();
+         InputSource is = new InputSource(new StringReader(data));
+-        return (T) new SAXSource(is);
++        return (T) new SAXSource(reader, is);
+       } else if (StreamSource.class.equals(sourceClass)) {
+         return (T) new StreamSource(new StringReader(data));
+       } else if (StAXSource.class.equals(sourceClass)) {
+-        XMLInputFactory xif = XMLInputFactory.newInstance();
++        XMLInputFactory xif = getXmlFactoryFactory().newXMLInputFactory();
+         XMLStreamReader xsr = xif.createXMLStreamReader(new StringReader(data));
+         return (T) new StAXSource(xsr);
+       }
+@@ -191,8 +197,7 @@ public synchronized <T extends Result> T setResult(Class<T> resultClass) throws
+       return (T) domResult;
+     } else if (SAXResult.class.equals(resultClass)) {
+       try {
+-        SAXTransformerFactory transformerFactory =
+-            (SAXTransformerFactory) SAXTransformerFactory.newInstance();
++        SAXTransformerFactory transformerFactory = getXmlFactoryFactory().newSAXTransformerFactory();
+         TransformerHandler transformerHandler = transformerFactory.newTransformerHandler();
+         stringWriter = new StringWriter();
+         transformerHandler.setResult(new StreamResult(stringWriter));
+@@ -209,7 +214,7 @@ public synchronized <T extends Result> T setResult(Class<T> resultClass) throws
+     } else if (StAXResult.class.equals(resultClass)) {
+       stringWriter = new StringWriter();
+       try {
+-        XMLOutputFactory xof = XMLOutputFactory.newInstance();
++        XMLOutputFactory xof = getXmlFactoryFactory().newXMLOutputFactory();
+         XMLStreamWriter xsw = xof.createXMLStreamWriter(stringWriter);
+         active = true;
+         return (T) new StAXResult(xsw);
+@@ -272,7 +277,7 @@ private void ensureInitialized() throws SQLException {
+       // and use the identify transform to get it into a
+       // friendlier result format.
+       try {
+-        TransformerFactory factory = TransformerFactory.newInstance();
++        TransformerFactory factory = getXmlFactoryFactory().newTransformerFactory();
+         Transformer transformer = factory.newTransformer();
+         DOMSource domSource = new DOMSource(domResult.getNode());
+         StringWriter stringWriter = new StringWriter();
+@@ -298,18 +303,4 @@ private void initialize() throws SQLException {
+     }
+     initialized = true;
+   }
+-
+-  // Don't clutter System.err with errors the user can't silence.
+-  // If something bad really happens an exception will be thrown.
+-  static class NonPrintingErrorHandler implements ErrorHandler {
+-    public void error(SAXParseException e) {
+-    }
+-
+-    public void fatalError(SAXParseException e) {
+-    }
+-
+-    public void warning(SAXParseException e) {
+-    }
+-  }
+-
+ }
+diff --git a/pgjdbc/src/main/java/org/postgresql/xml/DefaultPGXmlFactoryFactory.java b/pgjdbc/src/main/java/org/postgresql/xml/DefaultPGXmlFactoryFactory.java
+new file mode 100644
+index 0000000000..50b765dac1
+--- /dev/null
++++ b/pgjdbc/src/main/java/org/postgresql/xml/DefaultPGXmlFactoryFactory.java
+@@ -0,0 +1,140 @@
++/*
++ * Copyright (c) 2020, PostgreSQL Global Development Group
++ * See the LICENSE file in the project root for more information.
++ */
++
++package org.postgresql.xml;
++
++import org.xml.sax.SAXException;
++import org.xml.sax.XMLReader;
++import org.xml.sax.helpers.XMLReaderFactory;
++
++import javax.xml.XMLConstants;
++import javax.xml.parsers.DocumentBuilder;
++import javax.xml.parsers.DocumentBuilderFactory;
++import javax.xml.parsers.ParserConfigurationException;
++import javax.xml.stream.XMLInputFactory;
++import javax.xml.stream.XMLOutputFactory;
++import javax.xml.transform.TransformerFactory;
++import javax.xml.transform.sax.SAXTransformerFactory;
++
++/**
++ * Default implementation of PGXmlFactoryFactory that configures each factory per OWASP recommendations.
++ *
++ * @see <a href="https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html">https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html</a>
++ */
++public class DefaultPGXmlFactoryFactory implements PGXmlFactoryFactory {
++  public static final DefaultPGXmlFactoryFactory INSTANCE = new DefaultPGXmlFactoryFactory();
++
++  private DefaultPGXmlFactoryFactory() {
++  }
++
++  private DocumentBuilderFactory getDocumentBuilderFactory() {
++    DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
++    setFactoryProperties(factory);
++    factory.setXIncludeAware(false);
++    factory.setExpandEntityReferences(false);
++    return factory;
++  }
++
++  @Override
++  public DocumentBuilder newDocumentBuilder() throws ParserConfigurationException {
++    DocumentBuilder builder = getDocumentBuilderFactory().newDocumentBuilder();
++    builder.setEntityResolver(EmptyStringEntityResolver.INSTANCE);
++    builder.setErrorHandler(NullErrorHandler.INSTANCE);
++    return builder;
++  }
++
++  @Override
++  public TransformerFactory newTransformerFactory() {
++    TransformerFactory factory = TransformerFactory.newInstance();
++    setFactoryProperties(factory);
++    return factory;
++  }
++
++  @Override
++  public SAXTransformerFactory newSAXTransformerFactory() {
++    SAXTransformerFactory factory = (SAXTransformerFactory) SAXTransformerFactory.newInstance();
++    setFactoryProperties(factory);
++    return factory;
++  }
++
++  @Override
++  public XMLInputFactory newXMLInputFactory() {
++    XMLInputFactory factory = XMLInputFactory.newInstance();
++    setPropertyQuietly(factory, XMLInputFactory.SUPPORT_DTD, false);
++    setPropertyQuietly(factory, XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
++    return factory;
++  }
++
++  @Override
++  public XMLOutputFactory newXMLOutputFactory() {
++    XMLOutputFactory factory = XMLOutputFactory.newInstance();
++    return factory;
++  }
++
++  @Override
++  public XMLReader createXMLReader() throws SAXException {
++    XMLReader factory = XMLReaderFactory.createXMLReader();
++    setFeatureQuietly(factory, "http://apache.org/xml/features/disallow-doctype-decl", true);
++    setFeatureQuietly(factory, "http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
++    setFeatureQuietly(factory, "http://xml.org/sax/features/external-general-entities", false);
++    setFeatureQuietly(factory, "http://xml.org/sax/features/external-parameter-entities", false);
++    factory.setErrorHandler(NullErrorHandler.INSTANCE);
++    return factory;
++  }
++
++  private static void setFeatureQuietly(Object factory, String name, boolean value) {
++    try {
++      if (factory instanceof DocumentBuilderFactory) {
++        ((DocumentBuilderFactory) factory).setFeature(name, value);
++      } else if (factory instanceof TransformerFactory) {
++        ((TransformerFactory) factory).setFeature(name, value);
++      } else if (factory instanceof XMLReader) {
++        ((XMLReader) factory).setFeature(name, value);
++      } else {
++        throw new Error("Invalid factory class: " + factory.getClass());
++      }
++      return;
++    } catch (Exception ignore) {
++    }
++  }
++
++  private static void setAttributeQuietly(Object factory, String name, Object value) {
++    try {
++      if (factory instanceof DocumentBuilderFactory) {
++        ((DocumentBuilderFactory) factory).setAttribute(name, value);
++      } else if (factory instanceof TransformerFactory) {
++        ((TransformerFactory) factory).setAttribute(name, value);
++      } else {
++        throw new Error("Invalid factory class: " + factory.getClass());
++      }
++    } catch (Exception ignore) {
++    }
++  }
++
++  private static void setFactoryProperties(Object factory) {
++    setFeatureQuietly(factory, XMLConstants.FEATURE_SECURE_PROCESSING, true);
++    setFeatureQuietly(factory, "http://apache.org/xml/features/disallow-doctype-decl", true);
++    setFeatureQuietly(factory, "http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
++    setFeatureQuietly(factory, "http://xml.org/sax/features/external-general-entities", false);
++    setFeatureQuietly(factory, "http://xml.org/sax/features/external-parameter-entities", false);
++    // Values from XMLConstants inlined for JDK 1.6 compatibility
++    setAttributeQuietly(factory, "http://javax.xml.XMLConstants/property/accessExternalDTD", "");
++    setAttributeQuietly(factory, "http://javax.xml.XMLConstants/property/accessExternalSchema", "");
++    setAttributeQuietly(factory, "http://javax.xml.XMLConstants/property/accessExternalStylesheet", "");
++  }
++
++  private static void setPropertyQuietly(Object factory, String name, Object value) {
++    try {
++      if (factory instanceof XMLReader) {
++        ((XMLReader) factory).setProperty(name, value);
++      } else if (factory instanceof XMLInputFactory) {
++        ((XMLInputFactory) factory).setProperty(name, value);
++      } else {
++        throw new Error("Invalid factory class: " + factory.getClass());
++      }
++    } catch (Exception ignore) {
++    }
++  }
++}
+diff --git a/pgjdbc/src/main/java/org/postgresql/xml/EmptyStringEntityResolver.java b/pgjdbc/src/main/java/org/postgresql/xml/EmptyStringEntityResolver.java
+new file mode 100644
+index 0000000000..e96a39b895
+--- /dev/null
++++ b/pgjdbc/src/main/java/org/postgresql/xml/EmptyStringEntityResolver.java
+@@ -0,0 +1,23 @@
++/*
++ * Copyright (c) 2020, PostgreSQL Global Development Group
++ * See the LICENSE file in the project root for more information.
++ */
++
++package org.postgresql.xml;
++
++import org.xml.sax.EntityResolver;
++import org.xml.sax.InputSource;
++import org.xml.sax.SAXException;
++
++import java.io.IOException;
++import java.io.StringReader;
++
++public class EmptyStringEntityResolver implements EntityResolver {
++  public static final EmptyStringEntityResolver INSTANCE = new EmptyStringEntityResolver();
++
++  @Override
++  public InputSource resolveEntity(String publicId, String systemId)
++      throws SAXException, IOException {
++    return new InputSource(new StringReader(""));
++  }
++}
+diff --git a/pgjdbc/src/main/java/org/postgresql/xml/LegacyInsecurePGXmlFactoryFactory.java b/pgjdbc/src/main/java/org/postgresql/xml/LegacyInsecurePGXmlFactoryFactory.java
+new file mode 100644
+index 0000000000..ac90fa4cec
+--- /dev/null
++++ b/pgjdbc/src/main/java/org/postgresql/xml/LegacyInsecurePGXmlFactoryFactory.java
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (c) 2020, PostgreSQL Global Development Group
++ * See the LICENSE file in the project root for more information.
++ */
++
++package org.postgresql.xml;
++
++import org.xml.sax.SAXException;
++import org.xml.sax.XMLReader;
++import org.xml.sax.helpers.XMLReaderFactory;
++
++import javax.xml.parsers.DocumentBuilder;
++import javax.xml.parsers.DocumentBuilderFactory;
++import javax.xml.parsers.ParserConfigurationException;
++import javax.xml.stream.XMLInputFactory;
++import javax.xml.stream.XMLOutputFactory;
++import javax.xml.transform.TransformerFactory;
++import javax.xml.transform.sax.SAXTransformerFactory;
++
++public class LegacyInsecurePGXmlFactoryFactory implements PGXmlFactoryFactory {
++  public static final LegacyInsecurePGXmlFactoryFactory INSTANCE = new LegacyInsecurePGXmlFactoryFactory();
++
++  private LegacyInsecurePGXmlFactoryFactory() {
++  }
++
++  @Override
++  public DocumentBuilder newDocumentBuilder() throws ParserConfigurationException {
++    DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
++    builder.setErrorHandler(NullErrorHandler.INSTANCE);
++    return builder;
++  }
++
++  @Override
++  public TransformerFactory newTransformerFactory() {
++    return TransformerFactory.newInstance();
++  }
++
++  @Override
++  public SAXTransformerFactory newSAXTransformerFactory() {
++    return (SAXTransformerFactory) SAXTransformerFactory.newInstance();
++  }
++
++  @Override
++  public XMLInputFactory newXMLInputFactory() {
++    return XMLInputFactory.newInstance();
++  }
++
++  @Override
++  public XMLOutputFactory newXMLOutputFactory() {
++    return XMLOutputFactory.newInstance();
++  }
++
++  @Override
++  public XMLReader createXMLReader() throws SAXException {
++    return XMLReaderFactory.createXMLReader();
++  }
++}
+diff --git a/pgjdbc/src/main/java/org/postgresql/xml/NullErrorHandler.java b/pgjdbc/src/main/java/org/postgresql/xml/NullErrorHandler.java
+new file mode 100644
+index 0000000000..d12a4fa6f3
+--- /dev/null
++++ b/pgjdbc/src/main/java/org/postgresql/xml/NullErrorHandler.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright (c) 2020, PostgreSQL Global Development Group
++ * See the LICENSE file in the project root for more information.
++ */
++
++package org.postgresql.xml;
++
++import org.xml.sax.ErrorHandler;
++import org.xml.sax.SAXParseException;
++
++/**
++ * Error handler that silently suppresses all errors.
++ */
++public class NullErrorHandler implements ErrorHandler {
++  public static final NullErrorHandler INSTANCE = new NullErrorHandler();
++
++  public void error(SAXParseException e) {
++  }
++
++  public void fatalError(SAXParseException e) {
++  }
++
++  public void warning(SAXParseException e) {
++  }
++}
+diff --git a/pgjdbc/src/main/java/org/postgresql/xml/PGXmlFactoryFactory.java b/pgjdbc/src/main/java/org/postgresql/xml/PGXmlFactoryFactory.java
+new file mode 100644
+index 0000000000..d5c74d521d
+--- /dev/null
++++ b/pgjdbc/src/main/java/org/postgresql/xml/PGXmlFactoryFactory.java
+@@ -0,0 +1,30 @@
++/*
++ * Copyright (c) 2020, PostgreSQL Global Development Group
++ * See the LICENSE file in the project root for more information.
++ */
++
++package org.postgresql.xml;
++
++import org.xml.sax.SAXException;
++import org.xml.sax.XMLReader;
++
++import javax.xml.parsers.DocumentBuilder;
++import javax.xml.parsers.ParserConfigurationException;
++import javax.xml.stream.XMLInputFactory;
++import javax.xml.stream.XMLOutputFactory;
++import javax.xml.transform.TransformerFactory;
++import javax.xml.transform.sax.SAXTransformerFactory;
++
++public interface PGXmlFactoryFactory {
++  DocumentBuilder newDocumentBuilder() throws ParserConfigurationException;
++
++  TransformerFactory newTransformerFactory();
++
++  SAXTransformerFactory newSAXTransformerFactory();
++
++  XMLInputFactory newXMLInputFactory();
++
++  XMLOutputFactory newXMLOutputFactory();
++
++  XMLReader createXMLReader() throws SAXException;
++}
+diff --git a/pgjdbc/src/test/java/org/postgresql/jdbc/PgSQLXMLTest.java b/pgjdbc/src/test/java/org/postgresql/jdbc/PgSQLXMLTest.java
+index 53fd56dc13..461ad037d3 100644
+--- a/pgjdbc/src/test/java/org/postgresql/jdbc/PgSQLXMLTest.java
++++ b/pgjdbc/src/test/java/org/postgresql/jdbc/PgSQLXMLTest.java
+@@ -7,19 +7,37 @@
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertThrows;
+ import static org.junit.Assert.assertTrue;
+ 
++import org.postgresql.PGProperty;
++import org.postgresql.core.BaseConnection;
+ import org.postgresql.test.TestUtil;
+ import org.postgresql.test.jdbc2.BaseTest4;
+ 
+ import org.junit.Before;
+ import org.junit.Test;
+ 
++import java.io.StringWriter;
+ import java.io.Writer;
++import java.sql.Connection;
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
++import java.sql.SQLException;
+ import java.sql.SQLXML;
+ import java.sql.Statement;
++import java.util.Properties;
++
++import javax.xml.stream.XMLStreamException;
++import javax.xml.stream.XMLStreamReader;
++import javax.xml.transform.Source;
++import javax.xml.transform.Transformer;
++import javax.xml.transform.TransformerException;
++import javax.xml.transform.TransformerFactory;
++import javax.xml.transform.dom.DOMSource;
++import javax.xml.transform.sax.SAXSource;
++import javax.xml.transform.stax.StAXSource;
++import javax.xml.transform.stream.StreamResult;
+ 
+ public class PgSQLXMLTest extends BaseTest4 {
+ 
+@@ -27,17 +45,17 @@ public class PgSQLXMLTest extends BaseTest4 {
+   @Before
+   public void setUp() throws Exception {
+     super.setUp();
+-    TestUtil.createTempTable(con, "xmltab","x xml");
++    TestUtil.createTempTable(con, "xmltab", "x xml");
+   }
+ 
+   @Test
+-  public void setCharacterStream() throws  Exception {
++  public void setCharacterStream() throws Exception {
+     String exmplar = "<x>value</x>";
+     SQLXML pgSQLXML = con.createSQLXML();
+     Writer writer = pgSQLXML.setCharacterStream();
+     writer.write(exmplar);
+     PreparedStatement preparedStatement = con.prepareStatement("insert into xmltab values (?)");
+-    preparedStatement.setSQLXML(1,pgSQLXML);
++    preparedStatement.setSQLXML(1, pgSQLXML);
+     preparedStatement.execute();
+ 
+     Statement statement = con.createStatement();
+@@ -47,4 +65,76 @@ public void setCharacterStream() throws  Exception {
+     assertNotNull(result);
+     assertEquals(exmplar, result.getString());
+   }
++
++  private static final String LICENSE_URL =
++      PgSQLXMLTest.class.getClassLoader().getResource("META-INF/LICENSE").toString();
++  private static final String XXE_EXAMPLE =
++      "<!DOCTYPE foo [<!ELEMENT foo ANY >\n"
++      + "<!ENTITY xxe SYSTEM \"" + LICENSE_URL + "\">]>"
++      + "<foo>&xxe;</foo>";
++
++  @Test
++  public void testLegacyXxe() throws Exception {
++    Properties props = new Properties();
++    props.setProperty(PGProperty.XML_FACTORY_FACTORY.getName(), "LEGACY_INSECURE");
++    try (Connection conn = TestUtil.openDB(props)) {
++      BaseConnection baseConn = conn.unwrap(BaseConnection.class);
++      PgSQLXML xml = new PgSQLXML(baseConn, XXE_EXAMPLE);
++      xml.getSource(null);
++    }
++  }
++
++  private static String sourceToString(Source source) throws TransformerException {
++    StringWriter sw = new StringWriter();
++    Transformer transformer = TransformerFactory.newInstance().newTransformer();
++    transformer.transform(source, new StreamResult(sw));
++    return sw.toString();
++  }
++
++  private <T extends Source> void testGetSourceXxe(Class<T> clazz) {
++    SQLException ex = assertThrows(SQLException.class, () -> {
++      PgSQLXML xml = new PgSQLXML(null, XXE_EXAMPLE);
++      xml.getSource(clazz);
++    });
++    String message = ex.getCause().getMessage();
++    assertTrue(
++        "Expected to get a <<DOCTYPE disallowed>> SAXParseException. Actual message is " + message,
++        message.startsWith("DOCTYPE is disallowed"));
++  }
++
++  @Test
++  public void testGetSourceXxeNull() throws Exception {
++    testGetSourceXxe(null);
++  }
++
++  @Test
++  public void testGetSourceXxeDOMSource() throws Exception {
++    testGetSourceXxe(DOMSource.class);
++  }
++
++  @Test
++  public void testGetSourceXxeSAXSource() throws Exception {
++    PgSQLXML xml = new PgSQLXML(null, XXE_EXAMPLE);
++    SAXSource source = xml.getSource(SAXSource.class);
++    TransformerException ex = assertThrows(TransformerException.class, () -> {
++      sourceToString(source);
++    });
++    String message = ex.getCause().getMessage();
++    assertTrue(
++        "Expected to get a <<DOCTYPE disallowed>> TransformerException. Actual message is " + message,
++        message.startsWith("DOCTYPE is disallowed"));
++  }
++
++  @Test
++  public void testGetSourceXxeStAXSource() throws Exception {
++    PgSQLXML xml = new PgSQLXML(null, XXE_EXAMPLE);
++    StAXSource source = xml.getSource(StAXSource.class);
++    XMLStreamReader reader = source.getXMLStreamReader();
++    // STAX will not throw XXE error until we actually read the element
++    assertThrows(XMLStreamException.class, () -> {
++      while (reader.hasNext()) {
++        reader.next();
++      }
++    });
++  }
+ }

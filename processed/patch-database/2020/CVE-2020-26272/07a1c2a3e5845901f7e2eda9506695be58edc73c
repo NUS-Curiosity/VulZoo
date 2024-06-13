@@ -1,0 +1,372 @@
+diff --git a/docs/api/structures/ipc-main-event.md b/docs/api/structures/ipc-main-event.md
+index f222de35b86dc..ae32dc46a6888 100644
+--- a/docs/api/structures/ipc-main-event.md
++++ b/docs/api/structures/ipc-main-event.md
+@@ -1,5 +1,6 @@
+ # IpcMainEvent Object extends `Event`
+ 
++* `processId` Integer - The internal ID of the renderer process that sent this message
+ * `frameId` Integer - The ID of the renderer frame that sent this message
+ * `returnValue` any - Set this to the value to be returned in a synchronous message
+ * `sender` WebContents - Returns the `webContents` that sent the message
+diff --git a/docs/api/structures/ipc-main-invoke-event.md b/docs/api/structures/ipc-main-invoke-event.md
+index 235b219c2d6ea..b765791e8258c 100644
+--- a/docs/api/structures/ipc-main-invoke-event.md
++++ b/docs/api/structures/ipc-main-invoke-event.md
+@@ -1,4 +1,5 @@
+ # IpcMainInvokeEvent Object extends `Event`
+ 
++* `processId` Integer - The internal ID of the renderer process that sent this message
+ * `frameId` Integer - The ID of the renderer frame that sent this message
+ * `sender` WebContents - Returns the `webContents` that sent the message
+diff --git a/docs/api/web-contents.md b/docs/api/web-contents.md
+index fb254511955e3..52c582404a800 100644
+--- a/docs/api/web-contents.md
++++ b/docs/api/web-contents.md
+@@ -1696,7 +1696,7 @@ app.whenReady().then(() => {
+ 
+ #### `contents.sendToFrame(frameId, channel, ...args)`
+ 
+-* `frameId` Integer
++* `frameId` Integer | [number, number]
+ * `channel` String
+ * `...args` any[]
+ 
+diff --git a/lib/browser/api/web-contents.ts b/lib/browser/api/web-contents.ts
+index 344e271693329..6de83d38f0400 100644
+--- a/lib/browser/api/web-contents.ts
++++ b/lib/browser/api/web-contents.ts
+@@ -148,23 +148,23 @@ WebContents.prototype._sendInternal = function (channel, ...args) {
+ 
+   return this._send(true /* internal */, channel, args);
+ };
+-WebContents.prototype.sendToFrame = function (frameId, channel, ...args) {
++WebContents.prototype.sendToFrame = function (frame, channel, ...args) {
+   if (typeof channel !== 'string') {
+     throw new Error('Missing required channel argument');
+-  } else if (typeof frameId !== 'number') {
+-    throw new Error('Missing required frameId argument');
++  } else if (!(typeof frame === 'number' || Array.isArray(frame))) {
++    throw new Error('Missing required frame argument (must be number or array)');
+   }
+ 
+-  return this._sendToFrame(false /* internal */, frameId, channel, args);
++  return this._sendToFrame(false /* internal */, frame, channel, args);
+ };
+-WebContents.prototype._sendToFrameInternal = function (frameId, channel, ...args) {
++WebContents.prototype._sendToFrameInternal = function (frame, channel, ...args) {
+   if (typeof channel !== 'string') {
+     throw new Error('Missing required channel argument');
+-  } else if (typeof frameId !== 'number') {
+-    throw new Error('Missing required frameId argument');
++  } else if (!(typeof frame === 'number' || Array.isArray(frame))) {
++    throw new Error('Missing required frame argument (must be number or array)');
+   }
+ 
+-  return this._sendToFrame(true /* internal */, frameId, channel, args);
++  return this._sendToFrame(true /* internal */, frame, channel, args);
+ };
+ 
+ // Following methods are mapped to webFrame.
+@@ -456,8 +456,9 @@ WebContents.prototype._callWindowOpenHandler = function (event: any, url: string
+ };
+ 
+ const addReplyToEvent = (event: any) => {
++  const { processId, frameId } = event;
+   event.reply = (...args: any[]) => {
+-    event.sender.sendToFrame(event.frameId, ...args);
++    event.sender.sendToFrame([processId, frameId], ...args);
+   };
+ };
+ 
+diff --git a/lib/browser/remote/server.ts b/lib/browser/remote/server.ts
+index f51fad0c14f6e..e95570c5af064 100644
+--- a/lib/browser/remote/server.ts
++++ b/lib/browser/remote/server.ts
+@@ -20,7 +20,7 @@ const FUNCTION_PROPERTIES = [
+ ];
+ 
+ type RendererFunctionId = [string, number] // [contextId, funcId]
+-type FinalizerInfo = { id: RendererFunctionId, webContents: electron.WebContents, frameId: number };
++type FinalizerInfo = { id: RendererFunctionId, webContents: electron.WebContents, frameId: [number, number] };
+ type CallIntoRenderer = (...args: any[]) => void
+ 
+ // The remote functions in renderer processes.
+@@ -43,7 +43,7 @@ function getCachedRendererFunction (id: RendererFunctionId): CallIntoRenderer |
+     if (deref !== undefined) return deref;
+   }
+ }
+-function setCachedRendererFunction (id: RendererFunctionId, wc: electron.WebContents, frameId: number, value: CallIntoRenderer) {
++function setCachedRendererFunction (id: RendererFunctionId, wc: electron.WebContents, frameId: [number, number], value: CallIntoRenderer) {
+   // eslint-disable-next-line no-undef
+   const wr = new WeakRef<CallIntoRenderer>(value);
+   const mapKey = id[0] + '~' + id[1];
+@@ -220,7 +220,7 @@ const fakeConstructor = (constructor: Function, name: string) =>
+   });
+ 
+ // Convert array of meta data from renderer into array of real values.
+-const unwrapArgs = function (sender: electron.WebContents, frameId: number, contextId: string, args: any[]) {
++const unwrapArgs = function (sender: electron.WebContents, frameId: [number, number], contextId: string, args: any[]) {
+   const metaToValue = function (meta: MetaTypeFromRenderer): any {
+     switch (meta.type) {
+       case 'nativeimage':
+@@ -423,7 +423,7 @@ handleRemoteCommand(IPC_MESSAGES.BROWSER_GET_CURRENT_WEB_CONTENTS, function (eve
+ });
+ 
+ handleRemoteCommand(IPC_MESSAGES.BROWSER_CONSTRUCTOR, function (event, contextId, id, args) {
+-  args = unwrapArgs(event.sender, event.frameId, contextId, args);
++  args = unwrapArgs(event.sender, [event.processId, event.frameId], contextId, args);
+   const constructor = objectsRegistry.get(id);
+ 
+   if (constructor == null) {
+@@ -434,7 +434,7 @@ handleRemoteCommand(IPC_MESSAGES.BROWSER_CONSTRUCTOR, function (event, contextId
+ });
+ 
+ handleRemoteCommand(IPC_MESSAGES.BROWSER_FUNCTION_CALL, function (event, contextId, id, args) {
+-  args = unwrapArgs(event.sender, event.frameId, contextId, args);
++  args = unwrapArgs(event.sender, [event.processId, event.frameId], contextId, args);
+   const func = objectsRegistry.get(id);
+ 
+   if (func == null) {
+@@ -451,7 +451,7 @@ handleRemoteCommand(IPC_MESSAGES.BROWSER_FUNCTION_CALL, function (event, context
+ });
+ 
+ handleRemoteCommand(IPC_MESSAGES.BROWSER_MEMBER_CONSTRUCTOR, function (event, contextId, id, method, args) {
+-  args = unwrapArgs(event.sender, event.frameId, contextId, args);
++  args = unwrapArgs(event.sender, [event.processId, event.frameId], contextId, args);
+   const object = objectsRegistry.get(id);
+ 
+   if (object == null) {
+@@ -462,7 +462,7 @@ handleRemoteCommand(IPC_MESSAGES.BROWSER_MEMBER_CONSTRUCTOR, function (event, co
+ });
+ 
+ handleRemoteCommand(IPC_MESSAGES.BROWSER_MEMBER_CALL, function (event, contextId, id, method, args) {
+-  args = unwrapArgs(event.sender, event.frameId, contextId, args);
++  args = unwrapArgs(event.sender, [event.processId, event.frameId], contextId, args);
+   const object = objectsRegistry.get(id);
+ 
+   if (object == null) {
+@@ -479,7 +479,7 @@ handleRemoteCommand(IPC_MESSAGES.BROWSER_MEMBER_CALL, function (event, contextId
+ });
+ 
+ handleRemoteCommand(IPC_MESSAGES.BROWSER_MEMBER_SET, function (event, contextId, id, name, args) {
+-  args = unwrapArgs(event.sender, event.frameId, contextId, args);
++  args = unwrapArgs(event.sender, [event.processId, event.frameId], contextId, args);
+   const obj = objectsRegistry.get(id);
+ 
+   if (obj == null) {
+diff --git a/shell/browser/api/electron_api_web_contents.cc b/shell/browser/api/electron_api_web_contents.cc
+index cec721384b43a..c3ed99c09ce43 100644
+--- a/shell/browser/api/electron_api_web_contents.cc
++++ b/shell/browser/api/electron_api_web_contents.cc
+@@ -2708,7 +2708,7 @@ bool WebContents::SendIPCMessageWithSender(bool internal,
+ }
+ 
+ bool WebContents::SendIPCMessageToFrame(bool internal,
+-                                        int32_t frame_id,
++                                        v8::Local<v8::Value> frame,
+                                         const std::string& channel,
+                                         v8::Local<v8::Value> args) {
+   v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
+@@ -2718,17 +2718,30 @@ bool WebContents::SendIPCMessageToFrame(bool internal,
+         gin::StringToV8(isolate, "Failed to serialize arguments")));
+     return false;
+   }
+-  auto frames = web_contents()->GetAllFrames();
+-  auto iter = std::find_if(frames.begin(), frames.end(), [frame_id](auto* f) {
+-    return f->GetRoutingID() == frame_id;
+-  });
+-  if (iter == frames.end())
+-    return false;
+-  if (!(*iter)->IsRenderFrameLive())
++  int32_t frame_id;
++  int32_t process_id;
++  if (gin::ConvertFromV8(isolate, frame, &frame_id)) {
++    process_id = web_contents()->GetMainFrame()->GetProcess()->GetID();
++  } else {
++    std::vector<int32_t> id_pair;
++    if (gin::ConvertFromV8(isolate, frame, &id_pair) && id_pair.size() == 2) {
++      process_id = id_pair[0];
++      frame_id = id_pair[1];
++    } else {
++      isolate->ThrowException(v8::Exception::Error(gin::StringToV8(
++          isolate,
++          "frameId must be a number or a pair of [processId, frameId]")));
++      return false;
++    }
++  }
++
++  auto* rfh = content::RenderFrameHost::FromID(process_id, frame_id);
++  if (!rfh || !rfh->IsRenderFrameLive() ||
++      content::WebContents::FromRenderFrameHost(rfh) != web_contents())
+     return false;
+ 
+   mojo::AssociatedRemote<mojom::ElectronRenderer> electron_renderer;
+-  (*iter)->GetRemoteAssociatedInterfaces()->GetInterface(&electron_renderer);
++  rfh->GetRemoteAssociatedInterfaces()->GetInterface(&electron_renderer);
+   electron_renderer->Message(internal, channel, std::move(message),
+                              0 /* sender_id */);
+   return true;
+diff --git a/shell/browser/api/electron_api_web_contents.h b/shell/browser/api/electron_api_web_contents.h
+index 5822558a5aada..be4c73aa4981d 100644
+--- a/shell/browser/api/electron_api_web_contents.h
++++ b/shell/browser/api/electron_api_web_contents.h
+@@ -258,7 +258,7 @@ class WebContents : public gin::Wrappable<WebContents>,
+                                 int32_t sender_id = 0);
+ 
+   bool SendIPCMessageToFrame(bool internal,
+-                             int32_t frame_id,
++                             v8::Local<v8::Value> frame,
+                              const std::string& channel,
+                              v8::Local<v8::Value> args);
+ 
+diff --git a/shell/common/gin_helper/event_emitter.cc b/shell/common/gin_helper/event_emitter.cc
+index ebb52d2ac90ca..710147b54f156 100644
+--- a/shell/common/gin_helper/event_emitter.cc
++++ b/shell/common/gin_helper/event_emitter.cc
+@@ -5,6 +5,7 @@
+ #include "shell/common/gin_helper/event_emitter.h"
+ 
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
+ #include "shell/browser/api/event.h"
+ #include "shell/common/gin_helper/dictionary.h"
+ #include "shell/common/gin_helper/object_template_builder.h"
+@@ -67,8 +68,10 @@ v8::Local<v8::Object> CreateNativeEvent(
+   Dictionary dict(isolate, event);
+   dict.Set("sender", sender);
+   // Should always set frameId even when callback is null.
+-  if (frame)
++  if (frame) {
+     dict.Set("frameId", frame->GetRoutingID());
++    dict.Set("processId", frame->GetProcess()->GetID());
++  }
+   return event;
+ }
+ 
+diff --git a/spec-main/api-ipc-main-spec.ts b/spec-main/api-ipc-main-spec.ts
+index 3f54527a5b497..b63dd7e8c05eb 100644
+--- a/spec-main/api-ipc-main-spec.ts
++++ b/spec-main/api-ipc-main-spec.ts
+@@ -3,6 +3,7 @@ import * as path from 'path';
+ import * as cp from 'child_process';
+ import { closeAllWindows } from './window-helpers';
+ import { emittedOnce } from './events-helpers';
++import { defer } from './spec-helpers';
+ import { ipcMain, BrowserWindow } from 'electron/main';
+ 
+ describe('ipc main module', () => {
+@@ -59,5 +60,30 @@ describe('ipc main module', () => {
+       output = JSON.parse(output);
+       expect(output).to.deep.equal(['error']);
+     });
++
++    it('can be replied to', async () => {
++      ipcMain.on('test-echo', (e, arg) => {
++        e.reply('test-echo', arg);
++      });
++      defer(() => {
++        ipcMain.removeAllListeners('test-echo');
++      });
++
++      const w = new BrowserWindow({
++        show: false,
++        webPreferences: {
++          nodeIntegration: true
++        }
++      });
++      w.loadURL('about:blank');
++      const v = await w.webContents.executeJavaScript(`new Promise((resolve, reject) => {
++        const { ipcRenderer } = require('electron')
++        ipcRenderer.send('test-echo', 'hello')
++        ipcRenderer.on('test-echo', (e, v) => {
++          resolve(v)
++        })
++      })`);
++      expect(v).to.equal('hello');
++    });
+   });
+ });
+diff --git a/spec-main/fixtures/snapshots/proxy-window-open.snapshot.txt b/spec-main/fixtures/snapshots/proxy-window-open.snapshot.txt
+index 84a69d21643df..5e91374a1b71d 100644
+--- a/spec-main/fixtures/snapshots/proxy-window-open.snapshot.txt
++++ b/spec-main/fixtures/snapshots/proxy-window-open.snapshot.txt
+@@ -3,7 +3,8 @@
+     "top=5,left=10,resizable=no",
+     {
+       "sender": "[WebContents]",
+-      "frameId": 1
++      "frameId": 1,
++      "processId": "placeholder-process-id"
+     },
+     "about:blank",
+     "frame name",
+@@ -37,7 +38,8 @@
+     "zoomFactor=2,resizable=0,x=0,y=10",
+     {
+       "sender": "[WebContents]",
+-      "frameId": 1
++      "frameId": 1,
++      "processId": "placeholder-process-id"
+     },
+     "about:blank",
+     "frame name",
+@@ -70,7 +72,8 @@
+     "backgroundColor=gray,webPreferences=0,x=100,y=100",
+     {
+       "sender": "[WebContents]",
+-      "frameId": 1
++      "frameId": 1,
++      "processId": "placeholder-process-id"
+     },
+     "about:blank",
+     "frame name",
+@@ -103,7 +106,8 @@
+     "x=50,y=20,title=sup",
+     {
+       "sender": "[WebContents]",
+-      "frameId": 1
++      "frameId": 1,
++      "processId": "placeholder-process-id"
+     },
+     "about:blank",
+     "frame name",
+@@ -134,7 +138,8 @@
+     "show=false,top=1,left=1",
+     {
+       "sender": "[WebContents]",
+-      "frameId": 1
++      "frameId": 1,
++      "processId": "placeholder-process-id"
+     },
+     "about:blank",
+     "frame name",
+diff --git a/spec-main/guest-window-manager-spec.ts b/spec-main/guest-window-manager-spec.ts
+index 41e91d84b3413..3c687916b3442 100644
+--- a/spec-main/guest-window-manager-spec.ts
++++ b/spec-main/guest-window-manager-spec.ts
+@@ -189,6 +189,9 @@ function stringifySnapshots (snapshots: any, pretty = false) {
+     if (key === 'openerId' && typeof value === 'number') {
+       return 'placeholder-opener-id';
+     }
++    if (key === 'processId' && typeof value === 'number') {
++      return 'placeholder-process-id';
++    }
+     if (key === 'returnValue') {
+       return 'placeholder-guest-contents-id';
+     }
+diff --git a/typings/internal-electron.d.ts b/typings/internal-electron.d.ts
+index 94b36dd9931a2..49c64a3c1e5eb 100644
+--- a/typings/internal-electron.d.ts
++++ b/typings/internal-electron.d.ts
+@@ -68,8 +68,8 @@ declare namespace Electron {
+     _callWindowOpenHandler(event: any, url: string, frameName: string, rawFeatures: string): Electron.BrowserWindowConstructorOptions | null;
+     _setNextChildWebPreferences(prefs: Partial<Electron.BrowserWindowConstructorOptions['webPreferences']> & Pick<Electron.BrowserWindowConstructorOptions, 'backgroundColor'>): void;
+     _send(internal: boolean, channel: string, args: any): boolean;
+-    _sendToFrame(internal: boolean, frameId: number, channel: string, args: any): boolean;
+-    _sendToFrameInternal(frameId: number, channel: string, ...args: any[]): boolean;
++    _sendToFrame(internal: boolean, frameId: number | [number, number], channel: string, args: any): boolean;
++    _sendToFrameInternal(frameId: number | [number, number], channel: string, ...args: any[]): boolean;
+     _postMessage(channel: string, message: any, transfer?: any[]): void;
+     _sendInternal(channel: string, ...args: any[]): void;
+     _printToPDF(options: any): Promise<Buffer>;
