@@ -20,7 +20,7 @@ with open(raw_data_file, "r") as f:
     data = f.read()
 
 data_dict = xmltodict.parse(data)
-json_content = json.dumps(data_dict)
+json_content = json.dumps(data_dict, indent=4)
 
 with open(processed_data_file, "w") as f:
     f.write(json_content)
