@@ -1,0 +1,634 @@
+diff --git a/google-oauth-client/src/main/java/com/google/api/client/auth/oauth2/AuthorizationCodeFlow.java b/google-oauth-client/src/main/java/com/google/api/client/auth/oauth2/AuthorizationCodeFlow.java
+index 71ca8d2f7..52208f9bd 100644
+--- a/google-oauth-client/src/main/java/com/google/api/client/auth/oauth2/AuthorizationCodeFlow.java
++++ b/google-oauth-client/src/main/java/com/google/api/client/auth/oauth2/AuthorizationCodeFlow.java
+@@ -17,10 +17,14 @@
+ import com.google.api.client.auth.oauth2.Credential.AccessMethod;
+ import com.google.api.client.http.GenericUrl;
+ import com.google.api.client.http.HttpExecuteInterceptor;
++import com.google.api.client.http.HttpRequest;
+ import com.google.api.client.http.HttpRequestInitializer;
+ import com.google.api.client.http.HttpTransport;
++import com.google.api.client.http.UrlEncodedContent;
+ import com.google.api.client.json.JsonFactory;
++import com.google.api.client.util.Base64;
+ import com.google.api.client.util.Beta;
++import com.google.api.client.util.Data;
+ import com.google.api.client.util.Clock;
+ import com.google.api.client.util.Joiner;
+ import com.google.api.client.util.Lists;
+@@ -29,8 +33,12 @@
+ import com.google.api.client.util.store.DataStoreFactory;
+ 
+ import java.io.IOException;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.security.SecureRandom;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.Map;
+ 
+ import static com.google.api.client.util.Strings.isNullOrEmpty;
+ 
+@@ -85,6 +93,9 @@ public class AuthorizationCodeFlow {
+   /** Authorization server encoded URL. */
+   private final String authorizationServerEncodedUrl;
+ 
++  /** The Proof Key for Code Exchange (PKCE) or {@code null} if this flow should not use PKCE. */
++  private final PKCE pkce;
++
+   /** Credential persistence store or {@code null} for none. */
+   @Beta
+   @Deprecated
+@@ -159,6 +170,7 @@ protected AuthorizationCodeFlow(Builder builder) {
+     clock = Preconditions.checkNotNull(builder.clock);
+     credentialCreatedListener = builder.credentialCreatedListener;
+     refreshListeners = Collections.unmodifiableCollection(builder.refreshListeners);
++    pkce = builder.pkce;
+   }
+ 
+   /**
+@@ -182,8 +194,13 @@ public void doGet(HttpServletRequest request, HttpServletResponse response) thro
+    * </pre>
+    */
+   public AuthorizationCodeRequestUrl newAuthorizationUrl() {
+-    return new AuthorizationCodeRequestUrl(authorizationServerEncodedUrl, clientId).setScopes(
+-        scopes);
++    AuthorizationCodeRequestUrl url = new  AuthorizationCodeRequestUrl(authorizationServerEncodedUrl, clientId);
++    url.setScopes(scopes);
++    if (pkce != null) {
++      url.setCodeChallenge(pkce.getChallenge());
++      url.setCodeChallengeMethod(pkce.getChallengeMethod());
++    }
++    return url;
+   }
+ 
+   /**
+@@ -206,9 +223,20 @@ static TokenResponse requestAccessToken(AuthorizationCodeFlow flow, String code)
+    * @param authorizationCode authorization code.
+    */
+   public AuthorizationCodeTokenRequest newTokenRequest(String authorizationCode) {
++    HttpExecuteInterceptor pkceClientAuthenticationWrapper = new HttpExecuteInterceptor() {
++      @Override
++      public void intercept(HttpRequest request) throws IOException {
++        clientAuthentication.intercept(request);
++        if (pkce != null) {
++          Map<String, Object> data = Data.mapOf(UrlEncodedContent.getContent(request).getData());
++          data.put("code_verifier", pkce.getVerifier());
++        }
++      }
++    };
++
+     return new AuthorizationCodeTokenRequest(transport, jsonFactory,
+         new GenericUrl(tokenServerEncodedUrl), authorizationCode).setClientAuthentication(
+-        clientAuthentication).setRequestInitializer(requestInitializer).setScopes(scopes);
++        pkceClientAuthenticationWrapper).setRequestInitializer(requestInitializer).setScopes(scopes);
+   }
+ 
+   /**
+@@ -412,6 +440,61 @@ public interface CredentialCreatedListener {
+     void onCredentialCreated(Credential credential, TokenResponse tokenResponse) throws IOException;
+   }
+ 
++  /**
++   * An implementation of <a href="https://tools.ietf.org/html/rfc7636">Proof Key for Code Exchange</a>
++   * which, according to the <a href="https://tools.ietf.org/html/rfc8252#section-6">OAuth 2.0 for Native Apps RFC</a>,
++   * is mandatory for public native apps.
++   */
++  private static class PKCE {
++    private final String verifier;
++    private String challenge;
++    private String challengeMethod;
++
++    public PKCE() {
++      verifier = generateVerifier();
++      generateChallenge(verifier);
++    }
++
++    private static String generateVerifier() {
++      SecureRandom sr = new SecureRandom();
++      byte[] code = new byte[32];
++      sr.nextBytes(code);
++      return Base64.encodeBase64URLSafeString(code);
++    }
++
++    /**
++     * Create the PKCE code verifier. It uses the S256 method but
++     * falls back to using the 'plain' method in the unlikely case
++     * that the SHA-256 MessageDigest algorithm implementation can't be
++     * loaded.
++     */
++    private void generateChallenge(String verifier) {
++      try {
++        byte[] bytes = verifier.getBytes();
++        MessageDigest md = MessageDigest.getInstance("SHA-256");
++        md.update(bytes, 0, bytes.length);
++        byte[] digest = md.digest();
++        challenge = Base64.encodeBase64URLSafeString(digest);
++        challengeMethod = "S256";
++      } catch (NoSuchAlgorithmException e) {
++        challenge = verifier;
++        challengeMethod = "plain";
++      }
++    }
++
++    public String getVerifier() {
++      return verifier;
++    }
++
++    public String getChallenge() {
++      return challenge;
++    }
++
++    public String getChallengeMethod() {
++      return challengeMethod;
++    }
++  }
++
+   /**
+    * Authorization code flow builder.
+    *
+@@ -448,6 +531,8 @@ public static class Builder {
+     /** Authorization server encoded URL. */
+     String authorizationServerEncodedUrl;
+ 
++    PKCE pkce;
++
+     /** Credential persistence store or {@code null} for none. */
+     @Deprecated
+     @Beta
+@@ -784,6 +869,16 @@ public Builder setRequestInitializer(HttpRequestInitializer requestInitializer)
+       return this;
+     }
+ 
++    /**
++     * Enables Proof Key for Code Exchange (PKCE) for this Athorization Code Flow.
++     * @since 1.31
++     */
++    @Beta
++    public Builder enablePKCE() {
++      this.pkce = new PKCE();
++      return this;
++    }
++
+     /**
+      * Sets the collection of scopes.
+      *
+diff --git a/google-oauth-client/src/main/java/com/google/api/client/auth/oauth2/AuthorizationCodeRequestUrl.java b/google-oauth-client/src/main/java/com/google/api/client/auth/oauth2/AuthorizationCodeRequestUrl.java
+index 3dc6bb46e..025aaa2ed 100644
+--- a/google-oauth-client/src/main/java/com/google/api/client/auth/oauth2/AuthorizationCodeRequestUrl.java
++++ b/google-oauth-client/src/main/java/com/google/api/client/auth/oauth2/AuthorizationCodeRequestUrl.java
+@@ -14,6 +14,8 @@
+ 
+ package com.google.api.client.auth.oauth2;
+ 
++import com.google.api.client.util.Key;
++
+ import java.util.Collection;
+ import java.util.Collections;
+ 
+@@ -52,6 +54,20 @@ public void doGet(HttpServletRequest request, HttpServletResponse response) thro
+  */
+ public class AuthorizationCodeRequestUrl extends AuthorizationRequestUrl {
+ 
++  /**
++   * The PKCE <a href="https://tools.ietf.org/html/rfc7636#section-4.3">Code Challenge</a>.
++   * @since 1.31
++   */
++  @Key("code_challenge")
++  String codeChallenge;
++
++  /**
++   * The PKCE <a href="https://tools.ietf.org/html/rfc7636#section-4.3">Code Challenge Method</a>.
++   * @since 1.31
++   */
++  @Key("code_challenge_method")
++  String codeChallengeMethod;
++
+   /**
+    * @param authorizationServerEncodedUrl authorization server encoded URL
+    * @param clientId client identifier
+@@ -60,6 +76,44 @@ public AuthorizationCodeRequestUrl(String authorizationServerEncodedUrl, String
+     super(authorizationServerEncodedUrl, clientId, Collections.singleton("code"));
+   }
+ 
++  /**
++   * Get the code challenge (<a href="https://tools.ietf.org/html/rfc7636#section-4.3">details</a>).
++   *
++   * @since 1.31
++   */
++  public String getCodeChallenge() {
++    return codeChallenge;
++  }
++
++  /**
++   * Get the code challenge method (<a href="https://tools.ietf.org/html/rfc7636#section-4.3">details</a>).
++   *
++   * @since 1.31
++   */
++  public String getCodeChallengeMethod() {
++    return codeChallengeMethod;
++  }
++
++  /**
++   * Set the code challenge (<a href="https://tools.ietf.org/html/rfc7636#section-4.3">details</a>).
++   * @param codeChallenge the code challenge.
++   *
++   * @since 1.31
++   */
++  public void setCodeChallenge(String codeChallenge) {
++    this.codeChallenge = codeChallenge;
++  }
++
++  /**
++   * Set the code challenge method (<a href="https://tools.ietf.org/html/rfc7636#section-4.3">details</a>).
++   * @param codeChallengeMethod the code challenge method.
++   *
++   * @since 1.31
++   */
++  public void setCodeChallengeMethod(String codeChallengeMethod) {
++    this.codeChallengeMethod = codeChallengeMethod;
++  }
++
+   @Override
+   public AuthorizationCodeRequestUrl setResponseTypes(Collection<String> responseTypes) {
+     return (AuthorizationCodeRequestUrl) super.setResponseTypes(responseTypes);
+diff --git a/google-oauth-client/src/test/java/com/google/api/client/auth/oauth2/AuthorizationCodeFlowTest.java b/google-oauth-client/src/test/java/com/google/api/client/auth/oauth2/AuthorizationCodeFlowTest.java
+index 75f65f541..e5bed2e98 100644
+--- a/google-oauth-client/src/test/java/com/google/api/client/auth/oauth2/AuthorizationCodeFlowTest.java
++++ b/google-oauth-client/src/test/java/com/google/api/client/auth/oauth2/AuthorizationCodeFlowTest.java
+@@ -23,6 +23,8 @@
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
+ 
+ /**
+  * Tests {@link AuthorizationCodeFlow}.
+@@ -123,4 +125,24 @@ public void subsetTestNewAuthorizationUrl(Collection<String> scopes) {
+       assertEquals(Joiner.on(' ').join(scopes), url.getScopes());
+     }
+   }
++
++  public void testPKCE() {
++    AuthorizationCodeFlow flow =
++        new AuthorizationCodeFlow.Builder(BearerToken.queryParameterAccessMethod(),
++            new AccessTokenTransport(),
++            new JacksonFactory(),
++            TOKEN_SERVER_URL,
++            new BasicAuthentication(CLIENT_ID, CLIENT_SECRET),
++            CLIENT_ID,
++            "https://example.com")
++        .enablePKCE()
++        .build();
++
++    AuthorizationCodeRequestUrl url = flow.newAuthorizationUrl();
++    assertNotNull(url.getCodeChallenge());
++    assertNotNull(url.getCodeChallengeMethod());
++    Set<String> methods = new HashSet<>(Arrays.asList("plain", "s256"));
++    assertTrue(methods.contains(url.getCodeChallengeMethod().toLowerCase()));
++    assertTrue(url.getCodeChallenge().length() > 0);
++  }
+ }
+diff --git a/pom.xml b/pom.xml
+index 83b10f46d..40d726726 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -65,6 +65,7 @@
+     <module>google-oauth-client-java6</module>
+     <module>google-oauth-client-jetty</module>
+     <module>samples/dailymotion-cmdline-sample</module>
++    <module>samples/keycloak-pkce-cmdline-sample</module>
+ 
+     <!-- For deployment reasons, a deployable artifact must be the last one. -->
+     <module>google-oauth-client-assembly</module>
+diff --git a/samples/dailymotion-cmdline-sample/README.md b/samples/dailymotion-cmdline-sample/README.md
+index 82b4063bb..c4a1fbb12 100644
+--- a/samples/dailymotion-cmdline-sample/README.md
++++ b/samples/dailymotion-cmdline-sample/README.md
+@@ -6,7 +6,7 @@
+ 
+ ## Command-Line Instructions
+ 
+-**Prerequisites:** install [Java 6 or higher][install-java], [git][install-git], and
++**Prerequisites:** install [Java 7 or higher][install-java], [git][install-git], and
+ [Maven][install-maven]. You may need to set your `JAVA_HOME`.
+ 
+ 1. Check out the sample code:
+diff --git a/samples/keycloak-pkce-cmdline-sample/README.md b/samples/keycloak-pkce-cmdline-sample/README.md
+new file mode 100644
+index 000000000..c5b5416a0
+--- /dev/null
++++ b/samples/keycloak-pkce-cmdline-sample/README.md
+@@ -0,0 +1,42 @@
++# Instructions for the Keycloak OAuth2 with PKCE Command-Line Sample
++
++## Browse Online
++
++[Browse Source][browse-source], or main file [PKCESample.java][main-source].
++
++## Command-Line Instructions
++
++**Prerequisites:** install [Java 7 or higher][install-java], [git][install-git], and
++[Maven][install-maven]. You may need to set your `JAVA_HOME`. 
++You'll also need [Docker][install-docker].
++
++1. Check out the sample code:
++
++    ```bash
++    git clone https://github.com/google/google-oauth-java-client.git
++    cd google-oauth-java-client
++    ```
++
++2. Run keycloak in a docker container:
++
++   ```
++   docker run -p 8080:8080 -e KEYCLOAK_USER=admin -e KEYCLOAK_PASSWORD=admin quay.io/keycloak/keycloak:10.0.1 
++   ```
++
++3. Run the sample:
++
++    ```bash
++    mvn install
++    mvn exec:java -pl samples/keycloak-pkce-cmdline-sample
++    ```
++   
++   This will open up the Keycloak login page where you can log in with the username/password specified
++   when running the Keycloak docker container above (`admin / admin`). Once you log in, the application
++   will print out a message that it successfully obtained an access token.
++
++[browse-source]: https://github.com/google/google-oauth-java-client/tree/dev/samples/keycloak-pkce-cmdline-sample
++[main-source]: https://github.com/google/google-oauth-java-client/blob/dev/samples/keycloak-pkce-cmdline-sample/src/main/java/com/google/api/services/samples/keycloak/cmdline/PKCESample.java
++[install-java]: https://java.com/
++[install-git]: https://git-scm.com
++[install-maven]: https://maven.apache.org
++[install-docker]: https://docs.docker.com/get-docker/
+\ No newline at end of file
+diff --git a/samples/keycloak-pkce-cmdline-sample/pom.xml b/samples/keycloak-pkce-cmdline-sample/pom.xml
+new file mode 100644
+index 000000000..b19a662a7
+--- /dev/null
++++ b/samples/keycloak-pkce-cmdline-sample/pom.xml
+@@ -0,0 +1,104 @@
++<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
++  <modelVersion>4.0.0</modelVersion>
++  <parent>
++    <groupId>com.google.oauth-client</groupId>
++    <artifactId>google-oauth-client-parent</artifactId>
++    <version>1.30.7-SNAPSHOT</version><!-- {x-version-update:google-oauth-client:current} -->
++    <relativePath>../../pom.xml</relativePath>
++  </parent>
++  <artifactId>keycloak-pkce-cmdline-sample</artifactId>
++  <name>Example for obtaining OAuth2 tokens with PKCE verification using the Authorization Code Flow against Keycloak.</name>
++
++  <build>
++    <plugins>
++      <plugin>
++        <groupId>org.codehaus.mojo</groupId>
++        <artifactId>exec-maven-plugin</artifactId>
++        <version>1.6.0</version>
++        <executions>
++          <execution>
++            <goals>
++              <goal>java</goal>
++            </goals>
++          </execution>
++        </executions>
++        <configuration>
++          <mainClass>com.google.api.services.samples.keycloak.cmdline.PKCESample</mainClass>
++          <systemProperties>
++            <systemProperty>
++              <key>java.util.logging.config.file</key>
++              <value>logging.properties</value>
++            </systemProperty>
++          </systemProperties>
++        </configuration>
++      </plugin>
++      <plugin>
++        <artifactId>maven-checkstyle-plugin</artifactId>
++        <version>2.6</version>
++        <configuration>
++          <configLocation>../checkstyle.xml</configLocation>
++          <consoleOutput>true</consoleOutput>
++          <failOnViolation>false</failOnViolation>
++        </configuration>
++        <executions>
++          <execution>
++            <goals>
++              <goal>check</goal>
++            </goals>
++          </execution>
++        </executions>
++      </plugin>
++      <plugin>
++        <groupId>org.codehaus.mojo</groupId>
++        <artifactId>findbugs-maven-plugin</artifactId>
++        <version>3.0.5</version>
++        <configuration>
++          <excludeFilterFile>../../findbugs-exclude.xml</excludeFilterFile>
++          <failOnError>false</failOnError>
++        </configuration>
++        <executions>
++          <execution>
++            <goals>
++              <goal>check</goal>
++            </goals>
++          </execution>
++        </executions>
++      </plugin>
++      <plugin>
++        <groupId>org.apache.maven.plugins</groupId>
++        <artifactId>maven-deploy-plugin</artifactId>
++        <version>2.8.2</version>
++        <configuration>
++          <skip>true</skip>
++        </configuration>
++      </plugin>
++      <plugin>
++        <groupId>org.sonatype.plugins</groupId>
++        <artifactId>nexus-staging-maven-plugin</artifactId>
++        <version>1.6.8</version>
++        <configuration>
++          <skipNexusStagingDeployMojo>true</skipNexusStagingDeployMojo>
++        </configuration>
++      </plugin>
++    </plugins>
++    <finalName>${project.artifactId}-${project.version}</finalName>
++  </build>
++  <dependencies>
++    <dependency>
++      <groupId>com.google.oauth-client</groupId>
++      <artifactId>google-oauth-client</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>com.google.oauth-client</groupId>
++      <artifactId>google-oauth-client-jetty</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>com.google.http-client</groupId>
++      <artifactId>google-http-client-jackson2</artifactId>
++    </dependency>
++  </dependencies>
++  <properties>
++    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
++  </properties>
++</project>
+diff --git a/samples/keycloak-pkce-cmdline-sample/scripts/initialize-keycloak.sh b/samples/keycloak-pkce-cmdline-sample/scripts/initialize-keycloak.sh
+new file mode 100755
+index 000000000..257da7d6c
+--- /dev/null
++++ b/samples/keycloak-pkce-cmdline-sample/scripts/initialize-keycloak.sh
+@@ -0,0 +1,44 @@
++#!/bin/sh
++# Copyright 2020 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++#Start keycloak server before running this script:
++# docker run -p 8080:8080 -e KEYCLOAK_USER=admin -e KEYCLOAK_PASSWORD=admin quay.io/keycloak/keycloak:10.0.1
++
++# The following script will create a new public client in the running keycloak server
++# in which PKCE is required for obtaining an authorization token via the authorization
++# code flow. Once this script has been run, the PKCESample.java sample application can
++# be run.
++
++KEYCLOAK_BASE_URL="http://localhost:8080/auth"
++KEYCLOAK_REALM="master"
++KEYCLOAK_URL="${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}"
++
++KEYCLOAK_CLIENT_ID="admin"
++KEYCLOAK_CLIENT_SECRET="admin"
++
++export TKN=$(curl -s -X POST "${KEYCLOAK_URL}/protocol/openid-connect/token" \
++ -H "Content-Type: application/x-www-form-urlencoded" \
++ -d "username=${KEYCLOAK_CLIENT_ID}" \
++ -d "password=${KEYCLOAK_CLIENT_SECRET}" \
++ -d 'grant_type=password' \
++ -d 'client_id=admin-cli' | jq -r '.access_token')
++
++curl -s -X POST "${KEYCLOAK_URL}/clients-registrations/default" \
++ -d '{ "clientId": "pkce-test-client", "publicClient": true, "redirectUris": ["http://127.0.0.1*"], "attributes": {"pkce.code.challenge.method": "S256"} }' \
++ -H "Content-Type:application/json" \
++ -H "Authorization: bearer ${TKN}" 
++
++ 
+\ No newline at end of file
+diff --git a/samples/keycloak-pkce-cmdline-sample/src/main/java/com/google/api/services/samples/keycloak/cmdline/PKCESample.java b/samples/keycloak-pkce-cmdline-sample/src/main/java/com/google/api/services/samples/keycloak/cmdline/PKCESample.java
+new file mode 100644
+index 000000000..8fa63ca97
+--- /dev/null
++++ b/samples/keycloak-pkce-cmdline-sample/src/main/java/com/google/api/services/samples/keycloak/cmdline/PKCESample.java
+@@ -0,0 +1,100 @@
++/*
++ * Copyright (c) 2020 Google Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++ * in compliance with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++
++package com.google.api.services.samples.keycloak.cmdline;
++
++import com.google.api.client.auth.oauth2.AuthorizationCodeFlow;
++import com.google.api.client.auth.oauth2.BearerToken;
++import com.google.api.client.auth.oauth2.ClientParametersAuthentication;
++import com.google.api.client.auth.oauth2.Credential;
++import com.google.api.client.extensions.java6.auth.oauth2.AuthorizationCodeInstalledApp;
++import com.google.api.client.extensions.jetty.auth.oauth2.LocalServerReceiver;
++import com.google.api.client.http.GenericUrl;
++import com.google.api.client.http.HttpTransport;
++import com.google.api.client.http.javanet.NetHttpTransport;
++import com.google.api.client.json.JsonFactory;
++import com.google.api.client.json.jackson2.JacksonFactory;
++import com.google.api.client.util.store.DataStoreFactory;
++import com.google.api.client.util.store.MemoryDataStoreFactory;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * A sample application that demonstrates how the Google OAuth2 library can be used to authenticate
++ * against a locally running Keycloak server with a registered public client where using
++ * <a href="https://tools.ietf.org/html/rfc7636">PKCE</a> is required.
++ *
++ * Please note that before running this sample application, a local Keycloak server must be running
++ * and a PKCE enabled client must have been defined. Please see
++ * <code>samples/keycloak-pkce-cmdline-sample/scripts/initialize-keycloak.sh</code> for further
++ * information.
++ *
++ * @author Stefan Freyr Stefansson
++ */
++public class PKCESample {
++    /**
++     * Global instance of the {@link DataStoreFactory}. The best practice is to make it a single
++     * globally shared instance across your application.
++     */
++    private static DataStoreFactory DATA_STORE_FACTORY;
++
++    /** OAuth 2 scope. */
++    private static final String SCOPE = "email";
++
++    /** Global instance of the HTTP transport. */
++    private static final HttpTransport HTTP_TRANSPORT = new NetHttpTransport();
++
++    /** Global instance of the JSON factory. */
++    static final JsonFactory JSON_FACTORY = new JacksonFactory();
++
++    private static final String TOKEN_SERVER_URL = "http://127.0.0.1:8080/auth/realms/master/protocol/openid-connect/token";
++    private static final String AUTHORIZATION_SERVER_URL = "http://127.0.0.1:8080/auth/realms/master/protocol/openid-connect/auth";
++
++    /** Authorizes the installed application to access user's protected data. */
++    private static Credential authorize() throws Exception {
++        // set up authorization code flow
++        String clientId = "pkce-test-client";
++        AuthorizationCodeFlow flow = new AuthorizationCodeFlow.Builder(
++                BearerToken.authorizationHeaderAccessMethod(),
++                HTTP_TRANSPORT,
++                JSON_FACTORY,
++                new GenericUrl(TOKEN_SERVER_URL),
++                new ClientParametersAuthentication(clientId, null),
++                clientId,
++                AUTHORIZATION_SERVER_URL)
++                .setScopes(Arrays.asList(SCOPE))
++                .enablePKCE()
++                .setDataStoreFactory(DATA_STORE_FACTORY).build();
++        // authorize
++        LocalServerReceiver receiver = new LocalServerReceiver.Builder().setHost("127.0.0.1").build();
++        return new AuthorizationCodeInstalledApp(flow, receiver).authorize("user");
++    }
++
++    public static void main(String[] args) {
++        try {
++            DATA_STORE_FACTORY = new MemoryDataStoreFactory();
++            final Credential credential = authorize();
++            System.out.println("Successfully obtained credential from Keycloak running on localhost.");
++            final String accessToken = credential.getAccessToken();
++            System.out.println("Retrieved an access token of length " + accessToken.length());
++            return;
++        } catch (IOException e) {
++            System.err.println(e.getMessage());
++        } catch (Throwable t) {
++            t.printStackTrace();
++        }
++        System.exit(1);
++    }
++}

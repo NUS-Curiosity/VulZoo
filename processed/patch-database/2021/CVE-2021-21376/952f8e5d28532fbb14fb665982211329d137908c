@@ -1,0 +1,471 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b4d6f6312b..ec753baf23 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,6 +22,10 @@
+ - Fix partial loading of annotations ([#256](https://github.com/ome/omero-web/pull/256))
+ - Fix ignored limit in webgateway/table endpoint ([#268](https://github.com/ome/omero-web/pull/268))
+ 
++- Security vulnerability fixes for
++  [2021-SV1](https://www.openmicroscopy.org/security/advisories/2021-SV1-user-context/),
++  [2021-SV2](https://www.openmicroscopy.org/security/advisories/2021-SV2-url-validation/)
++
+ 5.8.1 (September 2020)
+ ----------------------
+ 
+diff --git a/omeroweb/decorators.py b/omeroweb/decorators.py
+index 8ab85d4b43..b7cf301777 100644
+--- a/omeroweb/decorators.py
++++ b/omeroweb/decorators.py
+@@ -582,7 +582,8 @@ def __getattr__(self, name):
+ 
+     def prepare_context(self, request, context, *args, **kwargs):
+         """ Hook for adding additional data to the context dict """
+-        pass
++        context["html"] = context.get("html", {})
++        context["html"]["meta_referrer"] = settings.HTML_META_REFERRER
+ 
+     def __call__(ctx, f):
+         """ Here we wrap the view method f and return the wrapped method """
+diff --git a/omeroweb/settings.py b/omeroweb/settings.py
+index 521f05d369..b7f6446e91 100644
+--- a/omeroweb/settings.py
++++ b/omeroweb/settings.py
+@@ -508,6 +508,12 @@ def leave_none_unset_int(s):
+         leave_none_unset,
+         "The name to use for session cookies",
+     ],
++    "omero.web.session_cookie_path": [
++        "SESSION_COOKIE_PATH",
++        None,
++        leave_none_unset,
++        "The path to use for session cookies",
++    ],
+     "omero.web.session_cookie_secure": [
+         "SESSION_COOKIE_SECURE",
+         "false",
+@@ -866,6 +872,16 @@ def leave_none_unset_int(s):
+             ' {"experimenter": -1}}\'``'
+         ),
+     ],
++    "omero.web.redirect_allowed_hosts": [
++        "REDIRECT_ALLOWED_HOSTS",
++        "[]",
++        json.loads,
++        (
++            "If you wish to allow redirects to an external site, "
++            "the domains must be listed here. "
++            'For example ["openmicroscopy.org"].'
++        ),
++    ],
+     "omero.web.login.show_client_downloads": [
+         "SHOW_CLIENT_DOWNLOADS",
+         "true",
+@@ -1022,6 +1038,20 @@ def leave_none_unset_int(s):
+             "will be authorized to make cross-site HTTP requests."
+         ),
+     ],
++    "omero.web.html_meta_referrer": [
++        "HTML_META_REFERRER",
++        "origin-when-crossorigin",
++        str,
++        (
++            "Default content for the HTML Meta referrer tag. "
++            "See https://www.w3.org/TR/referrer-policy/#referrer-policies for "
++            "allowed values and https://caniuse.com/#feat=referrer-policy for "
++            "browser compatibility. "
++            "Warning: Internet Explorer 11 does not support the default value "
++            'of this setting, you may want to change this to "origin" after '
++            "reviewing the linked documentation."
++        ),
++    ],
+     "omero.web.x_frame_options": [
+         "X_FRAME_OPTIONS",
+         "SAMEORIGIN",
+diff --git a/omeroweb/webclient/decorators.py b/omeroweb/webclient/decorators.py
+index 591fa878db..eea31b00db 100644
+--- a/omeroweb/webclient/decorators.py
++++ b/omeroweb/webclient/decorators.py
+@@ -35,7 +35,6 @@
+ 
+ from omeroweb.webclient.forms import GlobalSearchForm
+ from omeroweb.utils import reverse_with_params
+-from omeroweb.webgateway.marshal import eventContextMarshal
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -116,6 +115,8 @@ def prepare_context(self, request, context, *args, **kwargs):
+         context.
+         """
+ 
++        super(render_response, self).prepare_context(request, context, *args, **kwargs)
++
+         # we expect @login_required to pass us 'conn', but just in case...
+         if "conn" not in kwargs:
+             return
+@@ -134,7 +135,6 @@ def prepare_context(self, request, context, *args, **kwargs):
+         public_user = omeroweb.decorators.is_public_user(request)
+         if public_user is not None:
+             context["ome"]["is_public_user"] = public_user
+-        context["ome"]["eventContext"] = eventContextMarshal(conn.getEventContext())
+         context["ome"]["user"] = conn.getUser
+         context["ome"]["user_id"] = request.session.get("user_id", conn.getUserId())
+         context["ome"]["group_id"] = request.session.get("group_id", None)
+diff --git a/omeroweb/webclient/forms.py b/omeroweb/webclient/forms.py
+index f31c95a5e9..6ac495d2a4 100644
+--- a/omeroweb/webclient/forms.py
++++ b/omeroweb/webclient/forms.py
+@@ -37,7 +37,6 @@
+ from .custom_forms import AnnotationModelMultipleChoiceField
+ from .custom_forms import ObjectModelMultipleChoiceField
+ from omeroweb.webadmin.custom_forms import ExperimenterModelMultipleChoiceField
+-from omeroweb.webadmin.custom_forms import GroupModelMultipleChoiceField
+ from omeroweb.webadmin.custom_forms import GroupModelChoiceField
+ from omeroweb.webclient.webclient_utils import formatPercentFraction
+ 
+@@ -127,23 +126,6 @@ def clean_expiration(self):
+         return self.cleaned_data["expiration"]
+ 
+ 
+-class BasketShareForm(ShareForm):
+-    def __init__(self, *args, **kwargs):
+-        super(BasketShareForm, self).__init__(*args, **kwargs)
+-
+-        try:
+-            self.fields["image"] = GroupModelMultipleChoiceField(
+-                queryset=kwargs["initial"]["images"],
+-                initial=kwargs["initial"]["selected"],
+-                widget=forms.SelectMultiple(attrs={"size": 10}),
+-            )
+-        except Exception:
+-            self.fields["image"] = GroupModelMultipleChoiceField(
+-                queryset=kwargs["initial"]["images"],
+-                widget=forms.SelectMultiple(attrs={"size": 10}),
+-            )
+-
+-
+ class ContainerForm(NonASCIIForm):
+ 
+     name = forms.CharField(max_length=250, widget=forms.TextInput(attrs={"size": 45}))
+diff --git a/omeroweb/webclient/static/webclient/javascript/ome.tree.js b/omeroweb/webclient/static/webclient/javascript/ome.tree.js
+index eefa1b2502..204746f388 100644
+--- a/omeroweb/webclient/static/webclient/javascript/ome.tree.js
++++ b/omeroweb/webclient/static/webclient/javascript/ome.tree.js
+@@ -1151,8 +1151,8 @@ $(function() {
+ 
+                 var userId = WEBCLIENT.active_user.id,
+                     // admin may be viewing a Group that they are not a member of
+-                    memberOfGroup = WEBCLIENT.eventContext.memberOfGroups.indexOf(WEBCLIENT.active_group_id) > -1,
+-                    writeOwned = WEBCLIENT.eventContext.adminPrivileges.indexOf("WriteOwned") > -1,
++                    memberOfGroup = WEBCLIENT.member_of_groups.indexOf(WEBCLIENT.active_group_id) > -1,
++                    writeOwned = WEBCLIENT.current_admin_privileges.indexOf("WriteOwned") > -1,
+                     allMembers = userId === -1,
+                     // canCreate if looking at your own data or 'All Members' OR User's data && writeOwned
+                     canCreate = (userId === WEBCLIENT.USER.id || (allMembers && memberOfGroup) ||
+diff --git a/omeroweb/webclient/templates/webclient/base/base_container.html b/omeroweb/webclient/templates/webclient/base/base_container.html
+index 6efb62e300..b30c11c478 100644
+--- a/omeroweb/webclient/templates/webclient/base/base_container.html
++++ b/omeroweb/webclient/templates/webclient/base/base_container.html
+@@ -166,7 +166,7 @@
+         WEBCLIENT.active_group_id = {{ active_group.id }};
+         WEBCLIENT.USER = {'id': {{ ome.user.id }}, 'fullName': "{{ ome.user.getFullName }}"};
+         WEBCLIENT.active_user = {'id': {{ ome.user_id }}, 'fullName': "{{ active_user.getFullName }}"};
+-        WEBCLIENT.eventContext = {{ ome.eventContext|json_dumps|safe }};
++        WEBCLIENT.member_of_groups = {{ member_of_groups|json_dumps|safe }};
+         WEBCLIENT.isAdmin = {% if ome.user.isAdmin %}true{% else %}false{% endif %};
+         WEBCLIENT.CAN_CREATE = {{ ome.can_create|json_dumps|safe }};
+         WEBCLIENT.current_admin_privileges = {{ current_admin_privileges|json_dumps|safe }};
+diff --git a/omeroweb/webclient/templates/webclient/base/includes/toolbar_forms.html b/omeroweb/webclient/templates/webclient/base/includes/toolbar_forms.html
+index ef58b6f5e2..4c8d7dd131 100644
+--- a/omeroweb/webclient/templates/webclient/base/includes/toolbar_forms.html
++++ b/omeroweb/webclient/templates/webclient/base/includes/toolbar_forms.html
+@@ -3,7 +3,7 @@
+ 
+ {% comment %}
+ <!--
+-  Copyright (C) 2011 University of Dundee & Open Microscopy Environment.
++  Copyright (C) 2011-2021 University of Dundee & Open Microscopy Environment.
+   All rights reserved.
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Affero General Public License as
+@@ -25,82 +25,33 @@
+ if (typeof OME === "undefined") { OME={}; }
+ 
+     OME.createShare = function() {
+-
+-        var productListQuery = [];
+-
+-        // we do inst.get_selected() here, since we then get objects
+-        // instead of ids for some reason?
+-        var inst = $.jstree.reference('#dataTree');
+-        data = inst.get_selected(true);
+-        data.forEach(function(node){
+-            productListQuery.push(node.type + "=" + node.data.id);
+-        });
+-
+-        var query = '{% url 'manage_action_containers' "add" "share" %}' + "?"+productListQuery.join("&");
+         $("#create_share_form").dialog("open");
+-        $("#create_share_form").attr("action", query)
+-        $("#create_share_form").load(query);
+         return false;
+     }
+ 
+     $(document).ready(function(){
+ 
+-        // AJAX handling of create-discussion form
+-        $("#create_share_form").ajaxForm({
+-            success: function(html) {
+-                if (html.indexOf("shareId") > -1) {
+-                    var shareId = html.replace("shareId:", "");
+-                    $("#create_share_form").dialog( "close" );
+-                    $("#shareCreatedId").text(shareId);
+-                    $("#share_dialog_form").dialog("open").show();
+-                } else {
+-                    $("#create_share_form").html(html);
+-                }
+-            },
+-        });
+-
+-        $("#share_dialog_form").dialog({
+-            autoOpen: false,
+-            resizable: true,
+-            height: 150,
+-            width:300,
+-            modal: true,
+-            buttons: {
+-                "OK": function() {
+-                    $( this ).dialog( "close" );
+-                }
+-            }
+-        });
+-
+         $("#create_share_form").dialog({
++            title: "Shares not supported",
+             autoOpen: false,
+             resizable: true,
+-            height: 600,
++            height: 250,
+             width:450,
+             modal: true,
+             buttons: {
+-                "Accept": function() {
+-                    // simply submit the form
+-                    $("#create_share_form").submit();
+-                },
+-                "Cancel": function() {
++                "OK": function() {
+                     $( this ).dialog( "close" );
+                 }
+             }
+         });
+-
+-
+     });
+ </script>
+ 
+ 
+-
+-<!-- hidden form for creating share - shown in dialog & loaded by AJAX -->
+-<form id="create_share_form" action="#" method="post" title="Create Share" class="standard_form">{% csrf_token %}
+-</form>
+-
+-<form id="share_dialog_form" action="#" title="Create Share" style="display:none">
+-    <p style="font-size: 120%; font-weight: bold">
+-        Share <span id="shareCreatedId"></span> was created successfully.
++<!-- hidden dialog -->
++<div id="create_share_form" style="display:none">
++    <p>Share functionality is no longer supported.</p>
++    <p>Please see <a target="_blank" href="https://www.openmicroscopy.org/omero/features/share/">Sharing your data in OMERO</a>
++        for alternative workflows.
+     </p>
+-</form>
++</div>
+diff --git a/omeroweb/webclient/templates/webclient/data/containers.html b/omeroweb/webclient/templates/webclient/data/containers.html
+index e6e3d8b7fc..835962a9fb 100644
+--- a/omeroweb/webclient/templates/webclient/data/containers.html
++++ b/omeroweb/webclient/templates/webclient/data/containers.html
+@@ -208,9 +208,9 @@
+             // If we are filtering to show another user's data,
+             // we 'should' have writeOwned privilege
+ 
+-            var writeOwned = WEBCLIENT.eventContext.adminPrivileges.indexOf("WriteOwned") > -1;
++            var writeOwned = WEBCLIENT.current_admin_privileges.indexOf("WriteOwned") > -1;
+             var $f = $("#new-container-form");
+-            var memberOfGroup = WEBCLIENT.eventContext.memberOfGroups.indexOf(WEBCLIENT.active_group_id) > -1;
++            var memberOfGroup = WEBCLIENT.member_of_groups.indexOf(WEBCLIENT.active_group_id) > -1;
+ 
+             // clear fields
+             $("input[name='owner']", $f).val("");
+@@ -289,8 +289,8 @@
+ 
+             // We 'canCreate' top level items, E.g. Project, Dataset, Screen, if the current userId is self or 'All Members'
+             var userId = {{ ome.user_id }},
+-                memberOfGroup = WEBCLIENT.eventContext.memberOfGroups.indexOf(WEBCLIENT.active_group_id) > -1,
+-                writeOwned = WEBCLIENT.eventContext.adminPrivileges.indexOf("WriteOwned") > -1,
++                memberOfGroup = WEBCLIENT.member_of_groups.indexOf(WEBCLIENT.active_group_id) > -1,
++                writeOwned = WEBCLIENT.current_admin_privileges.indexOf("WriteOwned") > -1,
+                 allMembers = userId === -1,
+                 // canCreate if looking at your own data or 'All Members' OR User's data with writeOwned
+                 canCreate = (userId === WEBCLIENT.USER.id || (allMembers && memberOfGroup) ||
+diff --git a/omeroweb/webclient/templates/webclient/public/public.html b/omeroweb/webclient/templates/webclient/public/public.html
+index 59e65f0080..16c38e022e 100644
+--- a/omeroweb/webclient/templates/webclient/public/public.html
++++ b/omeroweb/webclient/templates/webclient/public/public.html
+@@ -489,7 +489,15 @@
+ 
+ <div class="left_panel_tree_container">
+ 
+-    <div id="tree_details" class="left_panel_tree">
++    <div style="height: 110px; padding: 15px; box-sizing: border-box;">
++        <p>Creating new shares is no longer supported. Previously created shares are shown below.</p>
++        <p>Please see <a target="_blank" href="https://www.openmicroscopy.org/omero/features/share/">Sharing your data in
++                OMERO</a>
++            for alternative workflows.
++        </p>
++    </div>
++
++    <div id="tree_details" class="left_panel_tree" style="height: calc(100% - 110px)">
+         <div class="datashareTree" id="dataTree"></div>
+     </div>
+ 
+diff --git a/omeroweb/webclient/views.py b/omeroweb/webclient/views.py
+index ea17b390fa..e3972ac099 100755
+--- a/omeroweb/webclient/views.py
++++ b/omeroweb/webclient/views.py
+@@ -35,6 +35,7 @@
+ import warnings
+ from past.builtins import unicode
+ from future.utils import bytes_to_native_str
++from django.utils.http import is_safe_url
+ 
+ from time import time
+ 
+@@ -67,7 +68,7 @@
+ 
+ from omeroweb.webclient.webclient_utils import _formatReport, _purgeCallback
+ from .forms import GlobalSearchForm, ContainerForm
+-from .forms import ShareForm, BasketShareForm
++from .forms import ShareForm
+ from .forms import ContainerNameForm, ContainerDescriptionForm
+ from .forms import CommentAnnotationForm, TagsAnnotationForm
+ from .forms import MetadataFilterForm, MetadataDetectorForm
+@@ -176,6 +177,17 @@ def get_bool_or_default(request, name, default):
+     return toBoolean(request.GET.get(name, default))
+ 
+ 
++def validate_redirect_url(url):
++    """
++    Returns a URL is safe to redirect to.
++    If url is a different host, not in settings.REDIRECT_ALLOWED_HOSTS
++    we return webclient index URL.
++    """
++    if not is_safe_url(url, allowed_hosts=settings.REDIRECT_ALLOWED_HOSTS):
++        url = reverse("webindex")
++    return url
++
++
+ ##############################################################################
+ # custom index page
+ 
+@@ -257,6 +269,8 @@ def handle_logged_in(self, request, conn, connector):
+                 url = parse_url(settings.LOGIN_REDIRECT)
+             except Exception:
+                 url = reverse("webindex")
++        else:
++            url = validate_redirect_url(url)
+         return HttpResponseRedirect(url)
+ 
+     def handle_not_logged_in(self, request, error=None, form=None):
+@@ -335,6 +349,7 @@ def change_active_group(request, conn=None, url=None, **kwargs):
+     """
+     switch_active_group(request)
+     url = url or reverse("webindex")
++    url = validate_redirect_url(url)
+     return HttpResponseRedirect(url)
+ 
+ 
+@@ -534,6 +549,7 @@ def _load_template(request, menu, conn=None, url=None, **kwargs):
+     context["thumbnails_batch"] = settings.THUMBNAILS_BATCH
+     context["current_admin_privileges"] = conn.getCurrentAdminPrivileges()
+     context["leader_of_groups"] = conn.getEventContext().leaderOfGroups
++    context["member_of_groups"] = conn.getEventContext().memberOfGroups
+ 
+     return context
+ 
+@@ -2871,47 +2887,6 @@ def manage_action_containers(
+                 d.update({e[0]: unicode(e[1])})
+             rdict = {"bad": "true", "errs": d}
+             return JsonResponse(rdict)
+-    elif action == "add":
+-        template = "webclient/public/share_form.html"
+-        experimenters = list(conn.getExperimenters())
+-        experimenters.sort(key=lambda x: x.getOmeName().lower())
+-        if o_type == "share":
+-            img_ids = request.GET.getlist("image", request.POST.getlist("image"))
+-            if request.method == "GET" and len(img_ids) == 0:
+-                return HttpResponse("No images specified")
+-            images_to_share = list(conn.getObjects("Image", img_ids))
+-            if request.method == "POST":
+-                form = BasketShareForm(
+-                    initial={"experimenters": experimenters, "images": images_to_share},
+-                    data=request.POST.copy(),
+-                )
+-                if form.is_valid():
+-                    images = form.cleaned_data["image"]
+-                    message = form.cleaned_data["message"]
+-                    expiration = form.cleaned_data["expiration"]
+-                    members = form.cleaned_data["members"]
+-                    # guests = request.POST['guests']
+-                    enable = form.cleaned_data["enable"]
+-                    host = "%s?server=%i" % (
+-                        request.build_absolute_uri(
+-                            reverse("load_template", args=["public"])
+-                        ),
+-                        int(conn.server_id),
+-                    )
+-                    shareId = manager.createShare(
+-                        host, images, message, members, enable, expiration
+-                    )
+-                    return HttpResponse("shareId:%s" % shareId)
+-            else:
+-                initial = {
+-                    "experimenters": experimenters,
+-                    "images": images_to_share,
+-                    "enable": True,
+-                    "selected": request.GET.getlist("image"),
+-                }
+-                form = BasketShareForm(initial=initial)
+-        template = "webclient/public/share_form.html"
+-        context = {"manager": manager, "form": form}
+ 
+     elif action == "edit":
+         # form for editing Shares only
+diff --git a/omeroweb/webgateway/templates/webgateway/core_html.html b/omeroweb/webgateway/templates/webgateway/core_html.html
+index b2a992acd7..6e39032827 100644
+--- a/omeroweb/webgateway/templates/webgateway/core_html.html
++++ b/omeroweb/webgateway/templates/webgateway/core_html.html
+@@ -25,6 +25,7 @@
+ 
+ <head>
+     <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
++    <meta name="referrer" content="{{ html.meta_referrer|default:"origin-when-crossorigin" }}">
+ 
+     {% block link %}
+ 		<link rel="stylesheet" href="{% static "webgateway/css/reset.css"|add:url_suffix %}" type="text/css" />   
+diff --git a/omeroweb/webgateway/views.py b/omeroweb/webgateway/views.py
+index a7b6167d82..eb3dba2d58 100644
+--- a/omeroweb/webgateway/views.py
++++ b/omeroweb/webgateway/views.py
+@@ -2960,10 +2960,10 @@ def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
+             limit = (
+                 int(request.GET.get("limit"))
+                 if request.GET.get("limit") is not None
+-                else None
++                else rows
+             )
+         range_start = offset
+-        range_size = kwargs.get("limit", rows)
++        range_size = limit
+         range_end = min(rows, range_start + range_size)
+ 
+         if query == "*":

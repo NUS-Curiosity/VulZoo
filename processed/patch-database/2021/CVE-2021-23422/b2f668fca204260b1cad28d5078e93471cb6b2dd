@@ -1,0 +1,232 @@
+diff --git a/bikeshed/InputSource.py b/bikeshed/InputSource.py
+index f905484274..124f1ea078 100644
+--- a/bikeshed/InputSource.py
++++ b/bikeshed/InputSource.py
+@@ -13,6 +13,7 @@
+ import requests
+ import tenacity
+ 
++from . import config
+ from .Line import Line
+ 
+ 
+@@ -38,17 +39,17 @@ class InputSource:
+     manager for temporarily switching to the directory of a file InputSource.
+     """
+ 
+-    def __new__(cls, sourceName: str):
++    def __new__(cls, sourceName: str, **kwargs):
+         """Dispatches to the right subclass."""
+         if cls != InputSource:
+             # Only take control of calls to InputSource(...) itself.
+             return super().__new__(cls)
+ 
+         if sourceName == "-":
+-            return StdinInputSource(sourceName)
++            return StdinInputSource(sourceName, **kwargs)
+         if sourceName.startswith("https:"):
+-            return UrlInputSource(sourceName)
+-        return FileInputSource(sourceName)
++            return UrlInputSource(sourceName, **kwargs)
++        return FileInputSource(sourceName, **kwargs)
+ 
+     @abstractmethod
+     def __str__(self) -> str:
+@@ -157,11 +158,17 @@ def relative(self, relativePath) -> UrlInputSource:
+ 
+ 
+ class FileInputSource(InputSource):
+-    def __init__(self, sourceName: str):
++    def __init__(self, sourceName: str, *, chroot: bool, chrootPath: Optional[str] = None):
+         self.sourceName = sourceName
++        self.chrootPath = chrootPath
+         self.type = "file"
+         self.content = None
+ 
++        if chroot and self.chrootPath is None:
++            self.chrootPath = self.directory()
++        if self.chrootPath is not None:
++            self.sourceName = config.chrootPath(self.chrootPath, self.sourceName)
++
+     def __str__(self) -> str:
+         return self.sourceName
+ 
+@@ -179,7 +186,7 @@ def directory(self) -> str:
+         return os.path.dirname(os.path.abspath(self.sourceName))
+ 
+     def relative(self, relativePath) -> FileInputSource:
+-        return FileInputSource(os.path.join(self.directory(), relativePath))
++        return FileInputSource(os.path.join(self.directory(), relativePath), chroot=False, chrootPath=self.chrootPath)
+ 
+     def cheaplyExists(self, relativePath) -> bool:
+         return os.access(self.relative(relativePath).sourceName, os.R_OK)
+diff --git a/bikeshed/Spec.py b/bikeshed/Spec.py
+index 9ac335f85c..8d28c49c7c 100644
+--- a/bikeshed/Spec.py
++++ b/bikeshed/Spec.py
+@@ -58,7 +58,7 @@ def __init__(
+                 "No input file specified, and no *.bs or *.src.html files found in current directory.\nPlease specify an input file, or use - to pipe from STDIN."
+             )
+             return
+-        self.inputSource = InputSource(inputFilename)
++        self.inputSource = InputSource(inputFilename, chroot=constants.chroot)
+         self.transitiveDependencies = set()
+         self.debug = debug
+         self.token = token
+diff --git a/bikeshed/cli.py b/bikeshed/cli.py
+index dd4d33a92e..05af940449 100644
+--- a/bikeshed/cli.py
++++ b/bikeshed/cli.py
+@@ -75,6 +75,18 @@ def main():
+         choices=["nothing", "fatal", "link-error", "warning", "everything"],
+         help="Determines what sorts of errors cause Bikeshed to die (quit immediately with an error status code). Default is 'fatal'; the -f flag is a shorthand for 'nothing'",
+     )
++    argparser.add_argument(
++        "--allow-nonlocal-files",
++        dest="allowNonlocalFiles",
++        action="store_true",
++        help="Allows Bikeshed to see/include files from folders higher than the one your source document is in."
++    )
++    argparser.add_argument(
++        "--allow-execute",
++        dest="allowExecute",
++        action="store_true",
++        help="Allow some features to execute arbitrary code from outside the Bikeshed codebase."
++    )
+ 
+     subparsers = argparser.add_subparsers(title="Subcommands", dest="subparserName")
+ 
+@@ -444,6 +456,8 @@ def main():
+             constants.printMode = "console"
+     else:
+         constants.printMode = options.printMode
++    constants.chroot = not options.allowNonlocalFiles
++    constants.executeCode = options.allowExecute
+ 
+     update.fixupDataFiles()
+     if options.subparserName == "update":
+diff --git a/bikeshed/config/main.py b/bikeshed/config/main.py
+index 92b3f7bfc6..6edcd3ec57 100644
+--- a/bikeshed/config/main.py
++++ b/bikeshed/config/main.py
+@@ -4,6 +4,9 @@
+ 
+ import lxml
+ 
++from .. import constants
++from .. import messages
++
+ 
+ def englishFromList(items, conjunction="or"):
+     # Format a list of strings into an English list.
+@@ -168,7 +171,19 @@ def flatten(arr):
+ 
+ def scriptPath(*pathSegs):
+     startPath = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+-    return os.path.join(startPath, *pathSegs)
++    path = os.path.join(startPath, *pathSegs)
++    return path
++
++
++def chrootPath(chrootPath, path):
++    chrootPath = os.path.abspath(chrootPath)
++    path = os.path.abspath(path)
++    if not path.startswith(chrootPath):
++        messages.die(f"Attempted to access a file ({path}) outside the source document's directory ({chrootPath}). See --allow-nonlocal-files.")
++        raise Exception()
++    else:
++        return path
++
+ 
+ 
+ def doEvery(s, action, lastTime=None):
+diff --git a/bikeshed/config/retrieve.py b/bikeshed/config/retrieve.py
+index bfc9dee647..5c372522a6 100644
+--- a/bikeshed/config/retrieve.py
++++ b/bikeshed/config/retrieve.py
+@@ -63,7 +63,7 @@ def _fail(self, location, str, okayToFail):
+ )
+ 
+ 
+-def retrieveBoilerplateFile(doc, name, group=None, status=None, error=True):
++def retrieveBoilerplateFile(doc, name, group=None, status=None, error=True, allowLocal=True):
+     # Looks in three or four locations, in order:
+     # the folder the spec source is in, the group's boilerplate folder, the megagroup's boilerplate folder, and the generic boilerplate folder.
+     # In each location, it first looks for the file specialized on status, and then for the generic file.
+@@ -77,7 +77,7 @@ def retrieveBoilerplateFile(doc, name, group=None, status=None, error=True):
+             status = doc.md.rawStatus
+     megaGroup, status = splitStatus(status)
+ 
+-    searchLocally = doc.md.localBoilerplate[name]
++    searchLocally = allowLocal and doc.md.localBoilerplate[name]
+ 
+     def boilerplatePath(*segs):
+         return scriptPath("boilerplate", *segs)
+@@ -101,13 +101,13 @@ def boilerplatePath(*segs):
+                 # We should remove this after giving specs time to react to the warning:
+                 sources.append(doc.inputSource.relative(f))
+     if group:
+-        sources.append(InputSource(boilerplatePath(group, statusFile)))
+-        sources.append(InputSource(boilerplatePath(group, genericFile)))
++        sources.append(InputSource(boilerplatePath(group, statusFile), chroot=False))
++        sources.append(InputSource(boilerplatePath(group, genericFile), chroot=False))
+     if megaGroup:
+-        sources.append(InputSource(boilerplatePath(megaGroup, statusFile)))
+-        sources.append(InputSource(boilerplatePath(megaGroup, genericFile)))
+-    sources.append(InputSource(boilerplatePath(statusFile)))
+-    sources.append(InputSource(boilerplatePath(genericFile)))
++        sources.append(InputSource(boilerplatePath(megaGroup, statusFile), chroot=False))
++        sources.append(InputSource(boilerplatePath(megaGroup, genericFile), chroot=False))
++    sources.append(InputSource(boilerplatePath(statusFile), chroot=False))
++    sources.append(InputSource(boilerplatePath(genericFile), chroot=False))
+ 
+     # Watch all the possible sources, not just the one that got used, because if
+     # an earlier one appears, we want to rebuild.
+diff --git a/bikeshed/constants.py b/bikeshed/constants.py
+index 0d7bf59070..7290ef92ad 100644
+--- a/bikeshed/constants.py
++++ b/bikeshed/constants.py
+@@ -9,6 +9,8 @@
+ biblioDisplay = StringEnum("index", "inline")
+ specClass = None
+ testAnnotationURL = "https://test.csswg.org/harness/annotate.js"
++chroot = True
++executeCode = False
+ 
+ 
+ def errorLevelAt(target):
+diff --git a/bikeshed/extensions.py b/bikeshed/extensions.py
+index 02e4f64fcc..362d6d8936 100644
+--- a/bikeshed/extensions.py
++++ b/bikeshed/extensions.py
+@@ -1,8 +1,9 @@
+ from . import config
++from . import constants
+ from .h import *  # noqa: F401
+ from .messages import *  # noqa: F401
+ 
+ 
+ def load(doc):
+-    code = config.retrieveBoilerplateFile(doc, "bs-extensions")
++    code = config.retrieveBoilerplateFile(doc, "bs-extensions", allowLocal=constants.executeCode)
+     exec(code, globals())
+diff --git a/bikeshed/inlineTags/__init__.py b/bikeshed/inlineTags/__init__.py
+index d259b520dc..999d6d8f23 100644
+--- a/bikeshed/inlineTags/__init__.py
++++ b/bikeshed/inlineTags/__init__.py
+@@ -1,11 +1,15 @@
+ from subprocess import PIPE, Popen
+ 
++from .. import constants
+ from ..h import *
+ from ..messages import *
+ 
+ 
+ def processTags(doc):
+     for el in findAll("[data-span-tag]", doc):
++        if not constants.executeCode:
++            die("Found an inline code tag, but arbitrary code execution isn't allowed. See the --allow-execute flag.")
++            return
+         tag = el.get("data-span-tag")
+         if tag not in doc.md.inlineTagCommands:
+             die("Unknown inline tag '{0}' found:\n  {1}", tag, outerHTML(el), el=el)

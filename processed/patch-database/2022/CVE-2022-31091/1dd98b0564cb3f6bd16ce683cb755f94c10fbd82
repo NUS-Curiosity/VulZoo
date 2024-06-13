@@ -1,0 +1,322 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 241443f2b..3aaf11bf9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ Please refer to [UPGRADING](UPGRADING.md) guide for upgrading to a major version.
+ 
++## 7.4.5 - 2022-06-20
++
++* Fix change in port should be considered a change in origin
++* Fix `CURLOPT_HTTPAUTH` option not cleared on change of origin
++
+ ## 7.4.4 - 2022-06-09
+ 
+ * Fix failure to strip Authorization header on HTTP downgrade
+diff --git a/README.md b/README.md
+index c96b246eb..f287fa98d 100644
+--- a/README.md
++++ b/README.md
+@@ -44,7 +44,7 @@ We use GitHub issues only to discuss bugs and new features. For support please r
+ 
+ - [Documentation](https://docs.guzzlephp.org)
+ - [Stack Overflow](https://stackoverflow.com/questions/tagged/guzzle)
+-- [#guzzle](https://app.slack.com/client/T0D2S9JCT/CE6UAAKL4) channel on [PHP-HTTP Slack](http://slack.httplug.io/)
++- [#guzzle](https://app.slack.com/client/T0D2S9JCT/CE6UAAKL4) channel on [PHP-HTTP Slack](https://slack.httplug.io/)
+ - [Gitter](https://gitter.im/guzzle/guzzle)
+ 
+ 
+@@ -73,10 +73,10 @@ composer require guzzlehttp/guzzle
+ [guzzle-5-repo]: https://github.com/guzzle/guzzle/tree/5.3
+ [guzzle-6-repo]: https://github.com/guzzle/guzzle/tree/6.5
+ [guzzle-7-repo]: https://github.com/guzzle/guzzle
+-[guzzle-3-docs]: http://guzzle3.readthedocs.org
+-[guzzle-5-docs]: http://docs.guzzlephp.org/en/5.3/
+-[guzzle-6-docs]: http://docs.guzzlephp.org/en/6.5/
+-[guzzle-7-docs]: http://docs.guzzlephp.org/en/latest/
++[guzzle-3-docs]: https://guzzle3.readthedocs.io/
++[guzzle-5-docs]: https://docs.guzzlephp.org/en/5.3/
++[guzzle-6-docs]: https://docs.guzzlephp.org/en/6.5/
++[guzzle-7-docs]: https://docs.guzzlephp.org/en/latest/
+ 
+ 
+ ## Security
+diff --git a/composer.json b/composer.json
+index 9d60de424..7e043b038 100644
+--- a/composer.json
++++ b/composer.json
+@@ -54,7 +54,7 @@
+         "php": "^7.2.5 || ^8.0",
+         "ext-json": "*",
+         "guzzlehttp/promises": "^1.5",
+-        "guzzlehttp/psr7": "^1.8.3 || ^2.1",
++        "guzzlehttp/psr7": "^1.9 || ^2.4",
+         "psr/http-client": "^1.0",
+         "symfony/deprecation-contracts": "^2.2 || ^3.0"
+     },
+diff --git a/src/RedirectMiddleware.php b/src/RedirectMiddleware.php
+index cedad4e77..f67d448be 100644
+--- a/src/RedirectMiddleware.php
++++ b/src/RedirectMiddleware.php
+@@ -88,10 +88,8 @@ public function checkRedirect(RequestInterface $request, array $options, Respons
+         $this->guardMax($request, $response, $options);
+         $nextRequest = $this->modifyRequest($request, $options, $response);
+ 
+-        // If authorization is handled by curl, unset it if host is different.
+-        if ($request->getUri()->getHost() !== $nextRequest->getUri()->getHost()
+-            && defined('\CURLOPT_HTTPAUTH')
+-        ) {
++        // If authorization is handled by curl, unset it if URI is cross-origin.
++        if (Psr7\UriComparator::isCrossOrigin($request->getUri(), $nextRequest->getUri()) && defined('\CURLOPT_HTTPAUTH')) {
+             unset(
+                 $options['curl'][\CURLOPT_HTTPAUTH],
+                 $options['curl'][\CURLOPT_USERPWD]
+@@ -198,8 +196,8 @@ public function modifyRequest(RequestInterface $request, array $options, Respons
+             $modify['remove_headers'][] = 'Referer';
+         }
+ 
+-        // Remove Authorization and Cookie headers if required.
+-        if (self::shouldStripSensitiveHeaders($request->getUri(), $modify['uri'])) {
++        // Remove Authorization and Cookie headers if URI is cross-origin.
++        if (Psr7\UriComparator::isCrossOrigin($request->getUri(), $modify['uri'])) {
+             $modify['remove_headers'][] = 'Authorization';
+             $modify['remove_headers'][] = 'Cookie';
+         }
+@@ -207,29 +205,6 @@ public function modifyRequest(RequestInterface $request, array $options, Respons
+         return Psr7\Utils::modifyRequest($request, $modify);
+     }
+ 
+-    /**
+-     * Determine if we should strip sensitive headers from the request.
+-     *
+-     * We return true if either of the following conditions are true:
+-     *
+-     * 1. the host is different;
+-     * 2. the scheme has changed, and now is non-https.
+-     */
+-    private static function shouldStripSensitiveHeaders(
+-        UriInterface $originalUri,
+-        UriInterface $modifiedUri
+-    ): bool {
+-        if (\strcasecmp($originalUri->getHost(), $modifiedUri->getHost()) !== 0) {
+-            return true;
+-        }
+-
+-        if ($originalUri->getScheme() !== $modifiedUri->getScheme() && 'https' !== $modifiedUri->getScheme()) {
+-            return true;
+-        }
+-
+-        return false;
+-    }
+-
+     /**
+      * Set the appropriate URL on the request based on the location header.
+      */
+diff --git a/tests/RedirectMiddlewareTest.php b/tests/RedirectMiddlewareTest.php
+index 3378d241d..5ca36ccb7 100644
+--- a/tests/RedirectMiddlewareTest.php
++++ b/tests/RedirectMiddlewareTest.php
+@@ -272,65 +272,105 @@ public function testInvokesOnRedirectForRedirects()
+         self::assertTrue($call);
+     }
+ 
+-    public function crossOriginRedirectProvider()
++    /**
++     * @testWith ["digest"]
++     *           ["ntlm"]
++     */
++    public function testRemoveCurlAuthorizationOptionsOnRedirectCrossHost($auth)
+     {
+-        return [
+-            ['http://example.com?a=b', 'http://test.com/', false],
+-            ['https://example.com?a=b', 'https://test.com/', false],
+-            ['http://example.com?a=b', 'https://test.com/', false],
+-            ['https://example.com?a=b', 'http://test.com/', false],
+-            ['http://example.com?a=b', 'http://example.com/', true],
+-            ['https://example.com?a=b', 'https://example.com/', true],
+-            ['http://example.com?a=b', 'https://example.com/', true],
+-            ['https://example.com?a=b', 'http://example.com/', false],
+-        ];
++        if (!defined('\CURLOPT_HTTPAUTH')) {
++            self::markTestSkipped('ext-curl is required for this test');
++        }
++
++        $mock = new MockHandler([
++            new Response(302, ['Location' => 'http://test.com']),
++            static function (RequestInterface $request, $options) {
++                self::assertFalse(
++                    isset($options['curl'][\CURLOPT_HTTPAUTH]),
++                    'curl options still contain CURLOPT_HTTPAUTH entry'
++                );
++                self::assertFalse(
++                    isset($options['curl'][\CURLOPT_USERPWD]),
++                    'curl options still contain CURLOPT_USERPWD entry'
++                );
++                return new Response(200);
++            }
++        ]);
++        $handler = HandlerStack::create($mock);
++        $client = new Client(['handler' => $handler]);
++        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
+     }
+ 
+     /**
+-     * @dataProvider crossOriginRedirectProvider
++     * @testWith ["digest"]
++     *           ["ntlm"]
+      */
+-    public function testHeadersTreatmentOnRedirect($originalUri, $targetUri, $shouldBePresent)
++    public function testRemoveCurlAuthorizationOptionsOnRedirectCrossPort($auth)
+     {
+-        $mock = new MockHandler([
+-            new Response(302, ['Location' => $targetUri]),
+-            static function (RequestInterface $request) use ($shouldBePresent) {
+-                self::assertSame($shouldBePresent, $request->hasHeader('Authorization'));
+-                self::assertSame($shouldBePresent, $request->hasHeader('Cookie'));
++        if (!defined('\CURLOPT_HTTPAUTH')) {
++            self::markTestSkipped('ext-curl is required for this test');
++        }
+ 
++        $mock = new MockHandler([
++            new Response(302, ['Location' => 'http://example.com:81/']),
++            static function (RequestInterface $request, $options) {
++                self::assertFalse(
++                    isset($options['curl'][\CURLOPT_HTTPAUTH]),
++                    'curl options still contain CURLOPT_HTTPAUTH entry'
++                );
++                self::assertFalse(
++                    isset($options['curl'][\CURLOPT_USERPWD]),
++                    'curl options still contain CURLOPT_USERPWD entry'
++                );
+                 return new Response(200);
+             }
+         ]);
+         $handler = HandlerStack::create($mock);
+         $client = new Client(['handler' => $handler]);
+-        $client->get($originalUri, ['auth' => ['testuser', 'testpass'], 'headers' => ['Cookie' => 'foo=bar']]);
++        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
+     }
+ 
+-    public function testNotRemoveAuthorizationHeaderOnRedirect()
++    /**
++     * @testWith ["digest"]
++     *           ["ntlm"]
++     */
++    public function testRemoveCurlAuthorizationOptionsOnRedirectCrossScheme($auth)
+     {
++        if (!defined('\CURLOPT_HTTPAUTH')) {
++            self::markTestSkipped('ext-curl is required for this test');
++        }
++
+         $mock = new MockHandler([
+-            new Response(302, ['Location' => 'http://example.com/2']),
+-            static function (RequestInterface $request) {
+-                self::assertTrue($request->hasHeader('Authorization'));
++            new Response(302, ['Location' => 'http://example.com?a=b']),
++            static function (RequestInterface $request, $options) {
++                self::assertFalse(
++                    isset($options['curl'][\CURLOPT_HTTPAUTH]),
++                    'curl options still contain CURLOPT_HTTPAUTH entry'
++                );
++                self::assertFalse(
++                    isset($options['curl'][\CURLOPT_USERPWD]),
++                    'curl options still contain CURLOPT_USERPWD entry'
++                );
+                 return new Response(200);
+             }
+         ]);
+         $handler = HandlerStack::create($mock);
+         $client = new Client(['handler' => $handler]);
+-        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass']]);
++        $client->get('https://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
+     }
+ 
+     /**
+      * @testWith ["digest"]
+      *           ["ntlm"]
+      */
+-    public function testRemoveCurlAuthorizationOptionsOnRedirect($auth)
++    public function testRemoveCurlAuthorizationOptionsOnRedirectCrossSchemeSamePort($auth)
+     {
+         if (!defined('\CURLOPT_HTTPAUTH')) {
+             self::markTestSkipped('ext-curl is required for this test');
+         }
+ 
+         $mock = new MockHandler([
+-            new Response(302, ['Location' => 'http://test.com']),
++            new Response(302, ['Location' => 'http://example.com:80?a=b']),
+             static function (RequestInterface $request, $options) {
+                 self::assertFalse(
+                     isset($options['curl'][\CURLOPT_HTTPAUTH]),
+@@ -345,7 +385,7 @@ static function (RequestInterface $request, $options) {
+         ]);
+         $handler = HandlerStack::create($mock);
+         $client = new Client(['handler' => $handler]);
+-        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
++        $client->get('https://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
+     }
+ 
+     /**
+@@ -377,6 +417,61 @@ static function (RequestInterface $request, $options) {
+         $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass', $auth]]);
+     }
+ 
++    public function crossOriginRedirectProvider()
++    {
++        return [
++            ['http://example.com/123', 'http://example.com/', false],
++            ['http://example.com/123', 'http://example.com:80/', false],
++            ['http://example.com:80/123', 'http://example.com/', false],
++            ['http://example.com:80/123', 'http://example.com:80/', false],
++            ['http://example.com/123', 'https://example.com/', true],
++            ['http://example.com/123', 'http://www.example.com/', true],
++            ['http://example.com/123', 'http://example.com:81/', true],
++            ['http://example.com:80/123', 'http://example.com:81/', true],
++            ['https://example.com/123', 'https://example.com/', false],
++            ['https://example.com/123', 'https://example.com:443/', false],
++            ['https://example.com:443/123', 'https://example.com/', false],
++            ['https://example.com:443/123', 'https://example.com:443/', false],
++            ['https://example.com/123', 'http://example.com/', true],
++            ['https://example.com/123', 'https://www.example.com/', true],
++            ['https://example.com/123', 'https://example.com:444/', true],
++            ['https://example.com:443/123', 'https://example.com:444/', true],
++        ];
++    }
++
++    /**
++     * @dataProvider crossOriginRedirectProvider
++     */
++    public function testHeadersTreatmentOnRedirect($originalUri, $targetUri, $isCrossOrigin)
++    {
++        $mock = new MockHandler([
++            new Response(302, ['Location' => $targetUri]),
++            static function (RequestInterface $request) use ($isCrossOrigin) {
++                self::assertSame(!$isCrossOrigin, $request->hasHeader('Authorization'));
++                self::assertSame(!$isCrossOrigin, $request->hasHeader('Cookie'));
++
++                return new Response(200);
++            }
++        ]);
++        $handler = HandlerStack::create($mock);
++        $client = new Client(['handler' => $handler]);
++        $client->get($originalUri, ['auth' => ['testuser', 'testpass'], 'headers' => ['Cookie' => 'foo=bar']]);
++    }
++
++    public function testNotRemoveAuthorizationHeaderOnRedirect()
++    {
++        $mock = new MockHandler([
++            new Response(302, ['Location' => 'http://example.com/2']),
++            static function (RequestInterface $request) {
++                self::assertTrue($request->hasHeader('Authorization'));
++                return new Response(200);
++            }
++        ]);
++        $handler = HandlerStack::create($mock);
++        $client = new Client(['handler' => $handler]);
++        $client->get('http://example.com?a=b', ['auth' => ['testuser', 'testpass']]);
++    }
++
+     /**
+      * Verifies how RedirectMiddleware::modifyRequest() modifies the method and body of a request issued when
+      * encountering a redirect response.

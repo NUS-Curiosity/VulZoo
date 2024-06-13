@@ -1,0 +1,898 @@
+diff --git a/.eslintignore b/.eslintignore
+index 69e2292fe73..b138ca65627 100644
+--- a/.eslintignore
++++ b/.eslintignore
+@@ -55,3 +55,4 @@ ElectronClient/app/gui/ShareNoteDialog.js
+ ReactNativeClient/lib/JoplinServerApi.js
+ ReactNativeClient/PluginAssetsLoader.js
+ ReactNativeClient/lib/joplin-renderer/MdToHtml/rules/mermaid.js
++ReactNativeClient/lib/joplin-renderer/MdToHtml/rules/sanitize_html.js
+diff --git a/.gitignore b/.gitignore
+index 67cc93934eb..5b744d39d27 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -51,3 +51,4 @@ ElectronClient/app/gui/ShareNoteDialog.js
+ ReactNativeClient/lib/JoplinServerApi.js
+ ReactNativeClient/PluginAssetsLoader.js
+ ReactNativeClient/lib/joplin-renderer/MdToHtml/rules/mermaid.js
++ReactNativeClient/lib/joplin-renderer/MdToHtml/rules/sanitize_html.js
+diff --git a/CliClient/package-lock.json b/CliClient/package-lock.json
+index 0e93828c81b..47474167455 100644
+--- a/CliClient/package-lock.json
++++ b/CliClient/package-lock.json
+@@ -2667,6 +2667,11 @@
+       "resolved": "https://registry.npmjs.org/mdurl/-/mdurl-1.0.1.tgz",
+       "integrity": "sha1-/oWy7HWlkDfyrf7BAP1sYBdhFS4="
+     },
++    "memory-cache": {
++      "version": "0.2.0",
++      "resolved": "https://registry.npmjs.org/memory-cache/-/memory-cache-0.2.0.tgz",
++      "integrity": "sha1-eJCwHVLADI68nVM+H46xfjA0hxo="
++    },
+     "micromatch": {
+       "version": "3.1.10",
+       "resolved": "https://registry.npmjs.org/micromatch/-/micromatch-3.1.10.tgz",
+@@ -2920,6 +2925,15 @@
+         "is-stream": "^1.0.1"
+       }
+     },
++    "node-html-parser": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/node-html-parser/-/node-html-parser-1.2.4.tgz",
++      "integrity": "sha512-qHwPdGyGr9pOZBoSgUOuNPG20QYZVN00lFcxKQgjPUODSxVH7obQeLVVawa3B4cfSNtLIeczSzoy/xYA8XG5WQ==",
++      "dev": true,
++      "requires": {
++        "he": "1.1.1"
++      }
++    },
+     "node-persist": {
+       "version": "2.1.0",
+       "resolved": "https://registry.npmjs.org/node-persist/-/node-persist-2.1.0.tgz",
+diff --git a/CliClient/package.json b/CliClient/package.json
+index f3ecfa20872..1d4da230ee3 100644
+--- a/CliClient/package.json
++++ b/CliClient/package.json
+@@ -72,6 +72,7 @@
+     "markdown-it-toc-done-right": "^4.1.0",
+     "md5": "^2.2.1",
+     "md5-file": "^4.0.0",
++    "memory-cache": "^0.2.0",
+     "mime": "^2.0.3",
+     "moment": "^2.24.0",
+     "multiparty": "^4.2.1",
+@@ -104,7 +105,8 @@
+     "valid-url": "^1.0.9",
+     "word-wrap": "^1.2.3",
+     "xml2js": "^0.4.19",
+-    "yargs-parser": "^7.0.0"
++    "yargs-parser": "^7.0.0",
++    "node-html-parser": "^1.2.4"
+   },
+   "devDependencies": {
+     "jasmine": "^3.5.0"
+diff --git a/CliClient/tests/HtmlToHtml.js b/CliClient/tests/HtmlToHtml.js
+new file mode 100644
+index 00000000000..da614190af6
+--- /dev/null
++++ b/CliClient/tests/HtmlToHtml.js
+@@ -0,0 +1,79 @@
++/* eslint-disable no-unused-vars */
++
++require('app-module-path').addPath(__dirname);
++
++const os = require('os');
++const { time } = require('lib/time-utils.js');
++const { filename } = require('lib/path-utils.js');
++const { asyncTest, fileContentEqual, setupDatabase, setupDatabaseAndSynchronizer, db, synchronizer, fileApi, sleep, clearDatabase, switchClient, syncTargetId, objectsEqual, checkThrowAsync } = require('test-utils.js');
++const Folder = require('lib/models/Folder.js');
++const Note = require('lib/models/Note.js');
++const BaseModel = require('lib/BaseModel.js');
++const { shim } = require('lib/shim');
++const HtmlToHtml = require('lib/joplin-renderer/HtmlToHtml');
++const { enexXmlToMd } = require('lib/import-enex-md-gen.js');
++
++jasmine.DEFAULT_TIMEOUT_INTERVAL = 60 * 60 * 1000; // Can run for a while since everything is in the same test unit
++
++process.on('unhandledRejection', (reason, p) => {
++	console.log('Unhandled Rejection at: Promise', p, 'reason:', reason);
++});
++
++describe('HtmlToHtml', function() {
++
++	beforeEach(async (done) => {
++		await setupDatabaseAndSynchronizer(1);
++		await switchClient(1);
++		done();
++	});
++
++	it('should convert from Html to Html', asyncTest(async () => {
++		const basePath = `${__dirname}/html_to_html`;
++		const files = await shim.fsDriver().readDirStats(basePath);
++		const htmlToHtml = new HtmlToHtml();
++
++		for (let i = 0; i < files.length; i++) {
++			const htmlSourceFilename = files[i].path;
++			if (htmlSourceFilename.indexOf('.src.html') < 0) continue;
++
++			const htmlSourceFilePath = `${basePath}/${htmlSourceFilename}`;
++			const htmlDestPath = `${basePath}/${filename(filename(htmlSourceFilePath))}.dest.html`;
++
++			// if (htmlSourceFilename !== 'table_with_header.html') continue;
++
++			const htmlToHtmlOptions = {
++				bodyOnly: true,
++			};
++
++			const sourceHtml = await shim.fsDriver().readFile(htmlSourceFilePath);
++			let expectedHtml = await shim.fsDriver().readFile(htmlDestPath);
++
++			const result = await htmlToHtml.render(sourceHtml, null, htmlToHtmlOptions);
++			let actualHtml = result.html;
++
++			if (os.EOL === '\r\n') {
++				expectedHtml = expectedHtml.replace(/\r\n/g, '\n');
++				actualHtml = actualHtml.replace(/\r\n/g, '\n');
++			}
++
++			if (actualHtml !== expectedHtml) {
++				console.info('');
++				console.info(`Error converting file: ${htmlSourceFilename}`);
++				console.info('--------------------------------- Got:');
++				console.info(actualHtml);
++				console.info('--------------------------------- Raw:');
++				console.info(actualHtml.split('\n'));
++				console.info('--------------------------------- Expected:');
++				console.info(expectedHtml.split('\n'));
++				console.info('--------------------------------------------');
++				console.info('');
++
++				expect(false).toBe(true);
++				// return;
++			} else {
++				expect(true).toBe(true);
++			}
++		}
++	}));
++
++});
+diff --git a/CliClient/tests/MdToHtml.js b/CliClient/tests/MdToHtml.js
+new file mode 100644
+index 00000000000..e53ea49170b
+--- /dev/null
++++ b/CliClient/tests/MdToHtml.js
+@@ -0,0 +1,79 @@
++/* eslint-disable no-unused-vars */
++
++require('app-module-path').addPath(__dirname);
++
++const os = require('os');
++const { time } = require('lib/time-utils.js');
++const { filename } = require('lib/path-utils.js');
++const { asyncTest, fileContentEqual, setupDatabase, setupDatabaseAndSynchronizer, db, synchronizer, fileApi, sleep, clearDatabase, switchClient, syncTargetId, objectsEqual, checkThrowAsync } = require('test-utils.js');
++const Folder = require('lib/models/Folder.js');
++const Note = require('lib/models/Note.js');
++const BaseModel = require('lib/BaseModel.js');
++const { shim } = require('lib/shim');
++const MdToHtml = require('lib/joplin-renderer/MdToHtml');
++const { enexXmlToMd } = require('lib/import-enex-md-gen.js');
++
++jasmine.DEFAULT_TIMEOUT_INTERVAL = 60 * 60 * 1000; // Can run for a while since everything is in the same test unit
++
++process.on('unhandledRejection', (reason, p) => {
++	console.log('Unhandled Rejection at: Promise', p, 'reason:', reason);
++});
++
++describe('MdToHtml', function() {
++
++	beforeEach(async (done) => {
++		await setupDatabaseAndSynchronizer(1);
++		await switchClient(1);
++		done();
++	});
++
++	it('should convert from Markdown to Html', asyncTest(async () => {
++		const basePath = `${__dirname}/md_to_html`;
++		const files = await shim.fsDriver().readDirStats(basePath);
++		const mdToHtml = new MdToHtml();
++
++		for (let i = 0; i < files.length; i++) {
++			const mdFilename = files[i].path;
++			if (mdFilename.indexOf('.md') < 0) continue;
++
++			const mdFilePath = `${basePath}/${mdFilename}`;
++			const htmlPath = `${basePath}/${filename(mdFilePath)}.html`;
++
++			// if (mdFilename !== 'table_with_header.html') continue;
++
++			const mdToHtmlOptions = {
++				bodyOnly: true,
++			};
++
++			const markdown = await shim.fsDriver().readFile(mdFilePath);
++			let expectedHtml = await shim.fsDriver().readFile(htmlPath);
++
++			const result = await mdToHtml.render(markdown, null, mdToHtmlOptions);
++			let actualHtml = result.html;
++
++			if (os.EOL === '\r\n') {
++				expectedHtml = expectedHtml.replace(/\r\n/g, '\n');
++				actualHtml = actualHtml.replace(/\r\n/g, '\n');
++			}
++
++			if (actualHtml !== expectedHtml) {
++				console.info('');
++				console.info(`Error converting file: ${mdFilename}`);
++				console.info('--------------------------------- Got:');
++				console.info(actualHtml);
++				console.info('--------------------------------- Raw:');
++				console.info(actualHtml.split('\n'));
++				console.info('--------------------------------- Expected:');
++				console.info(expectedHtml.split('\n'));
++				console.info('--------------------------------------------');
++				console.info('');
++
++				expect(false).toBe(true);
++				// return;
++			} else {
++				expect(true).toBe(true);
++			}
++		}
++	}));
++
++});
+diff --git a/CliClient/tests/html_to_html/sanitize.dest.html b/CliClient/tests/html_to_html/sanitize.dest.html
+new file mode 100644
+index 00000000000..b0f104132fd
+--- /dev/null
++++ b/CliClient/tests/html_to_html/sanitize.dest.html
+@@ -0,0 +1,2 @@
++<img src onerror="" />
++<img src onerror="" />
+\ No newline at end of file
+diff --git a/CliClient/tests/html_to_html/sanitize.src.html b/CliClient/tests/html_to_html/sanitize.src.html
+new file mode 100644
+index 00000000000..7c16698dd9a
+--- /dev/null
++++ b/CliClient/tests/html_to_html/sanitize.src.html
+@@ -0,0 +1,3 @@
++<img src="" onerror="alert('ohno')"/>
++<img src=""
++   onerror="alert('ohno')"/>
+\ No newline at end of file
+diff --git a/CliClient/tests/md_to_html/sanitize.html b/CliClient/tests/md_to_html/sanitize.html
+new file mode 100644
+index 00000000000..b0f104132fd
+--- /dev/null
++++ b/CliClient/tests/md_to_html/sanitize.html
+@@ -0,0 +1,2 @@
++<img src onerror="" />
++<img src onerror="" />
+\ No newline at end of file
+diff --git a/CliClient/tests/md_to_html/sanitize.md b/CliClient/tests/md_to_html/sanitize.md
+new file mode 100644
+index 00000000000..7c16698dd9a
+--- /dev/null
++++ b/CliClient/tests/md_to_html/sanitize.md
+@@ -0,0 +1,3 @@
++<img src="" onerror="alert('ohno')"/>
++<img src=""
++   onerror="alert('ohno')"/>
+\ No newline at end of file
+diff --git a/Clipper/joplin-webclipper/content_scripts/index.js b/Clipper/joplin-webclipper/content_scripts/index.js
+index 772105a6106..7852ca66d8c 100644
+--- a/Clipper/joplin-webclipper/content_scripts/index.js
++++ b/Clipper/joplin-webclipper/content_scripts/index.js
+@@ -21,7 +21,7 @@
+ 	function absoluteUrl(url) {
+ 		if (!url) return url;
+ 		const protocol = url.toLowerCase().split(':')[0];
+-		if (['http', 'https', 'file'].indexOf(protocol) >= 0) return url;
++		if (['http', 'https', 'file', 'data'].indexOf(protocol) >= 0) return url;
+ 
+ 		if (url.indexOf('//') === 0) {
+ 			return location.protocol + url;
+diff --git a/ElectronClient/app/package-lock.json b/ElectronClient/app/package-lock.json
+index 77e1c284a47..cc833ecca8b 100644
+--- a/ElectronClient/app/package-lock.json
++++ b/ElectronClient/app/package-lock.json
+@@ -2233,10 +2233,68 @@
+         "minimist": "^1.1.1"
+       },
+       "dependencies": {
++        "domelementtype": {
++          "version": "1.3.1",
++          "resolved": "https://registry.npmjs.org/domelementtype/-/domelementtype-1.3.1.tgz",
++          "integrity": "sha512-BSKB+TSpMpFI/HOxCNr1O8aMOTZ8hT3pM3GQ0w/mWRmkhEDSFJkkyzz4XQsBV44BChwGkrDfMyjVD0eA2aFV3w=="
++        },
++        "domhandler": {
++          "version": "2.4.2",
++          "resolved": "https://registry.npmjs.org/domhandler/-/domhandler-2.4.2.tgz",
++          "integrity": "sha512-JiK04h0Ht5u/80fdLMCEmV4zkNh2BcoMFBmZ/91WtYZ8qVXSKjiw7fXMgFPnHcSZgOo3XdinHvmnDUeMf5R4wA==",
++          "requires": {
++            "domelementtype": "1"
++          }
++        },
++        "domutils": {
++          "version": "1.7.0",
++          "resolved": "https://registry.npmjs.org/domutils/-/domutils-1.7.0.tgz",
++          "integrity": "sha512-Lgd2XcJ/NjEw+7tFvfKxOzCYKZsdct5lczQ2ZaQY8Djz7pfAD3Gbp8ySJWtreII/vDlMVmxwa6pHmdxIYgttDg==",
++          "requires": {
++            "dom-serializer": "0",
++            "domelementtype": "1"
++          }
++        },
++        "htmlparser2": {
++          "version": "3.10.1",
++          "resolved": "https://registry.npmjs.org/htmlparser2/-/htmlparser2-3.10.1.tgz",
++          "integrity": "sha512-IgieNijUMbkDovyoKObU1DUhm1iwNYE/fuifEoEHfd1oZKZDaONBSkal7Y01shxsM49R4XaMdGez3WnF9UfiCQ==",
++          "requires": {
++            "domelementtype": "^1.3.1",
++            "domhandler": "^2.3.0",
++            "domutils": "^1.5.1",
++            "entities": "^1.1.1",
++            "inherits": "^2.0.1",
++            "readable-stream": "^3.1.1"
++          }
++        },
+         "minimist": {
+           "version": "1.2.0",
+           "resolved": "https://registry.npmjs.org/minimist/-/minimist-1.2.0.tgz",
+           "integrity": "sha1-o1AIsg9BOD7sH7kU9M1d95omQoQ="
++        },
++        "readable-stream": {
++          "version": "3.6.0",
++          "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.6.0.tgz",
++          "integrity": "sha512-BViHy7LKeTz4oNnkcLJ+lVSL6vpiFeX6/d3oSH8zCW7UxP2onchk+vTGB143xuFjHS3deTgkKoXXymXqymiIdA==",
++          "requires": {
++            "inherits": "^2.0.3",
++            "string_decoder": "^1.1.1",
++            "util-deprecate": "^1.0.1"
++          }
++        },
++        "safe-buffer": {
++          "version": "5.2.0",
++          "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.2.0.tgz",
++          "integrity": "sha512-fZEwUGbVl7kouZs1jCdMLdt95hdIv0ZeHg6L7qPeciMZhZ+/gdesW4wgTARkrFWEpspjEATAzUGPG8N2jJiwbg=="
++        },
++        "string_decoder": {
++          "version": "1.3.0",
++          "resolved": "https://registry.npmjs.org/string_decoder/-/string_decoder-1.3.0.tgz",
++          "integrity": "sha512-hkRX8U1WjJFd8LsDJ2yQ/wWWxaopEsABU1XfkM8A+j0+85JAGppt16cr1Whg6KIbb4okU6Mql6BOj+uup/wKeA==",
++          "requires": {
++            "safe-buffer": "~5.2.0"
++          }
+         }
+       }
+     },
+@@ -3158,19 +3216,14 @@
+       }
+     },
+     "dom-serializer": {
+-      "version": "0.2.1",
+-      "resolved": "https://registry.npmjs.org/dom-serializer/-/dom-serializer-0.2.1.tgz",
+-      "integrity": "sha512-sK3ujri04WyjwQXVoK4PU3y8ula1stq10GJZpqHIUgoGZdsGzAGu65BnU3d08aTVSvO7mGPZUc0wTEDL+qGE0Q==",
++      "version": "0.2.2",
++      "resolved": "https://registry.npmjs.org/dom-serializer/-/dom-serializer-0.2.2.tgz",
++      "integrity": "sha512-2/xPb3ORsQ42nHYiSunXkDjPLBaEj/xTwUO4B7XCZQTRk7EBtTOPaygh10YAAh2OI1Qrp6NWfpAhzswj0ydt9g==",
+       "requires": {
+         "domelementtype": "^2.0.1",
+         "entities": "^2.0.0"
+       },
+       "dependencies": {
+-        "domelementtype": {
+-          "version": "2.0.1",
+-          "resolved": "https://registry.npmjs.org/domelementtype/-/domelementtype-2.0.1.tgz",
+-          "integrity": "sha512-5HOHUDsYZWV8FGWN0Njbr/Rn7f/eWSQi1v7+HsUVwXgn8nWWlL64zKDkS0n8ZmQ3mlWOMuXOnR+7Nx/5tMO5AQ=="
+-        },
+         "entities": {
+           "version": "2.0.0",
+           "resolved": "https://registry.npmjs.org/entities/-/entities-2.0.0.tgz",
+@@ -3179,9 +3232,9 @@
+       }
+     },
+     "domelementtype": {
+-      "version": "1.3.1",
+-      "resolved": "https://registry.npmjs.org/domelementtype/-/domelementtype-1.3.1.tgz",
+-      "integrity": "sha512-BSKB+TSpMpFI/HOxCNr1O8aMOTZ8hT3pM3GQ0w/mWRmkhEDSFJkkyzz4XQsBV44BChwGkrDfMyjVD0eA2aFV3w=="
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/domelementtype/-/domelementtype-2.0.1.tgz",
++      "integrity": "sha512-5HOHUDsYZWV8FGWN0Njbr/Rn7f/eWSQi1v7+HsUVwXgn8nWWlL64zKDkS0n8ZmQ3mlWOMuXOnR+7Nx/5tMO5AQ=="
+     },
+     "domexception": {
+       "version": "1.0.1",
+@@ -3192,20 +3245,21 @@
+       }
+     },
+     "domhandler": {
+-      "version": "2.4.2",
+-      "resolved": "https://registry.npmjs.org/domhandler/-/domhandler-2.4.2.tgz",
+-      "integrity": "sha512-JiK04h0Ht5u/80fdLMCEmV4zkNh2BcoMFBmZ/91WtYZ8qVXSKjiw7fXMgFPnHcSZgOo3XdinHvmnDUeMf5R4wA==",
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/domhandler/-/domhandler-3.0.0.tgz",
++      "integrity": "sha512-eKLdI5v9m67kbXQbJSNn1zjh0SDzvzWVWtX+qEI3eMjZw8daH9k8rlj1FZY9memPwjiskQFbe7vHVVJIAqoEhw==",
+       "requires": {
+-        "domelementtype": "1"
++        "domelementtype": "^2.0.1"
+       }
+     },
+     "domutils": {
+-      "version": "1.7.0",
+-      "resolved": "https://registry.npmjs.org/domutils/-/domutils-1.7.0.tgz",
+-      "integrity": "sha512-Lgd2XcJ/NjEw+7tFvfKxOzCYKZsdct5lczQ2ZaQY8Djz7pfAD3Gbp8ySJWtreII/vDlMVmxwa6pHmdxIYgttDg==",
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/domutils/-/domutils-2.0.0.tgz",
++      "integrity": "sha512-n5SelJ1axbO636c2yUtOGia/IcJtVtlhQbFiVDBZHKV5ReJO1ViX7sFEemtuyoAnBxk5meNSYgA8V4s0271efg==",
+       "requires": {
+-        "dom-serializer": "0",
+-        "domelementtype": "1"
++        "dom-serializer": "^0.2.1",
++        "domelementtype": "^2.0.1",
++        "domhandler": "^3.0.0"
+       }
+     },
+     "dot-prop": {
+@@ -4640,40 +4694,20 @@
+       }
+     },
+     "htmlparser2": {
+-      "version": "3.10.1",
+-      "resolved": "https://registry.npmjs.org/htmlparser2/-/htmlparser2-3.10.1.tgz",
+-      "integrity": "sha512-IgieNijUMbkDovyoKObU1DUhm1iwNYE/fuifEoEHfd1oZKZDaONBSkal7Y01shxsM49R4XaMdGez3WnF9UfiCQ==",
+-      "requires": {
+-        "domelementtype": "^1.3.1",
+-        "domhandler": "^2.3.0",
+-        "domutils": "^1.5.1",
+-        "entities": "^1.1.1",
+-        "inherits": "^2.0.1",
+-        "readable-stream": "^3.1.1"
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/htmlparser2/-/htmlparser2-4.0.0.tgz",
++      "integrity": "sha512-cChwXn5Vam57fyXajDtPXL1wTYc8JtLbr2TN76FYu05itVVVealxLowe2B3IEznJG4p9HAYn/0tJaRlGuEglFQ==",
++      "requires": {
++        "domelementtype": "^2.0.1",
++        "domhandler": "^3.0.0",
++        "domutils": "^2.0.0",
++        "entities": "^2.0.0"
+       },
+       "dependencies": {
+-        "readable-stream": {
+-          "version": "3.4.0",
+-          "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.4.0.tgz",
+-          "integrity": "sha512-jItXPLmrSR8jmTRmRWJXCnGJsfy85mB3Wd/uINMXA65yrnFo0cPClFIUWzo2najVNSl+mx7/4W8ttlLWJe99pQ==",
+-          "requires": {
+-            "inherits": "^2.0.3",
+-            "string_decoder": "^1.1.1",
+-            "util-deprecate": "^1.0.1"
+-          }
+-        },
+-        "safe-buffer": {
+-          "version": "5.2.0",
+-          "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.2.0.tgz",
+-          "integrity": "sha512-fZEwUGbVl7kouZs1jCdMLdt95hdIv0ZeHg6L7qPeciMZhZ+/gdesW4wgTARkrFWEpspjEATAzUGPG8N2jJiwbg=="
+-        },
+-        "string_decoder": {
+-          "version": "1.3.0",
+-          "resolved": "https://registry.npmjs.org/string_decoder/-/string_decoder-1.3.0.tgz",
+-          "integrity": "sha512-hkRX8U1WjJFd8LsDJ2yQ/wWWxaopEsABU1XfkM8A+j0+85JAGppt16cr1Whg6KIbb4okU6Mql6BOj+uup/wKeA==",
+-          "requires": {
+-            "safe-buffer": "~5.2.0"
+-          }
++        "entities": {
++          "version": "2.0.0",
++          "resolved": "https://registry.npmjs.org/entities/-/entities-2.0.0.tgz",
++          "integrity": "sha512-D9f7V0JSRwIxlRI2mjMqufDrRDnx8p+eEOz7aUM9SuvF8gsBzra0/6tbjl1m8eQHrZlYj6PxqE00hZ1SAIKPLw=="
+         }
+       }
+     },
+@@ -5582,6 +5616,11 @@
+       "resolved": "https://registry.npmjs.org/memoize-one/-/memoize-one-5.0.4.tgz",
+       "integrity": "sha512-P0z5IeAH6qHHGkJIXWw0xC2HNEgkx/9uWWBQw64FJj3/ol14VYdfVGWWr0fXfjhhv3TKVIqUq65os6O4GUNksA=="
+     },
++    "memory-cache": {
++      "version": "0.2.0",
++      "resolved": "https://registry.npmjs.org/memory-cache/-/memory-cache-0.2.0.tgz",
++      "integrity": "sha1-eJCwHVLADI68nVM+H46xfjA0hxo="
++    },
+     "mermaid": {
+       "version": "8.4.6",
+       "resolved": "https://registry.npmjs.org/mermaid/-/mermaid-8.4.6.tgz",
+@@ -6183,6 +6222,21 @@
+         }
+       }
+     },
++    "node-html-parser": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/node-html-parser/-/node-html-parser-1.2.4.tgz",
++      "integrity": "sha512-qHwPdGyGr9pOZBoSgUOuNPG20QYZVN00lFcxKQgjPUODSxVH7obQeLVVawa3B4cfSNtLIeczSzoy/xYA8XG5WQ==",
++      "requires": {
++        "he": "1.1.1"
++      },
++      "dependencies": {
++        "he": {
++          "version": "1.1.1",
++          "resolved": "https://registry.npmjs.org/he/-/he-1.1.1.tgz",
++          "integrity": "sha1-k0EP0hsAlzUVH4howvJx80J+I/0="
++        }
++      }
++    },
+     "node-notifier": {
+       "version": "6.0.0",
+       "resolved": "https://registry.npmjs.org/node-notifier/-/node-notifier-6.0.0.tgz",
+diff --git a/ElectronClient/app/package.json b/ElectronClient/app/package.json
+index 323c300500b..c2e1c6bfe82 100644
+--- a/ElectronClient/app/package.json
++++ b/ElectronClient/app/package.json
+@@ -131,11 +131,13 @@
+     "markdown-it-toc-done-right": "^4.1.0",
+     "md5": "^2.2.1",
+     "md5-file": "^4.0.0",
++    "memory-cache": "^0.2.0",
+     "mermaid": "^8.4.6",
+     "moment": "^2.22.2",
+     "multiparty": "^4.2.1",
+     "mustache": "^3.0.1",
+     "node-fetch": "^1.7.3",
++    "node-html-parser": "^1.2.4",
+     "node-notifier": "^6.0.0",
+     "promise": "^8.0.1",
+     "query-string": "^5.1.1",
+diff --git a/ElectronClient/build.sh b/ElectronClient/build.sh
+index 76193518f42..f39c91926a9 100755
+--- a/ElectronClient/build.sh
++++ b/ElectronClient/build.sh
+@@ -5,8 +5,8 @@ BUILD_DIR="$ROOT_DIR/app"
+ 
+ rsync -a --delete "$ROOT_DIR/../ReactNativeClient/lib/" "$BUILD_DIR/lib/"
+ 
+-cd "$ROOT_DIR/.."
+-npm run tsc
++# cd "$ROOT_DIR/.."
++# npm run tsc
+ 
+ cd "$BUILD_DIR"
+ npm run compile
+diff --git a/ReactNativeClient/lib/BaseApplication.js b/ReactNativeClient/lib/BaseApplication.js
+index 1ae4a52f009..32d40074e23 100644
+--- a/ReactNativeClient/lib/BaseApplication.js
++++ b/ReactNativeClient/lib/BaseApplication.js
+@@ -539,27 +539,6 @@ class BaseApplication {
+ 		return `${os.homedir()}/.config/${Setting.value('appName')}`;
+ 	}
+ 
+-	async testing() {
+-		const markdownUtils = require('lib/markdownUtils');
+-		const ClipperServer = require('lib/ClipperServer');
+-		const server = new ClipperServer();
+-		const HtmlToMd = require('lib/HtmlToMd');
+-		const service = new HtmlToMd();
+-		const html = await shim.fsDriver().readFile('/mnt/d/test.html');
+-		let markdown = service.parse(html, { baseUrl: 'https://duckduckgo.com/' });
+-		console.info(markdown);
+-		console.info('--------------------------------------------------');
+-
+-		const imageUrls = markdownUtils.extractImageUrls(markdown);
+-		let result = await server.downloadImages_(imageUrls);
+-		result = await server.createResourcesFromPaths_(result);
+-		console.info(result);
+-		markdown = server.replaceImageUrlsByResources_(markdown, result);
+-		console.info('--------------------------------------------------');
+-		console.info(markdown);
+-		console.info('--------------------------------------------------');
+-	}
+-
+ 	async start(argv) {
+ 		let startFlags = await this.handleStartFlags_(argv);
+ 
+diff --git a/ReactNativeClient/lib/joplin-renderer/HtmlToHtml.js b/ReactNativeClient/lib/joplin-renderer/HtmlToHtml.js
+index 0a929c4ec9f..0afb76b18a3 100644
+--- a/ReactNativeClient/lib/joplin-renderer/HtmlToHtml.js
++++ b/ReactNativeClient/lib/joplin-renderer/HtmlToHtml.js
+@@ -1,33 +1,50 @@
+ const htmlUtils = require('./htmlUtils');
+ const utils = require('./utils');
+ const noteStyle = require('./noteStyle');
++const memoryCache = require('memory-cache');
++const md5 = require('md5');
+ 
+ class HtmlToHtml {
+ 	constructor(options) {
+ 		if (!options) options = {};
+ 		this.resourceBaseUrl_ = 'resourceBaseUrl' in options ? options.resourceBaseUrl : null;
+ 		this.ResourceModel_ = options.ResourceModel;
++		this.cache_ = new memoryCache.Cache();
+ 	}
+ 
+-	render(markup, theme, options) {
+-		const html = htmlUtils.processImageTags(markup, data => {
+-			if (!data.src) return null;
+-
+-			const r = utils.imageReplacement(this.ResourceModel_, data.src, options.resources, this.resourceBaseUrl_);
+-			if (!r) return null;
+-
+-			if (typeof r === 'string') {
+-				return {
+-					type: 'replaceElement',
+-					html: r,
+-				};
+-			} else {
+-				return {
+-					type: 'setAttributes',
+-					attrs: r,
+-				};
+-			}
+-		});
++	async render(markup, theme, options) {
++		const cacheKey = md5(escape(markup));
++		let html = this.cache_.get(cacheKey);
++
++		if (!html) {
++			html = htmlUtils.sanitizeHtml(markup);
++
++			html = htmlUtils.processImageTags(html, data => {
++				if (!data.src) return null;
++
++				const r = utils.imageReplacement(this.ResourceModel_, data.src, options.resources, this.resourceBaseUrl_);
++				if (!r) return null;
++
++				if (typeof r === 'string') {
++					return {
++						type: 'replaceElement',
++						html: r,
++					};
++				} else {
++					return {
++						type: 'setAttributes',
++						attrs: r,
++					};
++				}
++			});
++		}
++
++		if (options.bodyOnly) return {
++			html: html,
++			pluginAssets: [],
++		};
++
++		this.cache_.put(cacheKey, html, 1000 * 60 * 10);
+ 
+ 		const cssStrings = noteStyle(theme, options);
+ 		const styleHtml = `<style>${cssStrings.join('\n')}</style>`;
+diff --git a/ReactNativeClient/lib/joplin-renderer/MarkupToHtml.js b/ReactNativeClient/lib/joplin-renderer/MarkupToHtml.js
+index 9b1f68c0c1b..8c186949cc7 100644
+--- a/ReactNativeClient/lib/joplin-renderer/MarkupToHtml.js
++++ b/ReactNativeClient/lib/joplin-renderer/MarkupToHtml.js
+@@ -33,7 +33,7 @@ class MarkupToHtml {
+ 		return '';
+ 	}
+ 
+-	render(markupLanguage, markup, theme, options) {
++	async render(markupLanguage, markup, theme, options) {
+ 		return this.renderer(markupLanguage).render(markup, theme, options);
+ 	}
+ }
+diff --git a/ReactNativeClient/lib/joplin-renderer/MdToHtml.js b/ReactNativeClient/lib/joplin-renderer/MdToHtml.js
+index 2f29dca3c1a..c0980c430eb 100644
+--- a/ReactNativeClient/lib/joplin-renderer/MdToHtml.js
++++ b/ReactNativeClient/lib/joplin-renderer/MdToHtml.js
+@@ -2,6 +2,7 @@ const MarkdownIt = require('markdown-it');
+ const md5 = require('md5');
+ const noteStyle = require('./noteStyle');
+ const { fileExtension } = require('./pathUtils');
++const memoryCache = require('memory-cache');
+ const rules = {
+ 	image: require('./MdToHtml/rules/image'),
+ 	checkbox: require('./MdToHtml/rules/checkbox'),
+@@ -12,6 +13,7 @@ const rules = {
+ 	code_inline: require('./MdToHtml/rules/code_inline'),
+ 	fountain: require('./MdToHtml/rules/fountain'),
+ 	mermaid: require('./MdToHtml/rules/mermaid').default,
++	sanitize_html: require('./MdToHtml/rules/sanitize_html').default,
+ };
+ const setupLinkify = require('./MdToHtml/setupLinkify');
+ const hljs = require('highlight.js');
+@@ -50,6 +52,7 @@ class MdToHtml {
+ 		this.cachedHighlightedCode_ = {};
+ 		this.ResourceModel_ = options.ResourceModel;
+ 		this.pluginOptions_ = options.pluginOptions ? options.pluginOptions : {};
++		this.contextCache_ = new memoryCache.Cache();
+ 	}
+ 
+ 	pluginOptions(name) {
+@@ -106,6 +109,7 @@ class MdToHtml {
+ 
+ 	async render(body, style = null, options = null) {
+ 		if (!options) options = {};
++		if (!('bodyOnly' in options)) options.bodyOnly = false;
+ 		if (!options.postMessageSyntax) options.postMessageSyntax = 'postMessage';
+ 		if (!options.paddingBottom) options.paddingBottom = '0';
+ 		if (!options.highlightedKeywords) options.highlightedKeywords = [];
+@@ -129,6 +133,7 @@ class MdToHtml {
+ 		const context = {
+ 			css: {},
+ 			pluginAssets: {},
++			cache: this.contextCache_,
+ 		};
+ 
+ 		const ruleOptions = Object.assign({}, options, {
+@@ -203,6 +208,7 @@ class MdToHtml {
+ 		if (this.pluginEnabled('katex')) markdownIt.use(rules.katex(context, ruleOptions));
+ 		if (this.pluginEnabled('fountain')) markdownIt.use(rules.fountain(context, ruleOptions));
+ 		if (this.pluginEnabled('mermaid')) markdownIt.use(rules.mermaid(context, ruleOptions));
++		markdownIt.use(rules.sanitize_html(context, ruleOptions));
+ 		markdownIt.use(rules.highlight_keywords(context, ruleOptions));
+ 		markdownIt.use(rules.code_inline(context, ruleOptions));
+ 		markdownIt.use(markdownItAnchor, { slugify: uslugify });
+diff --git a/ReactNativeClient/lib/joplin-renderer/MdToHtml/rules/sanitize_html.ts b/ReactNativeClient/lib/joplin-renderer/MdToHtml/rules/sanitize_html.ts
+new file mode 100644
+index 00000000000..2ecb46a814a
+--- /dev/null
++++ b/ReactNativeClient/lib/joplin-renderer/MdToHtml/rules/sanitize_html.ts
+@@ -0,0 +1,40 @@
++const md5 = require('md5');
++const htmlUtils = require('../../htmlUtils');
++
++// @ts-ignore: Keep the function signature as-is despite unusued arguments
++function installRule(markdownIt:any, mdOptions:any, ruleOptions:any, context:any) {
++	markdownIt.core.ruler.push('sanitize_html', (state:any) => {
++		const tokens = state.tokens;
++
++		const walkHtmlTokens = (tokens:any[]) => {
++			if (!tokens || !tokens.length) return;
++
++			for (const token of tokens) {
++				if (!['html_block', 'html_inline'].includes(token.type)) {
++					walkHtmlTokens(token.children);
++					continue;
++				}
++
++				const cacheKey = md5(escape(token.content));
++				let sanitizedContent = context.cache.get(cacheKey);
++
++				if (!sanitizedContent) {
++					sanitizedContent = htmlUtils.sanitizeHtml(token.content);
++				}
++
++				token.content = sanitizedContent;
++
++				context.cache.put(cacheKey, sanitizedContent, 1000 * 60 * 60);
++				walkHtmlTokens(token.children);
++			}
++		};
++
++		walkHtmlTokens(tokens);
++	});
++}
++
++export default function(context:any, ruleOptions:any) {
++	return function(md:any, mdOptions:any) {
++		installRule(md, mdOptions, ruleOptions, context);
++	};
++}
+diff --git a/ReactNativeClient/lib/joplin-renderer/htmlUtils.js b/ReactNativeClient/lib/joplin-renderer/htmlUtils.js
+index 2b775f81976..dc78c4a9666 100644
+--- a/ReactNativeClient/lib/joplin-renderer/htmlUtils.js
++++ b/ReactNativeClient/lib/joplin-renderer/htmlUtils.js
+@@ -2,8 +2,11 @@ const Entities = require('html-entities').AllHtmlEntities;
+ const htmlentities = new Entities().encode;
+ 
+ // [\s\S] instead of . for multiline matching
++const NodeHtmlParser = require('node-html-parser');
++
+ // https://stackoverflow.com/a/16119722/561309
+ const imageRegex = /<img([\s\S]*?)src=["']([\s\S]*?)["']([\s\S]*?)>/gi;
++const JS_EVENT_NAMES = ['onabort', 'onafterprint', 'onbeforeprint', 'onbeforeunload', 'onblur', 'oncanplay', 'oncanplaythrough', 'onchange', 'onclick', 'oncontextmenu', 'oncopy', 'oncuechange', 'oncut', 'ondblclick', 'ondrag', 'ondragend', 'ondragenter', 'ondragleave', 'ondragover', 'ondragstart', 'ondrop', 'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus', 'onhashchange', 'oninput', 'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup', 'onload', 'onloadeddata', 'onloadedmetadata', 'onloadstart', 'onmessage', 'onmousedown', 'onmousemove', 'onmouseout', 'onmouseover', 'onmouseup', 'onmousewheel', 'onoffline', 'ononline', 'onpagehide', 'onpageshow', 'onpaste', 'onpause', 'onplay', 'onplaying', 'onpopstate', 'onprogress', 'onratechange', 'onreset', 'onresize', 'onscroll', 'onsearch', 'onseeked', 'onseeking', 'onselect', 'onstalled', 'onstorage', 'onsubmit', 'onsuspend', 'ontimeupdate', 'ontoggle', 'onunload', 'onvolumechange', 'onwaiting', 'onwheel'];
+ 
+ class HtmlUtils {
+ 
+@@ -43,6 +46,34 @@ class HtmlUtils {
+ 		});
+ 	}
+ 
++	sanitizeHtml(html) {
++		const walkHtmlNodes = (nodes) => {
++			if (!nodes || !nodes.length) return;
++
++			for (const node of nodes) {
++				for (const attr in node.attributes) {
++					if (!node.attributes.hasOwnProperty(attr)) continue;
++					if (JS_EVENT_NAMES.includes(attr)) node.setAttribute(attr, '');
++				}
++				walkHtmlNodes(node.childNodes);
++			}
++		};
++
++		// Need to wrap in div, otherwise elements at the root will be skipped
++		// The DIV tags are removed below
++		const dom = NodeHtmlParser.parse(`<div>${html}</div>`, {
++			script: false,
++			style: true,
++			pre: true,
++			comment: false,
++		});
++
++		walkHtmlNodes([dom]);
++		const output = dom.toString();
++		return output.substr(5, output.length - 11);
++	}
++
++
+ }
+ 
+ const htmlUtils = new HtmlUtils();
+diff --git a/ReactNativeClient/lib/joplin-renderer/package.json b/ReactNativeClient/lib/joplin-renderer/package.json
+index ac1978e5dc1..a3daa853301 100644
+--- a/ReactNativeClient/lib/joplin-renderer/package.json
++++ b/ReactNativeClient/lib/joplin-renderer/package.json
+@@ -37,6 +37,8 @@
+     "markdown-it-toc-done-right": "^4.1.0",
+     "md5": "^2.2.1",
+     "mermaid": "^8.4.6",
++    "memory-cache": "^0.2.0",
++    "node-html-parser": "^1.2.4",
+     "uslug": "^1.0.4"
+   }
+ }
+diff --git a/ReactNativeClient/lib/shim-init-node.js b/ReactNativeClient/lib/shim-init-node.js
+index 81c34cb3184..e906e5bb441 100644
+--- a/ReactNativeClient/lib/shim-init-node.js
++++ b/ReactNativeClient/lib/shim-init-node.js
+@@ -214,7 +214,7 @@ function shimInit() {
+ 		if (shim.isElectron()) {
+ 			const nativeImage = require('electron').nativeImage;
+ 			let image = nativeImage.createFromDataURL(imageDataUrl);
+-			if (image.isEmpty()) throw new Error('Could not convert data URL to image'); // Would throw for example if the image format is no supported (eg. image/gif)
++			if (image.isEmpty()) throw new Error('Could not convert data URL to image - perhaps the format is not supported (eg. image/gif)'); // Would throw for example if the image format is no supported (eg. image/gif)
+ 			if (options.cropRect) {
+ 				// Crop rectangle values need to be rounded or the crop() call will fail
+ 				const c = options.cropRect;
+diff --git a/ReactNativeClient/package-lock.json b/ReactNativeClient/package-lock.json
+index 86b4632c3b5..4087c19b905 100644
+--- a/ReactNativeClient/package-lock.json
++++ b/ReactNativeClient/package-lock.json
+@@ -5689,6 +5689,11 @@
+         "mimic-fn": "^1.0.0"
+       }
+     },
++    "memory-cache": {
++      "version": "0.2.0",
++      "resolved": "https://registry.npmjs.org/memory-cache/-/memory-cache-0.2.0.tgz",
++      "integrity": "sha1-eJCwHVLADI68nVM+H46xfjA0hxo="
++    },
+     "merge-stream": {
+       "version": "1.0.1",
+       "resolved": "https://registry.npmjs.org/merge-stream/-/merge-stream-1.0.1.tgz",
+@@ -6380,6 +6385,21 @@
+         "is-stream": "^1.0.1"
+       }
+     },
++    "node-html-parser": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/node-html-parser/-/node-html-parser-1.2.4.tgz",
++      "integrity": "sha512-qHwPdGyGr9pOZBoSgUOuNPG20QYZVN00lFcxKQgjPUODSxVH7obQeLVVawa3B4cfSNtLIeczSzoy/xYA8XG5WQ==",
++      "requires": {
++        "he": "1.1.1"
++      },
++      "dependencies": {
++        "he": {
++          "version": "1.1.1",
++          "resolved": "https://registry.npmjs.org/he/-/he-1.1.1.tgz",
++          "integrity": "sha1-k0EP0hsAlzUVH4howvJx80J+I/0="
++        }
++      }
++    },
+     "node-int64": {
+       "version": "0.4.0",
+       "resolved": "https://registry.npmjs.org/node-int64/-/node-int64-0.4.0.tgz",
+diff --git a/ReactNativeClient/package.json b/ReactNativeClient/package.json
+index 98a227ca50d..1f44d59f4d3 100644
+--- a/ReactNativeClient/package.json
++++ b/ReactNativeClient/package.json
+@@ -72,6 +72,8 @@
+     "react-native-version-info": "^0.5.1",
+     "react-native-webview": "^5.12.0",
+     "react-redux": "5.0.7",
++    "memory-cache": "^0.2.0",
++    "node-html-parser": "^1.2.4",
+     "redux": "4.0.0",
+     "reselect": "^4.0.0",
+     "rn-fetch-blob": "^0.12.0",

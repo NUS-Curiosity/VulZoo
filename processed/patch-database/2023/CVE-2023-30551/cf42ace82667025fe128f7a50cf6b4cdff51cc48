@@ -1,0 +1,191 @@
+diff --git a/cmd/rekor-server/app/root.go b/cmd/rekor-server/app/root.go
+index f1fbdd10d..df313365c 100644
+--- a/cmd/rekor-server/app/root.go
++++ b/cmd/rekor-server/app/root.go
+@@ -106,6 +106,8 @@ Memory and file-based signers should only be used for testing.`)
+ 	rootCmd.PersistentFlags().StringSlice("enabled_api_endpoints", operationIds, "list of API endpoints to enable using operationId from openapi.yaml")
+ 
+ 	rootCmd.PersistentFlags().Uint64("max_request_body_size", 0, "maximum size for HTTP request body, in bytes; set to 0 for unlimited")
++	rootCmd.PersistentFlags().Uint64("max_jar_metadata_size", 1048576, "maximum permitted size for jar META-INF/ files, in bytes; set to 0 for unlimited")
++	rootCmd.PersistentFlags().Uint64("max_apk_metadata_size", 1048576, "maximum permitted size for apk .SIGN and .PKGINFO files, in bytes; set to 0 for unlimited")
+ 
+ 	if err := viper.BindPFlags(rootCmd.PersistentFlags()); err != nil {
+ 		log.Logger.Fatal(err)
+diff --git a/pkg/types/alpine/apk.go b/pkg/types/alpine/apk.go
+index 51e2d61c5..5007ee4dc 100644
+--- a/pkg/types/alpine/apk.go
++++ b/pkg/types/alpine/apk.go
+@@ -33,6 +33,7 @@ import (
+ 
+ 	"github.com/sigstore/sigstore/pkg/signature"
+ 	"github.com/sigstore/sigstore/pkg/signature/options"
++	"github.com/spf13/viper"
+ 	"gopkg.in/ini.v1"
+ )
+ 
+@@ -149,6 +150,12 @@ func (p *Package) Unmarshal(pkgReader io.Reader) error {
+ 		}
+ 
+ 		if strings.HasPrefix(header.Name, ".SIGN") && pkg.Signature == nil {
++			if header.Size < 0 {
++				return errors.New("negative header size for .SIGN file")
++			}
++			if uint64(header.Size) > viper.GetUint64("max_apk_metadata_size") && viper.GetUint64("max_apk_metadata_size") > 0 {
++				return fmt.Errorf("uncompressed .SIGN file size %d exceeds max allowed size %d", header.Size, viper.GetUint64("max_apk_metadata_size"))
++			}
+ 			sigBytes := make([]byte, header.Size)
+ 			if _, err = sigReader.Read(sigBytes); err != nil && err != io.EOF {
+ 				return fmt.Errorf("reading signature: %w", err)
+@@ -176,6 +183,12 @@ func (p *Package) Unmarshal(pkgReader io.Reader) error {
+ 		}
+ 
+ 		if header.Name == ".PKGINFO" {
++			if header.Size < 0 {
++				return errors.New("negative header size for .PKGINFO file")
++			}
++			if uint64(header.Size) > viper.GetUint64("max_apk_metadata_size") && viper.GetUint64("max_apk_metadata_size") > 0 {
++				return fmt.Errorf("uncompressed .PKGINFO file size %d exceeds max allowed size %d", header.Size, viper.GetUint64("max_apk_metadata_size"))
++			}
+ 			pkginfoContent := make([]byte, header.Size)
+ 			if _, err = ctlReader.Read(pkginfoContent); err != nil && err != io.EOF {
+ 				return fmt.Errorf("reading .PKGINFO: %w", err)
+diff --git a/pkg/types/alpine/apk_test.go b/pkg/types/alpine/apk_test.go
+index 922542452..4a5983c94 100644
+--- a/pkg/types/alpine/apk_test.go
++++ b/pkg/types/alpine/apk_test.go
+@@ -17,12 +17,15 @@ package alpine
+ 
+ import (
+ 	"os"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/sigstore/rekor/pkg/pki/x509"
++	"github.com/spf13/viper"
+ )
+ 
+ func TestAlpinePackage(t *testing.T) {
++
+ 	inputArchive, err := os.Open("tests/test_alpine.apk")
+ 	if err != nil {
+ 		t.Fatalf("could not open archive %v", err)
+@@ -48,3 +51,22 @@ func TestAlpinePackage(t *testing.T) {
+ 		t.Fatalf("signature verification failed: %v", err)
+ 	}
+ }
++
++func TestAlpineMetadataSize(t *testing.T) {
++	os.Setenv("MAX_APK_METADATA_SIZE", "10")
++	viper.AutomaticEnv()
++
++	inputArchive, err := os.Open("tests/test_alpine.apk")
++	if err != nil {
++		t.Fatalf("could not open archive %v", err)
++	}
++
++	p := Package{}
++	err = p.Unmarshal(inputArchive)
++	if err == nil {
++		t.Fatal("expecting metadata too large err")
++	}
++	if !strings.Contains(err.Error(), "exceeds max allowed size 10") {
++		t.Fatalf("unexpected error %v", err)
++	}
++}
+diff --git a/pkg/types/jar/v0.0.1/entry.go b/pkg/types/jar/v0.0.1/entry.go
+index 20ae81dc5..ab85ccd5a 100644
+--- a/pkg/types/jar/v0.0.1/entry.go
++++ b/pkg/types/jar/v0.0.1/entry.go
+@@ -45,6 +45,7 @@ import (
+ 	"github.com/go-openapi/swag"
+ 	jarutils "github.com/sassoftware/relic/lib/signjar"
+ 	"github.com/sigstore/rekor/pkg/generated/models"
++	"github.com/spf13/viper"
+ )
+ 
+ const (
+@@ -139,6 +140,20 @@ func (v *V001Entry) fetchExternalEntities(ctx context.Context) (*pkcs7.PublicKey
+ 		return nil, nil, types.ValidationError(err)
+ 	}
+ 
++	// Checking that uncompressed metadata files are within acceptable bounds before reading into memory.
++	// Checks match those performed by the relic library in the jarutils.Verify method below. For example,
++	// the META-INF/MANIFEST.MF is read into memory by the relic lib, but a META-INF/LICENSE file is not.
++	for _, f := range zipReader.File {
++		dir, name := path.Split(strings.ToUpper(f.Name))
++		if dir != "META-INF/" || name == "" || strings.LastIndex(name, ".") < 0 {
++			continue
++		}
++		if f.UncompressedSize64 > viper.GetUint64("max_jar_metadata_size") && viper.GetUint64("max_jar_metadata_size") > 0 {
++			return nil, nil, types.ValidationError(
++				fmt.Errorf("uncompressed jar metadata of size %d exceeds max allowed size %d", f.UncompressedSize64, viper.GetUint64("max_jar_metadata_size")))
++		}
++	}
++
+ 	// this ensures that the JAR is signed and the signature verifies, as
+ 	// well as checks that the hashes in the signed manifest are all valid
+ 	jarObjs, err := jarutils.Verify(zipReader, false)
+diff --git a/pkg/types/jar/v0.0.1/entry_test.go b/pkg/types/jar/v0.0.1/entry_test.go
+index 893347672..9253a7ec9 100644
+--- a/pkg/types/jar/v0.0.1/entry_test.go
++++ b/pkg/types/jar/v0.0.1/entry_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"os"
+ 	"reflect"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/go-openapi/runtime"
+@@ -27,6 +28,7 @@ import (
+ 	"github.com/go-openapi/swag"
+ 	"github.com/sigstore/rekor/pkg/generated/models"
+ 	"github.com/sigstore/rekor/pkg/types"
++	"github.com/spf13/viper"
+ 	"go.uber.org/goleak"
+ )
+ 
+@@ -150,3 +152,43 @@ Hr/+CxFvaJWmpYqNkLDGRU+9orzh5hI2RrcuaQ==
+ 		}
+ 	}
+ }
++
++func TestJarMetadataSize(t *testing.T) {
++	type TestCase struct {
++		caseDesc                  string
++		entry                     V001Entry
++		expectUnmarshalSuccess    bool
++		expectCanonicalizeSuccess bool
++		expectedVerifierSuccess   bool
++	}
++
++	jarBytes, _ := os.ReadFile("tests/test.jar")
++
++	os.Setenv("MAX_JAR_METADATA_SIZE", "10")
++	viper.AutomaticEnv()
++
++	v := V001Entry{
++		JARModel: models.JarV001Schema{
++			Archive: &models.JarV001SchemaArchive{
++				Content: strfmt.Base64(jarBytes),
++			},
++		},
++	}
++
++	r := models.Jar{
++		APIVersion: swag.String(v.APIVersion()),
++		Spec:       v.JARModel,
++	}
++
++	if err := v.Unmarshal(&r); err != nil {
++		t.Errorf("unexpected unmarshal failure: %v", err)
++	}
++
++	_, err := v.Canonicalize(context.TODO())
++	if err == nil {
++		t.Fatal("expecting metadata too large err")
++	}
++	if !strings.Contains(err.Error(), "exceeds max allowed size 10") {
++		t.Fatalf("unexpected error %v", err)
++	}
++}

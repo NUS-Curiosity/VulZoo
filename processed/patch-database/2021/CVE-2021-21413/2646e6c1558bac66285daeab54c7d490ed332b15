@@ -1,0 +1,620 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 37ab864..112b529 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,8 +1,9 @@
+ ## v4.0.0
+ - `Callback` class addeed.
+-- When possible, `reference.get()` will return a function proxy instead of a `Reference`.
++- When possible, `reference.get()` will return a function delegate instead of a `Reference`.
+ - `reference.get()` will no longer return inherited properties by default.
+ - `result` property on `eval` and `evalClosure` has been removed. The result is now just the return
+ value.
+ - All `isolated-vm` class prototypes, and most instances are frozen.
+ - `isolate.cpuTime` and `isolate.wallTime` now return bigints.
++- Proxies and accessors are no longer tolerated via `reference.get`, and related functions.
+diff --git a/README.md b/README.md
+index 3946ac4..91aab53 100644
+--- a/README.md
++++ b/README.md
+@@ -344,7 +344,7 @@ A instance of [`Reference`](#class-reference-transferable) is a pointer to a val
+ ##### `new ivm.Reference(value, options)`
+ * `value` - The value to create a reference to.
+ * `options` *[object]*
+-  * `inheritUnsafe` *[boolean]* - If enabled then the `get` family of functions will follow the
++  * `unsafeInherit` *[boolean]* - If enabled then the `get` family of functions will follow the
+     object's prototype chain. References created with this option should never be given to untrusted
+     code.
+ 
+@@ -388,7 +388,6 @@ all attempts to access the reference will throw an error.
+ ##### `reference.deleteIgnored(property)`
+ ##### `reference.deleteSync(property)`
+ * `property` *[transferable]* - The property to access on this object.
+-* **return** `true` or `false`
+ 
+ Delete a property from this reference, as if using `delete reference[property]`
+ 
+@@ -401,6 +400,8 @@ Delete a property from this reference, as if using `delete reference[property]`
+ 
+ Will access a reference as if using `reference[property]` and transfer the value out.
+ 
++If the object is a proxy, or if the property is a getter, this method will throw.
++
+ ##### `reference.set(property, value, options)` *[Promise](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise)*
+ ##### `reference.setIgnored(property, value, options)`
+ ##### `reference.setSync(property, value, options)`
+@@ -408,10 +409,6 @@ Will access a reference as if using `reference[property]` and transfer the value
+ * `value` *[transferable]* - The value to set on this object.
+ * `options` *[object]*
+ 	* [`{ ...TransferOptions }`](#transferoptions)
+-* **return** `true` or `false`
+-
+-Returns a boolean indicating whether or not this operation succeeded. I'm actually not really sure
+-when `false` would be returned, I'm just giving you the result back straight from the v8 API.
+ 
+ ##### `reference.apply(receiver, arguments, options)` *[Promise](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise)*
+ ##### `reference.applyIgnored(receiver, arguments, options)`
+diff --git a/isolated-vm.d.ts b/isolated-vm.d.ts
+index 6f366de..882cdb7 100644
+--- a/isolated-vm.d.ts
++++ b/isolated-vm.d.ts
+@@ -9,10 +9,12 @@ declare module "isolated-vm" {
+ 		| Context
+ 		| Script
+ 		| ExternalCopy<any>
++		| Callback<any>
+ 		| Copy<any>
+ 		| Reference<any>
+ 		| Dereference<any>
+ 		| Module
++		| ((...args: any[]) => any)
+ 		| typeof import("isolated-vm");
+ 
+ 	/**
+@@ -284,7 +286,7 @@ declare module "isolated-vm" {
+ 	 */
+ 	export class Reference<T = any> {
+ 		private __ivm_reference: T;
+-		constructor(value: T, options?: { inheritUnsafe?: boolean });
++		constructor(value: T, options?: { unsafeInherit?: boolean });
+ 
+ 		/**
+ 		 * This is the typeof the referenced value, and is available at any time
+@@ -331,31 +333,29 @@ declare module "isolated-vm" {
+ 		/**
+ 		 * Delete a property from this reference, as if using `delete reference[property]`
+ 		 */
+-		 delete(property: keyof T): Promise<boolean>;
++		 delete(property: keyof T): Promise<void>;
+ 		 deleteIgnored(property: keyof T): void;
+-		 deleteSync(property: keyof T): boolean;
++		 deleteSync(property: keyof T): void;
+ 
+ 		/**
+ 		 * Will access a reference as if using reference[property] and return a reference to that value.
++		 *
++		 * If the object is a proxy, or if the property is a getter, this method will throw.
+ 		 */
+ 		get<Options extends TransferOptions, Key extends keyof T>(
+-			property: Key, options?: Options): ResultTypeAsync<Options & AsReference, T[Key]>;
++			property: Key, options?: Options): ResultTypeAsync<Options & FallbackReference, T[Key]>;
+ 		getSync<Options extends TransferOptions, Key extends keyof T>(
+-			property: Key, options?: Options): ResultTypeSync<Options & AsReference, T[Key]>;
++			property: Key, options?: Options): ResultTypeSync<Options & FallbackReference, T[Key]>;
+ 
+ 		/**
+ 		 * Will access a reference as if using reference[property] and return a reference to that value.
+-		 *
+-		 * @return {boolean} Indicating whether or not this operation succeeded. I'm actually not really
+-		 * sure when false would be returned, I'm just giving you the result back straight from the v8
+-		 * API.
+ 		 */
+ 		set<Options extends TransferOptions, Key extends keyof T>(
+-			property: Key, value: ArgumentType<Options, T[Key]>, options?: Options): Promise<boolean>;
++			property: Key, value: ArgumentType<Options, T[Key]>, options?: Options): Promise<void>;
+ 		setIgnored<Options extends TransferOptions, Key extends keyof T>(
+ 			property: Key, value: ArgumentType<Options, T[Key]>, options?: Options): void;
+ 		setSync<Options extends TransferOptions, Key extends keyof T>(
+-			property: Key, value: ArgumentType<Options, T[Key]>, options?: Options): boolean;
++			property: Key, value: ArgumentType<Options, T[Key]>, options?: Options): void;
+ 
+ 		/**
+ 		 * Will attempt to invoke an object as if it were a function. If the return
+@@ -366,17 +366,17 @@ declare module "isolated-vm" {
+ 			receiver?: ArgumentType<Options['arguments'], ApplyArgumentThis<T>>,
+ 			arguments?: ArgumentsTypeBidirectional<Options, ApplyArguments<T>>,
+ 			options?: Options
+-		): ResultTypeBidirectionalAsync<Options & ApplyAsReference, ApplyResult<T>>;
++		): ResultTypeBidirectionalAsync<Options & FallbackReference, ApplyResult<T>>;
+ 		applyIgnored<Options extends ReferenceApplyOptions>(
+ 			receiver?: ArgumentType<Options['arguments'], ApplyArgumentThis<T>>,
+-			arguments?: ArgumentsTypeBidirectional<Options & ApplyAsReference, ApplyArguments<T>>,
++			arguments?: ArgumentsTypeBidirectional<Options & FallbackReference, ApplyArguments<T>>,
+ 			options?: Options
+ 		): void;
+ 		applySync<Options extends ReferenceApplyOptions>(
+ 			receiver?: ArgumentType<Options['arguments'], ApplyArgumentThis<T>>,
+ 			arguments?: ArgumentsTypeBidirectional<Options, ApplyArguments<T>>,
+ 			options?: Options
+-		): ResultTypeBidirectionalSync<Options & ApplyAsReference, ApplyResult<T>>;
++		): ResultTypeBidirectionalSync<Options & FallbackReference, ApplyResult<T>>;
+ 
+ 		/**
+ 		 * `applySyncPromise` is a special version of `applySync` which may only be invoked on functions
+@@ -392,7 +392,7 @@ declare module "isolated-vm" {
+ 			receiver?: ArgumentType<Options['arguments'], ApplyArgumentThis<T>>,
+ 			arguments?: ArgumentsTypeBidirectional<Options, ApplyArguments<T>>,
+ 			options?: Options
+-		): ResultTypeBidirectionalSync<Options & ApplyAsReference, ApplyResult<T>>;
++		): ResultTypeBidirectionalSync<Options & FallbackReference, ApplyResult<T>>;
+ 	}
+ 
+ 	/**
+@@ -707,6 +707,7 @@ declare module "isolated-vm" {
+ 	type AsCopy = { copy: true };
+ 	type AsExternal = { externalCopy: true };
+ 	type AsReference = { reference: true };
++	type FallbackReference = { _reference: true };
+ 	type ApplyAsReference = { result: AsReference };
+ 	type WithTransfer = AsCopy | AsExternal | AsReference;
+ 
+@@ -727,6 +728,7 @@ declare module "isolated-vm" {
+ 		Options extends AsReference ? Reference<Result> :
+ 		Result extends Transferable ? Result :
+ 		Result extends void ? void :
++		Options extends FallbackReference ? Reference<Result> :
+ 		Transferable;
+ 	type ResultTypeAsync<Options extends TransferOptions, Result = any> = Promise<ResultTypeBase<Options, Result>>;
+ 	type ResultTypeSync<Options extends TransferOptions, Result = any> = CheckPromise<Options, ResultTypeBase<Options, Result>>;
+diff --git a/src/isolate/strings.h b/src/isolate/strings.h
+index 8001aa3..bf019ba 100644
+--- a/src/isolate/strings.h
++++ b/src/isolate/strings.h
+@@ -58,7 +58,6 @@ class StringTable {
+ 		String function{"function"};
+ 		String global{"global"};
+ 		String ignored{"ignored"};
+-		String inheritUnsafe{"inheritUnsafe"};
+ 		String inspector{"inspector"};
+ 		String isolateIsDisposed{"Isolate is disposed"};
+ 		String isolatedVm{"isolated-vm"};
+@@ -82,6 +81,7 @@ class StringTable {
+ 		String transferList{"transferList"};
+ 		String transferOut{"transferOut"};
+ 		String undefined{"undefined"};
++		String unsafeInherit{"unsafeInherit"};
+ 
+ 		String does_zap_garbage{"does_zap_garbage"};
+ 		String externally_allocated_size{"externally_allocated_size"};
+diff --git a/src/module/reference_handle.cc b/src/module/reference_handle.cc
+index 6d6ca39..d18ed57 100644
+--- a/src/module/reference_handle.cc
++++ b/src/module/reference_handle.cc
+@@ -127,7 +127,7 @@ auto ReferenceHandle::Definition() -> Local<FunctionTemplate> {
+ }
+ 
+ auto ReferenceHandle::New(Local<Value> value, MaybeLocal<Object> options) -> unique_ptr<ReferenceHandle> {
+-	auto inherit = ReadOption<bool>(options, StringTable::Get().inheritUnsafe, false);
++	auto inherit = ReadOption<bool>(options, StringTable::Get().unsafeInherit, false);
+ 	return std::make_unique<ReferenceHandle>(value, inherit);
+ }
+ 
+@@ -426,49 +426,102 @@ auto ReferenceHandle::Copy() -> Local<Value> {
+ }
+ 
+ /**
+- * Get a property from this reference, returned as another reference
++ * Base class for get, set, and delete runners
+  */
+-class GetRunner : public ThreePhaseTask {
++class AccessorRunner : public ThreePhaseTask {
+ 	public:
+-		GetRunner(
+-			const ReferenceHandle& that,
+-			Local<Value> key_handle,
+-			MaybeLocal<Object> maybe_options,
+-			bool inherit
+-		) :
+-				context{that.context},
+-				reference{that.reference},
+-				options{maybe_options, inherit ?
+-					TransferOptions::Type::DeepReference : TransferOptions::Type::Reference},
+-				inherit{inherit} {
+-			that.CheckDisposed();
+-			key = ExternalCopy::CopyIfPrimitive(key_handle);
+-			if (!key) {
++		AccessorRunner(ReferenceHandle& target, Local<Value> key_handle) :
++		context{target.context},
++		target{target.reference},
++		key{ExternalCopy::CopyIfPrimitive(key_handle)} {
++			target.CheckDisposed();
++			if (!key || (!key_handle->IsName() && !key_handle->IsUint32())) {
+ 				throw RuntimeTypeError("Invalid `key`");
++			} else if (target.type_of != decltype(target.type_of)::Object) {
++				throw RuntimeTypeError("Reference is not an object");
++			}
++		}
++
++	protected:
++		auto GetTargetAndAlsoCheckForProxy() -> Local<Object> {
++			auto object = Local<Object>::Cast(Deref(target));
++			if (HasProxy(object)) {
++				throw RuntimeTypeError("Object is or has proxy");
++			}
++			return object;
++		}
++
++		auto GetKey(Local<Context> context) -> Local<Name> {
++			auto key_inner = key->CopyInto();
++			return (key_inner->IsString() || key_inner->IsSymbol()) ?
++				key_inner.As<Name>() : Unmaybe(key_inner->ToString(context)).As<Name>();
++		}
++
++		RemoteHandle<Context> context;
++
++	private:
++		static auto HasProxy(Local<Object> object) -> bool {
++			if (object->IsProxy()) {
++				return true;
++			} else {
++				auto proto = object->GetPrototype();
++				if (proto->IsNullOrUndefined()) {
++					return false;
++				} else {
++					return HasProxy(proto.As<Object>());
++				}
+ 			}
+ 		}
+ 
++		RemoteHandle<Value> target;
++		unique_ptr<ExternalCopy> key;
++};
++
++/**
++ * Get a property from this reference, returned as another reference
++ */
++class GetRunner final : public AccessorRunner {
++	public:
++		GetRunner(ReferenceHandle& target, Local<Value> key_handle, MaybeLocal<Object> maybe_options) :
++		AccessorRunner{target, key_handle},
++		options{maybe_options, target.inherit ?
++			TransferOptions::Type::DeepReference : TransferOptions::Type::Reference},
++		inherit{target.inherit} {}
++
+ 		void Phase2() final {
+-			Local<Context> context_handle = Deref(context);
+-			Context::Scope context_scope{context_handle};
+-			Local<Value> key_inner = key->CopyInto();
+-			Local<Object> object = Local<Object>::Cast(Deref(reference));
+-			bool allow = [&]() {
+-				if (!inherit) {
+-					if (key_inner->IsName()) {
+-						return Unmaybe(object->HasRealNamedProperty(context_handle, key_inner.As<Name>()));
+-					} else if (key_inner->IsNumber()) {
+-						return Unmaybe(object->HasRealIndexedProperty(context_handle, HandleCast<uint32_t>(key_inner)));
+-					} else {
+-						return false;
+-					}
++			// Setup
++			auto* isolate = Isolate::GetCurrent();
++			auto context = Deref(this->context);
++			Context::Scope context_scope{context};
++			auto name = GetKey(context);
++			auto object = GetTargetAndAlsoCheckForProxy();
++
++			// Get property
++			ret = TransferOut([&]() {
++				if (inherit) {
++					// To avoid accessors I guess we have to walk the prototype chain ourselves
++					auto target = object;
++					do {
++						if (Unmaybe(target->HasOwnProperty(context, name))) {
++							if (Unmaybe(target->HasRealNamedCallbackProperty(context, name))) {
++								throw RuntimeTypeError("Property is getter");
++							}
++							return Unmaybe(target->GetRealNamedProperty(context, name));
++						}
++						auto next = target->GetPrototype();
++						if (next->IsNullOrUndefined()) {
++							return Undefined(isolate).As<Value>();
++						}
++						target = next.As<Object>();
++					} while (true);
++				} else if (!Unmaybe(object->HasOwnProperty(context, name))) {
++					return Undefined(isolate).As<Value>();
++				} else if (Unmaybe(object->HasRealNamedCallbackProperty(context, name))) {
++					throw RuntimeTypeError("Property is getter");
++				} else {
++					return Unmaybe(object->Get(context, name));
+ 				}
+-				return true;
+-			}();
+-			Local<Value> value = allow ?
+-				Unmaybe(object->Get(context_handle, key_inner)) :
+-				Undefined(Isolate::GetCurrent()).As<Value>();
+-			ret = TransferOut(value, options);
++			}(), options);
+ 		}
+ 
+ 		auto Phase3() -> Local<Value> final {
+@@ -476,49 +529,35 @@ class GetRunner : public ThreePhaseTask {
+ 		}
+ 
+ 	private:
+-		unique_ptr<ExternalCopy> key;
+-		RemoteHandle<Context> context;
+-		RemoteHandle<Value> reference;
+ 		unique_ptr<Transferable> ret;
+ 		TransferOptions options;
+ 		bool inherit;
+ };
+ template <int async>
+ auto ReferenceHandle::Get(Local<Value> key_handle, MaybeLocal<Object> maybe_options) -> Local<Value> {
+-	return ThreePhaseTask::Run<async, GetRunner>(*isolate, *this, key_handle, maybe_options, inherit);
++	return ThreePhaseTask::Run<async, GetRunner>(*isolate, *this, key_handle, maybe_options);
+ }
+ 
+ /**
+  * Delete a property on this reference
+  */
+-class DeleteRunner : public ThreePhaseTask {
++class DeleteRunner final : public AccessorRunner {
+ 	public:
+ 		DeleteRunner(ReferenceHandle& that, Local<Value> key_handle) :
+-				key{ExternalCopy::CopyIfPrimitive(key_handle)},
+-				context{that.context},
+-				reference{that.reference} {
+-			that.CheckDisposed();
+-			if (!key) {
+-				throw RuntimeTypeError("Invalid `key`");
+-			}
+-		}
++		AccessorRunner{that, key_handle} {}
+ 
+ 		void Phase2() final {
+-			Local<Context> context_handle = Deref(context);
+-			Context::Scope context_scope{context_handle};
+-			Local<Object> object = Local<Object>::Cast(Deref(reference));
+-			result = Unmaybe(object->Delete(context_handle, key->CopyInto()));
++			auto context = Deref(this->context);
++			Context::Scope context_scope{context};
++			auto object = GetTargetAndAlsoCheckForProxy();
++			if (!Unmaybe(object->Delete(context, GetKey(context)))) {
++				throw RuntimeTypeError("Delete failed");
++			}
+ 		}
+ 
+ 		auto Phase3() -> Local<Value> final {
+-			return Boolean::New(Isolate::GetCurrent(), result);
++			return Undefined(Isolate::GetCurrent());
+ 		}
+-
+-	private:
+-		unique_ptr<ExternalCopy> key;
+-		RemoteHandle<Context> context;
+-		RemoteHandle<Value> reference;
+-		bool result = false;
+ };
+ template <int async>
+ auto ReferenceHandle::Delete(Local<Value> key_handle) -> Local<Value> {
+@@ -528,7 +567,7 @@ auto ReferenceHandle::Delete(Local<Value> key_handle) -> Local<Value> {
+ /**
+  * Attempt to set a property on this reference
+  */
+-class SetRunner : public ThreePhaseTask {
++class SetRunner final : public AccessorRunner {
+ 	public:
+ 		SetRunner(
+ 			ReferenceHandle& that,
+@@ -536,37 +575,28 @@ class SetRunner : public ThreePhaseTask {
+ 			Local<Value> val_handle,
+ 			MaybeLocal<Object> maybe_options
+ 		) :
+-				key{ExternalCopy::CopyIfPrimitive(key_handle)},
+-				val{TransferOut(val_handle, TransferOptions{maybe_options})},
+-				context{that.context},
+-				reference{that.reference} {
+-			that.CheckDisposed();
+-			if (!key) {
+-				throw RuntimeTypeError("Invalid `key`");
+-			}
+-		}
++		AccessorRunner{that, key_handle},
++		val{TransferOut(val_handle, TransferOptions{maybe_options})} {}
+ 
+ 		void Phase2() final {
+-			Local<Context> context_handle = Deref(context);
+-			Context::Scope context_scope{context_handle};
+-			Local<Value> key_inner = key->CopyInto();
+-			Local<Object> object = Local<Object>::Cast(Deref(reference));
++			auto context = Deref(this->context);
++			Context::Scope context_scope{context};
++			auto name = GetKey(context);
++			auto object = GetTargetAndAlsoCheckForProxy();
+ 			// Delete key before transferring in, potentially freeing up some v8 heap
+-			Unmaybe(object->Delete(context_handle, key_inner));
+-			Local<Value> val_inner = val->TransferIn();
+-			did_set = Unmaybe(object->Set(context_handle, key_inner, val_inner));
++			Unmaybe(object->Delete(context, name));
++			auto val_inner = val->TransferIn();
++			if (!Unmaybe(object->CreateDataProperty(context, GetKey(context), val_inner))) {
++				throw RuntimeTypeError("Set failed");
++			}
+ 		}
+ 
+ 		auto Phase3() -> Local<Value> final {
+-			return Boolean::New(Isolate::GetCurrent(), did_set);
++			return Undefined(Isolate::GetCurrent());
+ 		}
+ 
+ 	private:
+-		unique_ptr<ExternalCopy> key;
+ 		unique_ptr<Transferable> val;
+-		RemoteHandle<Context> context;
+-		RemoteHandle<Value> reference;
+-		bool did_set = false;
+ };
+ template <int async>
+ auto ReferenceHandle::Set(Local<Value> key_handle, Local<Value> val_handle, MaybeLocal<Object> maybe_options) -> Local<Value> {
+diff --git a/src/module/reference_handle.h b/src/module/reference_handle.h
+index 700c153..55a6503 100644
+--- a/src/module/reference_handle.h
++++ b/src/module/reference_handle.h
+@@ -13,6 +13,7 @@ namespace detail {
+  * Holds common data for ReferenceHandle and ReferenceHandleTransferable
+  */
+ class ReferenceData {
++	friend class AccessorRunner;
+ 	public:
+ 		enum class TypeOf { Null, Undefined, Number, String, Boolean, Object, Function };
+ 
+@@ -41,9 +42,8 @@ class ReferenceData {
+ class ReferenceHandle : public TransferableHandle, public detail::ReferenceData {
+ 	friend class ApplyRunner;
+ 	friend class CopyRunner;
++	friend class AccessorRunner;
+ 	friend class GetRunner;
+-	friend class DeleteRunner;
+-	friend class SetRunner;
+ 	public:
+ 		using TypeOf = detail::ReferenceData::TypeOf;
+ 
+diff --git a/tests/reference.js b/tests/reference.js
+index 92e3467..0852183 100644
+--- a/tests/reference.js
++++ b/tests/reference.js
+@@ -1,22 +1,120 @@
++'use strict';
+ const ivm = require('isolated-vm');
+-const { strictEqual } = require('assert');
++const { strictEqual, throws } = require('assert');
++let trap = false;
+ 
+-const foo = { foo: 1 };
+-const bar = Object.create(foo);
+-bar.bar = 2;
+-const etc = Object.create(bar);
+-etc.etc = bar;
+ {
+-	const ref = new ivm.Reference(etc);
+-	strictEqual(ref.getSync('bar'), undefined);
+-	strictEqual(ref.getSync('etc').getSync('foo'), undefined);
+-	strictEqual(ref.getSync('etc').getSync('bar'), 2);
++	// Set up inheritance
++	const foo = { foo: 1 };
++	const bar = Object.create(foo);
++	bar.bar = 2;
++	const etc = Object.create(bar);
++	etc.etc = bar;
++
++	{
++		// Test without inheritance
++		const ref = new ivm.Reference(etc);
++		strictEqual(ref.getSync('bar'), undefined);
++		strictEqual(ref.getSync('etc').getSync('foo'), undefined);
++		strictEqual(ref.getSync('etc').getSync('bar'), 2);
++		ref.setSync('prop', 1);
++		strictEqual(ref.getSync('prop'), 1);
++		ref.deleteSync('prop');
++		strictEqual(ref.getSync('prop'), undefined);
++	}
++
++	{
++		// Test with inheritance
++		const ref = new ivm.Reference(etc, { unsafeInherit: true });
++		strictEqual(ref.getSync('bar'), 2);
++		strictEqual(ref.getSync('etc').getSync('foo'), 1);
++		strictEqual(ref.getSync('etc').getSync('bar'), 2);
++		ref.getSync('etc').setSync('prop', 1);
++		ref.setSync('prop', 2);
++		strictEqual(ref.getSync('prop'), 2);
++		ref.deleteSync('prop');
++		strictEqual(ref.getSync('prop'), 1);
++	}
++}
++
++{
++	// Set up getter / setters
++	let setter = 0;
++	const foo = {
++		get str() { trap = true; return 'got' },
++		set str(_) { trap = true },
++	};
++	Object.defineProperty(foo, 0, {
++		get() { trap = true; return 'got' },
++		set() { trap = true },
++	});
++
++	{
++		// Test plain accessors
++		const ref = new ivm.Reference(foo);
++		throws(() => ref.getSync('str'));
++		throws(() => ref.getSync(0));
++		throws(() => ref.setSync(0, undefined));
++	}
++
++	{
++		// Test accessors + inheritance
++		const ref = new ivm.Reference(Object.create(foo), { unsafeInherit: true });
++		throws(() => ref.getSync('str'));
++		ref.setSync('str', undefined);
++		throws(() => ref.getSync(0));
++	}
++}
++
++{
++	// Set up evil proxy
++	const val = { prop: 1 };
++	const prox = new Proxy(val, {
++		get() { trap = true },
++    set() { trap = true },
++    getOwnPropertyDescriptor() { trap = true },
++    getPrototypeOf() { trap = true },
++    has() { trap = true },
++    ownKeys() { trap = true },
++	});
++	const inherited = Object.create(prox);
++
++	{
++		// Test proxy
++		const ref = new ivm.Reference(prox);
++		throws(() => ref.getSync('prop'));
++	}
++
++	{
++		// Test inherited proxy
++		const ref = new ivm.Reference(inherited);
++		throws(() => ref.getSync('prop'),);
++	}
++
++	{
++		// Test deep inherited proxy
++		const ref = new ivm.Reference(inherited, { unsafeInherit: true });
++		throws(() => ref.getSync('prop'));
++	}
+ }
++
+ {
+-	const ref = new ivm.Reference(etc, { inheritUnsafe: true });
+-	strictEqual(ref.getSync('bar'), 2);
+-	strictEqual(ref.getSync('etc').getSync('foo'), 1);
+-	strictEqual(ref.getSync('etc').getSync('bar'), 2);
++	// Test Array (numeric indices)
++	const val = [ 1, 2, 3 ];
++	Object.defineProperty(val, 1, { get() { trap = true; return 'got' }});
++	const ref = new ivm.Reference(val);
++	strictEqual(ref.getSync(0), 1);
++	throws(() => ref.getSync(1));
+ }
+ 
++{
++	// Test ArrayBuffer (numeric indices)
++	const val = new Uint8Array([ 1, 2, 3 ]);
++	const ref = new ivm.Reference(val);
++	strictEqual(ref.getSync(0), 1);
++}
++
++if (trap) {
++	console.log('fail');
++}
+ console.log('pass');

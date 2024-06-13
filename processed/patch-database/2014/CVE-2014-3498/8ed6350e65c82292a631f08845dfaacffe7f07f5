@@ -1,0 +1,143 @@
+diff --git a/lib/ansible/inventory/script.py b/lib/ansible/inventory/script.py
+index 05348b68397a58..aec52256f90539 100644
+--- a/lib/ansible/inventory/script.py
++++ b/lib/ansible/inventory/script.py
+@@ -49,7 +49,7 @@ def __init__(self, filename=C.DEFAULT_HOST_LIST):
+     def _parse(self, err):
+ 
+         all_hosts = {}
+-        self.raw  = utils.parse_json(self.data)
++        self.raw  = utils.parse_json(self.data, from_remote=True)
+         all       = Group('all')
+         groups    = dict(all=all)
+         group     = None
+diff --git a/lib/ansible/runner/__init__.py b/lib/ansible/runner/__init__.py
+index f9980f857399a7..e810885e3bdecb 100644
+--- a/lib/ansible/runner/__init__.py
++++ b/lib/ansible/runner/__init__.py
+@@ -497,7 +497,7 @@ def _execute_module(self, conn, tmp, module_name, args,
+                 cmd2 = conn.shell.remove(tmp, recurse=True)
+                 self._low_level_exec_command(conn, cmd2, tmp, sudoable=False)
+ 
+-        data = utils.parse_json(res['stdout'])
++        data = utils.parse_json(res['stdout'], from_remote=True)
+         if 'parsed' in data and data['parsed'] == False:
+             data['msg'] += res['stderr']
+         return ReturnData(conn=conn, result=data)
+diff --git a/lib/ansible/runner/return_data.py b/lib/ansible/runner/return_data.py
+index 8e2252d4a3f434..5b99c4589851e2 100644
+--- a/lib/ansible/runner/return_data.py
++++ b/lib/ansible/runner/return_data.py
+@@ -43,8 +43,7 @@ def __init__(self, conn=None, host=None, result=None,
+         self.diff = diff
+ 
+         if type(self.result) in [ str, unicode ]:
+-            self.result = utils.parse_json(self.result)
+-
++            self.result = utils.parse_json(self.result, from_remote=True)
+ 
+         if self.host is None:
+             raise Exception("host not set")
+diff --git a/lib/ansible/utils/__init__.py b/lib/ansible/utils/__init__.py
+index bf68eea4cca025..9d09254e3c2222 100644
+--- a/lib/ansible/utils/__init__.py
++++ b/lib/ansible/utils/__init__.py
+@@ -313,7 +313,38 @@ def json_loads(data):
+ 
+     return json.loads(data)
+ 
+-def parse_json(raw_data):
++def _clean_data(orig_data):
++    ''' remove template tags from a string '''
++    data = orig_data
++    if isinstance(orig_data, basestring):
++        for pattern,replacement in (('{{','{#'), ('}}','#}'), ('{%','{#'), ('%}','#}')):
++            data = data.replace(pattern, replacement)
++    return data
++
++def _clean_data_struct(orig_data):
++    '''
++    walk a complex data structure, and use _clean_data() to
++    remove any template tags that may exist
++    '''
++    if isinstance(orig_data, dict):
++        data = orig_data.copy()
++        for key in data:
++            new_key = _clean_data_struct(key)
++            new_val = _clean_data_struct(data[key])
++            if key != new_key:
++                del data[key]
++            data[new_key] = new_val
++    elif isinstance(orig_data, list):
++        data = orig_data[:]
++        for i in range(0, len(data)):
++            data[i] = _clean_data_struct(data[i])
++    elif isinstance(orig_data, basestring):
++        data = _clean_data(orig_data)
++    else:
++        data = orig_data
++    return data
++
++def parse_json(raw_data, from_remote=False):
+     ''' this version for module return data only '''
+ 
+     orig_data = raw_data
+@@ -322,7 +353,7 @@ def parse_json(raw_data):
+     data = filter_leading_non_json_lines(raw_data)
+ 
+     try:
+-        return json.loads(data)
++        results = json.loads(data)
+     except:
+         # not JSON, but try "Baby JSON" which allows many of our modules to not
+         # require JSON and makes writing modules in bash much simpler
+@@ -332,7 +363,6 @@ def parse_json(raw_data):
+         except:
+             print "failed to parse json: "+ data
+             raise
+-
+         for t in tokens:
+             if "=" not in t:
+                 raise errors.AnsibleError("failed to parse: %s" % orig_data)
+@@ -347,7 +377,11 @@ def parse_json(raw_data):
+             results[key] = value
+         if len(results.keys()) == 0:
+             return { "failed" : True, "parsed" : False, "msg" : orig_data }
+-        return results
++
++    if from_remote:
++        results = _clean_data_struct(results)
++
++    return results
+ 
+ def smush_braces(data):
+     ''' smush Jinaj2 braces so unresolved templates like {{ foo }} don't get parsed weird by key=value code '''
+diff --git a/lib/ansible/utils/template.py b/lib/ansible/utils/template.py
+index 58fe2287cb5ead..9203470d31f7b0 100644
+--- a/lib/ansible/utils/template.py
++++ b/lib/ansible/utils/template.py
+@@ -80,7 +80,6 @@ class Flags:
+ 
+ FILTER_PLUGINS = None
+ _LISTRE = re.compile(r"(\w+)\[(\d+)\]")
+-JINJA2_OVERRIDE='#jinja2:'
+ 
+ def lookup(name, *args, **kwargs):
+     from ansible import utils
+@@ -231,16 +230,6 @@ def my_finalize(thing):
+     except:
+         raise errors.AnsibleError("unable to read %s" % realpath)
+ 
+-
+-    # Get jinja env overrides from template
+-    if data.startswith(JINJA2_OVERRIDE):
+-        eol = data.find('\n')
+-        line = data[len(JINJA2_OVERRIDE):eol]
+-        data = data[eol+1:]
+-        for pair in line.split(','):
+-            (key,val) = pair.split(':')
+-            setattr(environment,key.strip(),ast.literal_eval(val.strip()))
+-
+     environment.template_class = J2Template
+     try:
+         t = environment.from_string(data)

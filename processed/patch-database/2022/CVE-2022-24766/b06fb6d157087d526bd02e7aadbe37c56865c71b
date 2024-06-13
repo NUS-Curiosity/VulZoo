@@ -1,0 +1,241 @@
+diff --git a/mitmproxy/addons/proxyserver.py b/mitmproxy/addons/proxyserver.py
+index db1ce43c86..3f3099c865 100644
+--- a/mitmproxy/addons/proxyserver.py
++++ b/mitmproxy/addons/proxyserver.py
+@@ -98,6 +98,13 @@ def load(self, loader):
+             in custom scripts are lowercased before they are sent.
+             """,
+         )
++        loader.add_option(
++            "validate_inbound_headers", bool, True,
++            """
++            Make sure that incoming HTTP requests are not malformed.
++            Disabling this option makes mitmproxy vulnerable to HTTP smuggling attacks.
++            """,
++        )
+ 
+     async def running(self):
+         self.master = ctx.master
+diff --git a/mitmproxy/net/http/http1/__init__.py b/mitmproxy/net/http/http1/__init__.py
+index d05ef2fdc4..5de7a1ab9a 100644
+--- a/mitmproxy/net/http/http1/__init__.py
++++ b/mitmproxy/net/http/http1/__init__.py
+@@ -3,6 +3,7 @@
+     read_response_head,
+     connection_close,
+     expected_http_body_size,
++    validate_headers,
+ )
+ from .assemble import (
+     assemble_request, assemble_request_head,
+@@ -16,6 +17,7 @@
+     "read_response_head",
+     "connection_close",
+     "expected_http_body_size",
++    "validate_headers",
+     "assemble_request", "assemble_request_head",
+     "assemble_response", "assemble_response_head",
+     "assemble_body",
+diff --git a/mitmproxy/net/http/http1/read.py b/mitmproxy/net/http/http1/read.py
+index 4ac21698b1..30840e9754 100644
+--- a/mitmproxy/net/http/http1/read.py
++++ b/mitmproxy/net/http/http1/read.py
+@@ -38,6 +38,38 @@ def connection_close(http_version, headers):
+     )
+ 
+ 
++# https://datatracker.ietf.org/doc/html/rfc7230#section-3.2: Header fields are tokens.
++# "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /  "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
++_valid_header_name = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9a-zA-Z]+$")
++
++
++def validate_headers(
++    headers: Headers
++) -> None:
++    """
++    Validate headers to avoid request smuggling attacks. Raises a ValueError if they are malformed.
++    """
++
++    te_found = False
++    cl_found = False
++
++    for (name, value) in headers.fields:
++        if not _valid_header_name.match(name):
++            raise ValueError(f"Received an invalid header name: {name!r}. Invalid header names may introduce "
++                             f"request smuggling vulnerabilities. Disable the validate_inbound_headers option "
++                             f"to skip this security check.")
++
++        name_lower = name.lower()
++        te_found = te_found or name_lower == b"transfer-encoding"
++        cl_found = cl_found or name_lower == b"content-length"
++
++    if te_found and cl_found:
++        raise ValueError("Received both a Transfer-Encoding and a Content-Length header, "
++                         "refusing as recommended in RFC 7230 Section 3.3.3. "
++                         "See https://github.com/mitmproxy/mitmproxy/issues/4799 for details. "
++                         "Disable the validate_inbound_headers option to skip this security check.")
++
++
+ def expected_http_body_size(
+         request: Request,
+         response: Optional[Response] = None
+@@ -101,10 +133,8 @@ def expected_http_body_size(
+     #        a message downstream.
+     #
+     if "transfer-encoding" in headers:
+-        if "content-length" in headers:
+-            raise ValueError("Received both a Transfer-Encoding and a Content-Length header, "
+-                             "refusing as recommended in RFC 7230 Section 3.3.3. "
+-                             "See https://github.com/mitmproxy/mitmproxy/issues/4799 for details.")
++        # we should make sure that there isn't also a content-length header.
++        # this is already handled in validate_headers.
+ 
+         te: str = headers["transfer-encoding"]
+         if not te.isascii():
+diff --git a/mitmproxy/proxy/layers/http/_http1.py b/mitmproxy/proxy/layers/http/_http1.py
+index 3fff8faeae..a312570a5b 100644
+--- a/mitmproxy/proxy/layers/http/_http1.py
++++ b/mitmproxy/proxy/layers/http/_http1.py
+@@ -234,6 +234,8 @@ def read_headers(self, event: events.ConnectionEvent) -> layer.CommandGenerator[
+                 request_head = [bytes(x) for x in request_head]  # TODO: Make url.parse compatible with bytearrays
+                 try:
+                     self.request = http1.read_request_head(request_head)
++                    if self.context.options.validate_inbound_headers:
++                        http1.validate_headers(self.request.headers)
+                     expected_body_size = http1.expected_http_body_size(self.request)
+                 except ValueError as e:
+                     yield commands.SendData(self.conn, make_error_response(400, str(e)))
+@@ -330,6 +332,8 @@ def read_headers(self, event: events.ConnectionEvent) -> layer.CommandGenerator[
+                 response_head = [bytes(x) for x in response_head]  # TODO: Make url.parse compatible with bytearrays
+                 try:
+                     self.response = http1.read_response_head(response_head)
++                    if self.context.options.validate_inbound_headers:
++                        http1.validate_headers(self.response.headers)
+                     expected_size = http1.expected_http_body_size(self.request, self.response)
+                 except ValueError as e:
+                     yield commands.CloseConnection(self.conn)
+diff --git a/mitmproxy/proxy/layers/http/_http2.py b/mitmproxy/proxy/layers/http/_http2.py
+index cf71e84259..d72b18436f 100644
+--- a/mitmproxy/proxy/layers/http/_http2.py
++++ b/mitmproxy/proxy/layers/http/_http2.py
+@@ -40,7 +40,7 @@ class Http2Connection(HttpConnection):
+     h2_conf_defaults = dict(
+         header_encoding=False,
+         validate_outbound_headers=False,
+-        validate_inbound_headers=True,
++        # validate_inbound_headers is controlled by the validate_inbound_headers option.
+         normalize_inbound_headers=False,  # changing this to True is required to pass h2spec
+         normalize_outbound_headers=False,
+     )
+@@ -58,6 +58,7 @@ def __init__(self, context: Context, conn: Connection):
+         if self.debug:
+             self.h2_conf.logger = H2ConnectionLogger(f"{human.format_address(self.context.client.peername)}: "
+                                                      f"{self.__class__.__name__}")
++        self.h2_conf.validate_inbound_headers = self.context.options.validate_inbound_headers
+         self.h2_conn = BufferedH2Connection(self.h2_conf)
+         self.streams = {}
+ 
+diff --git a/test/mitmproxy/net/http/http1/test_read.py b/test/mitmproxy/net/http/http1/test_read.py
+index 576093896e..e8170ae858 100644
+--- a/test/mitmproxy/net/http/http1/test_read.py
++++ b/test/mitmproxy/net/http/http1/test_read.py
+@@ -4,7 +4,7 @@
+ from mitmproxy.net.http.http1.read import (
+     read_request_head,
+     read_response_head, connection_close, expected_http_body_size,
+-    _read_request_line, _read_response_line, _read_headers, get_header_tokens
++    _read_request_line, _read_response_line, _read_headers, get_header_tokens, validate_headers
+ )
+ from mitmproxy.test.tutils import treq, tresp
+ 
+@@ -59,6 +59,19 @@ def test_read_response_head():
+     assert r.content is None
+ 
+ 
++def test_validate_headers():
++    # both content-length and chunked (possible request smuggling)
++    with pytest.raises(ValueError, match="Received both a Transfer-Encoding and a Content-Length header"):
++        validate_headers(
++            Headers(transfer_encoding="chunked", content_length="42"),
++        )
++
++    with pytest.raises(ValueError, match="Received an invalid header name"):
++        validate_headers(
++            Headers([(b"content-length ", b"42")]),
++        )
++
++
+ def test_expected_http_body_size():
+     # Expect: 100-continue
+     assert expected_http_body_size(
+@@ -91,11 +104,6 @@ def test_expected_http_body_size():
+     assert expected_http_body_size(
+         treq(headers=Headers(transfer_encoding="gzip,\tchunked")),
+     ) is None
+-    # both content-length and chunked (possible request smuggling)
+-    with pytest.raises(ValueError, match="Received both a Transfer-Encoding and a Content-Length header"):
+-        expected_http_body_size(
+-            treq(headers=Headers(transfer_encoding="chunked", content_length="42")),
+-        )
+     with pytest.raises(ValueError, match="Invalid transfer encoding"):
+         expected_http_body_size(
+             treq(headers=Headers(transfer_encoding="chun\u212Aed")),  # "chunKed".lower() == "chunked"
+diff --git a/test/mitmproxy/proxy/layers/http/test_http.py b/test/mitmproxy/proxy/layers/http/test_http.py
+index dfeb35f62a..32b1d07ae5 100644
+--- a/test/mitmproxy/proxy/layers/http/test_http.py
++++ b/test/mitmproxy/proxy/layers/http/test_http.py
+@@ -1261,6 +1261,37 @@ def test_request_smuggling(tctx):
+     assert b"Received both a Transfer-Encoding and a Content-Length header" in err()
+ 
+ 
++def test_request_smuggling_whitespace(tctx):
++    """Test that we reject header names with whitespace"""
++    err = Placeholder(bytes)
++    assert (
++        Playbook(http.HttpLayer(tctx, HTTPMode.regular), hooks=False)
++        >> DataReceived(tctx.client, b"GET http://example.com/ HTTP/1.1\r\n"
++                                     b"Host: example.com\r\n"
++                                     b"Content-Length : 42\r\n\r\n")
++        << SendData(tctx.client, err)
++        << CloseConnection(tctx.client)
++    )
++    assert b"Received an invalid header name" in err()
++
++
++def test_request_smuggling_validation_disabled(tctx):
++    """Test that we don't reject request smuggling when validation is disabled."""
++    tctx.options.validate_inbound_headers = False
++    assert (
++        Playbook(http.HttpLayer(tctx, HTTPMode.regular), hooks=False)
++        >> DataReceived(tctx.client, b"GET http://example.com/ HTTP/1.1\r\n"
++                                     b"Host: example.com\r\n"
++                                     b"Content-Length: 4\r\n"
++                                     b"Transfer-Encoding: chunked\r\n\r\n"
++                                     b"4\r\n"
++                                     b"abcd\r\n"
++                                     b"0\r\n"
++                                     b"\r\n")
++        << OpenConnection(Placeholder(Server))
++    )
++
++
+ def test_request_smuggling_te_te(tctx):
+     """Test that we reject transfer-encoding headers that are weird in some way"""
+     err = Placeholder(bytes)
+diff --git a/test/mitmproxy/proxy/layers/http/test_http2.py b/test/mitmproxy/proxy/layers/http/test_http2.py
+index 60ed363692..2044b0bb18 100644
+--- a/test/mitmproxy/proxy/layers/http/test_http2.py
++++ b/test/mitmproxy/proxy/layers/http/test_http2.py
+@@ -352,11 +352,11 @@ def enable_response_streaming(flow: HTTPFlow):
+         assert "peer closed connection" in flow().error.msg
+ 
+ 
+-@pytest.mark.xfail(reason="inbound validation turned on to protect against request smuggling")
+ @pytest.mark.parametrize("normalize", [True, False])
+ def test_no_normalization(tctx, normalize):
+     """Test that we don't normalize headers when we just pass them through."""
+     tctx.options.normalize_outbound_headers = normalize
++    tctx.options.validate_inbound_headers = False
+ 
+     server = Placeholder(Server)
+     flow = Placeholder(HTTPFlow)

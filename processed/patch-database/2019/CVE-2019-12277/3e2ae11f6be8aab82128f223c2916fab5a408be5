@@ -1,0 +1,164 @@
+diff --git a/src/Core/Api/AssetsController.cs b/src/Core/Api/AssetsController.cs
+index e120d910d..766d1a00b 100644
+--- a/src/Core/Api/AssetsController.cs
++++ b/src/Core/Api/AssetsController.cs
+@@ -7,6 +7,7 @@
+ using System.Collections.Generic;
+ using System.Threading.Tasks;
+ using System.Linq;
++using Microsoft.AspNetCore.Authorization;
+ 
+ namespace Core.Api
+ {
+@@ -40,20 +41,20 @@ public async Task<AssetsModel> Get(int page = 1, string filter = "", string sear
+             {
+                 if (filter == "filterImages")
+                 {
+-                    items = await _store.Find(a => a.AssetType == AssetType.Image, pager);
++                    items = await _store.Find(a => a.AssetType == AssetType.Image, pager, "", !User.Identity.IsAuthenticated);
+                 }
+                 else if (filter == "filterAttachments")
+                 {
+-                    items = await _store.Find(a => a.AssetType == AssetType.Attachment, pager);
++                    items = await _store.Find(a => a.AssetType == AssetType.Attachment, pager, "", !User.Identity.IsAuthenticated);
+                 }
+                 else
+                 {
+-                    items = await _store.Find(null, pager);
++                    items = await _store.Find(null, pager, "", !User.Identity.IsAuthenticated);
+                 }
+             }
+             else
+             {
+-                items = await _store.Find(a => a.Title.Contains(search), pager);
++                items = await _store.Find(a => a.Title.Contains(search), pager, "", !User.Identity.IsAuthenticated);
+             }
+ 
+             if (page < 1 || page > pager.LastPage)
+@@ -110,11 +111,12 @@ public async Task<AssetItem> Pick(string type, string asset, string post)
+         }
+ 
+         /// <summary>
+-        /// Upload file(s) to user data store
++        /// Upload file(s) to user data store, authentication required
+         /// </summary>
+         /// <param name="files">Selected files</param>
+         /// <returns>Success or internal error</returns>
+         [HttpPost("upload")]
++        [Authorize]
+         public async Task<IActionResult> Upload(ICollection<IFormFile> files)
+         {
+             try
+@@ -137,6 +139,7 @@ public async Task<IActionResult> Upload(ICollection<IFormFile> files)
+         /// <param name="url">Relative URL of the file to remove</param>
+         /// <returns></returns>
+         [HttpDelete("remove")]
++        [Authorize]
+         public IActionResult Remove(string url)
+         {
+             try
+diff --git a/src/Core/CoreAPI.xml b/src/Core/CoreAPI.xml
+index d6046d504..6ec357a0a 100644
+--- a/src/Core/CoreAPI.xml
++++ b/src/Core/CoreAPI.xml
+@@ -24,7 +24,7 @@
+         </member>
+         <member name="M:Core.Api.AssetsController.Upload(System.Collections.Generic.ICollection{Microsoft.AspNetCore.Http.IFormFile})">
+             <summary>
+-            Upload file(s) to user data store
++            Upload file(s) to user data store, authentication required
+             </summary>
+             <param name="files">Selected files</param>
+             <returns>Success or internal error</returns>
+diff --git a/src/Core/Extensions/StringExtensions.cs b/src/Core/Extensions/StringExtensions.cs
+index 363ac4c45..23f3dfcb0 100644
+--- a/src/Core/Extensions/StringExtensions.cs
++++ b/src/Core/Extensions/StringExtensions.cs
+@@ -212,6 +212,22 @@ static string RemoveExtraHyphen(string text)
+             return text;
+         }
+ 
++        public static string SanitizePath(this string str)
++        {
++            if (str.Contains("..") || str.Contains("//"))
++                throw new ApplicationException("Invalid directory path");
++
++            return str;
++        }
++
++        public static string SanitizeFileName(this string str)
++        {
++            if (str.Contains("..") || str.Contains("//") || str.Count(x => x == '.') > 1)
++                throw new ApplicationException("Invalid file name");
++
++            return str;
++        }
++
+         #endregion
+     }
+ }
+\ No newline at end of file
+diff --git a/src/Core/Services/StorageService.cs b/src/Core/Services/StorageService.cs
+index 03a31cf3f..3b9d6c62c 100644
+--- a/src/Core/Services/StorageService.cs
++++ b/src/Core/Services/StorageService.cs
+@@ -32,7 +32,7 @@ public interface IStorageService
+ 
+         string GetHtmlTemplate(string template);
+ 
+-        Task<IEnumerable<AssetItem>> Find(Func<AssetItem, bool> predicate, Pager pager, string path = "");
++        Task<IEnumerable<AssetItem>> Find(Func<AssetItem, bool> predicate, Pager pager, string path = "", bool sanitize = false);
+ 
+         Task Reset();
+     }
+@@ -254,7 +254,7 @@ public async Task<AssetItem> UploadFromWeb(Uri requestUri, string root, string p
+             }
+         }
+ 
+-        public async Task<IEnumerable<AssetItem>> Find(Func<AssetItem, bool> predicate, Pager pager, string path = "")
++        public async Task<IEnumerable<AssetItem>> Find(Func<AssetItem, bool> predicate, Pager pager, string path = "", bool sanitize = false)
+         {
+             var skip = pager.CurrentPage * pager.ItemsPerPage - pager.ItemsPerPage;
+             var files = GetAssets(path);
+@@ -267,6 +267,14 @@ public async Task<IEnumerable<AssetItem>> Find(Func<AssetItem, bool> predicate,
+ 
+             var page = items.Skip(skip).Take(pager.ItemsPerPage).ToList();
+ 
++            if (sanitize)
++            {
++                foreach (var p in page)
++                {
++                    p.Path = "";
++                }
++            }
++
+             return await Task.FromResult(page);
+         }
+ 
+@@ -331,6 +339,8 @@ public async Task Reset()
+ 
+         void VerifyPath(string path)
+         {
++            path = path.SanitizePath();
++
+             if (!string.IsNullOrEmpty(path))
+             {
+                 var dir = Path.Combine(Location, path);
+@@ -373,7 +383,7 @@ string GetFileName(string fileName)
+                 Random rnd = new Random();
+                 fileName = fileName.Replace("mceclip0", rnd.Next(100000, 999999).ToString());
+             }
+-            return fileName;
++            return fileName.SanitizeFileName();
+         }
+ 
+         string GetUrl(string path, string root)
+@@ -444,7 +454,7 @@ string TitleFromUri(Uri uri)
+ 
+             title = title.Replace(" ", "-");
+ 
+-            return title.Replace("/", "");
++            return title.Replace("/", "").SanitizeFileName();
+         }
+ 
+         List<AssetItem> MapFilesToAssets(IList<string> assets)

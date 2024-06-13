@@ -1,0 +1,252 @@
+diff --git a/.env.example b/.env.example
+index a3c3f3769b..3fd9072117 100644
+--- a/.env.example
++++ b/.env.example
+@@ -11,6 +11,9 @@ COMPANION_PORT=3020
+ COMPANION_CLIENT_ORIGINS=
+ COMPANION_SECRET=development
+ 
++# NOTE: Only enable this in development. Enabling it in production is a security risk
++COMPANION_ALLOW_LOCAL_URLS=true
++
+ COMPANION_DROPBOX_KEY=***
+ COMPANION_DROPBOX_SECRET=***
+ 
+diff --git a/bin/companion.sh b/bin/companion.sh
+index 43b9437a49..df114b8b35 100755
+--- a/bin/companion.sh
++++ b/bin/companion.sh
+@@ -11,6 +11,7 @@ else
+     COMPANION_PORT=3020 \
+     COMPANION_CLIENT_ORIGINS="" \
+     COMPANION_SECRET="development" \
++    COMPANION_ALLOW_LOCAL_URLS="true" \
+     nodemon --watch packages/@uppy/companion/src --exec node ./packages/@uppy/companion/src/standalone/start-server.js
+ fi
+ 
+diff --git a/packages/@uppy/companion/src/companion.js b/packages/@uppy/companion/src/companion.js
+index 964b1c200e..2135fd431e 100644
+--- a/packages/@uppy/companion/src/companion.js
++++ b/packages/@uppy/companion/src/companion.js
+@@ -41,7 +41,7 @@ const defaultOptions = {
+       expires: ms('5 minutes') / 1000,
+     },
+   },
+-  debug: true,
++  allowLocalUrls: false,
+   logClientVersion: true,
+   periodicPingUrls: [],
+   streamingUpload: false,
+diff --git a/packages/@uppy/companion/src/server/controllers/url.js b/packages/@uppy/companion/src/server/controllers/url.js
+index b7bc41c5fe..088e2f66cc 100644
+--- a/packages/@uppy/companion/src/server/controllers/url.js
++++ b/packages/@uppy/companion/src/server/controllers/url.js
+@@ -11,9 +11,9 @@ const logger = require('../logger')
+  * Validates that the download URL is secure
+  *
+  * @param {string} url the url to validate
+- * @param {boolean} debug whether the server is running in debug mode
++ * @param {boolean} ignoreTld whether to allow local addresses
+  */
+-const validateURL = (url, debug) => {
++const validateURL = (url, ignoreTld) => {
+   if (!url) {
+     return false
+   }
+@@ -21,7 +21,7 @@ const validateURL = (url, debug) => {
+   const validURLOpts = {
+     protocols: ['http', 'https'],
+     require_protocol: true,
+-    require_tld: !debug,
++    require_tld: !ignoreTld,
+   }
+   if (!validator.isURL(url, validURLOpts)) {
+     return false
+@@ -83,13 +83,13 @@ const downloadURL = async (url, blockLocalIPs, traceId) => {
+ const meta = async (req, res) => {
+   try {
+     logger.debug('URL file import handler running', null, req.id)
+-    const { debug } = req.companion.options
+-    if (!validateURL(req.body.url, debug)) {
++    const { allowLocalUrls } = req.companion.options
++    if (!validateURL(req.body.url, allowLocalUrls)) {
+       logger.debug('Invalid request body detected. Exiting url meta handler.', null, req.id)
+       return res.status(400).json({ error: 'Invalid request body' })
+     }
+ 
+-    const urlMeta = await getURLMeta(req.body.url, !debug)
++    const urlMeta = await getURLMeta(req.body.url, !allowLocalUrls)
+     return res.json(urlMeta)
+   } catch (err) {
+     logger.error(err, 'controller.url.meta.error', req.id)
+@@ -107,20 +107,20 @@ const meta = async (req, res) => {
+  */
+ const get = async (req, res) => {
+   logger.debug('URL file import handler running', null, req.id)
+-  const { debug } = req.companion.options
+-  if (!validateURL(req.body.url, debug)) {
++  const { allowLocalUrls } = req.companion.options
++  if (!validateURL(req.body.url, allowLocalUrls)) {
+     logger.debug('Invalid request body detected. Exiting url import handler.', null, req.id)
+     res.status(400).json({ error: 'Invalid request body' })
+     return
+   }
+ 
+   async function getSize () {
+-    const { size } = await getURLMeta(req.body.url, !debug)
++    const { size } = await getURLMeta(req.body.url, !allowLocalUrls)
+     return size
+   }
+ 
+   async function download () {
+-    return downloadURL(req.body.url, !debug, req.id)
++    return downloadURL(req.body.url, !allowLocalUrls, req.id)
+   }
+ 
+   function onUnhandledError (err) {
+diff --git a/packages/@uppy/companion/src/server/logger.js b/packages/@uppy/companion/src/server/logger.js
+index 68d5563e93..7972ba9453 100644
+--- a/packages/@uppy/companion/src/server/logger.js
++++ b/packages/@uppy/companion/src/server/logger.js
+@@ -112,7 +112,6 @@ exports.error = (msg, tag, traceId, shouldLogStackTrace) => {
+  * @param {string=} traceId a unique id to easily trace logs tied to a request
+  */
+ exports.debug = (msg, tag, traceId) => {
+-  // @todo: this function should depend on companion's debug option instead
+   if (process.env.NODE_ENV !== 'production') {
+     // @ts-ignore
+     log(msg, tag, 'debug', traceId, chalk.bold.blue)
+diff --git a/packages/@uppy/companion/src/server/provider/facebook/index.js b/packages/@uppy/companion/src/server/provider/facebook/index.js
+index 6e684dbdbc..826456ffaa 100644
+--- a/packages/@uppy/companion/src/server/provider/facebook/index.js
++++ b/packages/@uppy/companion/src/server/provider/facebook/index.js
+@@ -127,7 +127,7 @@ class Facebook extends Provider {
+           return done(err)
+         }
+ 
+-        getURLMeta(this._getMediaUrl(body))
++        getURLMeta(this._getMediaUrl(body), true)
+           .then(({ size }) => done(null, size))
+           .catch((err2) => {
+             logger.error(err2, 'provider.facebook.size.error')
+diff --git a/packages/@uppy/companion/src/server/provider/instagram/graph/index.js b/packages/@uppy/companion/src/server/provider/instagram/graph/index.js
+index 79b380d5cd..95ecef61f7 100644
+--- a/packages/@uppy/companion/src/server/provider/instagram/graph/index.js
++++ b/packages/@uppy/companion/src/server/provider/instagram/graph/index.js
+@@ -118,7 +118,7 @@ class Instagram extends Provider {
+           return done(err)
+         }
+ 
+-        getURLMeta(body.media_url)
++        getURLMeta(body.media_url, true)
+           .then(({ size }) => done(null, size))
+           .catch((err2) => {
+             logger.error(err2, 'provider.instagram.size.error')
+diff --git a/packages/@uppy/companion/src/server/provider/unsplash/index.js b/packages/@uppy/companion/src/server/provider/unsplash/index.js
+index d3b14648af..64d6be2bf8 100644
+--- a/packages/@uppy/companion/src/server/provider/unsplash/index.js
++++ b/packages/@uppy/companion/src/server/provider/unsplash/index.js
+@@ -129,7 +129,7 @@ class Unsplash extends SearchProvider {
+         return
+       }
+ 
+-      getURLMeta(body.links.download)
++      getURLMeta(body.links.download, true)
+         .then(({ size }) => done(null, size))
+         .catch((err2) => {
+           logger.error(err2, 'provider.unsplash.size.error')
+diff --git a/packages/@uppy/companion/src/standalone/helper.js b/packages/@uppy/companion/src/standalone/helper.js
+index 0d9a263313..7d87d14c34 100644
+--- a/packages/@uppy/companion/src/standalone/helper.js
++++ b/packages/@uppy/companion/src/standalone/helper.js
+@@ -106,7 +106,7 @@ const getConfigFromEnv = () => {
+     uploadUrls: uploadUrls ? uploadUrls.split(',') : null,
+     secret: getSecret('COMPANION_SECRET') || generateSecret(),
+     preAuthSecret: getSecret('COMPANION_PREAUTH_SECRET') || generateSecret(),
+-    debug: process.env.NODE_ENV && process.env.NODE_ENV !== 'production',
++    allowLocalUrls: process.env.COMPANION_ALLOW_LOCAL_URLS === 'true',
+     // cookieDomain is kind of a hack to support distributed systems. This should be improved but we never got so far.
+     cookieDomain: process.env.COMPANION_COOKIE_DOMAIN,
+     multipleInstances: true,
+diff --git a/packages/@uppy/companion/test/__tests__/companion.js b/packages/@uppy/companion/test/__tests__/companion.js
+index 1e011b78b1..48b0115f7d 100644
+--- a/packages/@uppy/companion/test/__tests__/companion.js
++++ b/packages/@uppy/companion/test/__tests__/companion.js
+@@ -171,6 +171,34 @@ it('periodically pings', (done) => {
+   })
+ }, 1000)
+ 
++it('respects allowLocalUrls', async () => {
++  const server = getServer()
++  const url = 'http://localhost/'
++
++  let res
++
++  res = await request(server)
++    .post('/url/meta')
++    .send({ url })
++    .expect(400)
++
++  expect(res.body).toEqual({ error: 'Invalid request body' })
++
++  res = await request(server)
++    .post('/url/get')
++    .send({
++      fileId: url,
++      metadata: {},
++      endpoint: 'http://url.myendpoint.com/files',
++      protocol: 'tus',
++      size: null,
++      url,
++    })
++    .expect(400)
++
++  expect(res.body).toEqual({ error: 'Invalid request body' })
++}, 1000)
++
+ afterAll(() => {
+   nock.cleanAll()
+   nock.restore()
+diff --git a/packages/@uppy/companion/test/mockserver.js b/packages/@uppy/companion/test/mockserver.js
+index 830b39195f..159a2caa14 100644
+--- a/packages/@uppy/companion/test/mockserver.js
++++ b/packages/@uppy/companion/test/mockserver.js
+@@ -11,6 +11,7 @@ const defaultEnv = {
+   COMPANION_HIDE_WELCOME: 'false',
+ 
+   COMPANION_STREAMING_UPLOAD: 'true',
++  COMPANION_ALLOW_LOCAL_URLS : 'false',
+ 
+   COMPANION_PROTOCOL: 'http',
+   COMPANION_DATADIR: './test/output',
+diff --git a/website/src/docs/companion.md b/website/src/docs/companion.md
+index 7990dba4f6..5aaa6e381d 100644
+--- a/website/src/docs/companion.md
++++ b/website/src/docs/companion.md
+@@ -246,6 +246,9 @@ export COMPANION_UPLOAD_URLS="http://tusd.tusdemo.net/files/,https://tusd.tusdem
+ # corresponds to the streamingUpload option
+ export COMPANION_STREAMING_UPLOAD=true
+ 
++# corresponds to the allowLocalUrls option
++export COMPANION_ALLOW_LOCAL_URLS=false
++
+ # corresponds to the maxFileSize option
+ export COMPANION_MAX_FILE_SIZE="100000000"
+ 
+@@ -309,6 +312,7 @@ const options = {
+   debug: true,
+   metrics: false,
+   streamingUpload: true,
++  allowLocalUrls: false,
+   maxFileSize: 100000000,
+   periodicPingUrls: [],
+   periodicPingInterval: 60000,
+@@ -359,6 +363,8 @@ const options = {
+ 
+ 18. **periodicPingStaticPayload(optional)** - A `JSON.stringify`-able JavaScript Object that will be sent as part of the JSON body in the period ping requests.
+ 
++19. **allowLocalUrls(optional)** - A boolean flag to tell Companion whether to allow requesting local URLs. Note: Only enable this in development. **Enabling it in production is a security risk.**
++
+ ### Provider Redirect URIs
+ 
+ When generating your provider API keys on their corresponding developer platforms (e.g [Google Developer Console](https://console.developers.google.com/)), you’d need to provide a `redirect URI` for the OAuth authorization process. In general the redirect URI for each provider takes the format:

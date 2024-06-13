@@ -1,0 +1,189 @@
+diff --git a/lib/Convos/Core/Settings.pm b/lib/Convos/Core/Settings.pm
+index fd51a10ab..138016486 100644
+--- a/lib/Convos/Core/Settings.pm
++++ b/lib/Convos/Core/Settings.pm
+@@ -1,10 +1,10 @@
+ package Convos::Core::Settings;
+ use Mojo::Base -base;
+ 
++use Convos::Util 'generate_secret';
+ use Mojo::JSON qw(false true);
+ use Mojo::Path;
+ use Mojo::URL;
+-use Mojo::Util;
+ 
+ has contact => sub { $ENV{CONVOS_CONTACT} || 'mailto:root@localhost' };
+ sub core { shift->{core} or die 'core is required in constructor' }
+@@ -12,7 +12,7 @@ has default_connection => \&_build_default_connection;
+ has forced_connection =>
+   sub { $ENV{CONVOS_FORCED_CONNECTION} || $ENV{CONVOS_FORCED_IRC_SERVER} ? true : false };
+ sub id {'settings'}
+-has local_secret   => \&_build_local_secret;
++has local_secret   => sub { $ENV{CONVOS_LOCAL_SECRET} || generate_secret };
+ has open_to_public => sub {false};
+ has organization_name =>
+   sub { $ENV{CONVOS_ORGANIZATION_NAME} || shift->defaults->{organization_name} };
+@@ -63,14 +63,8 @@ sub load_p {
+ 
+ sub save_p {
+   my $self = shift;
+-
+   $self->_set_attributes(shift, 0) if ref $_[0] eq 'HASH';
+   my $p = $self->core->backend->save_object_p($self, @_);
+-
+-  # Remove legacy secrets file
+-  my $file = $self->_legacy_session_secrets_file;
+-  $file->remove if -e $file;
+-
+   return $p;
+ }
+ 
+@@ -91,29 +85,17 @@ sub _build_default_connection {
+   return Mojo::URL->new('irc://chat.freenode.net:6697/%23convos');
+ }
+ 
+-sub _build_local_secret {
+-  my $self = shift;
+-  return $ENV{CONVOS_LOCAL_SECRET} if $ENV{CONVOS_LOCAL_SECRET};
+-
+-  my $secret = Mojo::Util::md5_sum(join ':', $self->core->home->to_string, $<, $(, $0);
+-  return $secret;
+-}
+-
+ sub _build_session_secrets {
+   my $self = shift;
+   return [split /,/, $ENV{CONVOS_SECRETS} || ''] if $ENV{CONVOS_SECRETS};
+ 
+-  my $secrets;
+-  my $file = $self->_legacy_session_secrets_file;
+-  $secrets = [split /‚/, $file->slurp] if -e $file;
+-  return $secrets if $secrets and @$secrets;
++  my $file    = $self->core->home->child('secrets');
++  my $secrets = -r $file ? [split /‚/, $file->slurp] : [];
++  $file->remove if -e $file;
+ 
+-  $secrets = [Mojo::Util::sha1_sum(join ':', rand(), $$, $<, $(, $^X, Time::HiRes::time())];
+-  return $secrets;
++  return @$secrets ? $secrets : [generate_secret];
+ }
+ 
+-sub _legacy_session_secrets_file { shift->core->home->child('secrets') }
+-
+ sub _set_attributes {
+   my ($self, $params, $safe_source) = @_;
+ 
+diff --git a/lib/Convos/Util.pm b/lib/Convos/Util.pm
+index 5ca7d1838..04da68438 100644
+--- a/lib/Convos/Util.pm
++++ b/lib/Convos/Util.pm
+@@ -3,16 +3,17 @@ use Mojo::Base 'Exporter';
+ 
+ use JSON::Validator::Error;
+ use Mojo::Collection 'c';
+-use Mojo::File;
+-use Mojo::Util qw(b64_decode b64_encode md5_sum monkey_patch);
+-use Time::Piece ();
++use Mojo::Util qw(b64_decode b64_encode md5_sum monkey_patch sha1_sum);
++use Sys::Hostname ();
++use Time::HiRes   ();
++use Time::Piece   ();
+ 
+ use constant DEBUG => $ENV{CONVOS_DEBUG} || 0;
+ 
+ our $CHANNEL_RE = qr{[#&]};
+ our @EXPORT_OK  = (
+-  qw($CHANNEL_RE DEBUG E has_many pretty_connection_name require_module),
+-  qw(sdp_decode sdp_encode short_checksum tp),
++  qw($CHANNEL_RE DEBUG E generate_secret has_many pretty_connection_name),
++  qw(require_module sdp_decode sdp_encode short_checksum tp),
+ );
+ 
+ sub E {
+@@ -22,6 +23,10 @@ sub E {
+   return {errors => [JSON::Validator::Error->new($path, $msg)]};
+ }
+ 
++sub generate_secret {
++  return eval { _generate_secret_urandom() } || _generate_secret_fallback();
++}
++
+ sub has_many {
+   my ($plural_accessor, $many_class, $constructor) = @_;
+   my $class = caller;
+@@ -126,6 +131,18 @@ sub tp {
+   Time::Piece->strptime($_, '%Y-%m-%dT%H:%M:%S');
+ }
+ 
++sub _generate_secret_fallback {
++  return sha1_sum join ':', rand(), $$, $<, Sys::Hostname::hostname(), Time::HiRes::time();
++}
++
++sub _generate_secret_urandom {
++  my $len = shift || $ENV{CONVOS_SECRET_URANDOM_READ_LEN} || 128;
++  open my $fh, '<', '/dev/urandom' or die "Can't open /dev/urandom: $!";
++  my $ret = sysread $fh, my ($secret), $len;
++  return sha1_sum $secret if $ret == $len;
++  die qq{Could not read $len bytes from "/dev/urandom": $!};
++}
++
+ 1;
+ 
+ =encoding utf8
+@@ -145,6 +162,18 @@ L<Convos::Util> is a utily module for L<Convos>.
+ 
+ =head1 FUNCTIONS
+ 
++=head2 generate_secret
++
++  $str = generate_secret;
++
++Returns a SHA1 sum of bytes from "/dev/urandom" or fallback to a SHA1 sum of:
++
++    rand()     # Not cryptographically secure, but pseudo random
++    $$         # Will probably be "1" inside Docker and probably less than 32768 on Linux
++    $<         # Will probably be "0" inside Docker and probably less than 10000 on Linux
++    hostname() # Will be unique inside Docker and guessable on Linux
++    time()     # Floating seconds since the epoch (Ex: 1592094819.82439)
++
+ =head2 has_many
+ 
+   has_many $attribute => $many_class_class => sub {
+diff --git a/t/config.t b/t/config.t
+index a6cab6cde..501993a4b 100644
+--- a/t/config.t
++++ b/t/config.t
+@@ -15,7 +15,7 @@ is $convos->config->{home}, $ENV{CONVOS_HOME}, 'home from ENV';
+ is $convos->settings('organization_name'), 'Convos',              'default organization_name';
+ is $convos->settings('organization_url'),  'https://convos.chat', 'default organization_url';
+ is $convos->config->{hypnotoad}{pid_file}, undef, 'default pid_file';
+-like $convos->settings('local_secret'), qr/^\w{32}$/, 'generated local_secret';
++like $convos->settings('local_secret'), qr/^\w{40}$/, 'generated local_secret';
+ like $secret, qr/^[a-z0-9]{40}$/, 'default secrets';
+ 
+ note 'Make sure we load the same secret';
+diff --git a/t/util.t b/t/util.t
+index c8485ff1b..8d20c4428 100644
+--- a/t/util.t
++++ b/t/util.t
+@@ -1,5 +1,5 @@
+ use Test::More;
+-use Convos::Util qw(require_module sdp_decode sdp_encode short_checksum);
++use Convos::Util qw(generate_secret require_module sdp_decode sdp_encode short_checksum);
+ use Mojo::Loader 'data_section';
+ use Mojo::Util qw(b64_encode gzip md5_sum);
+ 
+@@ -16,6 +16,14 @@ like $err, qr{\./script/convos cpanm -n Foo::Bar},        'require_module failed
+ eval { require_module 'Convos::Util' };
+ ok !$@, 'require_module success';
+ 
++note 'generate_secret';
++is length(generate_secret), 40, 'generate_secret';
++my %secrets;
++map { $secrets{+Convos::Util::_generate_secret_urandom()}++ } 1 .. 1000 if -r '/dev/urandom';
++map { $secrets{+Convos::Util::_generate_secret_fallback()}++ } 1 .. 1000;
++is_deeply [values %secrets], [map {1} values %secrets],
++  '1..1000 is not nearly enough to prove anything, but testing it anyways';
++
+ for my $name (qw(answer.sdp offer.sdp)) {
+   my $sdp     = data_section 'main', $name;
+   my @sdp     = split /\r?\n/, $sdp;

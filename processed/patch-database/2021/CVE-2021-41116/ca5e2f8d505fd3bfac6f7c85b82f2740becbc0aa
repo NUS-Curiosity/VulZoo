@@ -1,0 +1,126 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bc6a92fc8647..b19cfe345b48 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,7 @@
++### [1.10.23] 2021-10-05
++
++  * Security: Fixed command injection vulnerability on Windows (GHSA-frqg-7g38-6gcf / CVE-2021-41116)
++
+ ### [1.10.22] 2021-04-27
+ 
+   * Security: Fixed command injection vulnerability in HgDriver/HgDownloader and hardened other VCS drivers and downloaders (GHSA-h5h8-pc6h-jvvx / CVE-2021-29472)
+@@ -938,6 +942,7 @@
+ 
+   * Initial release
+ 
++[1.10.23]: https://github.com/composer/composer/compare/1.10.22...1.10.23
+ [1.10.22]: https://github.com/composer/composer/compare/1.10.21...1.10.22
+ [1.10.21]: https://github.com/composer/composer/compare/1.10.20...1.10.21
+ [1.10.20]: https://github.com/composer/composer/compare/1.10.19...1.10.20
+diff --git a/src/Composer/Command/HomeCommand.php b/src/Composer/Command/HomeCommand.php
+index b7d907066aaa..c22128d46d54 100644
+--- a/src/Composer/Command/HomeCommand.php
++++ b/src/Composer/Command/HomeCommand.php
+@@ -129,7 +129,7 @@ private function openBrowser($url)
+ 
+         $process = new ProcessExecutor($this->getIO());
+         if (Platform::isWindows()) {
+-            return $process->execute('start "web" explorer "' . $url . '"', $output);
++            return $process->execute('start "web" explorer ' . $url, $output);
+         }
+ 
+         $linux = $process->execute('which xdg-open', $output);
+diff --git a/src/Composer/Util/ProcessExecutor.php b/src/Composer/Util/ProcessExecutor.php
+index 658c2a136b10..7cb83e39b124 100644
+--- a/src/Composer/Util/ProcessExecutor.php
++++ b/src/Composer/Util/ProcessExecutor.php
+@@ -155,7 +155,7 @@ public static function escape($argument)
+     }
+ 
+     /**
+-     * Copy of ProcessUtils::escapeArgument() that is deprecated in Symfony 3.3 and removed in Symfony 4.
++     * Copy of Symfony's Process::escapeArgument() which is private
+      *
+      * @param string $argument
+      *
+@@ -163,40 +163,21 @@ public static function escape($argument)
+      */
+     private static function escapeArgument($argument)
+     {
+-        //Fix for PHP bug #43784 escapeshellarg removes % from given string
+-        //Fix for PHP bug #49446 escapeshellarg doesn't work on Windows
+-        //@see https://bugs.php.net/bug.php?id=43784
+-        //@see https://bugs.php.net/bug.php?id=49446
+-        if ('\\' === DIRECTORY_SEPARATOR) {
+-            if ((string) $argument === '') {
+-                return escapeshellarg($argument);
+-            }
+-
+-            $escapedArgument = '';
+-            $quote = false;
+-            foreach (preg_split('/(")/', $argument, -1, PREG_SPLIT_NO_EMPTY | PREG_SPLIT_DELIM_CAPTURE) as $part) {
+-                if ('"' === $part) {
+-                    $escapedArgument .= '\\"';
+-                } elseif (self::isSurroundedBy($part, '%')) {
+-                    // Avoid environment variable expansion
+-                    $escapedArgument .= '^%"'.substr($part, 1, -1).'"^%';
+-                } else {
+-                    // escape trailing backslash
+-                    if ('\\' === substr($part, -1)) {
+-                        $part .= '\\';
+-                    }
+-                    $quote = true;
+-                    $escapedArgument .= $part;
+-                }
+-            }
+-            if ($quote) {
+-                $escapedArgument = '"'.$escapedArgument.'"';
+-            }
+-
+-            return $escapedArgument;
++        if ('' === $argument || null === $argument) {
++            return '""';
++        }
++        if ('\\' !== \DIRECTORY_SEPARATOR) {
++            return "'".str_replace("'", "'\\''", $argument)."'";
++        }
++        if (false !== strpos($argument, "\0")) {
++            $argument = str_replace("\0", '?', $argument);
++        }
++        if (!preg_match('/[\/()%!^"<>&|\s]/', $argument)) {
++            return $argument;
+         }
++        $argument = preg_replace('/(\\\\+)$/', '$1$1', $argument);
+ 
+-        return "'".str_replace("'", "'\\''", $argument)."'";
++        return '"'.str_replace(array('"', '^', '%', '!', "\n"), array('""', '"^^"', '"^%"', '"^!"', '!LF!'), $argument).'"';
+     }
+ 
+     private static function isSurroundedBy($arg, $char)
+diff --git a/tests/Composer/Test/Downloader/GitDownloaderTest.php b/tests/Composer/Test/Downloader/GitDownloaderTest.php
+index cd446a73bf36..3bc9686c5593 100644
+--- a/tests/Composer/Test/Downloader/GitDownloaderTest.php
++++ b/tests/Composer/Test/Downloader/GitDownloaderTest.php
+@@ -524,7 +524,7 @@ public function testUpdateThrowsRuntimeExceptionIfGitCommandFails()
+ 
+     public function testUpdateDoesntThrowsRuntimeExceptionIfGitCommandFailsAtFirstButIsAbleToRecover()
+     {
+-        $expectedFirstGitUpdateCommand = $this->winCompat("(git remote set-url composer -- '' && git rev-parse --quiet --verify 'ref^{commit}' || (git fetch composer && git fetch --tags composer)) && git remote set-url composer -- ''");
++        $expectedFirstGitUpdateCommand = $this->winCompat("(git remote set-url composer -- \"\" && git rev-parse --quiet --verify 'ref^{commit}' || (git fetch composer && git fetch --tags composer)) && git remote set-url composer -- \"\"");
+         $expectedSecondGitUpdateCommand = $this->winCompat("(git remote set-url composer -- 'https://github.com/composer/composer' && git rev-parse --quiet --verify 'ref^{commit}' || (git fetch composer && git fetch --tags composer)) && git remote set-url composer -- 'https://github.com/composer/composer'");
+ 
+         $packageMock = $this->getMockBuilder('Composer\Package\PackageInterface')->getMock();
+diff --git a/tests/Composer/Test/Util/SvnTest.php b/tests/Composer/Test/Util/SvnTest.php
+index ada3818ae68f..8e1db31ecece 100644
+--- a/tests/Composer/Test/Util/SvnTest.php
++++ b/tests/Composer/Test/Util/SvnTest.php
+@@ -47,7 +47,7 @@ public function urlProvider()
+         return array(
+             array('http://till:test@svn.example.org/', $this->getCmd(" --username 'till' --password 'test' ")),
+             array('http://svn.apache.org/', ''),
+-            array('svn://johndoe@example.org', $this->getCmd(" --username 'johndoe' --password '' ")),
++            array('svn://johndoe@example.org', $this->getCmd(" --username 'johndoe' --password \"\" ")),
+         );
+     }
+ 

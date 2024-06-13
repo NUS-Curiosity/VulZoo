@@ -1,0 +1,1104 @@
+diff --git a/NEWS b/NEWS
+index 257414c100..8bf6284fed 100644
+--- a/NEWS
++++ b/NEWS
+@@ -5,6 +5,7 @@ New features
+  - [core] new database structure options to make SOGo use a total of nine tables
+  - [core] new user-based rate-limiting support for all SOGo requests (#3188)
+  - [web] toolbar of all-day events can be expanded to display all events
++ - [web] added AngularJS's XSRF support (#3246)
+ 
+ Enhancements
+  - [web] updated Angular Material to version 1.0.6
+diff --git a/SoObjects/SOGo/SOGoSystemDefaults.h b/SoObjects/SOGo/SOGoSystemDefaults.h
+index 58bdb81745..00a38d0ac1 100644
+--- a/SoObjects/SOGo/SOGoSystemDefaults.h
++++ b/SoObjects/SOGo/SOGoSystemDefaults.h
+@@ -65,6 +65,7 @@
+ 
+ - (BOOL) uixDebugEnabled;
+ - (BOOL) easDebugEnabled;
++- (BOOL) xsrfValidationEnabled;
+ 
+ - (NSString *) pageTitle;
+ - (NSString *) helpURL;
+diff --git a/SoObjects/SOGo/SOGoSystemDefaults.m b/SoObjects/SOGo/SOGoSystemDefaults.m
+index 51959e8ae6..4ac596dd6b 100644
+--- a/SoObjects/SOGo/SOGoSystemDefaults.m
++++ b/SoObjects/SOGo/SOGoSystemDefaults.m
+@@ -430,6 +430,18 @@ - (BOOL) easDebugEnabled
+   return [self boolForKey: @"SOGoEASDebugEnabled"];
+ }
+ 
++- (BOOL) xsrfValidationEnabled
++{
++  id o;
++
++  if (!(o = [self objectForKey: @"SOGoXSRFValidationEnabled"]))
++    {
++      return YES;
++    }
++
++  return [o boolValue];
++}
++
+ - (NSString *) pageTitle
+ {
+   return [self stringForKey: @"SOGoPageTitle"];
+diff --git a/UI/Common/GNUmakefile b/UI/Common/GNUmakefile
+index 39e5a584f0..58b4cfdc4a 100644
+--- a/UI/Common/GNUmakefile
++++ b/UI/Common/GNUmakefile
+@@ -21,7 +21,7 @@ CommonUI_OBJC_FILES +=			\
+ 	UIxTopnavToolbar.m      	\
+ 	UIxToolbar.m			\
+ 	\
+-	WODirectAction+SOGo.m		\
++	SOGoDirectAction.m		\
+ 
+ CommonUI_RESOURCE_FILES += \
+ 	product.plist
+diff --git a/UI/Common/WODirectAction+SOGo.h b/UI/Common/SOGoDirectAction.h
+similarity index 91%
+rename from UI/Common/WODirectAction+SOGo.h
+rename to UI/Common/SOGoDirectAction.h
+index aa4e5094ca..27a0c65ae1 100644
+--- a/UI/Common/WODirectAction+SOGo.h
++++ b/UI/Common/SOGoDirectAction.h
+@@ -1,6 +1,6 @@
+-/* WODirectAction+SOGo.h - this file is part of SOGo
++/* SOGoDirectAction.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2015 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -26,7 +26,7 @@
+ @class NSString;
+ @class WOResponse, WOResourceManager;
+ 
+-@interface WODirectAction (SOGoExtension)
++@interface SOGoDirectAction : WODirectAction
+ 
+ - (WOResponse *) responseWithStatus: (unsigned int) status;
+ - (WOResponse *) responseWithStatus: (unsigned int) status
+diff --git a/UI/Common/WODirectAction+SOGo.m b/UI/Common/SOGoDirectAction.m
+similarity index 81%
+rename from UI/Common/WODirectAction+SOGo.m
+rename to UI/Common/SOGoDirectAction.m
+index 5055c2db19..73a1062fc2 100644
+--- a/UI/Common/WODirectAction+SOGo.m
++++ b/UI/Common/SOGoDirectAction.m
+@@ -1,6 +1,6 @@
+-/* WODirectAction+SOGo.m - this file is part of SOGo
++/* SOGoDirectAction - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2015 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -26,15 +26,19 @@
+ 
+ #import <SoObjects/SOGo/NSObject+Utilities.h>
+ #import <SoObjects/SOGo/NSDictionary+Utilities.h>
++#import <SoObjects/SOGo/NSString+Crypto.h>
+ #import <SoObjects/SOGo/NSString+Utilities.h>
++#import <SoObjects/SOGo/SOGoSession.h>
++#import <SoObjects/SOGo/SOGoSystemDefaults.h>
++#import <SoObjects/SOGo/SOGoWebAuthenticator.h>
+ 
+ #import <NGExtensions/NSObject+Logs.h>
+ 
+-#import "WODirectAction+SOGo.h"
++#import "SOGoDirectAction.h"
+ 
+ static SoProduct      *commonProduct      = nil;
+ 
+-@implementation WODirectAction (SOGoExtension)
++@implementation SOGoDirectAction
+ 
+ + (void) initialize
+ {
+@@ -205,4 +209,34 @@ - (NSString *) urlForResourceFilename: (NSString *) filename
+   return url;
+ }
+ 
++//
++// Protection against XSRF
++//
++- (id<WOActionResults>)performActionNamed:(NSString *)_actionName
++{
++  SOGoWebAuthenticator *auth;
++  NSString *value, *token;
++  NSArray *creds;
++
++  if (![[SOGoSystemDefaults sharedSystemDefaults] xsrfValidationEnabled])
++    return [super performActionNamed: _actionName];
++
++  // We grab the X-XSRF-TOKEN header
++  token = [[context request] headerForKey: @"X-XSRF-TOKEN"];
++
++  // We compare it with our session key
++  auth = [[WOApplication application]
++           authenticatorInContext: context];
++  value = [[context request]
++           cookieValueForKey: [auth cookieNameInContext: context]];
++  creds = [auth parseCredentials: value];
++
++  value = [SOGoSession valueForSessionKey: [creds lastObject]];
++
++  if ([token isEqualToString: [value asSHA1String]])
++    return [super performActionNamed: _actionName];
++
++  return nil;
++}
++
+ @end
+diff --git a/UI/Common/UIxFolderActions.h b/UI/Common/UIxFolderActions.h
+index 194bf86253..495237f791 100644
+--- a/UI/Common/UIxFolderActions.h
++++ b/UI/Common/UIxFolderActions.h
+@@ -1,6 +1,6 @@
+ /* UIxFolderActions.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2014 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -30,7 +30,9 @@
+ @class SOGoGCSFolder;
+ @class SOGoUserSettings;
+ 
+-@interface UIxFolderActions : WODirectAction
++#include "SOGoDirectAction.h"
++
++@interface UIxFolderActions : SOGoDirectAction
+ {
+   SOGoGCSFolder *clientObject;
+   LDAPUserManager *um;
+diff --git a/UI/Common/UIxFolderActions.m b/UI/Common/UIxFolderActions.m
+index 7ed2987b7d..acd43069df 100644
+--- a/UI/Common/UIxFolderActions.m
++++ b/UI/Common/UIxFolderActions.m
+@@ -1,6 +1,6 @@
+ /* UIxFolderActions.m - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2015 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -42,8 +42,6 @@
+ 
+ #import <Appointments/SOGoAppointmentFolder.h>
+ 
+-#import "WODirectAction+SOGo.h"
+-
+ #import "UIxFolderActions.h"
+ 
+ @implementation UIxFolderActions
+diff --git a/UI/Common/UIxObjectActions.h b/UI/Common/UIxObjectActions.h
+index 314a9747b4..c0f19c04e6 100644
+--- a/UI/Common/UIxObjectActions.h
++++ b/UI/Common/UIxObjectActions.h
+@@ -1,8 +1,6 @@
+ /* UIxObjectActions.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007 Inverse inc.
+- *
+- * Author: Wolfgang Sourdeau <wsourdeau@inverse.ca>
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -23,10 +21,11 @@
+ #ifndef UIXOBJECTACTIONS_H
+ #define UIXOBJECTACTIONS_H
+ 
++#include "SOGoDirectAction.h"
+ 
+ @class WOResponse;
+ 
+-@interface UIxObjectActions : WODirectAction
++@interface UIxObjectActions : SOGoDirectAction
+ 
+ - (WOResponse *) addUserInAclsAction;
+ 
+diff --git a/UI/Common/UIxObjectActions.m b/UI/Common/UIxObjectActions.m
+index 602f039d6b..19042f5d35 100644
+--- a/UI/Common/UIxObjectActions.m
++++ b/UI/Common/UIxObjectActions.m
+@@ -30,8 +30,6 @@
+ 
+ #import <SOGo/NSDictionary+Utilities.h>
+ 
+-#import "WODirectAction+SOGo.h"
+-
+ #import "UIxObjectActions.h"
+ 
+ @implementation UIxObjectActions
+diff --git a/UI/Common/UIxParentFolderActions.h b/UI/Common/UIxParentFolderActions.h
+index 9b6d4cfce6..23e58483d6 100644
+--- a/UI/Common/UIxParentFolderActions.h
++++ b/UI/Common/UIxParentFolderActions.h
+@@ -1,8 +1,6 @@
+ /* UIxParentFolderActions.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007 Inverse inc.
+- *
+- * Author: Wolfgang Sourdeau <wsourdeau@inverse.ca>
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -23,8 +21,9 @@
+ #ifndef UIXPARENTFOLDERACTIONS_H
+ #define UIXPARENTFOLDERACTIONS_H
+ 
++#include "SOGoDirectAction.h"
+ 
+-@interface UIxParentFolderActions : WODirectAction
++@interface UIxParentFolderActions : SOGoDirectAction
+ @end
+ 
+ #endif /* UIXPARENTFOLDERACTIONS_H */
+diff --git a/UI/Common/UIxParentFolderActions.m b/UI/Common/UIxParentFolderActions.m
+index d1bb603423..6669e3e715 100644
+--- a/UI/Common/UIxParentFolderActions.m
++++ b/UI/Common/UIxParentFolderActions.m
+@@ -1,6 +1,6 @@
+ /* UIxParentFolderActions.m - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2015 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -29,8 +29,6 @@
+ #import <SOGo/NSDictionary+Utilities.h>
+ #import <SOGo/NSString+Utilities.h>
+ 
+-#import <UI/Common/WODirectAction+SOGo.h>
+-
+ #import "UIxParentFolderActions.h"
+ 
+ @implementation UIxParentFolderActions
+diff --git a/UI/Contacts/UIxContactActions.m b/UI/Contacts/UIxContactActions.m
+index fa50fe1dbc..1d50d8f2b0 100644
+--- a/UI/Contacts/UIxContactActions.m
++++ b/UI/Contacts/UIxContactActions.m
+@@ -1,8 +1,6 @@
+ /* UIxContactActions.m - this file is part of SOGo
+  *
+- * Copyright (C) 2010 Inverse inc.
+- *
+- * Author: Wolfgang Sourdeau <wsourdeau@inverse.ca>
++ * Copyright (C) 2010-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -30,7 +28,7 @@
+ 
+ #import <Contacts/SOGoContactGCSEntry.h>
+ 
+-#import <Common/WODirectAction+SOGo.h>
++#import <Common/SOGoDirectAction.h>
+ 
+ @interface NGVCard (SOGoActionCategory)
+ 
+@@ -80,7 +78,7 @@ - (BOOL) addOrRemove: (BOOL) set
+ 
+ @end
+ 
+-@interface UIxContactActions : WODirectAction
++@interface UIxContactActions : SOGoDirectAction
+ 
+ - (WOResponse *) setCategoryAction;
+ - (WOResponse *) unsetCategoryAction;
+diff --git a/UI/Contacts/UIxContactsListActions.h b/UI/Contacts/UIxContactsListActions.h
+index cd0e33dac1..f775c6676b 100644
+--- a/UI/Contacts/UIxContactsListActions.h
++++ b/UI/Contacts/UIxContactsListActions.h
+@@ -1,34 +1,35 @@
+ /*
+- Copyright (C) 2004-2005 SKYRIX Software AG
+- 
+- This file is part of OpenGroupware.org.
+- 
+- OGo is free software; you can redistribute it and/or modify it under
+- the terms of the GNU Lesser General Public License as published by the
+- Free Software Foundation; either version 2, or (at your option) any
+- later version.
+- 
+- OGo is distributed in the hope that it will be useful, but WITHOUT ANY
+- WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+- License for more details.
+- 
+- You should have received a copy of the GNU Lesser General Public
+- License along with OGo; see the file COPYING.  If not, write to the
+- Free Software Foundation, 59 Temple Place - Suite 330, Boston, MA
+- 02111-1307, USA.
++  Copyright (C) 2006-2016 Inverse inc.
++
++  This file is part of SOGo.
++
++  SOGo is free software; you can redistribute it and/or modify it under
++  the terms of the GNU Lesser General Public License as published by the
++  Free Software Foundation; either version 2, or (at your option) any
++  later version.
++
++  SOGo is distributed in the hope that it will be useful, but WITHOUT ANY
++  WARRANTY; without even the implied warranty of MERCHANTABILITY or
++  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
++  License for more details.
++
++  You should have received a copy of the GNU Lesser General Public
++  License along with SOGo; see the file COPYING.  If not, write to the
++  Free Software Foundation, 59 Temple Place - Suite 330, Boston, MA
++  02111-1307, USA.
+ */
+ 
+ #ifndef __UIxContactsListActions_H__
+ #define __UIxContactsListActions_H__
+ 
++#import <Common/SOGoDirectAction.h>
+ 
+ @class NSDictionary;
+ @class NSString;
+ 
+ @protocol SOGoContactObject;
+ 
+-@interface UIxContactsListActions : WODirectAction
++@interface UIxContactsListActions : SOGoDirectAction
+ {
+   NSDictionary *currentContact;
+ 
+diff --git a/UI/Contacts/UIxContactsListActions.m b/UI/Contacts/UIxContactsListActions.m
+index d3577e1f40..8266e7ab87 100644
+--- a/UI/Contacts/UIxContactsListActions.m
++++ b/UI/Contacts/UIxContactsListActions.m
+@@ -37,9 +37,6 @@
+ #import <EOControl/EOQualifier.h>
+ #import <EOControl/EOSortOrdering.h>
+ 
+-#import <Common/WODirectAction+SOGo.h>
+-
+-
+ #import <SOGo/SOGoUser.h>
+ #import <SOGo/SOGoUserSettings.h>
+ 
+diff --git a/UI/MailPartViewers/UIxMailPartICalActions.h b/UI/MailPartViewers/UIxMailPartICalActions.h
+index a0299402e0..620e6075af 100644
+--- a/UI/MailPartViewers/UIxMailPartICalActions.h
++++ b/UI/MailPartViewers/UIxMailPartICalActions.h
+@@ -1,8 +1,6 @@
+ /* UIxMailPartICalActions.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007 Inverse inc.
+- *
+- * Author: Wolfgang Sourdeau <wsourdeau@inverse.ca>
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -23,12 +21,13 @@
+ #ifndef UIXMAILPARTICALACTIONS_H
+ #define UIXMAILPARTICALACTIONS_H
+ 
+-
+ @class iCalCalendar;
+ @class SOGoMailBodyPart;
+ @class WOResponse;
+ 
+-@interface UIxMailPartICalActions : WODirectAction
++#import <UI/Common/SOGoDirectAction.h>
++
++@interface UIxMailPartICalActions : SOGoDirectAction
+ 
+ - (WOResponse *) acceptAction;
+ - (WOResponse *) declineAction;
+diff --git a/UI/MailPartViewers/UIxMailPartICalActions.m b/UI/MailPartViewers/UIxMailPartICalActions.m
+index b7c15267f7..2fecb3ab5b 100644
+--- a/UI/MailPartViewers/UIxMailPartICalActions.m
++++ b/UI/MailPartViewers/UIxMailPartICalActions.m
+@@ -1,6 +1,6 @@
+ /* UIxMailPartICalActions.m - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2015 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -32,8 +32,6 @@
+ 
+ #import <NGCards/iCalCalendar.h>
+ 
+-#import <UI/Common/WODirectAction+SOGo.h>
+-
+ #import <NGImap4/NGImap4EnvelopeAddress.h>
+ 
+ #import <Appointments/iCalEvent+SOGo.h>
+@@ -239,7 +237,6 @@ - (WOResponse *) _changePartStatusAction: (NSString *) newStatus
+   WOResponse *response;
+   SOGoAppointmentObject *eventObject;
+   iCalEvent *chosenEvent;
+-  //NSException *ex;
+ 
+   chosenEvent = [self _setupChosenEventAndEventObject: &eventObject];
+   if (chosenEvent)
+diff --git a/UI/MailerUI/UIxMailAccountActions.h b/UI/MailerUI/UIxMailAccountActions.h
+index 4dfc9b4570..8f54aac894 100644
+--- a/UI/MailerUI/UIxMailAccountActions.h
++++ b/UI/MailerUI/UIxMailAccountActions.h
+@@ -1,6 +1,6 @@
+ /* UIxMailAccountActions.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2013 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -21,10 +21,11 @@
+ #ifndef UIXMAILACCOUNTACTIONS_H
+ #define UIXMAILACCOUNTACTIONS_H
+ 
++#import <UI/Common/SOGoDirectAction.h>
+ 
+ @class WOResponse;
+ 
+-@interface UIxMailAccountActions : WODirectAction
++@interface UIxMailAccountActions : SOGoDirectAction
+ {
+ }
+ 
+diff --git a/UI/MailerUI/UIxMailAccountActions.m b/UI/MailerUI/UIxMailAccountActions.m
+index ecc7398558..af7e94ce7a 100644
+--- a/UI/MailerUI/UIxMailAccountActions.m
++++ b/UI/MailerUI/UIxMailAccountActions.m
+@@ -1,6 +1,6 @@
+ /* UIxMailAccountActions.m - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2014 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -34,8 +34,6 @@
+ #import <SOGo/SOGoDomainDefaults.h>
+ #import <SOGo/SOGoUser.h>
+ 
+-#import "../Common/WODirectAction+SOGo.h"
+-
+ #import "UIxMailAccountActions.h"
+ 
+ @implementation UIxMailAccountActions
+diff --git a/UI/MailerUI/UIxMailActions.h b/UI/MailerUI/UIxMailActions.h
+index e2d92cd7a4..7cfdecce11 100644
+--- a/UI/MailerUI/UIxMailActions.h
++++ b/UI/MailerUI/UIxMailActions.h
+@@ -1,6 +1,6 @@
+ /* UIxMailActions.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2013 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -21,8 +21,9 @@
+ #ifndef UIXMAILACTIONS_H
+ #define UIXMAILACTIONS_H
+ 
++#import <UI/Common/SOGoDirectAction.h>
+ 
+-@interface UIxMailActions : WODirectAction
++@interface UIxMailActions : SOGoDirectAction
+ @end
+ 
+ #endif /* UIXMAILACTIONS_H */
+diff --git a/UI/MailerUI/UIxMailActions.m b/UI/MailerUI/UIxMailActions.m
+index 7263b4ce61..688b220736 100644
+--- a/UI/MailerUI/UIxMailActions.m
++++ b/UI/MailerUI/UIxMailActions.m
+@@ -37,8 +37,6 @@
+ #import <SoObjects/SOGo/SOGoUserSettings.h>
+ #import <SoObjects/SOGo/SOGoUserDefaults.h>
+ 
+-#import "../Common/WODirectAction+SOGo.h"
+-
+ #import "UIxMailActions.h"
+ 
+ @implementation UIxMailActions
+diff --git a/UI/MailerUI/UIxMailFolderActions.h b/UI/MailerUI/UIxMailFolderActions.h
+index 42c0dc84b6..685b1f2f16 100644
+--- a/UI/MailerUI/UIxMailFolderActions.h
++++ b/UI/MailerUI/UIxMailFolderActions.h
+@@ -21,10 +21,11 @@
+ #ifndef UIXMAILFOLDERACTIONS_H
+ #define UIXMAILFOLDERACTIONS_H
+ 
++#import <UI/Common/SOGoDirectAction.h>
+ 
+ @class WOResponse;
+ 
+-@interface UIxMailFolderActions : WODirectAction
++@interface UIxMailFolderActions : SOGoDirectAction
+ 
+ - (id <WOActionResults>) createFolderAction;
+ - (WOResponse *) renameFolderAction;
+diff --git a/UI/MailerUI/UIxMailFolderActions.m b/UI/MailerUI/UIxMailFolderActions.m
+index 56fcc73301..36081cf1e8 100644
+--- a/UI/MailerUI/UIxMailFolderActions.m
++++ b/UI/MailerUI/UIxMailFolderActions.m
+@@ -38,8 +38,6 @@
+ #import <SOGo/SOGoUser.h>
+ #import <SOGo/SOGoUserSettings.h>
+ 
+-#import <UI/Common/WODirectAction+SOGo.h>
+-
+ #import "UIxMailFolderActions.h"
+ 
+ @implementation UIxMailFolderActions
+@@ -225,7 +223,6 @@ - (WOResponse *) deleteAction
+   SOGoUserSettings *us;
+   WOResponse *response;
+   NSException *error;
+-
+   BOOL moved;
+ 
+   co = [self clientObject];
+@@ -380,20 +377,20 @@ - (WOResponse *) saveMessagesAction
+   response = nil;
+ 
+   if ([value length] > 0)
+-  {
+-    uids = [value componentsSeparatedByString: @","];
+-    response = [co archiveUIDs: uids
+-                inArchiveNamed: [self labelForKey: @"Saved Messages.zip" inContext: context]
+-                     inContext: context];
+-    if (!response)
+-      response = [self responseWith204];
+-  }
++    {
++      uids = [value componentsSeparatedByString: @","];
++      response = [co archiveUIDs: uids
++                  inArchiveNamed: [self labelForKey: @"Saved Messages.zip" inContext: context]
++                       inContext: context];
++      if (!response)
++        response = [self responseWith204];
++    }
+   else
+-  {
+-    jsonResponse = [NSDictionary dictionaryWithObject: [self labelForKey: @"Missing 'uid' parameter." inContext: context]
+-                                               forKey: @"message"];
+-    response = [self responseWithStatus: 500 andJSONRepresentation: jsonResponse];
+-  }
++    {
++      jsonResponse = [NSDictionary dictionaryWithObject: [self labelForKey: @"Missing 'uid' parameter." inContext: context]
++                                                 forKey: @"message"];
++      response = [self responseWithStatus: 500 andJSONRepresentation: jsonResponse];
++    }
+ 
+   return response;
+ }
+diff --git a/UI/MailerUI/UIxMailListActions.h b/UI/MailerUI/UIxMailListActions.h
+index c85ab9fbda..2f7af144be 100644
+--- a/UI/MailerUI/UIxMailListActions.h
++++ b/UI/MailerUI/UIxMailListActions.h
+@@ -1,6 +1,5 @@
+ /*
+-  Copyright (C) 2004-2005 SKYRIX Software AG
+-  Copyright (C) 2004-2014 Inverse inc
++  Copyright (C) 2004-2016 Inverse inc
+ 
+   This file is part of SOGo.
+ 
+@@ -23,13 +22,14 @@
+ #ifndef UIXMAILLISTACTIONS_H
+ #define UIXMAILLISTACTIONS_H
+ 
+-
+ @class NSDictionary;
+ @class EOQualifier;
+ @class SOGoDateFormatter;
+ @class UIxMailSizeFormatter;
+ 
+-@interface UIxMailListActions : WODirectAction
++#import <UI/Common/SOGoDirectAction.h>
++
++@interface UIxMailListActions : SOGoDirectAction
+ {
+   NSArray *sortedUIDs; /* we always need to retrieve all anyway! */
+   NSArray *messages;
+diff --git a/UI/MailerUI/UIxMailListActions.m b/UI/MailerUI/UIxMailListActions.m
+index b15281fb29..a524ecd8cc 100644
+--- a/UI/MailerUI/UIxMailListActions.m
++++ b/UI/MailerUI/UIxMailListActions.m
+@@ -58,7 +58,6 @@
+ #import <SOGo/SOGoUserSettings.h>
+ #import <SOGo/WOResourceManager+SOGo.h>
+ 
+-#import <UI/Common/WODirectAction+SOGo.h>
+ #import <UI/MailPartViewers/UIxMailSizeFormatter.h>
+ 
+ #import "WOContext+UIxMailer.h"
+diff --git a/UI/MailerUI/UIxMailSourceView.h b/UI/MailerUI/UIxMailSourceView.h
+index 0b60fa6e6d..41e1757b31 100644
+--- a/UI/MailerUI/UIxMailSourceView.h
++++ b/UI/MailerUI/UIxMailSourceView.h
+@@ -1,6 +1,6 @@
+ /* UIxMailSourceView.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2015 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -21,8 +21,9 @@
+ #ifndef UIXMAILSOURCEVIEW_H
+ #define UIXMAILSOURCEVIEW_H
+ 
++#import <UI/Common/SOGoDirectAction.h>
+ 
+-@interface UIxMailSourceView : WODirectAction
++@interface UIxMailSourceView : SOGoDirectAction
+ 
+ @end
+ 
+diff --git a/UI/MailerUI/UIxMailSourceView.m b/UI/MailerUI/UIxMailSourceView.m
+index cadb461407..6dd05c3676 100644
+--- a/UI/MailerUI/UIxMailSourceView.m
++++ b/UI/MailerUI/UIxMailSourceView.m
+@@ -1,6 +1,6 @@
+ /* UIxMailSourceView.m - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2015 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -23,8 +23,6 @@
+ 
+ #import <SoObjects/Mailer/SOGoMailObject.h>
+ 
+-#import <UI/Common/WODirectAction+SOGo.h>
+-
+ #import "UIxMailSourceView.h"
+ 
+ @implementation UIxMailSourceView
+diff --git a/UI/MainUI/SOGoMicrosoftActiveSyncActions.m b/UI/MainUI/SOGoMicrosoftActiveSyncActions.m
+index 5761d65ffe..4b1e257486 100644
+--- a/UI/MainUI/SOGoMicrosoftActiveSyncActions.m
++++ b/UI/MainUI/SOGoMicrosoftActiveSyncActions.m
+@@ -1,5 +1,5 @@
+ /*
+-  Copyright (C) 2014 Inverse inc. 
++  Copyright (C) 2014-2016 Inverse inc.
+ 
+   This file is part of SOGo.
+ 
+@@ -23,10 +23,11 @@
+ #import <SOGo/SOGoCache.h>
+ #import <SOGo/NSObject+Utilities.h>
+ 
+-#import <NGObjWeb/NSException+HTTP.h>
+ #import <NGObjWeb/WOContext.h>
++#import <NGObjWeb/WODirectAction.h>
++#import <NGObjWeb/NSException+HTTP.h>
++#import <NGObjWeb/WOResponse.h>
+ 
+-#import <Common/WODirectAction+SOGo.h>
+ #import <ActiveSync/SOGoActiveSyncDispatcher.h>
+ 
+ @interface SOGoMicrosoftActiveSyncActions : WODirectAction
+@@ -47,7 +48,9 @@ - (WOResponse *) microsoftServerActiveSyncAction
+   Class clazz;
+ 
+   request = (WORequest *)[context request];
+-  response = [self responseWithStatus: 200];
++  response = [context response];
++  [response setStatus: 200];
++  [response setHeader: @"text/plain; charset=utf-8"  forKey: @"content-type"];
+ 
+   bundle = [NSBundle bundleForClass: NSClassFromString(@"ActiveSyncProduct")];
+   clazz = [bundle classNamed: @"SOGoActiveSyncDispatcher"];
+diff --git a/UI/MainUI/SOGoRootPage.m b/UI/MainUI/SOGoRootPage.m
+index 9348da2f90..ec821a0422 100644
+--- a/UI/MainUI/SOGoRootPage.m
++++ b/UI/MainUI/SOGoRootPage.m
+@@ -36,6 +36,7 @@
+ 
+ #import <Appointments/SOGoAppointmentFolders.h>
+ 
++#import <SOGo/NSString+Crypto.h>
+ #import <SOGo/NSString+Utilities.h>
+ #import <SOGo/SOGoBuild.h>
+ #import <SOGo/SOGoCache.h>
+@@ -170,14 +171,14 @@ - (WOResponse *) _responseWithLDAPPolicyError: (int) error
+ {
+   WOResponse *response;
+   WORequest *request;
+-  WOCookie *authCookie;
++  WOCookie *authCookie, *xsrfCookie;
+   SOGoWebAuthenticator *auth;
+   SOGoAppointmentFolders *calendars;
+   SOGoUserDefaults *ud;
+   SOGoUser *loggedInUser;
+   NSDictionary *params;
+   NSString *username, *password, *language, *domain, *remoteHost;
+-  NSArray *supportedLanguages;
++  NSArray *supportedLanguages, *creds;
+   
+   SOGoPasswordPolicyError err;
+   int expire, grace;
+@@ -232,6 +233,13 @@ - (WOResponse *) _responseWithLDAPPolicyError: (int) error
+                                   inContext: context];
+       [response addCookie: authCookie];
+ 
++      // We prepare the XSRF protection cookie
++      creds = [auth parseCredentials: [authCookie value]];
++      xsrfCookie = [WOCookie cookieWithName: @"XSRF-TOKEN"
++                                      value: [[SOGoSession valueForSessionKey: [creds lastObject]] asSHA1String]];
++      [xsrfCookie setPath: [NSString stringWithFormat: @"/%@/", [[context request] applicationName]]];
++      [response addCookie: xsrfCookie];
++
+       supportedLanguages = [[SOGoSystemDefaults sharedSystemDefaults]
+                              supportedLanguages];
+       loggedInUser = [SOGoUser userWithLogin: username];
+@@ -540,8 +548,8 @@ - (NSString *) version
+ - (WOResponse *) changePasswordAction
+ {
+   NSString *username, *domain, *password, *newPassword, *value;
++  WOCookie *authCookie, *xsrfCookie;
+   NSDictionary *message;
+-  WOCookie *authCookie;
+   NSArray *creds;
+   SOGoUserManager *um;
+   SOGoPasswordPolicyError error;
+@@ -592,6 +600,12 @@ - (WOResponse *) changePasswordAction
+                                 andPassword: newPassword
+                                   inContext: context];
+       [response addCookie: authCookie];
++
++      // We update the XSRF protection cookie
++      creds = [auth parseCredentials: [authCookie value]];
++      xsrfCookie = [WOCookie cookieWithName: @"XSRF-TOKEN"
++                                      value: [[SOGoSession valueForSessionKey: [creds lastObject]] asSHA1String]];
++      [response addCookie: xsrfCookie];
+     }
+   else
+     response = [self _responseWithLDAPPolicyError: error];
+diff --git a/UI/MainUI/SOGoUserHomePage.m b/UI/MainUI/SOGoUserHomePage.m
+index 7770e9e075..e6cf4bfb7d 100644
+--- a/UI/MainUI/SOGoUserHomePage.m
++++ b/UI/MainUI/SOGoUserHomePage.m
+@@ -455,8 +455,8 @@ - (WOCookie *) _logoutCookieWithDate: (NSCalendarDate *) date
+ 
+ - (id <WOActionResults>) logoffAction
+ {
+-  SOGoWebAuthenticator *auth;
+   NSString *userName, *value;
++  SOGoWebAuthenticator *auth;
+   WOResponse *response;
+   NSCalendarDate *date;
+   WOCookie *cookie;
+@@ -486,6 +486,12 @@ - (WOCookie *) _logoutCookieWithDate: (NSCalendarDate *) date
+   if (cookie)
+     [response addCookie: cookie];
+ 
++  // We remove the XSRF cookie
++  cookie = [WOCookie cookieWithName: @"XSRF-TOKEN"  value: @"discard"];
++  [cookie setPath: [NSString stringWithFormat: @"/%@/", [[context request] applicationName]]];
++  [cookie setExpires: [date yesterday]];
++  [response addCookie: cookie];
++
+   [response setHeader: [date rfc822DateString] forKey: @"Last-Modified"];
+   [response setHeader: @"no-store, no-cache, must-revalidate,"
+             @" max-age=0, post-check=0, pre-check=0"
+diff --git a/UI/PreferencesUI/UIxJSONPreferences.h b/UI/PreferencesUI/UIxJSONPreferences.h
+index f095254fc3..42d4353f5e 100644
+--- a/UI/PreferencesUI/UIxJSONPreferences.h
++++ b/UI/PreferencesUI/UIxJSONPreferences.h
+@@ -1,6 +1,6 @@
+ /* UIxJSONPreferences.h - this file is part of SOGo
+  *
+- * Copyright (C) 2007-2015 Inverse inc.
++ * Copyright (C) 2007-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -21,8 +21,9 @@
+ #ifndef UIXJSONPREFERENCES_H
+ #define UIXJSONPREFERENCES_H
+ 
++#import <UI/Common/SOGoDirectAction.h>
+ 
+-@interface UIxJSONPreferences : WODirectAction
++@interface UIxJSONPreferences : SOGoDirectAction
+ 
+ @end
+ 
+diff --git a/UI/PreferencesUI/UIxJSONPreferences.m b/UI/PreferencesUI/UIxJSONPreferences.m
+index 8d639ab88a..41288018d1 100644
+--- a/UI/PreferencesUI/UIxJSONPreferences.m
++++ b/UI/PreferencesUI/UIxJSONPreferences.m
+@@ -35,8 +35,6 @@
+ #import <SOGo/WOResourceManager+SOGo.h>
+ #import <Mailer/SOGoMailLabel.h>
+ 
+-#import <UI/Common/WODirectAction+SOGo.h>
+-
+ #import "UIxJSONPreferences.h"
+ 
+ static SoProduct *preferencesProduct = nil;
+diff --git a/UI/SOGoUI/UIxComponent.m b/UI/SOGoUI/UIxComponent.m
+index c4606f13ff..c23db4bb1e 100644
+--- a/UI/SOGoUI/UIxComponent.m
++++ b/UI/SOGoUI/UIxComponent.m
+@@ -34,11 +34,14 @@
+ #import <SOGo/NSCalendarDate+SOGo.h>
+ #import <SOGo/NSDictionary+Utilities.h>
+ #import <SOGo/NSObject+Utilities.h>
++#import <SOGo/NSString+Crypto.h>
+ #import <SOGo/NSString+Utilities.h>
+ #import <SOGo/SOGoBuild.h>
++#import <SOGo/SOGoSession.h>
+ #import <SOGo/SOGoSystemDefaults.h>
+ #import <SOGo/SOGoUser.h>
+ #import <SOGo/SOGoUserFolder.h>
++#import <SOGo/SOGoWebAuthenticator.h>
+ #import <SOGo/WOContext+SOGo.h>
+ #import <SOGo/WOResourceManager+SOGo.h>
+ 
+@@ -763,4 +766,42 @@ - (BOOL) isUIxDebugEnabled
+   return [sd uixDebugEnabled];
+ }
+ 
++//
++// Protection against XSRF
++//
++- (id<WOActionResults>)performActionNamed:(NSString *)_actionName
++{
++  SOGoWebAuthenticator *auth;
++  NSString *value, *token;
++  NSArray *creds;
++
++  if (![[SOGoSystemDefaults sharedSystemDefaults] xsrfValidationEnabled])
++    return [super performActionNamed: _actionName];
++
++  // If the action is 'connect' (or 'logoff'), we let it go as the token
++  // needs to be created (or destroyed) during the session initialization
++  if ([_actionName isEqualToString: @"connect"] ||
++      [_actionName isEqualToString: @"logoff"])
++    {
++      return [super performActionNamed: _actionName];
++    }
++
++  // We grab the X-XSRF-TOKEN header
++  token = [[context request] headerForKey: @"X-XSRF-TOKEN"];
++
++  // We compare it with our session key
++  auth = [[WOApplication application]
++           authenticatorInContext: context];
++  value = [[context request]
++           cookieValueForKey: [auth cookieNameInContext: context]];
++  creds = [auth parseCredentials: value];
++
++  value = [SOGoSession valueForSessionKey: [creds lastObject]];
++
++  if ([token isEqualToString: [value asSHA1String]])
++    return [super performActionNamed: _actionName];
++
++  return nil;
++}
++
+ @end /* UIxComponent */
+diff --git a/UI/Scheduler/UIxAppointmentActions.h b/UI/Scheduler/UIxAppointmentActions.h
+index a50346d9c4..fa012e4114 100644
+--- a/UI/Scheduler/UIxAppointmentActions.h
++++ b/UI/Scheduler/UIxAppointmentActions.h
+@@ -21,8 +21,9 @@
+ #ifndef UIXAPPOINTMENTACTIONS_H
+ #define UIXAPPOINTMENTACTIONS_H
+ 
++#import <Common/SOGoDirectAction.h>
+ 
+-@interface UIxAppointmentActions : WODirectAction
++@interface UIxAppointmentActions : SOGoDirectAction
+ 
+ @end
+ 
+diff --git a/UI/Scheduler/UIxAppointmentActions.m b/UI/Scheduler/UIxAppointmentActions.m
+index cd47098c71..8f16ba9807 100644
+--- a/UI/Scheduler/UIxAppointmentActions.m
++++ b/UI/Scheduler/UIxAppointmentActions.m
+@@ -40,8 +40,6 @@
+ #import <Appointments/SOGoAppointmentFolder.h>
+ #import <Appointments/SOGoAppointmentFolders.h>
+ 
+-#import <Common/WODirectAction+SOGo.h>
+-
+ #import "UIxAppointmentActions.h"
+ 
+ @implementation UIxAppointmentActions
+diff --git a/UI/Scheduler/UIxCalListingActions.h b/UI/Scheduler/UIxCalListingActions.h
+index f57df5c770..b4aec4ffb0 100644
+--- a/UI/Scheduler/UIxCalListingActions.h
++++ b/UI/Scheduler/UIxCalListingActions.h
+@@ -1,6 +1,6 @@
+ /* UIxCalListingActions.h - this file is part of SOGo
+  *
+- * Copyright (C) 2006-2015 Inverse inc.
++ * Copyright (C) 2006-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -21,7 +21,7 @@
+ #ifndef UIXCALLISTINGACTIONVIEW_H
+ #define UIXCALLISTINGACTIONVIEW_H
+ 
+-#import <Common/WODirectAction+SOGo.h>
++#import <Common/SOGoDirectAction.h>
+ 
+ @class NSCalendarDate;
+ @class NSMutableDictionary;
+@@ -33,7 +33,7 @@
+ @class WOResponse;
+ @class WORequest;
+ 
+-@interface UIxCalListingActions : WODirectAction
++@interface UIxCalListingActions : SOGoDirectAction
+ {
+   NSMutableDictionary *componentsData;
+   NSCalendarDate *startDate;
+diff --git a/UI/Scheduler/UIxCalListingActions.m b/UI/Scheduler/UIxCalListingActions.m
+index 635008b0e1..35208333d6 100644
+--- a/UI/Scheduler/UIxCalListingActions.m
++++ b/UI/Scheduler/UIxCalListingActions.m
+@@ -47,8 +47,6 @@
+ #import <Appointments/SOGoAppointmentFolders.h>
+ #import <Appointments/SOGoWebAppointmentFolder.h>
+ 
+-#import <UI/Common/WODirectAction+SOGo.h>
+-
+ #import "NSArray+Scheduler.h"
+ 
+ #import "UIxCalListingActions.h"
+@@ -638,7 +636,7 @@ - (WOResponse *) alarmsListAction
+   NSDictionary *data;
+   NSEnumerator *folders;
+   unsigned int browserTime, laterTime;
+-  
++
+   // We look for alarms in the next 48 hours
+   browserTime = [[[context request] formValueForKey: @"browserTime"] intValue];
+   laterTime = browserTime + 60*60*48;
+@@ -779,7 +777,7 @@ - (WOResponse *) eventsListAction
+   unsigned int interval;
+   BOOL isAllDay;
+   NSString *sort, *ascending;
+-  
++
+   [self _setupContext];
+   [self saveFilterValue: @"EventsFilterState"];
+   [self saveSortValue: @"EventsSortingState"];
+@@ -1317,7 +1315,7 @@ - (WOResponse *) eventsBlocksAction
+   NSString *calendarName, *calendarId;
+   BOOL isAllDay;
+   int i, j;
+-  
++
+   [self _setupContext];
+   
+   events = [self _fetchFields: eventsFields forComponentOfType: @"vevent"];
+@@ -1486,7 +1484,7 @@ - (WOResponse *) tasksListAction
+   int statusCode;
+   int startSecs;
+   int endsSecs;
+-  
++
+   filteredTasks = [NSMutableArray array];
+   
+   [self _setupContext];
+@@ -1573,9 +1571,8 @@ - (WOResponse *) activeTasksAction
+   SOGoAppointmentFolder *folder;
+   SOGoAppointmentFolders *co;
+   NSArray *folders;
+-  
+   int i;
+-  
++
+   co = [self clientObject];
+   folders = [co subFolders];
+   activeTasksByCalendars = [NSMutableDictionary dictionaryWithCapacity: [folders count]];
+diff --git a/UI/Scheduler/UIxCalMainActions.h b/UI/Scheduler/UIxCalMainActions.h
+index 36ba4fbf34..53fdc451ae 100644
+--- a/UI/Scheduler/UIxCalMainActions.h
++++ b/UI/Scheduler/UIxCalMainActions.h
+@@ -1,6 +1,6 @@
+ /* UIxCalMainActions.h - this file is part of SOGo
+  *
+- * Copyright (C) 2009-2013 Inverse inc.
++ * Copyright (C) 2009-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -21,9 +21,9 @@
+ #ifndef UIXCALMAINACTIONS_H
+ #define UIXCALMAINACTIONS_H
+ 
+-#import <Common/WODirectAction+SOGo.h>
++#import <Common/SOGoDirectAction.h>
+ 
+-@interface UIxCalMainActions : WODirectAction
++@interface UIxCalMainActions : SOGoDirectAction
+ 
+ @end
+ 
+diff --git a/UI/Scheduler/UIxCalMainActions.m b/UI/Scheduler/UIxCalMainActions.m
+index d76490a82a..f20387c17f 100644
+--- a/UI/Scheduler/UIxCalMainActions.m
++++ b/UI/Scheduler/UIxCalMainActions.m
+@@ -1,6 +1,6 @@
+ /* UIxCalMainActions.m - this file is part of SOGo
+  *
+- * Copyright (C) 2009-2015 Inverse inc.
++ * Copyright (C) 2009-2016 Inverse inc.
+  *
+  * This file is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+diff --git a/UI/WebServerResources/js/Common/Authentication.service.js b/UI/WebServerResources/js/Common/Authentication.service.js
+index 5401fd99ed..f1a883f9a4 100644
+--- a/UI/WebServerResources/js/Common/Authentication.service.js
++++ b/UI/WebServerResources/js/Common/Authentication.service.js
+@@ -151,11 +151,17 @@
+ 
+         changePassword: function(newPassword) {
+           var d = $q.defer(),
+-              loginCookie = readLoginCookie();
++              loginCookie = readLoginCookie(),
++              xsrfCookie = $cookies.get('XSRF-TOKEN');
++
++          $cookies.remove('XSRF-TOKEN', {path: '/SOGo/'});
+ 
+           $http({
+             method: 'POST',
+             url: '/SOGo/so/changePassword',
++            headers: {
++              'X-XSRF-TOKEN' : xsrfCookie
++            },
+             data: {
+               userName: loginCookie[0],
+               password: loginCookie[1],
+@@ -186,6 +192,8 @@
+               perr = passwordPolicyConfig.PolicyPasswordUnknown;
+             }
+ 
++            // Restore the cookie
++            $cookies.put('XSRF-TOKEN', xsrfCookie, {path: '/SOGo/'});
+             d.reject(error);
+           });
+           return d.promise;

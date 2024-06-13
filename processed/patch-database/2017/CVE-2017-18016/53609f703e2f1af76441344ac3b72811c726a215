@@ -1,0 +1,406 @@
+diff --git a/dapps/src/lib.rs b/dapps/src/lib.rs
+index 0860f0c1092..1cbc446a7d6 100644
+--- a/dapps/src/lib.rs
++++ b/dapps/src/lib.rs
+@@ -71,7 +71,7 @@ use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::collections::HashMap;
+ 
+-use jsonrpc_http_server::{self as http, hyper};
++use jsonrpc_http_server::{self as http, hyper, Origin};
+ 
+ use fetch::Fetch;
+ use parity_reactor::Remote;
+@@ -90,12 +90,12 @@ impl<F> SyncStatus for F where F: Fn() -> bool + Send + Sync {
+ 
+ /// Validates Web Proxy tokens
+ pub trait WebProxyTokens: Send + Sync {
+-	/// Should return true if token is a valid web proxy access token.
+-	fn is_web_proxy_token_valid(&self, token: &str) -> bool;
++	/// Should return a domain allowed to be accessed by this token or `None` if the token is not valid
++	fn domain(&self, token: &str) -> Option<Origin>;
+ }
+ 
+-impl<F> WebProxyTokens for F where F: Fn(String) -> bool + Send + Sync {
+-	fn is_web_proxy_token_valid(&self, token: &str) -> bool { self(token.to_owned()) }
++impl<F> WebProxyTokens for F where F: Fn(String) -> Option<Origin> + Send + Sync {
++	fn domain(&self, token: &str) -> Option<Origin> { self(token.to_owned()) }
+ }
+ 
+ /// Current supported endpoints.
+diff --git a/dapps/src/tests/fetch.rs b/dapps/src/tests/fetch.rs
+index 7a9773f078d..51650a963af 100644
+--- a/dapps/src/tests/fetch.rs
++++ b/dapps/src/tests/fetch.rs
+@@ -312,7 +312,7 @@ fn should_encode_and_decode_base32() {
+ #[test]
+ fn should_stream_web_content() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("token");
++	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
+ 
+ 	// when
+ 	let response = request(server,
+@@ -335,7 +335,7 @@ fn should_stream_web_content() {
+ #[test]
+ fn should_support_base32_encoded_web_urls() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("token");
++	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
+ 
+ 	// when
+ 	let response = request(server,
+@@ -358,7 +358,7 @@ fn should_support_base32_encoded_web_urls() {
+ #[test]
+ fn should_correctly_handle_long_label_when_splitted() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("xolrg9fePeQyKLnL");
++	let (server, fetch) = serve_with_fetch("xolrg9fePeQyKLnL", "https://contribution.melonport.com");
+ 
+ 	// when
+ 	let response = request(server,
+@@ -382,7 +382,7 @@ fn should_correctly_handle_long_label_when_splitted() {
+ #[test]
+ fn should_support_base32_encoded_web_urls_as_path() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("token");
++	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
+ 
+ 	// when
+ 	let response = request(server,
+@@ -402,10 +402,32 @@ fn should_support_base32_encoded_web_urls_as_path() {
+ 	fetch.assert_no_more_requests();
+ }
+ 
++#[test]
++fn should_return_error_on_non_whitelisted_domain() {
++	// given
++	let (server, fetch) = serve_with_fetch("token", "https://ethcore.io");
++
++	// when
++	let response = request(server,
++		"\
++			GET / HTTP/1.1\r\n\
++			Host: EHQPPSBE5DM78X3GECX2YBVGC5S6JX3S5SMPY.web.web3.site\r\n\
++			Connection: close\r\n\
++			\r\n\
++		"
++	);
++
++	// then
++	response.assert_status("HTTP/1.1 400 Bad Request");
++	assert_security_headers_for_embed(&response.headers);
++
++	fetch.assert_no_more_requests();
++}
++
+ #[test]
+ fn should_return_error_on_invalid_token() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("test");
++	let (server, fetch) = serve_with_fetch("test", "https://parity.io");
+ 
+ 	// when
+ 	let response = request(server,
+@@ -427,7 +449,7 @@ fn should_return_error_on_invalid_token() {
+ #[test]
+ fn should_return_error_on_invalid_protocol() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("token");
++	let (server, fetch) = serve_with_fetch("token", "ftp://parity.io");
+ 
+ 	// when
+ 	let response = request(server,
+@@ -449,7 +471,7 @@ fn should_return_error_on_invalid_protocol() {
+ #[test]
+ fn should_disallow_non_get_requests() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("token");
++	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
+ 
+ 	// when
+ 	let response = request(server,
+@@ -474,7 +496,7 @@ fn should_disallow_non_get_requests() {
+ #[test]
+ fn should_fix_absolute_requests_based_on_referer() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("token");
++	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
+ 
+ 	// when
+ 	let response = request(server,
+@@ -497,7 +519,7 @@ fn should_fix_absolute_requests_based_on_referer() {
+ #[test]
+ fn should_fix_absolute_requests_based_on_referer_in_url() {
+ 	// given
+-	let (server, fetch) = serve_with_fetch("token");
++	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
+ 
+ 	// when
+ 	let response = request(server,
+diff --git a/dapps/src/tests/helpers/mod.rs b/dapps/src/tests/helpers/mod.rs
+index 6bc0006ce83..06042079273 100644
+--- a/dapps/src/tests/helpers/mod.rs
++++ b/dapps/src/tests/helpers/mod.rs
+@@ -100,13 +100,15 @@ pub fn serve_with_registrar_and_fetch_and_threads(multi_threaded: bool) -> (Serv
+ 	(server, fetch, reg)
+ }
+ 
+-pub fn serve_with_fetch(web_token: &'static str) -> (Server, FakeFetch) {
++pub fn serve_with_fetch(web_token: &'static str, domain: &'static str) -> (Server, FakeFetch) {
+ 	let fetch = FakeFetch::default();
+ 	let f = fetch.clone();
+ 	let (server, _) = init_server(move |builder| {
+ 		builder
+ 			.fetch(f.clone())
+-			.web_proxy_tokens(Arc::new(move |token| &token == web_token))
++			.web_proxy_tokens(Arc::new(move |token| {
++				if &token == web_token { Some(domain.into()) } else { None }
++			}))
+ 	}, Default::default(), Remote::new_sync());
+ 
+ 	(server, fetch)
+@@ -147,7 +149,7 @@ impl ServerBuilder {
+ 			dapps_path: dapps_path.as_ref().to_owned(),
+ 			registrar: registrar,
+ 			sync_status: Arc::new(|| false),
+-			web_proxy_tokens: Arc::new(|_| false),
++			web_proxy_tokens: Arc::new(|_| None),
+ 			signer_address: None,
+ 			allowed_hosts: DomainsValidation::Disabled,
+ 			remote: remote,
+diff --git a/dapps/src/web.rs b/dapps/src/web.rs
+index 0e872daf2b1..a404099db39 100644
+--- a/dapps/src/web.rs
++++ b/dapps/src/web.rs
+@@ -133,14 +133,14 @@ impl<F: Fetch> WebHandler<F> {
+ 		let target_url = token_it.next();
+ 
+ 		// Check if token supplied in URL is correct.
+-		match token {
+-			Some(token) if self.web_proxy_tokens.is_web_proxy_token_valid(token) => {},
++		let domain = match token.and_then(|token| self.web_proxy_tokens.domain(token)) {
++			Some(domain) => domain,
+ 			_ => {
+ 				return Err(State::Error(ContentHandler::error(
+ 					StatusCode::BadRequest, "Invalid Access Token", "Invalid or old web proxy access token supplied.", Some("Try refreshing the page."), self.embeddable_on.clone()
+ 				)));
+ 			}
+-		}
++		};
+ 
+ 		// Validate protocol
+ 		let mut target_url = match target_url {
+@@ -152,6 +152,12 @@ impl<F: Fetch> WebHandler<F> {
+ 			}
+ 		};
+ 
++		if !target_url.starts_with(&*domain) {
++			return Err(State::Error(ContentHandler::error(
++				StatusCode::BadRequest, "Invalid Domain", "Dapp attempted to access invalid domain.", Some(&target_url), self.embeddable_on.clone(),
++			)));
++		}
++
+ 		if !target_url.ends_with("/") {
+ 			target_url = format!("{}/", target_url);
+ 		}
+diff --git a/js/src/api/rpc/signer/signer.js b/js/src/api/rpc/signer/signer.js
+index 3beef5747cf..915b811589e 100644
+--- a/js/src/api/rpc/signer/signer.js
++++ b/js/src/api/rpc/signer/signer.js
+@@ -42,9 +42,9 @@ export default class Signer {
+       .execute('signer_generateAuthorizationToken');
+   }
+ 
+-  generateWebProxyAccessToken () {
++  generateWebProxyAccessToken (domain) {
+     return this._transport
+-      .execute('signer_generateWebProxyAccessToken');
++      .execute('signer_generateWebProxyAccessToken', domain);
+   }
+ 
+   rejectRequest (requestId) {
+diff --git a/js/src/jsonrpc/interfaces/signer.js b/js/src/jsonrpc/interfaces/signer.js
+index 495b8e0e85e..ead97df1617 100644
+--- a/js/src/jsonrpc/interfaces/signer.js
++++ b/js/src/jsonrpc/interfaces/signer.js
+@@ -30,7 +30,11 @@ export default {
+ 
+   generateWebProxyAccessToken: {
+     desc: 'Generates a new web proxy access token.',
+-    params: [],
++    params: [{
++      type: String,
++      desc: 'Domain for which the token is valid. Only requests to this domain will be allowed.',
++      example: 'https://parity.io'
++    }],
+     returns: {
+       type: String,
+       desc: 'The new web proxy access token.',
+diff --git a/js/src/views/Web/store.js b/js/src/views/Web/store.js
+index 4eed3eaf37f..9dd8ea3fe51 100644
+--- a/js/src/views/Web/store.js
++++ b/js/src/views/Web/store.js
+@@ -59,15 +59,17 @@ export default class Store {
+   }
+ 
+   @action gotoUrl = (_url) => {
+-    transaction(() => {
+-      let url = (_url || this.nextUrl).trim().replace(/\/+$/, '');
++    let url = (_url || this.nextUrl).trim().replace(/\/+$/, '');
+ 
+-      if (!hasProtocol.test(url)) {
+-        url = `https://${url}`;
+-      }
++    if (!hasProtocol.test(url)) {
++      url = `https://${url}`;
++    }
+ 
+-      this.setNextUrl(url);
+-      this.setCurrentUrl(this.nextUrl);
++    return this.generateToken(url).then(() => {
++      transaction(() => {
++        this.setNextUrl(url);
++        this.setCurrentUrl(this.nextUrl);
++      });
+     });
+   }
+ 
+@@ -134,11 +136,11 @@ export default class Store {
+     this.nextUrl = url;
+   }
+ 
+-  generateToken = () => {
++  generateToken = (_url) => {
+     this.setToken(null);
+ 
+     return this._api.signer
+-      .generateWebProxyAccessToken()
++      .generateWebProxyAccessToken(_url)
+       .then((token) => {
+         this.setToken(token);
+       })
+diff --git a/js/src/views/Web/store.spec.js b/js/src/views/Web/store.spec.js
+index 9f7d2e77749..8e92cbd0167 100644
+--- a/js/src/views/Web/store.spec.js
++++ b/js/src/views/Web/store.spec.js
+@@ -62,15 +62,16 @@ describe('views/Web/Store', () => {
+     describe('gotoUrl', () => {
+       it('uses the nextUrl when none specified', () => {
+         store.setNextUrl('https://parity.io');
+-        store.gotoUrl();
+ 
+-        expect(store.currentUrl).to.equal('https://parity.io');
++        return store.gotoUrl().then(() => {
++          expect(store.currentUrl).to.equal('https://parity.io');
++        });
+       });
+ 
+       it('adds https when no protocol', () => {
+-        store.gotoUrl('google.com');
+-
+-        expect(store.currentUrl).to.equal('https://google.com');
++        return store.gotoUrl('google.com').then(() => {
++          expect(store.currentUrl).to.equal('https://google.com');
++        });
+       });
+     });
+ 
+diff --git a/js/src/views/Web/web.js b/js/src/views/Web/web.js
+index 2d94b1b16d4..8e81b43d5e4 100644
+--- a/js/src/views/Web/web.js
++++ b/js/src/views/Web/web.js
+@@ -37,7 +37,6 @@ export default class Web extends Component {
+ 
+   componentDidMount () {
+     this.store.gotoUrl(this.props.params.url);
+-    return this.store.generateToken();
+   }
+ 
+   componentWillReceiveProps (props) {
+diff --git a/parity/dapps.rs b/parity/dapps.rs
+index f0ae06c6b30..b19eaebb634 100644
+--- a/parity/dapps.rs
++++ b/parity/dapps.rs
+@@ -232,7 +232,7 @@ mod server {
+ 	) -> Result<Middleware, String> {
+ 		let signer = deps.signer;
+ 		let parity_remote = parity_reactor::Remote::new(deps.remote.clone());
+-		let web_proxy_tokens = Arc::new(move |token| signer.is_valid_web_proxy_access_token(&token));
++		let web_proxy_tokens = Arc::new(move |token| signer.web_proxy_access_token_domain(&token));
+ 
+ 		Ok(parity_dapps::Middleware::dapps(
+ 			parity_remote,
+diff --git a/rpc/src/v1/helpers/signer.rs b/rpc/src/v1/helpers/signer.rs
+index f35832a408a..81d21eb82e4 100644
+--- a/rpc/src/v1/helpers/signer.rs
++++ b/rpc/src/v1/helpers/signer.rs
+@@ -16,6 +16,7 @@
+ 
+ use std::sync::Arc;
+ use std::ops::Deref;
++use http::Origin;
+ use util::Mutex;
+ use transient_hashmap::TransientHashMap;
+ 
+@@ -29,7 +30,7 @@ const TOKEN_LIFETIME_SECS: u32 = 3600;
+ pub struct SignerService {
+ 	is_enabled: bool,
+ 	queue: Arc<ConfirmationsQueue>,
+-	web_proxy_tokens: Mutex<TransientHashMap<String, ()>>,
++	web_proxy_tokens: Mutex<TransientHashMap<String, Origin>>,
+ 	generate_new_token: Box<Fn() -> Result<String, String> + Send + Sync + 'static>,
+ }
+ 
+@@ -46,16 +47,16 @@ impl SignerService {
+ 	}
+ 
+ 	/// Checks if the token is valid web proxy access token.
+-	pub fn is_valid_web_proxy_access_token(&self, token: &String) -> bool {
+-		self.web_proxy_tokens.lock().contains_key(&token)
++	pub fn web_proxy_access_token_domain(&self, token: &String) -> Option<Origin> {
++		self.web_proxy_tokens.lock().get(token).cloned()
+ 	}
+ 
+ 	/// Generates a new web proxy access token.
+-	pub fn generate_web_proxy_access_token(&self) -> String {
++	pub fn generate_web_proxy_access_token(&self, domain: Origin) -> String {
+ 		let token = random_string(16);
+ 		let mut tokens = self.web_proxy_tokens.lock();
+ 		tokens.prune();
+-		tokens.insert(token.clone(), ());
++		tokens.insert(token.clone(), domain);
+ 		token
+ 	}
+ 
+diff --git a/rpc/src/v1/impls/signer.rs b/rpc/src/v1/impls/signer.rs
+index 4667283c942..d0b1b7a3c6e 100644
+--- a/rpc/src/v1/impls/signer.rs
++++ b/rpc/src/v1/impls/signer.rs
+@@ -245,8 +245,8 @@ impl<D: Dispatcher + 'static> Signer for SignerClient<D> {
+ 			.map_err(|e| errors::token(e))
+ 	}
+ 
+-	fn generate_web_proxy_token(&self) -> Result<String, Error> {
+-		Ok(self.signer.generate_web_proxy_access_token())
++	fn generate_web_proxy_token(&self, domain: String) -> Result<String, Error> {
++		Ok(self.signer.generate_web_proxy_access_token(domain.into()))
+ 	}
+ 
+ 	fn subscribe_pending(&self, _meta: Self::Metadata, sub: Subscriber<Vec<ConfirmationRequest>>) {
+diff --git a/rpc/src/v1/traits/signer.rs b/rpc/src/v1/traits/signer.rs
+index 0280f96123d..f71b5f6042a 100644
+--- a/rpc/src/v1/traits/signer.rs
++++ b/rpc/src/v1/traits/signer.rs
+@@ -51,9 +51,9 @@ build_rpc_trait! {
+ 		#[rpc(name = "signer_generateAuthorizationToken")]
+ 		fn generate_token(&self) -> Result<String, Error>;
+ 
+-		/// Generates new web proxy access token.
++		/// Generates new web proxy access token for particular domain.
+ 		#[rpc(name = "signer_generateWebProxyAccessToken")]
+-		fn generate_web_proxy_token(&self) -> Result<String, Error>;
++		fn generate_web_proxy_token(&self, String) -> Result<String, Error>;
+ 
+ 		#[pubsub(name = "signer_pending")] {
+ 			/// Subscribe to new pending requests on signer interface.

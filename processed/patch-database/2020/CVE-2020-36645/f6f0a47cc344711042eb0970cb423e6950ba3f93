@@ -1,0 +1,121 @@
+diff --git a/ast.go b/ast.go
+index 7f5f1ff..6f8f7dd 100644
+--- a/ast.go
++++ b/ast.go
+@@ -12,6 +12,7 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"io"
++	"strings"
+ )
+ 
+ // Instructions for creating new types: If a type needs to satisfy an
+@@ -594,7 +595,7 @@ type SimpleTableExpr interface {
+ func (*TableName) simpleTableExpr() {}
+ func (*Subquery) simpleTableExpr()  {}
+ 
+-// TableName represents a table  name.
++// TableName represents a table name.
+ type TableName struct {
+ 	Name, Qualifier string
+ }
+@@ -1113,8 +1114,10 @@ type ColName struct {
+ }
+ 
+ var (
+-	astBackquote = []byte("`")
+-	astPeriod    = []byte(".")
++	astBackquoteStr       = "`"
++	astDoubleBackquoteStr = "``"
++	astBackquote          = []byte(astBackquoteStr)
++	astPeriod             = []byte(".")
+ )
+ 
+ func (node *ColName) Serialize(w Writer) error {
+@@ -1129,12 +1132,13 @@ func (node *ColName) Serialize(w Writer) error {
+ 	return quoteName(w, node.Name)
+ }
+ 
+-// note: quoteName does not escape s. quoteName is indirectly
++// note: quoteName escapes any backquote (`) characters in s. quoteName is indirectly
+ // called by builder.go, which checks that column/table names exist.
+ func quoteName(w io.Writer, s string) error {
+ 	if _, err := w.Write(astBackquote); err != nil {
+ 		return err
+ 	}
++	s = strings.ReplaceAll(s, astBackquoteStr, astDoubleBackquoteStr)
+ 	if _, err := io.WriteString(w, s); err != nil {
+ 		return err
+ 	}
+diff --git a/table.go b/table.go
+index bc4b8b6..1432ca2 100644
+--- a/table.go
++++ b/table.go
+@@ -355,10 +355,15 @@ func (t *Table) aliasOrName() string {
+ 	return t.Name
+ }
+ 
++// Enclose a name in backquotes and escape any internal backquotes.
++func quoteNameStr(s string) string {
++	return astBackquoteStr + strings.ReplaceAll(s, astBackquoteStr, astDoubleBackquoteStr) + astBackquoteStr
++}
++
+ // loadColumns loads a table's columns from a database. MySQL
+ // specific.
+ func (t *Table) loadColumns(db *sql.DB) error {
+-	rows, err := db.Query("SHOW FULL COLUMNS FROM " + t.Name)
++	rows, err := db.Query("SHOW FULL COLUMNS FROM " + quoteNameStr(t.Name))
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -450,7 +455,7 @@ func (t *Table) columnCount(name string) int {
+ // loadKeys loads a table's keys (indexes) from a database. MySQL
+ // specific.
+ func (t *Table) loadKeys(db *sql.DB) error {
+-	rows, err := db.Query("SHOW INDEX FROM " + t.Name)
++	rows, err := db.Query("SHOW INDEX FROM " + quoteNameStr(t.Name))
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/table_test.go b/table_test.go
+index 16303a3..f16009e 100644
+--- a/table_test.go
++++ b/table_test.go
+@@ -36,6 +36,37 @@ func TestLoadTable(t *testing.T) {
+ 	fmt.Printf("%s\n", table)
+ }
+ 
++func TestLoadTableNameInjection(t *testing.T) {
++	db := makeTestDB(t, objectsDDL)
++	defer db.Close()
++
++	// Ensure the table name is quoted to avoid possible SQL injection.
++	table, err := LoadTable(db.DB, "objects WHERE false")
++	if table != nil {
++		t.Fatalf("Expected nil table returned from injection attempt, got %v", table)
++	}
++	expectedError := "Error 1146: Table 'squalor_test.objects where false' doesn't exist"
++	if err == nil {
++		t.Fatalf("Expected error %q from injection attempt, got nil", expectedError)
++	}
++	if err.Error() != expectedError {
++		t.Fatalf("Expected error %q from injection attempt, got %q", expectedError, err.Error())
++	}
++
++	// Ensure the table name is quoted to avoid possible SQL injection.
++	table, err = LoadTable(db.DB, "foo`;bar")
++	if table != nil {
++		t.Fatalf("Expected nil table returned from injection attempt, got %v", table)
++	}
++	expectedError = "Error 1146: Table 'squalor_test.foo`;bar' doesn't exist"
++	if err == nil {
++		t.Fatalf("Expected error %q from injection attempt, got nil", expectedError)
++	}
++	if err.Error() != expectedError {
++		t.Fatalf("Expected error %q from injection attempt, got %q", expectedError, err.Error())
++	}
++}
++
+ func TestGetKey(t *testing.T) {
+ 	table := mustLoadTable(t, "objects")
+ 

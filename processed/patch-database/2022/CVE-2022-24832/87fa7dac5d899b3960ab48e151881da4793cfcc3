@@ -1,0 +1,113 @@
+diff --git a/src/main/java/cd/go/apacheds/ApacheDsLdapClient.java b/src/main/java/cd/go/apacheds/ApacheDsLdapClient.java
+index eaeb55f..156425c 100644
+--- a/src/main/java/cd/go/apacheds/ApacheDsLdapClient.java
++++ b/src/main/java/cd/go/apacheds/ApacheDsLdapClient.java
+@@ -25,6 +25,7 @@
+ import org.apache.directory.api.ldap.extras.controls.ppolicy_impl.PasswordPolicyDecorator;
+ import org.apache.directory.api.ldap.model.entry.Entry;
+ import org.apache.directory.api.ldap.model.exception.LdapException;
++import org.apache.directory.api.ldap.model.filter.FilterEncoder;
+ import org.apache.directory.api.ldap.model.message.*;
+ import org.apache.directory.api.ldap.model.name.Dn;
+ import org.apache.directory.ldap.client.api.LdapConnectionConfig;
+@@ -95,7 +96,7 @@ private PasswordWarning performBind(Dn userDn, String password) throws PasswordE
+     }
+ 
+     @Override
+-    public <T> List<T> search(final String filter, final Object[] filterArgs, final Mapper<T> mapper, final int maxResultCount) {
++    public <T> List<T> search(final String filter, final String[] filterArgs, final Mapper<T> mapper, final int maxResultCount) {
+         final List<T> searchResults = new ArrayList<>();
+         for (String searchBase : ldapConfiguration.getSearchBases()) {
+             int resultsToFetch = resultsToFetch(maxResultCount, searchResults.size());
+@@ -109,7 +110,7 @@ public <T> List<T> search(final String filter, final Object[] filterArgs, final
+                         .setScope(SearchScope.SUBTREE)
+                         .addAttributes("*")
+                         .setSizeLimit(resultsToFetch)
+-                        .setFilter(format(filter, filterArgs))
++                        .setFilter(FilterEncoder.format(filter, filterArgs))
+                         .setTimeLimit(ldapConfiguration.getSearchTimeout())
+                         .setBase(new Dn(searchBase));
+ 
+@@ -124,11 +125,11 @@ public <T> List<T> search(final String filter, final Object[] filterArgs, final
+ 
+     @Override
+     public void validate() {
+-        final String filter = format(ldapConfiguration.getUserSearchFilter(), "test");
++        final String filter = FilterEncoder.format(ldapConfiguration.getUserSearchFilter(), "test");
+         ldapConnectionTemplate.searchFirst(ldapConfiguration.getSearchBases().get(0), filter, SearchScope.SUBTREE, entry -> entry);
+     }
+ 
+-    public List<Entry> search(final String filter, final Object[] filterArgs, final int maxResultCount) {
++    public List<Entry> search(final String filter, final String[] filterArgs, final int maxResultCount) {
+         return search(filter, filterArgs, resultWrapper -> (Entry) resultWrapper.getResult(), maxResultCount);
+     }
+ 
+diff --git a/src/main/java/cd/go/authentication/ldap/LdapClient.java b/src/main/java/cd/go/authentication/ldap/LdapClient.java
+index 5dc2af4..3f05644 100644
+--- a/src/main/java/cd/go/authentication/ldap/LdapClient.java
++++ b/src/main/java/cd/go/authentication/ldap/LdapClient.java
+@@ -24,7 +24,7 @@
+ public interface LdapClient {
+     <T> T authenticate(String username, String password, Mapper<T> mapper);
+ 
+-    <T> List<T> search(String userSearchFilter, Object[] filterArgs, Mapper<T> mapper, int maxResult);
++    <T> List<T> search(String userSearchFilter, String[] filterArgs, Mapper<T> mapper, int maxResult);
+ 
+     void validate() throws NamingException;
+ }
+diff --git a/src/main/java/cd/go/framework/ldap/JNDILdapClient.java b/src/main/java/cd/go/framework/ldap/JNDILdapClient.java
+index bf9196f..23363fc 100644
+--- a/src/main/java/cd/go/framework/ldap/JNDILdapClient.java
++++ b/src/main/java/cd/go/framework/ldap/JNDILdapClient.java
+@@ -71,7 +71,7 @@ public <T> T authenticate(String username, String password, Mapper<T> mapper) {
+         }
+     }
+ 
+-    public <T> List<T> search(String filter, Object[] filterArgs, Mapper<T> mapper, int maxResult) {
++    public <T> List<T> search(String filter, String[] filterArgs, Mapper<T> mapper, int maxResult) {
+         List<T> results = new ArrayList<>();
+         DirContext dirContext = getDirContext(ldapConfiguration, ldapConfiguration.getManagerDn(), ldapConfiguration.getPassword());
+ 
+diff --git a/src/test/java/cd/go/apacheds/LdapTest.java b/src/test/java/cd/go/apacheds/ApacheDsLdapClientTest.java
+similarity index 88%
+rename from src/test/java/cd/go/apacheds/LdapTest.java
+rename to src/test/java/cd/go/apacheds/ApacheDsLdapClientTest.java
+index 8851964..c35c919 100644
+--- a/src/test/java/cd/go/apacheds/LdapTest.java
++++ b/src/test/java/cd/go/apacheds/ApacheDsLdapClientTest.java
+@@ -38,7 +38,7 @@
+ import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.*;
+ 
+-class LdapTest {
++class ApacheDsLdapClientTest {
+ 
+     @Test
+     void shouldBeAbleToSearchUsers() throws ParseException {
+@@ -65,6 +65,26 @@ void shouldBeAbleToSearchUsers() throws ParseException {
+         assertThat(searchRequest.getTimeLimit()).isEqualTo(10);
+     }
+ 
++    @Test
++    void shouldEscapeSearchFilterValues() throws ParseException {
++        final LdapConfiguration ldapConfiguration = new LdapConfigurationBuilder()
++                .withSearchTimeout(10)
++                .withSearchBases("ou=foo,dc=bar")
++                .build();
++
++        final LdapConnectionTemplate ldapConnectionTemplate = mock(LdapConnectionTemplate.class);
++        final ApacheDsLdapClient ldap = new ApacheDsLdapClient(ldapConfiguration, ldapConnectionTemplate);
++        final ArgumentCaptor<SearchRequest> argumentCaptor = ArgumentCaptor.forClass(SearchRequestImpl.class);
++
++        when(ldapConnectionTemplate.search(argumentCaptor.capture(), ArgumentMatchers.<EntryMapper<Entry>>any())).thenReturn(Collections.singletonList(new DefaultEntry()));
++
++        String injectionUserName = "*)(objectclass=*";
++        ldap.search("(uid={0})", new String[]{injectionUserName}, 1);
++
++        assertThat(argumentCaptor.getValue().getFilter())
++                .isEqualTo(FilterParser.parse("(uid=\\2A\\29\\28objectclass=\\2A)"));
++    }
++
+     @Test
+     void shouldAbleToFetchResultsFromMultipleSearchBase() {
+         final LdapConfiguration ldapConfiguration = new LdapConfigurationBuilder()

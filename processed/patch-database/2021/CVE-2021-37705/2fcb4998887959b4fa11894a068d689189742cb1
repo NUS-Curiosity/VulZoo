@@ -1,0 +1,534 @@
+diff --git a/docs/webhook_events.md b/docs/webhook_events.md
+index 9dc79c7599..967e94a8b1 100644
+--- a/docs/webhook_events.md
++++ b/docs/webhook_events.md
+@@ -641,7 +641,10 @@ Each event will be submitted via HTTP POST to the user provided URL.
+         "admins": [
+             "00000000-0000-0000-0000-000000000000"
+         ],
+-        "allow_pool_management": true
++        "allow_pool_management": true,
++        "allowed_aad_tenants": [
++            "00000000-0000-0000-0000-000000000000"
++        ]
+     }
+ }
+ ```
+@@ -665,8 +668,19 @@ Each event will be submitted via HTTP POST to the user provided URL.
+                     "default": true,
+                     "title": "Allow Pool Management",
+                     "type": "boolean"
++                },
++                "allowed_aad_tenants": {
++                    "items": {
++                        "format": "uuid",
++                        "type": "string"
++                    },
++                    "title": "Allowed Aad Tenants",
++                    "type": "array"
+                 }
+             },
++            "required": [
++                "allowed_aad_tenants"
++            ],
+             "title": "InstanceConfig",
+             "type": "object"
+         }
+@@ -5599,8 +5613,19 @@ Each event will be submitted via HTTP POST to the user provided URL.
+                     "default": true,
+                     "title": "Allow Pool Management",
+                     "type": "boolean"
++                },
++                "allowed_aad_tenants": {
++                    "items": {
++                        "format": "uuid",
++                        "type": "string"
++                    },
++                    "title": "Allowed Aad Tenants",
++                    "type": "array"
+                 }
+             },
++            "required": [
++                "allowed_aad_tenants"
++            ],
+             "title": "InstanceConfig",
+             "type": "object"
+         },
+diff --git a/src/api-service/__app__/info/__init__.py b/src/api-service/__app__/info/__init__.py
+index 61bf62ceee..bdd9ce892f 100644
+--- a/src/api-service/__app__/info/__init__.py
++++ b/src/api-service/__app__/info/__init__.py
+@@ -14,11 +14,12 @@
+     get_instance_id,
+     get_subscription,
+ )
++from ..onefuzzlib.endpoint_authorization import call_if_user
+ from ..onefuzzlib.request import ok
+ from ..onefuzzlib.versions import versions
+ 
+ 
+-def main(req: func.HttpRequest) -> func.HttpResponse:
++def get(req: func.HttpRequest) -> func.HttpResponse:
+     response = ok(
+         Info(
+             resource_group=get_base_resource_group(),
+@@ -32,3 +33,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
+     )
+ 
+     return response
++
++
++def main(req: func.HttpRequest) -> func.HttpResponse:
++    methods = {"GET": get}
++    method = methods[req.method]
++    result = call_if_user(req, method)
++
++    return result
+diff --git a/src/api-service/__app__/negotiate/__init__.py b/src/api-service/__app__/negotiate/__init__.py
+index f6898ca47d..e1a6a5ff41 100644
+--- a/src/api-service/__app__/negotiate/__init__.py
++++ b/src/api-service/__app__/negotiate/__init__.py
+@@ -5,6 +5,8 @@
+ 
+ import azure.functions as func
+ 
++from ..onefuzzlib.endpoint_authorization import call_if_user
++
+ # This endpoint handles the signalr negotation
+ # As we do not differentiate from clients at this time, we pass the Functions runtime
+ # provided connection straight to the client
+@@ -14,8 +16,19 @@
+ 
+ 
+ def main(req: func.HttpRequest, connectionInfoJson: str) -> func.HttpResponse:
+-    return func.HttpResponse(
+-        connectionInfoJson,
+-        status_code=200,
+-        headers={"Content-type": "application/json"},
+-    )
++    # NOTE: this is a sub-method because the call_if* do not support callbacks with
++    # additional arguments at this time.  Once call_if* supports additional arguments,
++    # this should be made a generic function
++    def post(req: func.HttpRequest) -> func.HttpResponse:
++        return func.HttpResponse(
++            connectionInfoJson,
++            status_code=200,
++            headers={"Content-type": "application/json"},
++        )
++
++    methods = {"POST": post}
++    method = methods[req.method]
++
++    result = call_if_user(req, method)
++
++    return result
+diff --git a/src/api-service/__app__/onefuzzlib/config.py b/src/api-service/__app__/onefuzzlib/config.py
+index c3f124d7d8..c58131d9e3 100644
+--- a/src/api-service/__app__/onefuzzlib/config.py
++++ b/src/api-service/__app__/onefuzzlib/config.py
+@@ -25,7 +25,7 @@ def key_fields(cls) -> Tuple[str, Optional[str]]:
+     def fetch(cls) -> "InstanceConfig":
+         entry = cls.get(get_instance_name())
+         if entry is None:
+-            entry = cls()
++            entry = cls(allowed_aad_tenants=[])
+             entry.save()
+         return entry
+ 
+diff --git a/src/api-service/__app__/onefuzzlib/user_credentials.py b/src/api-service/__app__/onefuzzlib/user_credentials.py
+index 71c648cf1d..ca9222094d 100644
+--- a/src/api-service/__app__/onefuzzlib/user_credentials.py
++++ b/src/api-service/__app__/onefuzzlib/user_credentials.py
+@@ -3,14 +3,18 @@
+ # Copyright (c) Microsoft Corporation.
+ # Licensed under the MIT License.
+ 
+-from typing import Optional
++import logging
++from typing import List, Optional
+ from uuid import UUID
+ 
+ import azure.functions as func
+ import jwt
++from memoization import cached
+ from onefuzztypes.enums import ErrorCode
+ from onefuzztypes.models import Error, Result, UserInfo
+ 
++from .config import InstanceConfig
++
+ 
+ def get_bearer_token(request: func.HttpRequest) -> Optional[str]:
+     auth: str = request.headers.get("Authorization", None)
+@@ -39,6 +43,13 @@ def get_auth_token(request: func.HttpRequest) -> Optional[str]:
+     return str(token_header)
+ 
+ 
++@cached(ttl=60)
++def get_allowed_tenants() -> List[str]:
++    config = InstanceConfig.fetch()
++    entries = [f"https://sts.windows.net/{x}/" for x in config.allowed_aad_tenants]
++    return entries
++
++
+ def parse_jwt_token(request: func.HttpRequest) -> Result[UserInfo]:
+     """Obtains the Access Token from the Authorization Header"""
+     token_str = get_auth_token(request)
+@@ -48,9 +59,20 @@ def parse_jwt_token(request: func.HttpRequest) -> Result[UserInfo]:
+             errors=["unable to find authorization token"],
+         )
+ 
+-    # This token has already been verified by the azure authentication layer
++    # The JWT token has already been verified by the azure authentication layer,
++    # but we need to verify the tenant is as we expect.
+     token = jwt.decode(token_str, options={"verify_signature": False})
+ 
++    if "iss" not in token:
++        return Error(
++            code=ErrorCode.INVALID_REQUEST, errors=["missing issuer from token"]
++        )
++
++    tenants = get_allowed_tenants()
++    if token["iss"] not in tenants:
++        logging.error("issuer not from allowed tenant: %s - %s", token["iss"], tenants)
++        return Error(code=ErrorCode.INVALID_REQUEST, errors=["unauthorized AAD issuer"])
++
+     application_id = UUID(token["appid"]) if "appid" in token else None
+     object_id = UUID(token["oid"]) if "oid" in token else None
+     upn = token.get("upn")
+diff --git a/src/api-service/tests/test_auth_check.py b/src/api-service/tests/test_auth_check.py
+index 18028afd94..13911422c2 100644
+--- a/src/api-service/tests/test_auth_check.py
++++ b/src/api-service/tests/test_auth_check.py
+@@ -5,7 +5,7 @@
+ 
+ import os
+ import unittest
+-from uuid import uuid4
++from uuid import UUID, uuid4
+ 
+ from onefuzztypes.models import UserInfo
+ 
+@@ -25,29 +25,41 @@ def test_modify_config(self) -> None:
+         user2 = uuid4()
+ 
+         # no admins set
+-        self.assertTrue(can_modify_config_impl(InstanceConfig(), UserInfo()))
++        self.assertTrue(
++            can_modify_config_impl(
++                InstanceConfig(allowed_aad_tenants=[UUID(int=0)]), UserInfo()
++            )
++        )
+ 
+         # with oid, but no admin
+         self.assertTrue(
+-            can_modify_config_impl(InstanceConfig(), UserInfo(object_id=user1))
++            can_modify_config_impl(
++                InstanceConfig(allowed_aad_tenants=[UUID(int=0)]),
++                UserInfo(object_id=user1),
++            )
+         )
+ 
+         # is admin
+         self.assertTrue(
+             can_modify_config_impl(
+-                InstanceConfig(admins=[user1]), UserInfo(object_id=user1)
++                InstanceConfig(allowed_aad_tenants=[UUID(int=0)], admins=[user1]),
++                UserInfo(object_id=user1),
+             )
+         )
+ 
+         # no user oid set
+         self.assertFalse(
+-            can_modify_config_impl(InstanceConfig(admins=[user1]), UserInfo())
++            can_modify_config_impl(
++                InstanceConfig(allowed_aad_tenants=[UUID(int=0)], admins=[user1]),
++                UserInfo(),
++            )
+         )
+ 
+         # not an admin
+         self.assertFalse(
+             can_modify_config_impl(
+-                InstanceConfig(admins=[user1]), UserInfo(object_id=user2)
++                InstanceConfig(allowed_aad_tenants=[UUID(int=0)], admins=[user1]),
++                UserInfo(object_id=user2),
+             )
+         )
+ 
+@@ -58,21 +70,31 @@ def test_manage_pools(self) -> None:
+         # by default, any can modify
+         self.assertIsNone(
+             check_can_manage_pools_impl(
+-                InstanceConfig(allow_pool_management=True), UserInfo()
++                InstanceConfig(
++                    allowed_aad_tenants=[UUID(int=0)], allow_pool_management=True
++                ),
++                UserInfo(),
+             )
+         )
+ 
+         # with oid, but no admin
+         self.assertIsNone(
+             check_can_manage_pools_impl(
+-                InstanceConfig(allow_pool_management=True), UserInfo(object_id=user1)
++                InstanceConfig(
++                    allowed_aad_tenants=[UUID(int=0)], allow_pool_management=True
++                ),
++                UserInfo(object_id=user1),
+             )
+         )
+ 
+         # is admin
+         self.assertIsNone(
+             check_can_manage_pools_impl(
+-                InstanceConfig(allow_pool_management=False, admins=[user1]),
++                InstanceConfig(
++                    allowed_aad_tenants=[UUID(int=0)],
++                    allow_pool_management=False,
++                    admins=[user1],
++                ),
+                 UserInfo(object_id=user1),
+             )
+         )
+@@ -80,14 +102,23 @@ def test_manage_pools(self) -> None:
+         # no user oid set
+         self.assertIsNotNone(
+             check_can_manage_pools_impl(
+-                InstanceConfig(allow_pool_management=False, admins=[user1]), UserInfo()
++                InstanceConfig(
++                    allowed_aad_tenants=[UUID(int=0)],
++                    allow_pool_management=False,
++                    admins=[user1],
++                ),
++                UserInfo(),
+             )
+         )
+ 
+         # not an admin
+         self.assertIsNotNone(
+             check_can_manage_pools_impl(
+-                InstanceConfig(allow_pool_management=False, admins=[user1]),
++                InstanceConfig(
++                    allowed_aad_tenants=[UUID(int=0)],
++                    allow_pool_management=False,
++                    admins=[user1],
++                ),
+                 UserInfo(object_id=user2),
+             )
+         )
+diff --git a/src/deployment/azuredeploy.json b/src/deployment/azuredeploy.json
+index 127fd3383d..bf2eaf79a8 100644
+--- a/src/deployment/azuredeploy.json
++++ b/src/deployment/azuredeploy.json
+@@ -821,6 +821,10 @@
+         "scaleset-identity": {
+             "type": "string",
+             "value": "[variables('scaleset_identity')]"
++        },
++        "tenant_id": {
++            "type": "string",
++            "value": "[subscription().tenantId]"
+         }
+     }
+ }
+diff --git a/src/deployment/deploy.py b/src/deployment/deploy.py
+index 8ea9324873..559f5daf4d 100644
+--- a/src/deployment/deploy.py
++++ b/src/deployment/deploy.py
+@@ -72,7 +72,7 @@
+     set_app_audience,
+     update_pool_registration,
+ )
+-from set_admins import update_admins
++from set_admins import update_admins, update_allowed_aad_tenants
+ 
+ # Found by manually assigning the User.Read permission to application
+ # registration in the admin portal. The values are in the manifest under
+@@ -130,7 +130,8 @@ def __init__(
+         multi_tenant_domain: str,
+         upgrade: bool,
+         subscription_id: Optional[str],
+-        admins: List[UUID]
++        admins: List[UUID],
++        allowed_aad_tenants: List[UUID],
+     ):
+         self.subscription_id = subscription_id
+         self.resource_group = resource_group
+@@ -161,6 +162,7 @@ def __init__(
+         self.export_appinsights = export_appinsights
+         self.log_service_principal = log_service_principal
+         self.admins = admins
++        self.allowed_aad_tenants = allowed_aad_tenants
+ 
+         machine = platform.machine()
+         system = platform.system()
+@@ -560,13 +562,20 @@ def apply_migrations(self) -> None:
+         table_service = TableService(account_name=name, account_key=key)
+         migrate(table_service, self.migrations)
+ 
+-    def set_admins(self) -> None:
++    def set_instance_config(self) -> None:
+         name = self.results["deploy"]["func-name"]["value"]
+         key = self.results["deploy"]["func-key"]["value"]
++        tenant = UUID(self.results["deploy"]["tenant_id"]["value"])
+         table_service = TableService(account_name=name, account_key=key)
++
+         if self.admins:
+             update_admins(table_service, self.application_name, self.admins)
+ 
++        tenants = self.allowed_aad_tenants
++        if tenant not in tenants:
++            tenants.append(tenant)
++        update_allowed_aad_tenants(table_service, self.application_name, tenants)
++
+     def create_queues(self) -> None:
+         logger.info("creating eventgrid destination queue")
+ 
+@@ -926,7 +935,7 @@ def main() -> None:
+ 
+     full_deployment_states = rbac_only_states + [
+         ("apply_migrations", Client.apply_migrations),
+-        ("set_admins", Client.set_admins),
++        ("set_instance_config", Client.set_instance_config),
+         ("queues", Client.create_queues),
+         ("eventgrid", Client.create_eventgrid),
+         ("tools", Client.upload_tools),
+@@ -1038,6 +1047,12 @@ def main() -> None:
+         nargs="*",
+         help="set the list of administrators (by OID in AAD)",
+     )
++    parser.add_argument(
++        "--allowed_aad_tenants",
++        type=UUID,
++        nargs="*",
++        help="Set additional AAD tenants beyond the tenant the app is deployed in",
++    )
+ 
+     args = parser.parse_args()
+ 
+@@ -1066,6 +1081,7 @@ def main() -> None:
+         upgrade=args.upgrade,
+         subscription_id=args.subscription_id,
+         admins=args.set_admins,
++        allowed_aad_tenants=args.allowed_aad_tenants or [],
+     )
+     if args.verbose:
+         level = logging.DEBUG
+diff --git a/src/deployment/set_admins.py b/src/deployment/set_admins.py
+index c733c70e2d..7b4e31804f 100644
+--- a/src/deployment/set_admins.py
++++ b/src/deployment/set_admins.py
+@@ -20,6 +20,21 @@ def create_if_missing(table_service: TableService) -> None:
+         table_service.create_table(TABLE_NAME)
+ 
+ 
++def update_allowed_aad_tenants(
++    table_service: TableService, resource_group: str, tenants: List[UUID]
++) -> None:
++    create_if_missing(table_service)
++    as_str = [str(x) for x in tenants]
++    table_service.insert_or_merge_entity(
++        TABLE_NAME,
++        {
++            "PartitionKey": resource_group,
++            "RowKey": resource_group,
++            "allowed_aad_tenants": json.dumps(as_str),
++        },
++    )
++
++
+ def update_admins(
+     table_service: TableService, resource_group: str, admins: List[UUID]
+ ) -> None:
+@@ -43,7 +58,8 @@ def main() -> None:
+     parser = argparse.ArgumentParser(formatter_class=formatter)
+     parser.add_argument("resource_group")
+     parser.add_argument("storage_account")
+-    parser.add_argument("admins", type=UUID, nargs="*")
++    parser.add_argument("--admins", type=UUID, nargs="*")
++    parser.add_argument("--allowed_aad_tenants", type=UUID, nargs="*")
+     args = parser.parse_args()
+ 
+     client = get_client_from_cli_profile(StorageManagementClient)
+@@ -53,7 +69,12 @@ def main() -> None:
+     table_service = TableService(
+         account_name=args.storage_account, account_key=storage_keys.keys[0].value
+     )
+-    update_admins(table_service, args.resource_group, args.admins)
++    if args.admins:
++        update_admins(table_service, args.resource_group, args.admins)
++    if args.allowed_aad_tenants:
++        update_allowed_aad_tenants(
++            table_service, args.resource_group, args.allowed_aad_tenants
++        )
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/pytypes/extra/generate-docs.py b/src/pytypes/extra/generate-docs.py
+index 260a686f37..f49e5a8f6a 100755
+--- a/src/pytypes/extra/generate-docs.py
++++ b/src/pytypes/extra/generate-docs.py
+@@ -258,7 +258,11 @@ def main() -> None:
+         EventFileAdded(container=Container("container-name"), filename="example.txt"),
+         EventNodeHeartbeat(machine_id=UUID(int=0), pool_name=PoolName("example")),
+         EventTaskHeartbeat(task_id=UUID(int=0), job_id=UUID(int=0), config=task_config),
+-        EventInstanceConfigUpdated(config=InstanceConfig(admins=[UUID(int=0)])),
++        EventInstanceConfigUpdated(
++            config=InstanceConfig(
++                admins=[UUID(int=0)], allowed_aad_tenants=[UUID(int=0)]
++            )
++        ),
+     ]
+ 
+     # works around `mypy` not handling that Union has `__args__`
+diff --git a/src/pytypes/onefuzztypes/models.py b/src/pytypes/onefuzztypes/models.py
+index cc4691386a..8d4d4d8dee 100644
+--- a/src/pytypes/onefuzztypes/models.py
++++ b/src/pytypes/onefuzztypes/models.py
+@@ -802,6 +802,8 @@ class InstanceConfig(BaseModel):
+     # if set, only admins can manage pools or scalesets
+     allow_pool_management: bool = Field(default=True)
+ 
++    allowed_aad_tenants: List[UUID]
++
+     def update(self, config: "InstanceConfig") -> None:
+         for field in config.__fields__:
+             # If no admins are set, then ignore setting admins
+@@ -817,5 +819,16 @@ def check_admins(cls, value: Optional[List[UUID]]) -> Optional[List[UUID]]:
+             raise ValueError("admins must be None or contain at least one UUID")
+         return value
+ 
++    # At the moment, this only checks allowed_aad_tenants, however adding
++    # support for 3rd party JWT validation is anticipated in a future release.
++    @root_validator()
++    def check_instance_config(cls, values: Any) -> Any:
++        if "allowed_aad_tenants" not in values:
++            raise ValueError("missing allowed_aad_tenants")
++
++        if not len(values["allowed_aad_tenants"]):
++            raise ValueError("allowed_aad_tenants must not be empty")
++        return values
++
+ 
+ _check_hotfix()
+diff --git a/src/pytypes/tests/test_instance_config_update.py b/src/pytypes/tests/test_instance_config_update.py
+index 8532c9a9b9..31abba0847 100644
+--- a/src/pytypes/tests/test_instance_config_update.py
++++ b/src/pytypes/tests/test_instance_config_update.py
+@@ -11,9 +11,13 @@
+ 
+ class TestInstanceConfig(unittest.TestCase):
+     def test_with_admins(self) -> None:
+-        no_admins = InstanceConfig(admins=None)
+-        with_admins = InstanceConfig(admins=[UUID(int=0)])
+-        with_admins_2 = InstanceConfig(admins=[UUID(int=1)])
++        no_admins = InstanceConfig(admins=None, allowed_aad_tenants=[UUID(int=0)])
++        with_admins = InstanceConfig(
++            admins=[UUID(int=0)], allowed_aad_tenants=[UUID(int=0)]
++        )
++        with_admins_2 = InstanceConfig(
++            admins=[UUID(int=1)], allowed_aad_tenants=[UUID(int=0)]
++        )
+ 
+         no_admins.update(with_admins)
+         self.assertEqual(no_admins.admins, None)

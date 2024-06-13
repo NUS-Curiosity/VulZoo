@@ -1,0 +1,275 @@
+diff --git a/src/njs_async.c b/src/njs_async.c
+index 7bc6c37e7..e4dd74863 100644
+--- a/src/njs_async.c
++++ b/src/njs_async.c
+@@ -29,9 +29,7 @@ njs_async_function_frame_invoke(njs_vm_t *vm, njs_value_t *retval)
+         return NJS_ERROR;
+     }
+ 
+-    frame->function->context = capability;
+-
+-    ret = njs_function_lambda_call(vm);
++    ret = njs_function_lambda_call(vm, capability, NULL);
+ 
+     if (ret == NJS_OK) {
+         ret = njs_function_call(vm, njs_function(&capability->resolve),
+@@ -63,7 +61,6 @@ njs_await_fulfilled(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
+     njs_int_t           ret;
+     njs_value_t         **cur_local, **cur_closures, **cur_temp, *value;
+     njs_frame_t         *frame, *async_frame;
+-    njs_function_t      *function;
+     njs_async_ctx_t     *ctx;
+     njs_native_frame_t  *top, *async;
+ 
+@@ -78,8 +75,6 @@ njs_await_fulfilled(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
+     async = &async_frame->native;
+     async->previous = vm->top_frame;
+ 
+-    function = async->function;
+-
+     cur_local = vm->levels[NJS_LEVEL_LOCAL];
+     cur_closures = vm->levels[NJS_LEVEL_CLOSURE];
+     cur_temp = vm->levels[NJS_LEVEL_TEMP];
+@@ -98,13 +93,7 @@ njs_await_fulfilled(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
+ 
+     vm->top_frame->retval = &vm->retval;
+ 
+-    function->context = ctx->capability;
+-    function->await = ctx;
+-
+-    ret = njs_vmcode_interpreter(vm, ctx->pc);
+-
+-    function->context = NULL;
+-    function->await = NULL;
++    ret = njs_vmcode_interpreter(vm, ctx->pc, ctx->capability, ctx);
+ 
+     vm->levels[NJS_LEVEL_LOCAL] = cur_local;
+     vm->levels[NJS_LEVEL_CLOSURE] = cur_closures;
+diff --git a/src/njs_function.c b/src/njs_function.c
+index ae0fa11ff..5f07ddd9c 100644
+--- a/src/njs_function.c
++++ b/src/njs_function.c
+@@ -608,7 +608,7 @@ njs_function_call2(njs_vm_t *vm, njs_function_t *function,
+ 
+ 
+ njs_int_t
+-njs_function_lambda_call(njs_vm_t *vm)
++njs_function_lambda_call(njs_vm_t *vm, void *promise_cap, void *async_ctx)
+ {
+     uint32_t               n;
+     njs_int_t              ret;
+@@ -622,6 +622,8 @@ njs_function_lambda_call(njs_vm_t *vm)
+     frame = (njs_frame_t *) vm->top_frame;
+     function = frame->native.function;
+ 
++    njs_assert(function->context == NULL);
++
+     if (function->global && !function->closure_copied) {
+         ret = njs_function_capture_global_closures(vm, function);
+         if (njs_slow_path(ret != NJS_OK)) {
+@@ -698,7 +700,7 @@ njs_function_lambda_call(njs_vm_t *vm)
+         }
+     }
+ 
+-    ret = njs_vmcode_interpreter(vm, lambda->start);
++    ret = njs_vmcode_interpreter(vm, lambda->start, promise_cap, async_ctx);
+ 
+     /* Restore current level. */
+     vm->levels[NJS_LEVEL_LOCAL] = cur_local;
+@@ -775,7 +777,7 @@ njs_function_frame_invoke(njs_vm_t *vm, njs_value_t *retval)
+         return njs_function_native_call(vm);
+ 
+     } else {
+-        return njs_function_lambda_call(vm);
++        return njs_function_lambda_call(vm, NULL, NULL);
+     }
+ }
+ 
+diff --git a/src/njs_function.h b/src/njs_function.h
+index b47e7dc6a..59150fdd5 100644
+--- a/src/njs_function.h
++++ b/src/njs_function.h
+@@ -112,7 +112,8 @@ njs_int_t njs_function_lambda_frame(njs_vm_t *vm, njs_function_t *function,
+ njs_int_t njs_function_call2(njs_vm_t *vm, njs_function_t *function,
+     const njs_value_t *this, const njs_value_t *args,
+     njs_uint_t nargs, njs_value_t *retval, njs_bool_t ctor);
+-njs_int_t njs_function_lambda_call(njs_vm_t *vm);
++njs_int_t njs_function_lambda_call(njs_vm_t *vm, void *promise_cap,
++    void *async_ctx);
+ njs_int_t njs_function_native_call(njs_vm_t *vm);
+ njs_native_frame_t *njs_function_frame_alloc(njs_vm_t *vm, size_t size);
+ void njs_function_frame_free(njs_vm_t *vm, njs_native_frame_t *frame);
+diff --git a/src/njs_value.h b/src/njs_value.h
+index 12448eacd..7297df395 100644
+--- a/src/njs_value.h
++++ b/src/njs_value.h
+@@ -270,7 +270,6 @@ struct njs_function_s {
+     } u;
+ 
+     void                              *context;
+-    void                              *await;
+ 
+     njs_value_t                       *bound;
+ };
+diff --git a/src/njs_vm.c b/src/njs_vm.c
+index b46f88c62..0c75fff71 100644
+--- a/src/njs_vm.c
++++ b/src/njs_vm.c
+@@ -490,7 +490,7 @@ njs_vm_start(njs_vm_t *vm)
+         return ret;
+     }
+ 
+-    ret = njs_vmcode_interpreter(vm, vm->start);
++    ret = njs_vmcode_interpreter(vm, vm->start, NULL, NULL);
+ 
+     return (ret == NJS_ERROR) ? NJS_ERROR : NJS_OK;
+ }
+diff --git a/src/njs_vmcode.c b/src/njs_vmcode.c
+index b371c3748..3039642cb 100644
+--- a/src/njs_vmcode.c
++++ b/src/njs_vmcode.c
+@@ -42,7 +42,8 @@ static njs_jump_off_t njs_vmcode_debugger(njs_vm_t *vm);
+ static njs_jump_off_t njs_vmcode_return(njs_vm_t *vm, njs_value_t *invld,
+     njs_value_t *retval);
+ 
+-static njs_jump_off_t njs_vmcode_await(njs_vm_t *vm, njs_vmcode_await_t *await);
++static njs_jump_off_t njs_vmcode_await(njs_vm_t *vm, njs_vmcode_await_t *await,
++    njs_promise_capability_t *pcap, njs_async_ctx_t *actx);
+ 
+ static njs_jump_off_t njs_vmcode_try_start(njs_vm_t *vm, njs_value_t *value,
+     njs_value_t *offset, u_char *pc);
+@@ -77,7 +78,8 @@ static njs_jump_off_t njs_function_frame_create(njs_vm_t *vm,
+ 
+ 
+ njs_int_t
+-njs_vmcode_interpreter(njs_vm_t *vm, u_char *pc)
++njs_vmcode_interpreter(njs_vm_t *vm, u_char *pc, void *promise_cap,
++    void *async_ctx)
+ {
+     u_char                       *catch;
+     double                       num, exponent;
+@@ -826,7 +828,7 @@ njs_vmcode_interpreter(njs_vm_t *vm, u_char *pc)
+ 
+             case NJS_VMCODE_AWAIT:
+                 await = (njs_vmcode_await_t *) pc;
+-                return njs_vmcode_await(vm, await);
++                return njs_vmcode_await(vm, await, promise_cap, async_ctx);
+ 
+             case NJS_VMCODE_TRY_START:
+                 ret = njs_vmcode_try_start(vm, value1, value2, pc);
+@@ -1812,7 +1814,8 @@ njs_vmcode_return(njs_vm_t *vm, njs_value_t *invld, njs_value_t *retval)
+ 
+ 
+ static njs_jump_off_t
+-njs_vmcode_await(njs_vm_t *vm, njs_vmcode_await_t *await)
++njs_vmcode_await(njs_vm_t *vm, njs_vmcode_await_t *await,
++    njs_promise_capability_t *pcap, njs_async_ctx_t *ctx)
+ {
+     size_t              size;
+     njs_int_t           ret;
+@@ -1820,7 +1823,6 @@ njs_vmcode_await(njs_vm_t *vm, njs_vmcode_await_t *await)
+     njs_value_t         ctor, val, on_fulfilled, on_rejected, *value;
+     njs_promise_t       *promise;
+     njs_function_t      *fulfilled, *rejected;
+-    njs_async_ctx_t     *ctx;
+     njs_native_frame_t  *active;
+ 
+     active = &vm->active_frame->native;
+@@ -1837,8 +1839,6 @@ njs_vmcode_await(njs_vm_t *vm, njs_vmcode_await_t *await)
+         return NJS_ERROR;
+     }
+ 
+-    ctx = active->function->await;
+-
+     if (ctx == NULL) {
+         ctx = njs_mp_alloc(vm->mem_pool, sizeof(njs_async_ctx_t));
+         if (njs_slow_path(ctx == NULL)) {
+@@ -1854,9 +1854,7 @@ njs_vmcode_await(njs_vm_t *vm, njs_vmcode_await_t *await)
+         }
+ 
+         ctx->await = fulfilled->context;
+-        ctx->capability = active->function->context;
+-
+-        active->function->context = NULL;
++        ctx->capability = pcap;
+ 
+         ret = njs_function_frame_save(vm, ctx->await, NULL);
+         if (njs_slow_path(ret != NJS_OK)) {
+diff --git a/src/njs_vmcode.h b/src/njs_vmcode.h
+index c15a4bd9e..6b8f65582 100644
+--- a/src/njs_vmcode.h
++++ b/src/njs_vmcode.h
+@@ -437,7 +437,8 @@ typedef struct {
+ } njs_vmcode_await_t;
+ 
+ 
+-njs_int_t njs_vmcode_interpreter(njs_vm_t *vm, u_char *pc);
++njs_int_t njs_vmcode_interpreter(njs_vm_t *vm, u_char *pc,
++    void *promise_cap, void *async_ctx);
+ 
+ njs_object_t *njs_function_new_object(njs_vm_t *vm, njs_value_t *constructor);
+ 
+diff --git a/test/js/async_recursive_last.t.js b/test/js/async_recursive_last.t.js
+new file mode 100644
+index 000000000..84f1b5792
+--- /dev/null
++++ b/test/js/async_recursive_last.t.js
+@@ -0,0 +1,26 @@
++/*---
++includes: [compareArray.js]
++flags: [async]
++---*/
++
++let stages = [];
++
++async function f(v) {
++    if (v == 3) {
++        return;
++    }
++
++    stages.push(`f>${v}`);
++
++    f(v + 1);
++
++    stages.push(`f<${v}`);
++
++    await "X";
++}
++
++f(0)
++.then(v => {
++    assert.compareArray(stages, ['f>0', 'f>1', 'f>2', 'f<2', 'f<1', 'f<0']);
++})
++.then($DONE, $DONE);
+diff --git a/test/js/async_recursive_mid.t.js b/test/js/async_recursive_mid.t.js
+new file mode 100644
+index 000000000..4d3a9fd19
+--- /dev/null
++++ b/test/js/async_recursive_mid.t.js
+@@ -0,0 +1,26 @@
++/*---
++includes: [compareArray.js]
++flags: [async]
++---*/
++
++let stages = [];
++
++async function f(v) {
++    if (v == 3) {
++        return;
++    }
++
++    stages.push(`f>${v}`);
++
++    await "X";
++
++    f(v + 1);
++
++    stages.push(`f<${v}`);
++}
++
++f(0)
++.then(v => {
++    assert.compareArray(stages, ['f>0','f>1','f<0','f>2','f<1']);
++})
++.then($DONE, $DONE);

@@ -1,0 +1,247 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7d159bfa08..3ccf87fd1a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,6 +22,7 @@ All notable changes to Gogs are documented in this file.
+ 
+ ### Fixed
+ 
++- _Security:_ SSRF in webhook. [#6901](https://github.com/gogs/gogs/issues/6901)
+ - _Security:_ XSS in cookies. [#6953](https://github.com/gogs/gogs/issues/6953)
+ - _Security:_ OS Command Injection in file uploading. [#6968](https://github.com/gogs/gogs/issues/6968)
+ - _Security:_ Remote Command Execution in file editing. [#6555](https://github.com/gogs/gogs/issues/6555)
+diff --git a/conf/locale/locale_en-US.ini b/conf/locale/locale_en-US.ini
+index 5ad18949ff..c2eaa4dffa 100644
+--- a/conf/locale/locale_en-US.ini
++++ b/conf/locale/locale_en-US.ini
+@@ -443,6 +443,7 @@ migrate.clone_address_desc = This can be a HTTP/HTTPS/GIT URL.
+ migrate.clone_address_desc_import_local = You're also allowed to migrate a repository by local server path.
+ migrate.permission_denied = You are not allowed to import local repositories.
+ migrate.invalid_local_path = Invalid local path, it does not exist or not a directory.
++migrate.clone_address_resolved_to_blocked_local_address = Clone address resolved to a local network address that is implicitly blocked.
+ migrate.failed = Migration failed: %v
+ 
+ mirror_from = mirror of
+@@ -809,7 +810,7 @@ settings.webhook.headers = Headers
+ settings.webhook.payload = Payload
+ settings.webhook.body = Body
+ settings.webhook.err_cannot_parse_payload_url = Cannot parse payload URL: %v
+-settings.webhook.err_cannot_use_local_addresses = Non admins are not allowed to use local addresses.
++settings.webhook.url_resolved_to_blocked_local_address = Payload URL resolved to a local network address that is implicitly blocked.
+ settings.githooks_desc = Git Hooks are powered by Git itself, you can edit files of supported hooks in the list below to perform custom operations.
+ settings.githook_edit_desc = If the hook is inactive, sample content will be presented. Leaving content to an empty value will disable this hook.
+ settings.githook_name = Hook Name
+diff --git a/internal/db/error.go b/internal/db/error.go
+index d1668d9919..f754df6d38 100644
+--- a/internal/db/error.go
++++ b/internal/db/error.go
+@@ -194,9 +194,10 @@ func (err ErrLastOrgOwner) Error() string {
+ //         \/     \/|__|              \/                       \/
+ 
+ type ErrInvalidCloneAddr struct {
+-	IsURLError         bool
+-	IsInvalidPath      bool
+-	IsPermissionDenied bool
++	IsURLError            bool
++	IsInvalidPath         bool
++	IsPermissionDenied    bool
++	IsBlockedLocalAddress bool
+ }
+ 
+ func IsErrInvalidCloneAddr(err error) bool {
+@@ -205,8 +206,8 @@ func IsErrInvalidCloneAddr(err error) bool {
+ }
+ 
+ func (err ErrInvalidCloneAddr) Error() string {
+-	return fmt.Sprintf("invalid clone address [is_url_error: %v, is_invalid_path: %v, is_permission_denied: %v]",
+-		err.IsURLError, err.IsInvalidPath, err.IsPermissionDenied)
++	return fmt.Sprintf("invalid clone address [is_url_error: %v, is_invalid_path: %v, is_permission_denied: %v, is_blocked_local_address: %v]",
++		err.IsURLError, err.IsInvalidPath, err.IsPermissionDenied, err.IsBlockedLocalAddress)
+ }
+ 
+ type ErrUpdateTaskNotExist struct {
+diff --git a/internal/db/webhook.go b/internal/db/webhook.go
+index bca1fb9181..fee3d1eca8 100644
+--- a/internal/db/webhook.go
++++ b/internal/db/webhook.go
+@@ -24,6 +24,7 @@ import (
+ 	"gogs.io/gogs/internal/conf"
+ 	"gogs.io/gogs/internal/errutil"
+ 	"gogs.io/gogs/internal/httplib"
++	"gogs.io/gogs/internal/netutil"
+ 	"gogs.io/gogs/internal/sync"
+ )
+ 
+@@ -688,6 +689,11 @@ func TestWebhook(repo *Repository, event HookEventType, p api.Payloader, webhook
+ }
+ 
+ func (t *HookTask) deliver() {
++	if netutil.IsBlockedLocalHostname(t.URL, conf.Security.LocalNetworkAllowlist) {
++		t.ResponseContent = "Payload URL resolved to a local network address that is implicitly blocked."
++		return
++	}
++
+ 	t.IsDelivered = true
+ 
+ 	timeout := time.Duration(conf.Webhook.DeliverTimeout) * time.Second
+diff --git a/internal/form/repo.go b/internal/form/repo.go
+index adcbc66ab7..5750d78ec5 100644
+--- a/internal/form/repo.go
++++ b/internal/form/repo.go
+@@ -72,8 +72,8 @@ func (f MigrateRepo) ParseRemoteAddr(user *db.User) (string, error) {
+ 			return "", db.ErrInvalidCloneAddr{IsURLError: true}
+ 		}
+ 
+-		if netutil.IsLocalHostname(u.Hostname(), conf.Security.LocalNetworkAllowlist) {
+-			return "", db.ErrInvalidCloneAddr{IsURLError: true}
++		if netutil.IsBlockedLocalHostname(u.Hostname(), conf.Security.LocalNetworkAllowlist) {
++			return "", db.ErrInvalidCloneAddr{IsBlockedLocalAddress: true}
+ 		}
+ 
+ 		if len(f.AuthUsername)+len(f.AuthPassword) > 0 {
+diff --git a/internal/netutil/netutil.go b/internal/netutil/netutil.go
+index 5059d46396..8fef311502 100644
+--- a/internal/netutil/netutil.go
++++ b/internal/netutil/netutil.go
+@@ -47,9 +47,10 @@ func init() {
+ 	}
+ }
+ 
+-// IsLocalHostname returns true if given hostname is resolved to local network
+-// address, except exempted from the allowlist.
+-func IsLocalHostname(hostname string, allowlist []string) bool {
++// IsBlockedLocalHostname returns true if given hostname is resolved to a local
++// network address that is implicitly blocked (i.e. not exempted from the
++// allowlist).
++func IsBlockedLocalHostname(hostname string, allowlist []string) bool {
+ 	for _, allow := range allowlist {
+ 		if hostname == allow {
+ 			return false
+diff --git a/internal/netutil/netutil_test.go b/internal/netutil/netutil_test.go
+index 65202baf3a..9bd9c98212 100644
+--- a/internal/netutil/netutil_test.go
++++ b/internal/netutil/netutil_test.go
+@@ -34,7 +34,7 @@ func TestIsLocalHostname(t *testing.T) {
+ 	}
+ 	for _, test := range tests {
+ 		t.Run("", func(t *testing.T) {
+-			assert.Equal(t, test.want, IsLocalHostname(test.hostname, test.allowlist))
++			assert.Equal(t, test.want, IsBlockedLocalHostname(test.hostname, test.allowlist))
+ 		})
+ 	}
+ }
+diff --git a/internal/route/api/v1/repo/repo.go b/internal/route/api/v1/repo/repo.go
+index 11548ec4cc..682d2a3b29 100644
+--- a/internal/route/api/v1/repo/repo.go
++++ b/internal/route/api/v1/repo/repo.go
+@@ -248,6 +248,8 @@ func Migrate(c *context.APIContext, f form.MigrateRepo) {
+ 				c.ErrorStatus(http.StatusUnprocessableEntity, errors.New("You are not allowed to import local repositories."))
+ 			case addrErr.IsInvalidPath:
+ 				c.ErrorStatus(http.StatusUnprocessableEntity, errors.New("Invalid local path, it does not exist or not a directory."))
++			case addrErr.IsBlockedLocalAddress:
++				c.ErrorStatus(http.StatusUnprocessableEntity, errors.New("Clone address resolved to a local network address that is implicitly blocked."))
+ 			default:
+ 				c.Error(err, "unexpected error")
+ 			}
+diff --git a/internal/route/repo/repo.go b/internal/route/repo/repo.go
+index 259aba564f..cef2500739 100644
+--- a/internal/route/repo/repo.go
++++ b/internal/route/repo/repo.go
+@@ -180,11 +180,13 @@ func MigratePost(c *context.Context, f form.MigrateRepo) {
+ 			addrErr := err.(db.ErrInvalidCloneAddr)
+ 			switch {
+ 			case addrErr.IsURLError:
+-				c.RenderWithErr(c.Tr("form.url_error"), MIGRATE, &f)
++				c.RenderWithErr(c.Tr("repo.migrate.clone_address")+c.Tr("form.url_error"), MIGRATE, &f)
+ 			case addrErr.IsPermissionDenied:
+ 				c.RenderWithErr(c.Tr("repo.migrate.permission_denied"), MIGRATE, &f)
+ 			case addrErr.IsInvalidPath:
+ 				c.RenderWithErr(c.Tr("repo.migrate.invalid_local_path"), MIGRATE, &f)
++			case addrErr.IsBlockedLocalAddress:
++				c.RenderWithErr(c.Tr("repo.migrate.clone_address_resolved_to_blocked_local_address"), MIGRATE, &f)
+ 			default:
+ 				c.Error(err, "unexpected error")
+ 			}
+diff --git a/internal/route/repo/webhook.go b/internal/route/repo/webhook.go
+index bed0d0bdac..c6ff312ab7 100644
+--- a/internal/route/repo/webhook.go
++++ b/internal/route/repo/webhook.go
+@@ -119,20 +119,17 @@ func WebhooksNew(c *context.Context, orCtx *orgRepoContext) {
+ 	c.Success(orCtx.TmplNew)
+ }
+ 
+-func validateWebhook(actor *db.User, l macaron.Locale, w *db.Webhook) (field, msg string, ok bool) {
+-	if !actor.IsAdmin {
+-		// 🚨 SECURITY: Local addresses must not be allowed by non-admins to prevent SSRF,
+-		// see https://github.com/gogs/gogs/issues/5366 for details.
+-		payloadURL, err := url.Parse(w.URL)
+-		if err != nil {
+-			return "PayloadURL", l.Tr("repo.settings.webhook.err_cannot_parse_payload_url", err), false
+-		}
+-
+-		if netutil.IsLocalHostname(payloadURL.Hostname(), conf.Security.LocalNetworkAllowlist) {
+-			return "PayloadURL", l.Tr("repo.settings.webhook.err_cannot_use_local_addresses"), false
+-		}
++func validateWebhook(l macaron.Locale, w *db.Webhook) (field, msg string, ok bool) {
++	// 🚨 SECURITY: Local addresses must not be allowed by non-admins to prevent SSRF,
++	// see https://github.com/gogs/gogs/issues/5366 for details.
++	payloadURL, err := url.Parse(w.URL)
++	if err != nil {
++		return "PayloadURL", l.Tr("repo.settings.webhook.err_cannot_parse_payload_url", err), false
+ 	}
+ 
++	if netutil.IsBlockedLocalHostname(payloadURL.Hostname(), conf.Security.LocalNetworkAllowlist) {
++		return "PayloadURL", l.Tr("repo.settings.webhook.url_resolved_to_blocked_local_address"), false
++	}
+ 	return "", "", true
+ }
+ 
+@@ -144,7 +141,7 @@ func validateAndCreateWebhook(c *context.Context, orCtx *orgRepoContext, w *db.W
+ 		return
+ 	}
+ 
+-	field, msg, ok := validateWebhook(c.User, c.Locale, w)
++	field, msg, ok := validateWebhook(c.Locale, w)
+ 	if !ok {
+ 		c.FormErr(field)
+ 		c.RenderWithErr(msg, orCtx.TmplNew, nil)
+@@ -348,7 +345,7 @@ func validateAndUpdateWebhook(c *context.Context, orCtx *orgRepoContext, w *db.W
+ 		return
+ 	}
+ 
+-	field, msg, ok := validateWebhook(c.User, c.Locale, w)
++	field, msg, ok := validateWebhook(c.Locale, w)
+ 	if !ok {
+ 		c.FormErr(field)
+ 		c.RenderWithErr(msg, orCtx.TmplNew, nil)
+diff --git a/internal/route/repo/webhook_test.go b/internal/route/repo/webhook_test.go
+index d10a6fcc0c..784d66ede0 100644
+--- a/internal/route/repo/webhook_test.go
++++ b/internal/route/repo/webhook_test.go
+@@ -31,23 +31,21 @@ func Test_validateWebhook(t *testing.T) {
+ 	}{
+ 		{
+ 			name:    "admin bypass local address check",
+-			actor:   &db.User{IsAdmin: true},
+-			webhook: &db.Webhook{URL: "http://localhost:3306"},
++			webhook: &db.Webhook{URL: "https://www.google.com"},
+ 			expOK:   true,
+ 		},
+ 
+ 		{
+ 			name:     "local address not allowed",
+-			actor:    &db.User{},
+ 			webhook:  &db.Webhook{URL: "http://localhost:3306"},
+ 			expField: "PayloadURL",
+-			expMsg:   "repo.settings.webhook.err_cannot_use_local_addresses",
++			expMsg:   "repo.settings.webhook.url_resolved_to_blocked_local_address",
+ 			expOK:    false,
+ 		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+-			field, msg, ok := validateWebhook(test.actor, l, test.webhook)
++			field, msg, ok := validateWebhook(l, test.webhook)
+ 			assert.Equal(t, test.expOK, ok)
+ 			assert.Equal(t, test.expMsg, msg)
+ 			assert.Equal(t, test.expField, field)

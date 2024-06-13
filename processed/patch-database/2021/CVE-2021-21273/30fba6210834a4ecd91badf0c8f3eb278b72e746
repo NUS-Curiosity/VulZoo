@@ -1,0 +1,984 @@
+diff --git a/changelog.d/8821.bugfix b/changelog.d/8821.bugfix
+new file mode 100644
+index 000000000000..8ddfbf31ced5
+--- /dev/null
++++ b/changelog.d/8821.bugfix
+@@ -0,0 +1 @@
++Apply the `federation_ip_range_blacklist` to push and key revocation requests.
+diff --git a/docs/sample_config.yaml b/docs/sample_config.yaml
+index 394eb9a3ffab..6dbccf593201 100644
+--- a/docs/sample_config.yaml
++++ b/docs/sample_config.yaml
+@@ -642,17 +642,19 @@ acme:
+ #  - nyc.example.com
+ #  - syd.example.com
+ 
+-# Prevent federation requests from being sent to the following
+-# blacklist IP address CIDR ranges. If this option is not specified, or
+-# specified with an empty list, no ip range blacklist will be enforced.
++# Prevent outgoing requests from being sent to the following blacklisted IP address
++# CIDR ranges. If this option is not specified, or specified with an empty list,
++# no IP range blacklist will be enforced.
+ #
+-# As of Synapse v1.4.0 this option also affects any outbound requests to identity
+-# servers provided by user input.
++# The blacklist applies to the outbound requests for federation, identity servers,
++# push servers, and for checking key validitity for third-party invite events.
+ #
+ # (0.0.0.0 and :: are always blacklisted, whether or not they are explicitly
+ # listed here, since they correspond to unroutable addresses.)
+ #
+-federation_ip_range_blacklist:
++# This option replaces federation_ip_range_blacklist in Synapse v1.24.0.
++#
++ip_range_blacklist:
+   - '127.0.0.0/8'
+   - '10.0.0.0/8'
+   - '172.16.0.0/12'
+diff --git a/synapse/app/generic_worker.py b/synapse/app/generic_worker.py
+index 1b511890aa36..aa12c74358a5 100644
+--- a/synapse/app/generic_worker.py
++++ b/synapse/app/generic_worker.py
+@@ -266,7 +266,6 @@ def __init__(self, hs):
+         super().__init__(hs)
+         self.hs = hs
+         self.is_mine_id = hs.is_mine_id
+-        self.http_client = hs.get_simple_http_client()
+ 
+         self._presence_enabled = hs.config.use_presence
+ 
+diff --git a/synapse/config/federation.py b/synapse/config/federation.py
+index ffd8fca54e05..27ccf61c3c13 100644
+--- a/synapse/config/federation.py
++++ b/synapse/config/federation.py
+@@ -36,22 +36,30 @@ def read_config(self, config, **kwargs):
+             for domain in federation_domain_whitelist:
+                 self.federation_domain_whitelist[domain] = True
+ 
+-        self.federation_ip_range_blacklist = config.get(
+-            "federation_ip_range_blacklist", []
+-        )
++        ip_range_blacklist = config.get("ip_range_blacklist", [])
+ 
+         # Attempt to create an IPSet from the given ranges
+         try:
+-            self.federation_ip_range_blacklist = IPSet(
+-                self.federation_ip_range_blacklist
+-            )
+-
+-            # Always blacklist 0.0.0.0, ::
+-            self.federation_ip_range_blacklist.update(["0.0.0.0", "::"])
++            self.ip_range_blacklist = IPSet(ip_range_blacklist)
++        except Exception as e:
++            raise ConfigError("Invalid range(s) provided in ip_range_blacklist: %s" % e)
++        # Always blacklist 0.0.0.0, ::
++        self.ip_range_blacklist.update(["0.0.0.0", "::"])
++
++        # The federation_ip_range_blacklist is used for backwards-compatibility
++        # and only applies to federation and identity servers. If it is not given,
++        # default to ip_range_blacklist.
++        federation_ip_range_blacklist = config.get(
++            "federation_ip_range_blacklist", ip_range_blacklist
++        )
++        try:
++            self.federation_ip_range_blacklist = IPSet(federation_ip_range_blacklist)
+         except Exception as e:
+             raise ConfigError(
+                 "Invalid range(s) provided in federation_ip_range_blacklist: %s" % e
+             )
++        # Always blacklist 0.0.0.0, ::
++        self.federation_ip_range_blacklist.update(["0.0.0.0", "::"])
+ 
+         federation_metrics_domains = config.get("federation_metrics_domains") or []
+         validate_config(
+@@ -76,17 +84,19 @@ def generate_config_section(self, config_dir_path, server_name, **kwargs):
+         #  - nyc.example.com
+         #  - syd.example.com
+ 
+-        # Prevent federation requests from being sent to the following
+-        # blacklist IP address CIDR ranges. If this option is not specified, or
+-        # specified with an empty list, no ip range blacklist will be enforced.
++        # Prevent outgoing requests from being sent to the following blacklisted IP address
++        # CIDR ranges. If this option is not specified, or specified with an empty list,
++        # no IP range blacklist will be enforced.
+         #
+-        # As of Synapse v1.4.0 this option also affects any outbound requests to identity
+-        # servers provided by user input.
++        # The blacklist applies to the outbound requests for federation, identity servers,
++        # push servers, and for checking key validitity for third-party invite events.
+         #
+         # (0.0.0.0 and :: are always blacklisted, whether or not they are explicitly
+         # listed here, since they correspond to unroutable addresses.)
+         #
+-        federation_ip_range_blacklist:
++        # This option replaces federation_ip_range_blacklist in Synapse v1.24.0.
++        #
++        ip_range_blacklist:
+           - '127.0.0.0/8'
+           - '10.0.0.0/8'
+           - '172.16.0.0/12'
+diff --git a/synapse/crypto/keyring.py b/synapse/crypto/keyring.py
+index c04ad77cf9ec..f23eacc0d708 100644
+--- a/synapse/crypto/keyring.py
++++ b/synapse/crypto/keyring.py
+@@ -578,7 +578,7 @@ class PerspectivesKeyFetcher(BaseV2KeyFetcher):
+     def __init__(self, hs):
+         super().__init__(hs)
+         self.clock = hs.get_clock()
+-        self.client = hs.get_http_client()
++        self.client = hs.get_federation_http_client()
+         self.key_servers = self.config.key_servers
+ 
+     async def get_keys(self, keys_to_fetch):
+@@ -748,7 +748,7 @@ class ServerKeyFetcher(BaseV2KeyFetcher):
+     def __init__(self, hs):
+         super().__init__(hs)
+         self.clock = hs.get_clock()
+-        self.client = hs.get_http_client()
++        self.client = hs.get_federation_http_client()
+ 
+     async def get_keys(self, keys_to_fetch):
+         """
+diff --git a/synapse/federation/federation_server.py b/synapse/federation/federation_server.py
+index 4b6ab470d059..35e345ce7077 100644
+--- a/synapse/federation/federation_server.py
++++ b/synapse/federation/federation_server.py
+@@ -845,7 +845,6 @@ class FederationHandlerRegistry:
+ 
+     def __init__(self, hs: "HomeServer"):
+         self.config = hs.config
+-        self.http_client = hs.get_simple_http_client()
+         self.clock = hs.get_clock()
+         self._instance_name = hs.get_instance_name()
+ 
+diff --git a/synapse/federation/transport/client.py b/synapse/federation/transport/client.py
+index 17a10f622eb9..abe9168c7866 100644
+--- a/synapse/federation/transport/client.py
++++ b/synapse/federation/transport/client.py
+@@ -35,7 +35,7 @@ class TransportLayerClient:
+ 
+     def __init__(self, hs):
+         self.server_name = hs.hostname
+-        self.client = hs.get_http_client()
++        self.client = hs.get_federation_http_client()
+ 
+     @log_function
+     def get_room_state_ids(self, destination, room_id, event_id):
+diff --git a/synapse/handlers/federation.py b/synapse/handlers/federation.py
+index b9799090f784..df82e60b3360 100644
+--- a/synapse/handlers/federation.py
++++ b/synapse/handlers/federation.py
+@@ -140,7 +140,7 @@ def __init__(self, hs: "HomeServer"):
+         self._message_handler = hs.get_message_handler()
+         self._server_notices_mxid = hs.config.server_notices_mxid
+         self.config = hs.config
+-        self.http_client = hs.get_simple_http_client()
++        self.http_client = hs.get_proxied_blacklisted_http_client()
+         self._instance_name = hs.get_instance_name()
+         self._replication = hs.get_replication_data_handler()
+ 
+diff --git a/synapse/handlers/identity.py b/synapse/handlers/identity.py
+index 9b3c6b4551eb..7301c2471068 100644
+--- a/synapse/handlers/identity.py
++++ b/synapse/handlers/identity.py
+@@ -46,13 +46,13 @@ class IdentityHandler(BaseHandler):
+     def __init__(self, hs):
+         super().__init__(hs)
+ 
++        # An HTTP client for contacting trusted URLs.
+         self.http_client = SimpleHttpClient(hs)
+-        # We create a blacklisting instance of SimpleHttpClient for contacting identity
+-        # servers specified by clients
++        # An HTTP client for contacting identity servers specified by clients.
+         self.blacklisting_http_client = SimpleHttpClient(
+             hs, ip_blacklist=hs.config.federation_ip_range_blacklist
+         )
+-        self.federation_http_client = hs.get_http_client()
++        self.federation_http_client = hs.get_federation_http_client()
+         self.hs = hs
+ 
+     async def threepid_from_creds(
+diff --git a/synapse/http/client.py b/synapse/http/client.py
+index e5b13593f24d..df7730078ff1 100644
+--- a/synapse/http/client.py
++++ b/synapse/http/client.py
+@@ -125,7 +125,7 @@ def _scheduler(x):
+     return _scheduler
+ 
+ 
+-class IPBlacklistingResolver:
++class _IPBlacklistingResolver:
+     """
+     A proxy for reactor.nameResolver which only produces non-blacklisted IP
+     addresses, preventing DNS rebinding attacks on URL preview.
+@@ -199,6 +199,35 @@ def resolutionComplete() -> None:
+         return r
+ 
+ 
++@implementer(IReactorPluggableNameResolver)
++class BlacklistingReactorWrapper:
++    """
++    A Reactor wrapper which will prevent DNS resolution to blacklisted IP
++    addresses, to prevent DNS rebinding.
++    """
++
++    def __init__(
++        self,
++        reactor: IReactorPluggableNameResolver,
++        ip_whitelist: Optional[IPSet],
++        ip_blacklist: IPSet,
++    ):
++        self._reactor = reactor
++
++        # We need to use a DNS resolver which filters out blacklisted IP
++        # addresses, to prevent DNS rebinding.
++        self._nameResolver = _IPBlacklistingResolver(
++            self._reactor, ip_whitelist, ip_blacklist
++        )
++
++    def __getattr__(self, attr: str) -> Any:
++        # Passthrough to the real reactor except for the DNS resolver.
++        if attr == "nameResolver":
++            return self._nameResolver
++        else:
++            return getattr(self._reactor, attr)
++
++
+ class BlacklistingAgentWrapper(Agent):
+     """
+     An Agent wrapper which will prevent access to IP addresses being accessed
+@@ -292,22 +321,11 @@ def __init__(
+         self.user_agent = self.user_agent.encode("ascii")
+ 
+         if self._ip_blacklist:
+-            real_reactor = hs.get_reactor()
+             # If we have an IP blacklist, we need to use a DNS resolver which
+             # filters out blacklisted IP addresses, to prevent DNS rebinding.
+-            nameResolver = IPBlacklistingResolver(
+-                real_reactor, self._ip_whitelist, self._ip_blacklist
++            self.reactor = BlacklistingReactorWrapper(
++                hs.get_reactor(), self._ip_whitelist, self._ip_blacklist
+             )
+-
+-            @implementer(IReactorPluggableNameResolver)
+-            class Reactor:
+-                def __getattr__(_self, attr):
+-                    if attr == "nameResolver":
+-                        return nameResolver
+-                    else:
+-                        return getattr(real_reactor, attr)
+-
+-            self.reactor = Reactor()
+         else:
+             self.reactor = hs.get_reactor()
+ 
+diff --git a/synapse/http/federation/matrix_federation_agent.py b/synapse/http/federation/matrix_federation_agent.py
+index e77f9587d047..3b756a7dc23d 100644
+--- a/synapse/http/federation/matrix_federation_agent.py
++++ b/synapse/http/federation/matrix_federation_agent.py
+@@ -16,7 +16,7 @@
+ import urllib.parse
+ from typing import List, Optional
+ 
+-from netaddr import AddrFormatError, IPAddress
++from netaddr import AddrFormatError, IPAddress, IPSet
+ from zope.interface import implementer
+ 
+ from twisted.internet import defer
+@@ -31,6 +31,7 @@
+ from twisted.web.iweb import IAgent, IAgentEndpointFactory, IBodyProducer
+ 
+ from synapse.crypto.context_factory import FederationPolicyForHTTPS
++from synapse.http.client import BlacklistingAgentWrapper
+ from synapse.http.federation.srv_resolver import Server, SrvResolver
+ from synapse.http.federation.well_known_resolver import WellKnownResolver
+ from synapse.logging.context import make_deferred_yieldable, run_in_background
+@@ -70,6 +71,7 @@ def __init__(
+         reactor: IReactorCore,
+         tls_client_options_factory: Optional[FederationPolicyForHTTPS],
+         user_agent: bytes,
++        ip_blacklist: IPSet,
+         _srv_resolver: Optional[SrvResolver] = None,
+         _well_known_resolver: Optional[WellKnownResolver] = None,
+     ):
+@@ -90,12 +92,18 @@ def __init__(
+         self.user_agent = user_agent
+ 
+         if _well_known_resolver is None:
++            # Note that the name resolver has already been wrapped in a
++            # IPBlacklistingResolver by MatrixFederationHttpClient.
+             _well_known_resolver = WellKnownResolver(
+                 self._reactor,
+-                agent=Agent(
++                agent=BlacklistingAgentWrapper(
++                    Agent(
++                        self._reactor,
++                        pool=self._pool,
++                        contextFactory=tls_client_options_factory,
++                    ),
+                     self._reactor,
+-                    pool=self._pool,
+-                    contextFactory=tls_client_options_factory,
++                    ip_blacklist=ip_blacklist,
+                 ),
+                 user_agent=self.user_agent,
+             )
+diff --git a/synapse/http/matrixfederationclient.py b/synapse/http/matrixfederationclient.py
+index 4e27f93b7ae4..c962994727f6 100644
+--- a/synapse/http/matrixfederationclient.py
++++ b/synapse/http/matrixfederationclient.py
+@@ -26,11 +26,10 @@
+ from canonicaljson import encode_canonical_json
+ from prometheus_client import Counter
+ from signedjson.sign import sign_json
+-from zope.interface import implementer
+ 
+ from twisted.internet import defer
+ from twisted.internet.error import DNSLookupError
+-from twisted.internet.interfaces import IReactorPluggableNameResolver, IReactorTime
++from twisted.internet.interfaces import IReactorTime
+ from twisted.internet.task import _EPSILON, Cooperator
+ from twisted.web.http_headers import Headers
+ from twisted.web.iweb import IBodyProducer, IResponse
+@@ -45,7 +44,7 @@
+ from synapse.http import QuieterFileBodyProducer
+ from synapse.http.client import (
+     BlacklistingAgentWrapper,
+-    IPBlacklistingResolver,
++    BlacklistingReactorWrapper,
+     encode_query_args,
+     readBodyToFile,
+ )
+@@ -221,31 +220,22 @@ def __init__(self, hs, tls_client_options_factory):
+         self.signing_key = hs.signing_key
+         self.server_name = hs.hostname
+ 
+-        real_reactor = hs.get_reactor()
+-
+         # We need to use a DNS resolver which filters out blacklisted IP
+         # addresses, to prevent DNS rebinding.
+-        nameResolver = IPBlacklistingResolver(
+-            real_reactor, None, hs.config.federation_ip_range_blacklist
++        self.reactor = BlacklistingReactorWrapper(
++            hs.get_reactor(), None, hs.config.federation_ip_range_blacklist
+         )
+ 
+-        @implementer(IReactorPluggableNameResolver)
+-        class Reactor:
+-            def __getattr__(_self, attr):
+-                if attr == "nameResolver":
+-                    return nameResolver
+-                else:
+-                    return getattr(real_reactor, attr)
+-
+-        self.reactor = Reactor()
+-
+         user_agent = hs.version_string
+         if hs.config.user_agent_suffix:
+             user_agent = "%s %s" % (user_agent, hs.config.user_agent_suffix)
+         user_agent = user_agent.encode("ascii")
+ 
+         self.agent = MatrixFederationAgent(
+-            self.reactor, tls_client_options_factory, user_agent
++            self.reactor,
++            tls_client_options_factory,
++            user_agent,
++            hs.config.federation_ip_range_blacklist,
+         )
+ 
+         # Use a BlacklistingAgentWrapper to prevent circumventing the IP
+diff --git a/synapse/push/httppusher.py b/synapse/push/httppusher.py
+index eff0975b6aed..0e845212a9a0 100644
+--- a/synapse/push/httppusher.py
++++ b/synapse/push/httppusher.py
+@@ -100,7 +100,7 @@ def __init__(self, hs, pusherdict):
+         if "url" not in self.data:
+             raise PusherConfigException("'url' required in data for HTTP pusher")
+         self.url = self.data["url"]
+-        self.http_client = hs.get_proxied_http_client()
++        self.http_client = hs.get_proxied_blacklisted_http_client()
+         self.data_minus_url = {}
+         self.data_minus_url.update(self.data)
+         del self.data_minus_url["url"]
+diff --git a/synapse/rest/media/v1/media_repository.py b/synapse/rest/media/v1/media_repository.py
+index 9cac74ebd87a..83beb02b0574 100644
+--- a/synapse/rest/media/v1/media_repository.py
++++ b/synapse/rest/media/v1/media_repository.py
+@@ -66,7 +66,7 @@ class MediaRepository:
+     def __init__(self, hs):
+         self.hs = hs
+         self.auth = hs.get_auth()
+-        self.client = hs.get_http_client()
++        self.client = hs.get_federation_http_client()
+         self.clock = hs.get_clock()
+         self.server_name = hs.hostname
+         self.store = hs.get_datastore()
+diff --git a/synapse/server.py b/synapse/server.py
+index b017e3489faf..9af759626ef1 100644
+--- a/synapse/server.py
++++ b/synapse/server.py
+@@ -350,16 +350,45 @@ def get_http_client_context_factory(self) -> IPolicyForHTTPS:
+ 
+     @cache_in_self
+     def get_simple_http_client(self) -> SimpleHttpClient:
++        """
++        An HTTP client with no special configuration.
++        """
+         return SimpleHttpClient(self)
+ 
+     @cache_in_self
+     def get_proxied_http_client(self) -> SimpleHttpClient:
++        """
++        An HTTP client that uses configured HTTP(S) proxies.
++        """
++        return SimpleHttpClient(
++            self,
++            http_proxy=os.getenvb(b"http_proxy"),
++            https_proxy=os.getenvb(b"HTTPS_PROXY"),
++        )
++
++    @cache_in_self
++    def get_proxied_blacklisted_http_client(self) -> SimpleHttpClient:
++        """
++        An HTTP client that uses configured HTTP(S) proxies and blacklists IPs
++        based on the IP range blacklist.
++        """
+         return SimpleHttpClient(
+             self,
++            ip_blacklist=self.config.ip_range_blacklist,
+             http_proxy=os.getenvb(b"http_proxy"),
+             https_proxy=os.getenvb(b"HTTPS_PROXY"),
+         )
+ 
++    @cache_in_self
++    def get_federation_http_client(self) -> MatrixFederationHttpClient:
++        """
++        An HTTP client for federation.
++        """
++        tls_client_options_factory = context_factory.FederationPolicyForHTTPS(
++            self.config
++        )
++        return MatrixFederationHttpClient(self, tls_client_options_factory)
++
+     @cache_in_self
+     def get_room_creation_handler(self) -> RoomCreationHandler:
+         return RoomCreationHandler(self)
+@@ -514,13 +543,6 @@ def get_filtering(self) -> Filtering:
+     def get_pusherpool(self) -> PusherPool:
+         return PusherPool(self)
+ 
+-    @cache_in_self
+-    def get_http_client(self) -> MatrixFederationHttpClient:
+-        tls_client_options_factory = context_factory.FederationPolicyForHTTPS(
+-            self.config
+-        )
+-        return MatrixFederationHttpClient(self, tls_client_options_factory)
+-
+     @cache_in_self
+     def get_media_repository_resource(self) -> MediaRepositoryResource:
+         # build the media repo resource. This indirects through the HomeServer
+diff --git a/tests/api/test_filtering.py b/tests/api/test_filtering.py
+index c98ae759743d..bcf1a8010e7b 100644
+--- a/tests/api/test_filtering.py
++++ b/tests/api/test_filtering.py
+@@ -50,7 +50,9 @@ def setUp(self):
+         self.mock_http_client.put_json = DeferredMockCallable()
+ 
+         hs = yield setup_test_homeserver(
+-            self.addCleanup, http_client=self.mock_http_client, keyring=Mock(),
++            self.addCleanup,
++            federation_http_client=self.mock_http_client,
++            keyring=Mock(),
+         )
+ 
+         self.filtering = hs.get_filtering()
+diff --git a/tests/app/test_frontend_proxy.py b/tests/app/test_frontend_proxy.py
+index 40abe9d72d3f..43fef5d64a4f 100644
+--- a/tests/app/test_frontend_proxy.py
++++ b/tests/app/test_frontend_proxy.py
+@@ -23,7 +23,7 @@ class FrontendProxyTests(HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+ 
+         hs = self.setup_test_homeserver(
+-            http_client=None, homeserver_to_use=GenericWorkerServer
++            federation_http_client=None, homeserver_to_use=GenericWorkerServer
+         )
+ 
+         return hs
+diff --git a/tests/app/test_openid_listener.py b/tests/app/test_openid_listener.py
+index ea3be95cf18f..b260ab734d7a 100644
+--- a/tests/app/test_openid_listener.py
++++ b/tests/app/test_openid_listener.py
+@@ -27,7 +27,7 @@
+ class FederationReaderOpenIDListenerTests(HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+         hs = self.setup_test_homeserver(
+-            http_client=None, homeserver_to_use=GenericWorkerServer
++            federation_http_client=None, homeserver_to_use=GenericWorkerServer
+         )
+         return hs
+ 
+@@ -84,7 +84,7 @@ def test_openid_listener(self, names, expectation):
+ class SynapseHomeserverOpenIDListenerTests(HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+         hs = self.setup_test_homeserver(
+-            http_client=None, homeserver_to_use=SynapseHomeServer
++            federation_http_client=None, homeserver_to_use=SynapseHomeServer
+         )
+         return hs
+ 
+diff --git a/tests/crypto/test_keyring.py b/tests/crypto/test_keyring.py
+index 697916a0194b..d146f2254fb1 100644
+--- a/tests/crypto/test_keyring.py
++++ b/tests/crypto/test_keyring.py
+@@ -315,7 +315,7 @@ async def get_keys2(keys_to_fetch):
+ class ServerKeyFetcherTestCase(unittest.HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+         self.http_client = Mock()
+-        hs = self.setup_test_homeserver(http_client=self.http_client)
++        hs = self.setup_test_homeserver(federation_http_client=self.http_client)
+         return hs
+ 
+     def test_get_keys_from_server(self):
+@@ -395,7 +395,9 @@ def make_homeserver(self, reactor, clock):
+             }
+         ]
+ 
+-        return self.setup_test_homeserver(http_client=self.http_client, config=config)
++        return self.setup_test_homeserver(
++            federation_http_client=self.http_client, config=config
++        )
+ 
+     def build_perspectives_response(
+         self, server_name: str, signing_key: SigningKey, valid_until_ts: int,
+diff --git a/tests/handlers/test_device.py b/tests/handlers/test_device.py
+index 875aaec2c693..5dfeccfeb6e9 100644
+--- a/tests/handlers/test_device.py
++++ b/tests/handlers/test_device.py
+@@ -27,7 +27,7 @@
+ 
+ class DeviceTestCase(unittest.HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+-        hs = self.setup_test_homeserver("server", http_client=None)
++        hs = self.setup_test_homeserver("server", federation_http_client=None)
+         self.handler = hs.get_device_handler()
+         self.store = hs.get_datastore()
+         return hs
+@@ -229,7 +229,7 @@ def _record_user(
+ 
+ class DehydrationTestCase(unittest.HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+-        hs = self.setup_test_homeserver("server", http_client=None)
++        hs = self.setup_test_homeserver("server", federation_http_client=None)
+         self.handler = hs.get_device_handler()
+         self.registration = hs.get_registration_handler()
+         self.auth = hs.get_auth()
+diff --git a/tests/handlers/test_directory.py b/tests/handlers/test_directory.py
+index ee6ef5e6fa0d..2f1f2a55171f 100644
+--- a/tests/handlers/test_directory.py
++++ b/tests/handlers/test_directory.py
+@@ -42,7 +42,7 @@ def register_query_handler(query_type, handler):
+         self.mock_registry.register_query_handler = register_query_handler
+ 
+         hs = self.setup_test_homeserver(
+-            http_client=None,
++            federation_http_client=None,
+             resource_for_federation=Mock(),
+             federation_client=self.mock_federation,
+             federation_registry=self.mock_registry,
+diff --git a/tests/handlers/test_federation.py b/tests/handlers/test_federation.py
+index bf866dacf3f2..d0452e1490cd 100644
+--- a/tests/handlers/test_federation.py
++++ b/tests/handlers/test_federation.py
+@@ -37,7 +37,7 @@ class FederationTestCase(unittest.HomeserverTestCase):
+     ]
+ 
+     def make_homeserver(self, reactor, clock):
+-        hs = self.setup_test_homeserver(http_client=None)
++        hs = self.setup_test_homeserver(federation_http_client=None)
+         self.handler = hs.get_federation_handler()
+         self.store = hs.get_datastore()
+         return hs
+diff --git a/tests/handlers/test_presence.py b/tests/handlers/test_presence.py
+index 8ed67640f8e7..0794b32c9c69 100644
+--- a/tests/handlers/test_presence.py
++++ b/tests/handlers/test_presence.py
+@@ -463,7 +463,7 @@ class PresenceJoinTestCase(unittest.HomeserverTestCase):
+ 
+     def make_homeserver(self, reactor, clock):
+         hs = self.setup_test_homeserver(
+-            "server", http_client=None, federation_sender=Mock()
++            "server", federation_http_client=None, federation_sender=Mock()
+         )
+         return hs
+ 
+diff --git a/tests/handlers/test_profile.py b/tests/handlers/test_profile.py
+index a69fa28b4153..ea2bcf26557f 100644
+--- a/tests/handlers/test_profile.py
++++ b/tests/handlers/test_profile.py
+@@ -44,7 +44,7 @@ def register_query_handler(query_type, handler):
+ 
+         hs = yield setup_test_homeserver(
+             self.addCleanup,
+-            http_client=None,
++            federation_http_client=None,
+             resource_for_federation=Mock(),
+             federation_client=self.mock_federation,
+             federation_server=Mock(),
+diff --git a/tests/handlers/test_typing.py b/tests/handlers/test_typing.py
+index abbdf2d5249f..36086ca83694 100644
+--- a/tests/handlers/test_typing.py
++++ b/tests/handlers/test_typing.py
+@@ -70,7 +70,7 @@ def make_homeserver(self, reactor, clock):
+ 
+         hs = self.setup_test_homeserver(
+             notifier=Mock(),
+-            http_client=mock_federation_client,
++            federation_http_client=mock_federation_client,
+             keyring=mock_keyring,
+             replication_streams={},
+         )
+@@ -192,7 +192,7 @@ def test_started_typing_remote_send(self):
+             )
+         )
+ 
+-        put_json = self.hs.get_http_client().put_json
++        put_json = self.hs.get_federation_http_client().put_json
+         put_json.assert_called_once_with(
+             "farm",
+             path="/_matrix/federation/v1/send/1000000",
+@@ -270,7 +270,7 @@ def test_stopped_typing(self):
+ 
+         self.on_new_event.assert_has_calls([call("typing_key", 1, rooms=[ROOM_ID])])
+ 
+-        put_json = self.hs.get_http_client().put_json
++        put_json = self.hs.get_federation_http_client().put_json
+         put_json.assert_called_once_with(
+             "farm",
+             path="/_matrix/federation/v1/send/1000000",
+diff --git a/tests/http/federation/test_matrix_federation_agent.py b/tests/http/federation/test_matrix_federation_agent.py
+index 8b5ad4574f5c..626acdcaa333 100644
+--- a/tests/http/federation/test_matrix_federation_agent.py
++++ b/tests/http/federation/test_matrix_federation_agent.py
+@@ -17,6 +17,7 @@
+ from mock import Mock
+ 
+ import treq
++from netaddr import IPSet
+ from service_identity import VerificationError
+ from zope.interface import implementer
+ 
+@@ -103,6 +104,7 @@ def setUp(self):
+             reactor=self.reactor,
+             tls_client_options_factory=self.tls_factory,
+             user_agent="test-agent",  # Note that this is unused since _well_known_resolver is provided.
++            ip_blacklist=IPSet(),
+             _srv_resolver=self.mock_resolver,
+             _well_known_resolver=self.well_known_resolver,
+         )
+@@ -736,6 +738,7 @@ def test_get_well_known_unsigned_cert(self):
+             reactor=self.reactor,
+             tls_client_options_factory=tls_factory,
+             user_agent=b"test-agent",  # This is unused since _well_known_resolver is passed below.
++            ip_blacklist=IPSet(),
+             _srv_resolver=self.mock_resolver,
+             _well_known_resolver=WellKnownResolver(
+                 self.reactor,
+diff --git a/tests/push/test_http.py b/tests/push/test_http.py
+index f1184303090f..e8cea39c8374 100644
+--- a/tests/push/test_http.py
++++ b/tests/push/test_http.py
+@@ -49,7 +49,9 @@ def post_json_get_json(url, body):
+         config = self.default_config()
+         config["start_pushers"] = True
+ 
+-        hs = self.setup_test_homeserver(config=config, proxied_http_client=m)
++        hs = self.setup_test_homeserver(
++            config=config, proxied_blacklisted_http_client=m
++        )
+ 
+         return hs
+ 
+diff --git a/tests/replication/_base.py b/tests/replication/_base.py
+index 295c5d58a68d..728de282773d 100644
+--- a/tests/replication/_base.py
++++ b/tests/replication/_base.py
+@@ -67,7 +67,7 @@ def prepare(self, reactor, clock, hs):
+         # Make a new HomeServer object for the worker
+         self.reactor.lookups["testserv"] = "1.2.3.4"
+         self.worker_hs = self.setup_test_homeserver(
+-            http_client=None,
++            federation_http_client=None,
+             homeserver_to_use=GenericWorkerServer,
+             config=self._get_worker_hs_config(),
+             reactor=self.reactor,
+@@ -264,7 +264,7 @@ def make_worker_hs(
+             worker_app: Type of worker, e.g. `synapse.app.federation_sender`.
+             extra_config: Any extra config to use for this instances.
+             **kwargs: Options that get passed to `self.setup_test_homeserver`,
+-                useful to e.g. pass some mocks for things like `http_client`
++                useful to e.g. pass some mocks for things like `federation_http_client`
+ 
+         Returns:
+             The new worker HomeServer instance.
+diff --git a/tests/replication/test_federation_sender_shard.py b/tests/replication/test_federation_sender_shard.py
+index 779745ae9da3..fffdb742c8ea 100644
+--- a/tests/replication/test_federation_sender_shard.py
++++ b/tests/replication/test_federation_sender_shard.py
+@@ -50,7 +50,7 @@ def test_send_event_single_sender(self):
+         self.make_worker_hs(
+             "synapse.app.federation_sender",
+             {"send_federation": True},
+-            http_client=mock_client,
++            federation_http_client=mock_client,
+         )
+ 
+         user = self.register_user("user", "pass")
+@@ -81,7 +81,7 @@ def test_send_event_sharded(self):
+                 "worker_name": "sender1",
+                 "federation_sender_instances": ["sender1", "sender2"],
+             },
+-            http_client=mock_client1,
++            federation_http_client=mock_client1,
+         )
+ 
+         mock_client2 = Mock(spec=["put_json"])
+@@ -93,7 +93,7 @@ def test_send_event_sharded(self):
+                 "worker_name": "sender2",
+                 "federation_sender_instances": ["sender1", "sender2"],
+             },
+-            http_client=mock_client2,
++            federation_http_client=mock_client2,
+         )
+ 
+         user = self.register_user("user2", "pass")
+@@ -144,7 +144,7 @@ def test_send_typing_sharded(self):
+                 "worker_name": "sender1",
+                 "federation_sender_instances": ["sender1", "sender2"],
+             },
+-            http_client=mock_client1,
++            federation_http_client=mock_client1,
+         )
+ 
+         mock_client2 = Mock(spec=["put_json"])
+@@ -156,7 +156,7 @@ def test_send_typing_sharded(self):
+                 "worker_name": "sender2",
+                 "federation_sender_instances": ["sender1", "sender2"],
+             },
+-            http_client=mock_client2,
++            federation_http_client=mock_client2,
+         )
+ 
+         user = self.register_user("user3", "pass")
+diff --git a/tests/replication/test_pusher_shard.py b/tests/replication/test_pusher_shard.py
+index 67c27a089fab..f894bcd6e7f5 100644
+--- a/tests/replication/test_pusher_shard.py
++++ b/tests/replication/test_pusher_shard.py
+@@ -98,7 +98,7 @@ def test_send_push_single_worker(self):
+         self.make_worker_hs(
+             "synapse.app.pusher",
+             {"start_pushers": True},
+-            proxied_http_client=http_client_mock,
++            proxied_blacklisted_http_client=http_client_mock,
+         )
+ 
+         event_id = self._create_pusher_and_send_msg("user")
+@@ -133,7 +133,7 @@ def test_send_push_multiple_workers(self):
+                 "worker_name": "pusher1",
+                 "pusher_instances": ["pusher1", "pusher2"],
+             },
+-            proxied_http_client=http_client_mock1,
++            proxied_blacklisted_http_client=http_client_mock1,
+         )
+ 
+         http_client_mock2 = Mock(spec_set=["post_json_get_json"])
+@@ -148,7 +148,7 @@ def test_send_push_multiple_workers(self):
+                 "worker_name": "pusher2",
+                 "pusher_instances": ["pusher1", "pusher2"],
+             },
+-            proxied_http_client=http_client_mock2,
++            proxied_blacklisted_http_client=http_client_mock2,
+         )
+ 
+         # We choose a user name that we know should go to pusher1.
+diff --git a/tests/rest/admin/test_admin.py b/tests/rest/admin/test_admin.py
+index 4f76f8f7682c..67d887839567 100644
+--- a/tests/rest/admin/test_admin.py
++++ b/tests/rest/admin/test_admin.py
+@@ -210,7 +210,7 @@ def write_to(r):
+         }
+         config["media_storage_providers"] = [provider_config]
+ 
+-        hs = self.setup_test_homeserver(config=config, http_client=client)
++        hs = self.setup_test_homeserver(config=config, federation_http_client=client)
+ 
+         return hs
+ 
+diff --git a/tests/rest/client/v1/test_presence.py b/tests/rest/client/v1/test_presence.py
+index 5d5c24d01c51..11cd8efe21d1 100644
+--- a/tests/rest/client/v1/test_presence.py
++++ b/tests/rest/client/v1/test_presence.py
+@@ -38,7 +38,7 @@ def make_homeserver(self, reactor, clock):
+ 
+         hs = self.setup_test_homeserver(
+             "red",
+-            http_client=None,
++            federation_http_client=None,
+             federation_client=Mock(),
+             presence_handler=presence_handler,
+         )
+diff --git a/tests/rest/client/v1/test_profile.py b/tests/rest/client/v1/test_profile.py
+index 383a9eafacc9..2a3b483eafd3 100644
+--- a/tests/rest/client/v1/test_profile.py
++++ b/tests/rest/client/v1/test_profile.py
+@@ -63,7 +63,7 @@ def setUp(self):
+         hs = yield setup_test_homeserver(
+             self.addCleanup,
+             "test",
+-            http_client=None,
++            federation_http_client=None,
+             resource_for_client=self.mock_resource,
+             federation=Mock(),
+             federation_client=Mock(),
+diff --git a/tests/rest/client/v1/test_rooms.py b/tests/rest/client/v1/test_rooms.py
+index 49f1073c8842..e67de41c180a 100644
+--- a/tests/rest/client/v1/test_rooms.py
++++ b/tests/rest/client/v1/test_rooms.py
+@@ -45,7 +45,7 @@ class RoomBase(unittest.HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+ 
+         self.hs = self.setup_test_homeserver(
+-            "red", http_client=None, federation_client=Mock(),
++            "red", federation_http_client=None, federation_client=Mock(),
+         )
+ 
+         self.hs.get_federation_handler = Mock()
+diff --git a/tests/rest/client/v1/test_typing.py b/tests/rest/client/v1/test_typing.py
+index bbd30f594bff..ae0207366b4c 100644
+--- a/tests/rest/client/v1/test_typing.py
++++ b/tests/rest/client/v1/test_typing.py
+@@ -39,7 +39,7 @@ class RoomTypingTestCase(unittest.HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+ 
+         hs = self.setup_test_homeserver(
+-            "red", http_client=None, federation_client=Mock(),
++            "red", federation_http_client=None, federation_client=Mock(),
+         )
+ 
+         self.event_source = hs.get_event_sources().sources["typing"]
+diff --git a/tests/rest/key/v2/test_remote_key_resource.py b/tests/rest/key/v2/test_remote_key_resource.py
+index fbcf8d5b8639..5e90d656f7c5 100644
+--- a/tests/rest/key/v2/test_remote_key_resource.py
++++ b/tests/rest/key/v2/test_remote_key_resource.py
+@@ -39,7 +39,7 @@
+ class BaseRemoteKeyResourceTestCase(unittest.HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+         self.http_client = Mock()
+-        return self.setup_test_homeserver(http_client=self.http_client)
++        return self.setup_test_homeserver(federation_http_client=self.http_client)
+ 
+     def create_test_resource(self):
+         return create_resource_tree(
+@@ -172,7 +172,7 @@ def prepare(self, reactor, clock, homeserver):
+             }
+         ]
+         self.hs2 = self.setup_test_homeserver(
+-            http_client=self.http_client2, config=config
++            federation_http_client=self.http_client2, config=config
+         )
+ 
+         # wire up outbound POST /key/v2/query requests from hs2 so that they
+diff --git a/tests/rest/media/v1/test_media_storage.py b/tests/rest/media/v1/test_media_storage.py
+index 2a3b2a8f27fa..4c749f1a61a7 100644
+--- a/tests/rest/media/v1/test_media_storage.py
++++ b/tests/rest/media/v1/test_media_storage.py
+@@ -214,7 +214,7 @@ def write_to(r):
+         }
+         config["media_storage_providers"] = [provider_config]
+ 
+-        hs = self.setup_test_homeserver(config=config, http_client=client)
++        hs = self.setup_test_homeserver(config=config, federation_http_client=client)
+ 
+         return hs
+ 
+diff --git a/tests/storage/test_e2e_room_keys.py b/tests/storage/test_e2e_room_keys.py
+index 35dafbb9047b..3d7760d5d9cf 100644
+--- a/tests/storage/test_e2e_room_keys.py
++++ b/tests/storage/test_e2e_room_keys.py
+@@ -26,7 +26,7 @@
+ 
+ class E2eRoomKeysHandlerTestCase(unittest.HomeserverTestCase):
+     def make_homeserver(self, reactor, clock):
+-        hs = self.setup_test_homeserver("server", http_client=None)
++        hs = self.setup_test_homeserver("server", federation_http_client=None)
+         self.store = hs.get_datastore()
+         return hs
+ 
+diff --git a/tests/storage/test_purge.py b/tests/storage/test_purge.py
+index cc1f3c53c51c..a06ad2c03e9b 100644
+--- a/tests/storage/test_purge.py
++++ b/tests/storage/test_purge.py
+@@ -27,7 +27,7 @@ class PurgeTests(HomeserverTestCase):
+     servlets = [room.register_servlets]
+ 
+     def make_homeserver(self, reactor, clock):
+-        hs = self.setup_test_homeserver("server", http_client=None)
++        hs = self.setup_test_homeserver("server", federation_http_client=None)
+         return hs
+ 
+     def prepare(self, reactor, clock, hs):
+diff --git a/tests/storage/test_redaction.py b/tests/storage/test_redaction.py
+index d4f9e809db36..fd0add5db3d8 100644
+--- a/tests/storage/test_redaction.py
++++ b/tests/storage/test_redaction.py
+@@ -34,7 +34,7 @@ def make_homeserver(self, reactor, clock):
+         config = self.default_config()
+         config["redaction_retention_period"] = "30d"
+         return self.setup_test_homeserver(
+-            resource_for_federation=Mock(), http_client=None, config=config
++            resource_for_federation=Mock(), federation_http_client=None, config=config
+         )
+ 
+     def prepare(self, reactor, clock, hs):
+diff --git a/tests/storage/test_roommember.py b/tests/storage/test_roommember.py
+index ff972daeaa68..5ba1db233229 100644
+--- a/tests/storage/test_roommember.py
++++ b/tests/storage/test_roommember.py
+@@ -36,7 +36,7 @@ class RoomMemberStoreTestCase(unittest.HomeserverTestCase):
+ 
+     def make_homeserver(self, reactor, clock):
+         hs = self.setup_test_homeserver(
+-            resource_for_federation=Mock(), http_client=None
++            resource_for_federation=Mock(), federation_http_client=None
+         )
+         return hs
+ 
+diff --git a/tests/test_federation.py b/tests/test_federation.py
+index 1ce4ea3a0142..fa45f8b3b7e9 100644
+--- a/tests/test_federation.py
++++ b/tests/test_federation.py
+@@ -37,7 +37,7 @@ def setUp(self):
+         self.hs_clock = Clock(self.reactor)
+         self.homeserver = setup_test_homeserver(
+             self.addCleanup,
+-            http_client=self.http_client,
++            federation_http_client=self.http_client,
+             clock=self.hs_clock,
+             reactor=self.reactor,
+         )
+diff --git a/tests/test_server.py b/tests/test_server.py
+index c387a85f2e41..6b2d2f0401fd 100644
+--- a/tests/test_server.py
++++ b/tests/test_server.py
+@@ -38,7 +38,10 @@ def setUp(self):
+         self.reactor = ThreadedMemoryReactorClock()
+         self.hs_clock = Clock(self.reactor)
+         self.homeserver = setup_test_homeserver(
+-            self.addCleanup, http_client=None, clock=self.hs_clock, reactor=self.reactor
++            self.addCleanup,
++            federation_http_client=None,
++            clock=self.hs_clock,
++            reactor=self.reactor,
+         )
+ 
+     def test_handler_for_request(self):

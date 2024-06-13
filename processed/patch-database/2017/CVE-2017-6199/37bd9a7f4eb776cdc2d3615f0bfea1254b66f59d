@@ -1,0 +1,111 @@
+diff --git a/shell/imports/server/email.js b/shell/imports/server/email.js
+index 9983be86da..29628d5201 100644
+--- a/shell/imports/server/email.js
++++ b/shell/imports/server/email.js
+@@ -75,13 +75,49 @@ const getPool = function (smtpConfig) {
+ };
+ 
+ const smtpSend = function (pool, mailOptions) {
++  console.log(mailOptions);
+   pool._futureWrappedSendMail(mailOptions).wait();
+ };
+ 
++// From http://emailregex.com/, which claims this is the W3C standard for the HTML input element,
++// although their link is broken and I can find no evidence that this is a standard. The page
++// lists several regexes, ostensibly in syntaxes intended for different programming languages,
++// but each regex is in fact substantially different for no apparent reason.
++//
++// The most important thing here is that we disallow separators that might allow a user to confuse
++// nodemailer into thinking the address is a list. Unfortunately, nodemailer will happily separate
++// strings into lists splitting on all kinds of separator characters, such as commas, semicolons,
++// etc. This regex should accomplish that both by disallowing the separators, and by disallowing
++// multiple @ signs. The rest is for show.
++const EMAIL_REGEX = /^[a-zA-Z0-9.!#$%&’*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*$/;
++
++function validateEmail(email) {
++  if (email instanceof Array) {
++    email.forEach(validateEmail);
++  } else if (typeof email === "object" && "address" in email) {
++    validateEmail(email.address);
++  } else if (email) {
++    check(email, String);
++
++    if (!email.match(EMAIL_REGEX)) {
++      console.log(email);
++      throw new Meteor.Error(400, "invalid e-mail address");
++    }
++  }
++}
++
+ const rawSend = function (mailOptions, smtpConfig) {
+   // Sends an email mailOptions object structured as described in
+   // https://github.com/nodemailer/mailcomposer#e-mail-message-fields
+   // across the transport described by smtpConfig.
++
++  // For fields that are supposed to be lists of addresses, if only a single string is provided,
++  // wrap it in an array. This prevents nodemailer from interpreting the address as a
++  // comma-separated list.
++  ["from", "to", "cc", "bcc", "replyTo"].forEach(field => {
++    validateEmail(mailOptions[field]);
++  });
++
+   const pool = getPool(smtpConfig);
+   if (pool) {
+     smtpSend(pool, mailOptions);
+diff --git a/shell/packages/sandstorm-db/db.js b/shell/packages/sandstorm-db/db.js
+index e3cf52ae39..15e702128f 100644
+--- a/shell/packages/sandstorm-db/db.js
++++ b/shell/packages/sandstorm-db/db.js
+@@ -1516,9 +1516,11 @@ _.extend(SandstormDb.prototype, {
+ 
+     // First remove any instances of characters that cause trouble for SimpleSmtp. Ideally,
+     // we could escape such characters with a backslash, but that does not seem to help here.
++    // TODO(cleanup): Unclear whether this sanitization is still necessary now that we return a
++    //   structured object and have moved to nodemailer. I'm not touching it for now.
+     const sanitized = displayName.replace(/"|<|>|\\|\r/g, "");
+ 
+-    return "\"" + sanitized + "\" <" + this.getReturnAddress() + ">";
++    return { name: sanitized, address: this.getReturnAddress() };
+   },
+ 
+   getPrimaryEmail(accountId, identityId) {
+diff --git a/shell/server/accounts/email-token/token-server.js b/shell/server/accounts/email-token/token-server.js
+index 28a2338efb..5b46384868 100644
+--- a/shell/server/accounts/email-token/token-server.js
++++ b/shell/server/accounts/email-token/token-server.js
+@@ -199,7 +199,7 @@ const sendTokenEmail = function (db, email, token, options) {
+ 
+   const sendOptions = {
+     to:  email,
+-    from: db.getServerTitle() + " <" + db.getReturnAddress() + ">",
++    from: { name: globalDb.getServerTitle(), address: db.getReturnAddress() },
+     subject: subject,
+     text: text,
+   };
+diff --git a/shell/server/admin-server.js b/shell/server/admin-server.js
+index c1f72f34c5..7fcbde4f2b 100644
+--- a/shell/server/admin-server.js
++++ b/shell/server/admin-server.js
+@@ -185,7 +185,7 @@ Meteor.methods({
+     try {
+       sendEmail({
+         to: to,
+-        from: globalDb.getServerTitle() + " <" + returnAddress + ">",
++        from: { name: globalDb.getServerTitle(), address: returnAddress },
+         subject: "Testing your Sandstorm's SMTP setting",
+         text: "Success! Your outgoing SMTP is working.",
+         smtpConfig: restConfig,
+@@ -224,10 +224,11 @@ Meteor.methods({
+ 
+   sendInvites: function (token, origin, from, list, subject, message, quota) {
+     checkAuth(token);
+-    check([origin, from, list, subject, message], [String]);
++    check(from, { name: String, address: String });
++    check([origin, list, subject, message], [String]);
+     check(quota, Match.OneOf(undefined, null, Number));
+ 
+-    if (!from.trim()) {
++    if (!from.address.trim()) {
+       throw new Meteor.Error(403, "Must enter 'from' address.");
+     }
+ 

@@ -1,0 +1,506 @@
+diff --git a/jooby/src/main/java/org/jooby/Jooby.java b/jooby/src/main/java/org/jooby/Jooby.java
+index 7f75ee7f77..a366b4194d 100644
+--- a/jooby/src/main/java/org/jooby/Jooby.java
++++ b/jooby/src/main/java/org/jooby/Jooby.java
+@@ -1363,7 +1363,11 @@ public Route.Definition use(final String path, final Route.OneArgHandler handler
+ 
+   @Override
+   public Route.Definition get(final String path, final Route.Handler handler) {
+-    return appendDefinition(GET, path, handler);
++    if (handler instanceof AssetHandler) {
++      return assets(path, (AssetHandler) handler);
++    } else {
++      return appendDefinition(GET, path, handler);
++    }
+   }
+ 
+   @Override
+diff --git a/jooby/src/main/java/org/jooby/Route.java b/jooby/src/main/java/org/jooby/Route.java
+index 94172045d7..0e3ae2cdab 100644
+--- a/jooby/src/main/java/org/jooby/Route.java
++++ b/jooby/src/main/java/org/jooby/Route.java
+@@ -1636,6 +1636,7 @@ class AssetDefinition extends Definition {
+     public AssetDefinition(final String method, final String pattern,
+         final Route.Filter handler, boolean caseSensitiveRouting) {
+       super(method, pattern, handler, caseSensitiveRouting);
++      filter().setRoute(this);
+     }
+ 
+     @Nonnull
+diff --git a/jooby/src/main/java/org/jooby/handlers/AssetHandler.java b/jooby/src/main/java/org/jooby/handlers/AssetHandler.java
+index 6345844646..d9217329ca 100644
+--- a/jooby/src/main/java/org/jooby/handlers/AssetHandler.java
++++ b/jooby/src/main/java/org/jooby/handlers/AssetHandler.java
+@@ -206,7 +206,6 @@
+ import com.google.common.base.Strings;
+ import com.typesafe.config.ConfigFactory;
+ import com.typesafe.config.ConfigValueFactory;
+-import static java.util.Objects.requireNonNull;
+ import org.jooby.Asset;
+ import org.jooby.Err;
+ import org.jooby.Jooby;
+@@ -229,6 +228,8 @@
+ import java.util.Date;
+ import java.util.Map;
+ 
++import static java.util.Objects.requireNonNull;
++
+ /**
+  * Serve static resources, via {@link Jooby#assets(String)} or variants.
+  *
+@@ -287,6 +288,12 @@ private interface Loader {
+ 
+   private int statusCode = 404;
+ 
++  private String location;
++
++  private Path basedir;
++
++  private ClassLoader classLoader;
++
+   /**
+    * <p>
+    * Creates a new {@link AssetHandler}. The handler accepts a location pattern, that serve for
+@@ -315,7 +322,9 @@ private interface Loader {
+    * @param loader The one who load the static resources.
+    */
+   public AssetHandler(final String pattern, final ClassLoader loader) {
+-    init(Route.normalize(pattern), Paths.get("public"), loader);
++    this.location = Route.normalize(pattern);
++    this.basedir = Paths.get("public");
++    this.classLoader = loader;
+   }
+ 
+   /**
+@@ -345,7 +354,9 @@ public AssetHandler(final String pattern, final ClassLoader loader) {
+    * @param basedir Base directory.
+    */
+   public AssetHandler(final Path basedir) {
+-    init("/{0}", basedir, getClass().getClassLoader());
++    this.location = "/{0}";
++    this.basedir = basedir;
++    this.classLoader = getClass().getClassLoader();
+   }
+ 
+   /**
+@@ -375,7 +386,9 @@ public AssetHandler(final Path basedir) {
+    * @param pattern Pattern to locate static resources.
+    */
+   public AssetHandler(final String pattern) {
+-    init(Route.normalize(pattern), Paths.get("public"), getClass().getClassLoader());
++    this.location = Route.normalize(pattern);
++    this.basedir = Paths.get("public");
++    this.classLoader = getClass().getClassLoader();
+   }
+ 
+   /**
+@@ -422,6 +435,45 @@ public AssetHandler maxAge(final long maxAge) {
+     return this;
+   }
+ 
++  /**
++   * Set the route definition and initialize the handler.
++   *
++   * @param route Route definition.
++   * @return This handler.
++   */
++  public AssetHandler setRoute(final Route.AssetDefinition route) {
++    String prefix;
++    boolean rootLocation = location.equals("/") || location.equals("/{0}");
++    if (rootLocation) {
++      String pattern = route.pattern();
++      int i = pattern.indexOf("/*");
++      if (i > 0) {
++        prefix = pattern.substring(0, i + 1);
++      } else {
++        prefix = pattern;
++      }
++    } else {
++      int i = location.indexOf("{");
++      if (i > 0) {
++        prefix = location.substring(0, i);
++      } else {
++        /// TODO: review what we have here
++        prefix = location;
++      }
++    }
++    if (prefix.startsWith("/")) {
++      prefix = prefix.substring(1);
++    }
++    if (prefix.isEmpty() && rootLocation) {
++      throw new IllegalArgumentException(
++          "For security reasons root classpath access is not allowed. Map your static resources "
++              + "using a prefix like: assets(static/**); or use a location classpath prefix like: "
++              + "assets(/, /static/{0})");
++    }
++    init(prefix, location, basedir, classLoader);
++    return this;
++  }
++
+   /**
+    * Parse value as {@link Duration}. If the value is already a number then it uses as seconds.
+    * Otherwise, it parse expressions like: 8m, 1h, 365d, etc...
+@@ -485,7 +537,6 @@ public void handle(final Request req, final Response rsp) throws Throwable {
+   }
+ 
+   private void doHandle(final Request req, final Response rsp, final Asset asset) throws Throwable {
+-
+     // handle etag
+     if (this.etag) {
+       String etag = asset.etag();
+@@ -551,12 +602,13 @@ protected URL resolve(final String path) throws Exception {
+     return loader.getResource(path);
+   }
+ 
+-  private void init(final String pattern, final Path basedir, final ClassLoader loader) {
++  private void init(final String classPathPrefix, final String location, final Path basedir,
++      final ClassLoader loader) {
+     requireNonNull(loader, "Resource loader is required.");
+-    this.fn = pattern.equals("/")
++    this.fn = location.equals("/")
+         ? (req, p) -> prefix.apply(p)
+-        : (req, p) -> MessageFormat.format(prefix.apply(pattern), vars(req));
+-    this.loader = loader(basedir, loader);
++        : (req, p) -> MessageFormat.format(prefix.apply(location), vars(req));
++    this.loader = loader(basedir, classpathLoader(classPathPrefix, classLoader));
+   }
+ 
+   private static Object[] vars(final Request req) {
+@@ -564,8 +616,8 @@ private static Object[] vars(final Request req) {
+     return vars.values().toArray(new Object[vars.size()]);
+   }
+ 
+-  private static Loader loader(final Path basedir, final ClassLoader classloader) {
+-    if (Files.exists(basedir)) {
++  private static Loader loader(final Path basedir, Loader classpath) {
++    if (basedir != null && Files.exists(basedir)) {
+       return name -> {
+         Path path = basedir.resolve(name).normalize();
+         if (Files.exists(path) && path.startsWith(basedir)) {
+@@ -575,10 +627,45 @@ private static Loader loader(final Path basedir, final ClassLoader classloader)
+             // shh
+           }
+         }
+-        return classloader.getResource(name);
++        return classpath.getResource(name);
+       };
+     }
+-    return classloader::getResource;
++    return classpath;
++  }
++
++  private static Loader classpathLoader(String prefix, ClassLoader classloader) {
++    return name -> {
++      String safePath = safePath(name);
++      if (safePath.startsWith(prefix)) {
++        URL resource = classloader.getResource(safePath);
++        return resource;
++      }
++      return null;
++    };
++  }
++
++  private static String safePath(String name) {
++    if (name.indexOf("./") > 0) {
++      Path path = toPath(name.split("/")).normalize();
++      return toStringPath(path);
++    }
++    return name;
++  }
++
++  private static String toStringPath(Path path) {
++    StringBuilder buffer = new StringBuilder();
++    for (Path segment : path) {
++      buffer.append("/").append(segment);
++    }
++    return buffer.substring(1);
++  }
++
++  private static Path toPath(String[] segments) {
++    Path path = Paths.get(segments[0]);
++    for (int i = 1; i < segments.length; i++) {
++      path = path.resolve(segments[i]);
++    }
++    return path;
+   }
+ 
+   private static Throwing.Function<String, String> prefix() {
+diff --git a/jooby/src/main/java/org/jooby/internal/AssetSource.java b/jooby/src/main/java/org/jooby/internal/AssetSource.java
+new file mode 100644
+index 0000000000..d6779e9c9d
+--- /dev/null
++++ b/jooby/src/main/java/org/jooby/internal/AssetSource.java
+@@ -0,0 +1,44 @@
++package org.jooby.internal;
++
++import com.google.common.base.Strings;
++
++import java.net.MalformedURLException;
++import java.net.URL;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++public interface AssetSource {
++  URL getResource(String name);
++
++  static AssetSource fromClassPath(ClassLoader loader, String source) {
++    if (Strings.isNullOrEmpty(source) || "/".equals(source.trim())) {
++      throw new IllegalArgumentException(
++          "For security reasons root classpath access is not allowed: " + source);
++    }
++    return path -> {
++      URL resource = loader.getResource(path);
++      if (resource == null) {
++        return null;
++      }
++      String realPath = resource.getPath();
++      if (realPath.startsWith(source)) {
++        return resource;
++      }
++      return null;
++    };
++  }
++
++  static AssetSource fromFileSystem(Path basedir) {
++    return name -> {
++      Path path = basedir.resolve(name).normalize();
++      if (Files.exists(path) && path.startsWith(basedir)) {
++        try {
++          return path.toUri().toURL();
++        } catch (MalformedURLException x) {
++          // shh
++        }
++      }
++      return null;
++    };
++  }
++}
+diff --git a/jooby/src/test/java/org/jooby/handlers/AssetHandlerTest.java b/jooby/src/test/java/org/jooby/handlers/AssetHandlerTest.java
+index 35343529d1..afe4e0c4c1 100644
+--- a/jooby/src/test/java/org/jooby/handlers/AssetHandlerTest.java
++++ b/jooby/src/test/java/org/jooby/handlers/AssetHandlerTest.java
+@@ -1,7 +1,12 @@
+ package org.jooby.handlers;
+ 
+-import static org.easymock.EasyMock.expect;
+-import static org.junit.Assert.assertNotNull;
++import org.jooby.Route;
++import org.jooby.test.MockUnit;
++import org.jooby.test.MockUnit.Block;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.powermock.core.classloader.annotations.PrepareForTest;
++import org.powermock.modules.junit4.PowerMockRunner;
+ 
+ import java.io.File;
+ import java.net.MalformedURLException;
+@@ -11,15 +16,11 @@
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
+ 
+-import org.jooby.test.MockUnit;
+-import org.jooby.test.MockUnit.Block;
+-import org.junit.Test;
+-import org.junit.runner.RunWith;
+-import org.powermock.core.classloader.annotations.PrepareForTest;
+-import org.powermock.modules.junit4.PowerMockRunner;
++import static org.easymock.EasyMock.expect;
++import static org.junit.Assert.assertNotNull;
+ 
+ @RunWith(PowerMockRunner.class)
+-@PrepareForTest({AssetHandler.class, File.class, Paths.class, Files.class })
++@PrepareForTest({AssetHandler.class, File.class, Paths.class, Files.class})
+ public class AssetHandlerTest {
+ 
+   @Test
+@@ -28,24 +29,30 @@ public void customClassloader() throws Exception {
+     new MockUnit(ClassLoader.class)
+         .expect(publicDir(uri, "JoobyTest.js"))
+         .run(unit -> {
+-          URL value = new AssetHandler("/", unit.get(ClassLoader.class))
++          URL value = newHandler(unit, "/")
+               .resolve("JoobyTest.js");
+           assertNotNull(value);
+         });
+   }
+ 
++  private AssetHandler newHandler(MockUnit unit, String location) {
++    AssetHandler handler = new AssetHandler(location, unit.get(ClassLoader.class));
++    new Route.AssetDefinition("GET", "/assets/**", handler, false);
++    return handler;
++  }
++
+   @Test
+   public void shouldCallParentOnMissing() throws Exception {
+     URI uri = Paths.get("src", "test", "resources", "org", "jooby").toUri();
+     new MockUnit(ClassLoader.class)
+-        .expect(publicDir(uri, "index.js", false))
++        .expect(publicDir(uri, "assets/index.js", false))
+         .expect(unit -> {
+           ClassLoader loader = unit.get(ClassLoader.class);
+-          expect(loader.getResource("index.js")).andReturn(uri.toURL());
++          expect(loader.getResource("assets/index.js")).andReturn(uri.toURL());
+         })
+         .run(unit -> {
+-          URL value = new AssetHandler("/", unit.get(ClassLoader.class))
+-              .resolve("index.js");
++          URL value = newHandler(unit, "/")
++              .resolve("assets/index.js");
+           assertNotNull(value);
+         });
+   }
+@@ -54,18 +61,18 @@ public void shouldCallParentOnMissing() throws Exception {
+   public void ignoreMalformedURL() throws Exception {
+     Path path = Paths.get("src", "test", "resources", "org", "jooby");
+     new MockUnit(ClassLoader.class, URI.class)
+-        .expect(publicDir(null, "index.js"))
++        .expect(publicDir(null, "assets/index.js"))
+         .expect(unit -> {
+           URI uri = unit.get(URI.class);
+           expect(uri.toURL()).andThrow(new MalformedURLException());
+         })
+         .expect(unit -> {
+           ClassLoader loader = unit.get(ClassLoader.class);
+-          expect(loader.getResource("index.js")).andReturn(path.toUri().toURL());
++          expect(loader.getResource("assets/index.js")).andReturn(path.toUri().toURL());
+         })
+         .run(unit -> {
+-          URL value = new AssetHandler("/", unit.get(ClassLoader.class))
+-              .resolve("index.js");
++          URL value = newHandler(unit, "/")
++              .resolve("assets/index.js");
+           assertNotNull(value);
+         });
+   }
+diff --git a/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639.java b/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639.java
+new file mode 100644
+index 0000000000..12cd2b874b
+--- /dev/null
++++ b/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639.java
+@@ -0,0 +1,31 @@
++package org.jooby.issues;
++
++import org.jooby.test.ServerFeature;
++import org.junit.Test;
++
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++
++import static org.junit.Assert.assertTrue;
++
++public class Issue1639 extends ServerFeature {
++
++  {
++    Path dir = Paths.get(System.getProperty("user.dir"), "src", "test", "resources", "assets");
++    assertTrue(Files.exists(dir));
++    assets("/static/**", dir);
++  }
++
++  @Test
++  public void shouldNotFallbackToArbitraryClasspathResources() throws Exception {
++    request()
++        .get("/static/WEB-INF/web2.xml")
++        .expect(404);
++
++    request()
++        .get("/static/../WEB-INF/web2.xml")
++        .expect(404);
++  }
++
++}
+diff --git a/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639b.java b/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639b.java
+new file mode 100644
+index 0000000000..424a60c64f
+--- /dev/null
++++ b/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639b.java
+@@ -0,0 +1,33 @@
++package org.jooby.issues;
++
++import org.jooby.test.ServerFeature;
++import org.junit.Test;
++
++import java.nio.file.Paths;
++
++public class Issue1639b extends ServerFeature {
++
++  {
++    assets("/static/**/*.js", Paths.get("static"));
++  }
++
++  @Test
++  public void shouldNotByPassPrefixValue() throws Exception {
++    request()
++        .get("/static/org/jooby/issues/Issue1639b.class.js")
++        .expect(404);
++
++    request()
++        .get("/static/../org/jooby/issues/Issue1639b.class.js")
++        .expect(404);
++
++    request()
++        .get("/static/..%252forg/jooby/issues/Issue1639b.class.js")
++        .expect(404);
++
++    request()
++        .get("/static/org/jooby/issues/Issue1639b.class")
++        .expect(404);
++  }
++
++}
+diff --git a/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639c.java b/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639c.java
+new file mode 100644
+index 0000000000..33e73a2051
+--- /dev/null
++++ b/modules/coverage-report/src/test/java/org/jooby/issues/Issue1639c.java
+@@ -0,0 +1,24 @@
++package org.jooby.issues;
++
++import org.jooby.test.ServerFeature;
++import org.junit.Test;
++
++import java.nio.file.Paths;
++
++public class Issue1639c extends ServerFeature {
++
++  {
++    assets("/static/**");
++  }
++
++  @Test
++  public void shouldNotByPassPrefixValue() throws Exception {
++    request()
++        .get("/static/..%252forg/jooby/issues/Issue1639c.class")
++        .expect(404);
++    request()
++        .get("/static/../org/jooby/issues/Issue1639c.class")
++        .expect(404);
++  }
++
++}
+diff --git a/modules/coverage-report/src/test/resources/WEB-INF/web2.xml b/modules/coverage-report/src/test/resources/WEB-INF/web2.xml
+new file mode 100644
+index 0000000000..262735fa3b
+--- /dev/null
++++ b/modules/coverage-report/src/test/resources/WEB-INF/web2.xml
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<web-app
++    xmlns="http://java.sun.com/xml/ns/javaee"
++    xmlns:web="http://java.sun.com/xml/ns/javaee/web-app_3_0.xsd"
++    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++    xsi:schemaLocation="http://java.sun.com/xml/ns/javaee http://java.sun.com/xml/ns/javaee/web-app_3_0.xsd"
++    version="3.0">
++</web-app>
+diff --git a/modules/jooby-assets/src/main/java/org/jooby/assets/Assets.java b/modules/jooby-assets/src/main/java/org/jooby/assets/Assets.java
+index e2751833c4..e51b6a340a 100644
+--- a/modules/jooby-assets/src/main/java/org/jooby/assets/Assets.java
++++ b/modules/jooby-assets/src/main/java/org/jooby/assets/Assets.java
+@@ -209,6 +209,7 @@
+ import com.typesafe.config.ConfigFactory;
+ import org.jooby.Env;
+ import org.jooby.Jooby;
++import org.jooby.Route;
+ import org.jooby.Router;
+ import org.jooby.handlers.AssetHandler;
+ import org.jooby.internal.assets.AssetVars;

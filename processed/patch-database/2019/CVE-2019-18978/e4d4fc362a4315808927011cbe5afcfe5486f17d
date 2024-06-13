@@ -1,0 +1,142 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 04c5bf7..d0c5e9b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,10 @@
+ # Change Log
+ All notable changes to this project will be documented in this file.
+ 
++## 1.0.4 - 2019-11-13
++### Security
++- Escape and resolve path before evaluating resource rules (thanks to Colby Morgan)
++
+ ## 1.0.3 - 2019-03-24
+ ### Changed
+ - Don't send 'Content-Type' header with pre-flight requests
+diff --git a/lib/rack/cors.rb b/lib/rack/cors.rb
+index 999b1c3..24bc2b3 100644
+--- a/lib/rack/cors.rb
++++ b/lib/rack/cors.rb
+@@ -64,24 +64,27 @@ def allow(&block)
+     def call(env)
+       env[HTTP_ORIGIN] ||= env[HTTP_X_ORIGIN] if env[HTTP_X_ORIGIN]
+ 
++      path = evaluate_path(env)
++
+       add_headers = nil
+       if env[HTTP_ORIGIN]
+         debug(env) do
+           [ 'Incoming Headers:',
+             "  Origin: #{env[HTTP_ORIGIN]}",
++            "  Path-Info: #{path}",
+             "  Access-Control-Request-Method: #{env[HTTP_ACCESS_CONTROL_REQUEST_METHOD]}",
+             "  Access-Control-Request-Headers: #{env[HTTP_ACCESS_CONTROL_REQUEST_HEADERS]}"
+             ].join("\n")
+         end
+         if env[REQUEST_METHOD] == OPTIONS and env[HTTP_ACCESS_CONTROL_REQUEST_METHOD]
+-          headers = process_preflight(env)
++          headers = process_preflight(env, path)
+           debug(env) do
+             "Preflight Headers:\n" +
+                 headers.collect{|kv| "  #{kv.join(': ')}"}.join("\n")
+           end
+           return [200, headers, []]
+         else
+-          add_headers = process_cors(env)
++          add_headers = process_cors(env, path)
+         end
+       else
+         Result.miss(env, Result::MISS_NO_ORIGIN)
+@@ -90,7 +93,7 @@ def call(env)
+       # This call must be done BEFORE calling the app because for some reason
+       # env[PATH_INFO] gets changed after that and it won't match. (At least
+       # in rails 4.1.6)
+-      vary_resource = resource_for_path(env[PATH_INFO])
++      vary_resource = resource_for_path(path)
+ 
+       status, headers, body = @app.call env
+ 
+@@ -147,14 +150,20 @@ def select_logger(env)
+         end
+       end
+ 
++      def evaluate_path(env)
++        path = env[PATH_INFO]
++        path = Rack::Utils.clean_path_info(Rack::Utils.unescape_path(path)) if path
++        path
++      end
++
+       def all_resources
+         @all_resources ||= []
+       end
+ 
+-      def process_preflight(env)
++      def process_preflight(env, path)
+         result = Result.preflight(env)
+ 
+-        resource, error = match_resource(env)
++        resource, error = match_resource(path, env)
+         unless resource
+           result.miss(error)
+           return {}
+@@ -163,8 +172,8 @@ def process_preflight(env)
+         return resource.process_preflight(env, result)
+       end
+ 
+-      def process_cors(env)
+-        resource, error = match_resource(env)
++      def process_cors(env, path)
++        resource, error = match_resource(path, env)
+         if resource
+           Result.hit(env)
+           cors = resource.to_headers(env)
+@@ -185,8 +194,7 @@ def resource_for_path(path_info)
+         nil
+       end
+ 
+-      def match_resource(env)
+-        path   = env[PATH_INFO]
++      def match_resource(path, env)
+         origin = env[HTTP_ORIGIN]
+ 
+         origin_matched = false
+diff --git a/lib/rack/cors/version.rb b/lib/rack/cors/version.rb
+index 5eef48d..513b551 100644
+--- a/lib/rack/cors/version.rb
++++ b/lib/rack/cors/version.rb
+@@ -1,5 +1,5 @@
+ module Rack
+   class Cors
+-    VERSION = "1.0.3"
++    VERSION = "1.0.4"
+   end
+ end
+diff --git a/test/unit/cors_test.rb b/test/unit/cors_test.rb
+index 10957bb..182a340 100644
+--- a/test/unit/cors_test.rb
++++ b/test/unit/cors_test.rb
+@@ -146,6 +146,12 @@ def load_app(name, options = {})
+     last_response.headers['Vary'].must_equal 'Origin, Host'
+   end
+ 
++  it "decode URL and resolve paths before resource matching" do
++    header 'Origin', 'http://localhost:3000'
++    get '/public/a/..%2F..%2Fprivate/stuff'
++    last_response.wont_render_cors_success
++  end
++
+   describe 'with array of upstream Vary headers' do
+     let(:app) { load_app('test', { proxy: true }) }
+ 
+diff --git a/test/unit/test.ru b/test/unit/test.ru
+index dda69e9..cf25c50 100644
+--- a/test/unit/test.ru
++++ b/test/unit/test.ru
+@@ -41,6 +41,7 @@ use Rack::Cors do
+   allow do
+     origins '*'
+     resource '/public'
++    resource '/public/*'
+     resource '/public_without_credentials', :credentials => false
+   end
+ 

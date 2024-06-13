@@ -1,0 +1,115 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1340b71..cd945bc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,8 @@
++## 4.0.0 - 2021-11-15
++
++ * Vary the encrypted/signed cookie salts per-hostname (fix for CVE-2021-41263). This update will
++   cause existing cookies to be invalidated
++
+ ## 3.1.0 - 2021-09-10
+ 
+  * Make config file path configurable via `Rails.configuration.multisite_config_path`
+diff --git a/lib/rails_multisite.rb b/lib/rails_multisite.rb
+index f997490..9244297 100644
+--- a/lib/rails_multisite.rb
++++ b/lib/rails_multisite.rb
+@@ -7,3 +7,4 @@
+ require 'rails_multisite/formatter'
+ require 'rails_multisite/connection_management'
+ require 'rails_multisite/middleware'
++require 'rails_multisite/cookie_salt'
+diff --git a/lib/rails_multisite/cookie_salt.rb b/lib/rails_multisite/cookie_salt.rb
+new file mode 100644
+index 0000000..61a5263
+--- /dev/null
++++ b/lib/rails_multisite/cookie_salt.rb
+@@ -0,0 +1,16 @@
++# frozen_string_literal: true
++
++module RailsMultisite
++  class CookieSalt
++    COOKIE_SALT_KEYS = [
++      "action_dispatch.signed_cookie_salt",
++      "action_dispatch.encrypted_cookie_salt",
++      "action_dispatch.encrypted_signed_cookie_salt",
++      "action_dispatch.authenticated_encrypted_cookie_salt"
++    ]
++
++    def self.update_cookie_salts(env:, host:)
++      COOKIE_SALT_KEYS.each { |key| env[key] = "#{env[key]} #{host}" }
++    end
++  end
++end
+diff --git a/lib/rails_multisite/middleware.rb b/lib/rails_multisite/middleware.rb
+index 59a627b..f3cae7d 100644
+--- a/lib/rails_multisite/middleware.rb
++++ b/lib/rails_multisite/middleware.rb
+@@ -22,6 +22,7 @@ def call(env)
+ 
+         ActiveRecord::Base.connection_handler.clear_active_connections!
+         ConnectionManagement.establish_connection(host: host, db: db)
++        CookieSalt.update_cookie_salts(env: env, host: host)
+         @app.call(env)
+       ensure
+         ActiveRecord::Base.connection_handler.clear_active_connections!
+diff --git a/lib/rails_multisite/version.rb b/lib/rails_multisite/version.rb
+index e8396d9..f524c81 100644
+--- a/lib/rails_multisite/version.rb
++++ b/lib/rails_multisite/version.rb
+@@ -1,5 +1,5 @@
+ # frozen_string_literal: true
+ #
+ module RailsMultisite
+-  VERSION = "3.1.0"
++  VERSION = "4.0.0"
+ end
+diff --git a/spec/middleware_spec.rb b/spec/middleware_spec.rb
+index 1157144..41a7944 100644
+--- a/spec/middleware_spec.rb
++++ b/spec/middleware_spec.rb
+@@ -2,6 +2,7 @@
+ require 'spec_helper'
+ require 'rails_multisite'
+ require 'rack/test'
++require 'json'
+ 
+ describe RailsMultisite::Middleware do
+   include Rack::Test::Methods
+@@ -22,6 +23,11 @@ def app(config = {})
+           [200, { 'Content-Type' => 'text/html' }, "<html><BODY><h1>#{request.hostname}</h1></BODY>\n \t</html>"]
+         end)
+       end
++      map '/salts' do
++        run (proc do |env|
++          [200, { 'Content-Type' => 'application/json' }, env.slice(*RailsMultisite::CookieSalt::COOKIE_SALT_KEYS).to_json]
++        end)
++      end
+     }.to_app
+   end
+ 
+@@ -98,4 +104,23 @@ def app(config = {})
+       expect(last_response).to be_not_found
+     end
+   end
++
++  describe 'encrypted/signed cookie salts' do
++    it 'updates salts per-hostname' do
++      get 'http://default.localhost/salts'
++      expect(last_response).to be_ok
++      default_salts = JSON.parse(last_response.body)
++      expect(default_salts.keys).to contain_exactly(*RailsMultisite::CookieSalt::COOKIE_SALT_KEYS)
++      expect(default_salts.values).to all(include("default.localhost"))
++
++      get 'http://second.localhost/salts'
++      expect(last_response).to be_ok
++      second_salts = JSON.parse(last_response.body)
++      expect(second_salts.keys).to contain_exactly(*RailsMultisite::CookieSalt::COOKIE_SALT_KEYS)
++      expect(second_salts.values).to all(include("second.localhost"))
++
++      leaked_previous_hostname = second_salts.values.any? { |v| v.include?("default.localhost") }
++      expect(leaked_previous_hostname).to eq(false)
++    end
++  end
+ end

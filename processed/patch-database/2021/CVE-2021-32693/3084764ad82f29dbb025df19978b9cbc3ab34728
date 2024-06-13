@@ -1,0 +1,127 @@
+diff --git a/src/Symfony/Bundle/SecurityBundle/Tests/Functional/AuthenticatorTest.php b/src/Symfony/Bundle/SecurityBundle/Tests/Functional/AuthenticatorTest.php
+index beb12a0b4d60..69f64693c85b 100644
+--- a/src/Symfony/Bundle/SecurityBundle/Tests/Functional/AuthenticatorTest.php
++++ b/src/Symfony/Bundle/SecurityBundle/Tests/Functional/AuthenticatorTest.php
+@@ -87,4 +87,17 @@ public function provideEmailsWithFirewalls()
+         yield ['jane@example.org', 'main'];
+         yield ['john@example.org', 'custom'];
+     }
++
++    public function testMultipleFirewalls()
++    {
++        $client = $this->createClient(['test_case' => 'Authenticator', 'root_config' => 'multiple_firewalls.yml']);
++
++        $client->request('POST', '/firewall1/login', [
++            '_username' => 'jane@example.org',
++            '_password' => 'test',
++        ]);
++
++        $client->request('GET', '/firewall2/profile');
++        $this->assertResponseRedirects('http://localhost/login');
++    }
+ }
+diff --git a/src/Symfony/Bundle/SecurityBundle/Tests/Functional/app/Authenticator/multiple_firewalls.yml b/src/Symfony/Bundle/SecurityBundle/Tests/Functional/app/Authenticator/multiple_firewalls.yml
+new file mode 100644
+index 000000000000..655a8d83d4d5
+--- /dev/null
++++ b/src/Symfony/Bundle/SecurityBundle/Tests/Functional/app/Authenticator/multiple_firewalls.yml
+@@ -0,0 +1,17 @@
++imports:
++- { resource: ./config.yml }
++- { resource: ./security.yml }
++
++security:
++    enable_authenticator_manager: true
++    firewalls:
++        firewall1:
++            pattern: /firewall1
++            provider: in_memory
++            form_login:
++                check_path: /firewall1/login
++        firewall2:
++            pattern: /firewall2
++            provider: in_memory2
++            form_login:
++                check_path: /firewall2/login
+diff --git a/src/Symfony/Bundle/SecurityBundle/Tests/Functional/app/Authenticator/routing.yml b/src/Symfony/Bundle/SecurityBundle/Tests/Functional/app/Authenticator/routing.yml
+index 35662387dcf7..4796a3f6bc00 100644
+--- a/src/Symfony/Bundle/SecurityBundle/Tests/Functional/app/Authenticator/routing.yml
++++ b/src/Symfony/Bundle/SecurityBundle/Tests/Functional/app/Authenticator/routing.yml
+@@ -18,3 +18,11 @@ security_main_profile:
+ security_custom_profile:
+     path:     /custom/user_profile
+     defaults: { _controller: Symfony\Bundle\SecurityBundle\Tests\Functional\Bundle\AuthenticatorBundle\SecurityController::profileAction }
++
++firewall1_login:
++    path: /firewall1/login
++
++firewall2_profile:
++    path: /firewall2/profile
++    defaults:
++        _controller: Symfony\Bundle\SecurityBundle\Tests\Functional\Bundle\AuthenticatorBundle\ProfileController
+diff --git a/src/Symfony/Bundle/SecurityBundle/composer.json b/src/Symfony/Bundle/SecurityBundle/composer.json
+index 1ebe4c7a8686..5e3d13d072a5 100644
+--- a/src/Symfony/Bundle/SecurityBundle/composer.json
++++ b/src/Symfony/Bundle/SecurityBundle/composer.json
+@@ -29,7 +29,7 @@
+         "symfony/security-core": "^5.3",
+         "symfony/security-csrf": "^4.4|^5.0",
+         "symfony/security-guard": "^5.3",
+-        "symfony/security-http": "^5.3"
++        "symfony/security-http": "^5.3.2"
+     },
+     "require-dev": {
+         "doctrine/annotations": "^1.10.4",
+diff --git a/src/Symfony/Component/Security/Http/Firewall/ContextListener.php b/src/Symfony/Component/Security/Http/Firewall/ContextListener.php
+index 9416777b81ae..098a2225c33f 100644
+--- a/src/Symfony/Component/Security/Http/Firewall/ContextListener.php
++++ b/src/Symfony/Component/Security/Http/Firewall/ContextListener.php
+@@ -95,7 +95,7 @@ public function authenticate(RequestEvent $event)
+         $request = $event->getRequest();
+         $session = $request->hasPreviousSession() && $request->hasSession() ? $request->getSession() : null;
+ 
+-        $request->attributes->set('_security_firewall_run', true);
++        $request->attributes->set('_security_firewall_run', $this->sessionKey);
+ 
+         if (null !== $session) {
+             $usageIndexValue = $session instanceof Session ? $usageIndexReference = &$session->getUsageIndex() : 0;
+@@ -169,7 +169,7 @@ public function onKernelResponse(ResponseEvent $event)
+ 
+         $request = $event->getRequest();
+ 
+-        if (!$request->hasSession() || !$request->attributes->get('_security_firewall_run', false)) {
++        if (!$request->hasSession() || $request->attributes->get('_security_firewall_run') !== $this->sessionKey) {
+             return;
+         }
+ 
+diff --git a/src/Symfony/Component/Security/Http/Tests/Firewall/ContextListenerTest.php b/src/Symfony/Component/Security/Http/Tests/Firewall/ContextListenerTest.php
+index f995d215cabf..bf9b028dcb63 100644
+--- a/src/Symfony/Component/Security/Http/Tests/Firewall/ContextListenerTest.php
++++ b/src/Symfony/Component/Security/Http/Tests/Firewall/ContextListenerTest.php
+@@ -106,7 +106,7 @@ public function testOnKernelResponseWithoutSession()
+         $tokenStorage = new TokenStorage();
+         $tokenStorage->setToken(new UsernamePasswordToken('test1', 'pass1', 'phpunit'));
+         $request = new Request();
+-        $request->attributes->set('_security_firewall_run', true);
++        $request->attributes->set('_security_firewall_run', '_security_session');
+         $session = new Session(new MockArraySessionStorage());
+         $request->setSession($session);
+ 
+@@ -212,7 +212,7 @@ public function testOnKernelResponseListenerRemovesItself()
+         $listener = new ContextListener($tokenStorage, [], 'key123', null, $dispatcher);
+ 
+         $request = new Request();
+-        $request->attributes->set('_security_firewall_run', true);
++        $request->attributes->set('_security_firewall_run', '_security_key123');
+         $request->setSession($session);
+ 
+         $event = new ResponseEvent($this->createMock(HttpKernelInterface::class), $request, HttpKernelInterface::MAIN_REQUEST, new Response());
+@@ -370,7 +370,7 @@ protected function runSessionOnKernelResponse($newToken, $original = null)
+     {
+         $session = new Session(new MockArraySessionStorage());
+         $request = new Request();
+-        $request->attributes->set('_security_firewall_run', true);
++        $request->attributes->set('_security_firewall_run', '_security_session');
+         $request->setSession($session);
+         $requestStack = new RequestStack();
+         $requestStack->push($request);

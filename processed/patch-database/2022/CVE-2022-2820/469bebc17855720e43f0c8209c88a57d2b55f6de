@@ -1,0 +1,313 @@
+diff --git a/core/classes/Core/User.php b/core/classes/Core/User.php
+index ee4c890eba..8db27c050e 100644
+--- a/core/classes/Core/User.php
++++ b/core/classes/Core/User.php
+@@ -6,7 +6,7 @@
+  * @author Samerton
+  * @author Partydragen
+  * @author Aberdeener
+- * @version 2.0.0-pr13
++ * @version 2.0.2
+  * @license MIT
+  */
+ class User {
+@@ -73,14 +73,14 @@ public function __construct(string $user = null, string $field = 'id') {
+ 
+         if ($user === null) {
+             if (Session::exists($this->_sessionName)) {
+-                $user = Session::get($this->_sessionName);
+-                if ($this->find($user, $field)) {
++                $hash = Session::get($this->_sessionName);
++                if ($this->find($hash, 'hash')) {
+                     $this->_isLoggedIn = true;
+                 }
+             }
+             if (Session::exists($this->_admSessionName)) {
+-                $user = Session::get($this->_admSessionName);
+-                if ($user == $this->data()->id && $this->find($user, $field)) {
++                $hash = Session::get($this->_admSessionName);
++                if ($this->find($hash, 'hash')) {
+                     $this->_isAdmLoggedIn = true;
+                 }
+             }
+@@ -107,7 +107,11 @@ public function find(string $value = null, string $field = 'id'): bool {
+                 return true;
+             }
+ 
+-            $data = $this->_db->get('users', [$field, $value]);
++            if ($field != 'hash') {
++                $data = $this->_db->get('users', [$field, $value]);
++            } else {
++                $data = $this->_db->query('SELECT nl2_users.* FROM nl2_users LEFT JOIN nl2_users_session ON nl2_users.id = user_id WHERE hash = ? AND nl2_users_session.active = 1', [$value]);
++            }
+ 
+             if ($data->count()) {
+                 $this->_data = new UserData($data->first());
+@@ -297,7 +301,7 @@ public function idToNickname(int $id): ?string {
+      * @param string|null $username Their username (or email, depending on $method).
+      * @param string|null $password Their password.
+      * @param bool $remember Whether to keep them logged in or not.
+-     * @param string $method What column to check for their details in. Can be either `username` or `email`.
++     * @param string $method What column to check for their details in. Can be either `username` or `email` or `oauth`.
+      *
+      * @return bool True/false on success or failure respectfully.
+      */
+@@ -307,29 +311,27 @@ public function login(?string $username = null, ?string $password = null, bool $
+ 
+     private function _commonLogin(?string $username, ?string $password, bool $remember, string $method, bool $is_admin): bool {
+         $sessionName = $is_admin ? $this->_admSessionName : $this->_sessionName;
+-        if (!$username && !$password && $this->exists()) {
+-            Session::put($sessionName, $this->data()->id);
++        if (!$username && $method == 'hash' && $this->exists()) {
++            // Logged in using hash from cookie
++            Session::put($sessionName, $password);
+             if (!$is_admin) {
+                 $this->_isLoggedIn = true;
+             }
+         } else if ($this->checkCredentials($username, $password, $method) === true) {
+             // Valid credentials
+-            Session::put($sessionName, $this->data()->id);
++            $hash = SecureRandom::alphanumeric();
++
++            $this->_db->insert('users_session', [
++                'user_id' => $this->data()->id,
++                'hash' => $hash,
++                'remember_me' => $remember,
++                'active' => 1,
++                'login_method' => $is_admin ? 'admin' : $method
++            ]);
+ 
+-            if ($remember) {
+-                $hash = SecureRandom::alphanumeric();
+-                $table = $is_admin ? 'users_admin_session' : 'users_session';
+-                $hashCheck = $this->_db->get($table, ['user_id', $this->data()->id]);
+-
+-                if (!$hashCheck->count()) {
+-                    $this->_db->insert($table, [
+-                        'user_id' => $this->data()->id,
+-                        'hash' => $hash
+-                    ]);
+-                } else {
+-                    $hash = $hashCheck->first()->hash;
+-                }
++            Session::put($sessionName, $hash);
+ 
++            if ($remember) {
+                 $expiry = $is_admin ? 3600 : Config::get('remember.cookie_expiry');
+                 $cookieName = $is_admin ? ($this->_cookieName . '_adm') : $this->_cookieName;
+                 Cookie::put($cookieName, $hash, $expiry, HttpUtils::getProtocol() === 'https', true);
+@@ -532,12 +534,24 @@ public function hasPermission(string $permission): bool {
+         return false;
+     }
+ 
++    /**
++     * Log the user out from all other sessions.
++     */
++    public function logoutAllOtherSessions(): void {
++        DB::getInstance()->query('UPDATE nl2_users_session SET `active` = 0 WHERE user_id = ? AND hash != ?', [
++            $this->data()->id,
++            Session::get(Config::get('session.session_name'))
++        ]);
++    }
++
+     /**
+      * Log the user out.
+      * Deletes their cookies, sessions and database session entry.
+      */
+     public function logout(): void {
+-        $this->_db->delete('users_session', ['user_id', $this->data()->id]);
++        $this->_db->update('users_session', [['user_id', $this->data()->id], ['hash', Session::get($this->_sessionName)]], [
++            'active' => 0
++        ]);
+ 
+         Session::delete($this->_sessionName);
+         Cookie::delete($this->_cookieName);
+@@ -547,7 +561,9 @@ public function logout(): void {
+      * Process logout if user is admin
+      */
+     public function admLogout(): void {
+-        $this->_db->delete('users_admin_session', ['user_id', $this->data()->id]);
++        $this->_db->update('users_session', [['user_id', $this->data()->id], ['hash', Session::get($this->_admSessionName)]], [
++            'active' => 0
++        ]);
+ 
+         Session::delete($this->_admSessionName);
+         Cookie::delete($this->_cookieName . '_adm');
+diff --git a/core/init.php b/core/init.php
+index edc98df05d..5bcf48c672 100644
+--- a/core/init.php
++++ b/core/init.php
+@@ -2,7 +2,7 @@
+ /*
+  *  Made by Samerton
+  *  https://github.com/NamelessMC/Nameless/
+- *  NamelessMC version 2.0.0-pr9
++ *  NamelessMC version 2.0.2
+  *
+  *  License: MIT
+  *
+@@ -132,11 +132,11 @@
+     // Do they need logging in (checked remember me)?
+     if (Cookie::exists(Config::get('remember.cookie_name')) && !Session::exists(Config::get('session.session_name'))) {
+         $hash = Cookie::get(Config::get('remember.cookie_name'));
+-        $hashCheck = DB::getInstance()->get('users_session', ['hash', $hash]);
++        $hashCheck = DB::getInstance()->get('users_session', [['hash', $hash], ['active', true]]);
+ 
+         if ($hashCheck->count()) {
+             $user = new User($hashCheck->first()->user_id);
+-            $user->login();
++            $user->login(null, $hash, true, 'hash');
+         }
+     }
+ 
+diff --git a/core/installation/includes/upgrade_perform.php b/core/installation/includes/upgrade_perform.php
+index 88624dd731..deface8ec5 100644
+--- a/core/installation/includes/upgrade_perform.php
++++ b/core/installation/includes/upgrade_perform.php
+@@ -521,43 +521,6 @@
+     $errors[] = 'Unable to convert users: ' . $e->getMessage();
+ }
+ 
+-// User admin session -> user profile wall replies
+-// User admin sessions
+-try {
+-    $old = $conn->get('nl1_users_admin_session', ['id', '<>', 0]);
+-    if ($old->count()) {
+-        $old = $old->results();
+-
+-        foreach ($old as $item) {
+-            DB::getInstance()->insert('users_admin_session', [
+-                'id' => $item->id,
+-                'user_id' => $item->user_id,
+-                'hash' => $item->hash
+-            ]);
+-        }
+-    }
+-} catch (Exception $e) {
+-    $errors[] = 'Unable to convert user admin sessions: ' . $e->getMessage();
+-}
+-
+-// User sessions
+-try {
+-    $old = $conn->get('nl1_users_session', ['id', '<>', 0]);
+-    if ($old->count()) {
+-        $old = $old->results();
+-
+-        foreach ($old as $item) {
+-            DB::getInstance()->insert('users_session', [
+-                'id' => $item->id,
+-                'user_id' => $item->user_id,
+-                'hash' => $item->hash
+-            ]);
+-        }
+-    }
+-} catch (Exception $e) {
+-    $errors[] = 'Unable to convert user sessions: ' . $e->getMessage();
+-}
+-
+ // Username history
+ try {
+     $old = $conn->get('nl1_users_username_history', ['id', '<>', 0]);
+diff --git a/core/migrations/20220807142446_add_user_session_activity_columns.php b/core/migrations/20220807142446_add_user_session_activity_columns.php
+new file mode 100644
+index 0000000000..5a2e0a08fd
+--- /dev/null
++++ b/core/migrations/20220807142446_add_user_session_activity_columns.php
+@@ -0,0 +1,22 @@
++<?php
++declare(strict_types=1);
++
++use Phinx\Migration\AbstractMigration;
++
++final class AddUserSessionActivityColumns extends AbstractMigration
++{
++    public function change(): void
++    {
++        $table = $this->table('nl2_users_session');
++        $table->addColumn('remember_me', 'boolean', ['default' => false]);
++        $table->addColumn('active', 'boolean', ['default' => false]);
++        $table->addColumn('device_name', 'string', ['length' => 256, 'null' => true, 'default' => null]);
++        $table->addColumn('last_seen', 'integer', ['length' => 11, 'null' => true, 'default' => null]);
++        $table->addColumn('login_method', 'string', ['length' => 32]);
++        $table->addIndex('hash', ['unique' => true]);
++        $table->update();
++
++        // Remove old data
++        $table->truncate();
++    }
++}
+diff --git a/core/migrations/20220807153708_delete_admin_session_table.php b/core/migrations/20220807153708_delete_admin_session_table.php
+new file mode 100644
+index 0000000000..4a7524c3fa
+--- /dev/null
++++ b/core/migrations/20220807153708_delete_admin_session_table.php
+@@ -0,0 +1,14 @@
++<?php
++declare(strict_types=1);
++
++use Phinx\Migration\AbstractMigration;
++
++final class DeleteAdminSessionTable extends AbstractMigration
++{
++    public function change(): void
++    {
++        $table = $this->table('nl2_users_admin_session');
++        $table->drop();
++        $table->update();
++    }
++}
+diff --git a/modules/Core/hooks/DeleteUserHook.php b/modules/Core/hooks/DeleteUserHook.php
+index f8d76beeb4..dee829e171 100644
+--- a/modules/Core/hooks/DeleteUserHook.php
++++ b/modules/Core/hooks/DeleteUserHook.php
+@@ -54,7 +54,6 @@ public static function execute(array $params = []): void {
+             $db->delete('reports_comments', ['commenter_id', $params['user_id']]);
+ 
+             // User sessions
+-            $db->delete('users_admin_session', ['user_id', $params['user_id']]);
+             $db->delete('users_session', ['user_id', $params['user_id']]);
+ 
+             // Profile fields
+diff --git a/modules/Core/pages/user/settings.php b/modules/Core/pages/user/settings.php
+index 3d0097e709..68d6c00b6d 100644
+--- a/modules/Core/pages/user/settings.php
++++ b/modules/Core/pages/user/settings.php
+@@ -2,7 +2,7 @@
+ /*
+  *  Made by Samerton
+  *  https://github.com/NamelessMC/Nameless/
+- *  NamelessMC version 2.0.0-pr13
++ *  NamelessMC version 2.0.2
+  *
+  *  License: MIT
+  *
+@@ -80,6 +80,10 @@
+                                 'tfa_enabled' => true,
+                                 'tfa_type' => 1
+                             ]);
++
++                            // Logout all other sessions for this user
++                            $user->logoutAllOtherSessions();
++
+                             Session::delete('force_tfa_alert');
+                             Session::flash('tfa_success', $language->get('user', 'tfa_successful'));
+                             Redirect::to(URL::build('/user/settings'));
+@@ -364,6 +368,9 @@
+                                 'pass_method' => 'default'
+                             ]);
+ 
++                            // Logout all other sessions for this user
++                            $user->logoutAllOtherSessions();
++
+                             $success = $language->get('user', 'password_changed_successfully');
+ 
+                         } else {
+@@ -410,7 +417,7 @@
+ 
+                                     // Update email
+                                     $user->update([
+-                                        'email' => Output::getClean($_POST['email'])
++                                        'email' => $_POST['email']
+                                     ]);
+ 
+                                     Session::flash('settings_success', $language->get('user', 'email_changed_successfully'));

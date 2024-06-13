@@ -1,0 +1,140 @@
+diff --git a/imap/auth_cram.c b/imap/auth_cram.c
+index 218406fdb0c..c33b05f8c1a 100644
+--- a/imap/auth_cram.c
++++ b/imap/auth_cram.c
+@@ -134,7 +134,7 @@ enum ImapAuthRes imap_auth_cram_md5(struct ImapData *idata, const char *method)
+     goto bail;
+   }
+ 
+-  len = mutt_b64_decode(obuf, idata->buf + 2);
++  len = mutt_b64_decode(obuf, idata->buf + 2, sizeof(obuf));
+   if (len == -1)
+   {
+     mutt_debug(1, "Error decoding base64 response.\n");
+diff --git a/imap/auth_gss.c b/imap/auth_gss.c
+index 6870eeb67c4..d5ff2f122b8 100644
+--- a/imap/auth_gss.c
++++ b/imap/auth_gss.c
+@@ -203,7 +203,7 @@ enum ImapAuthRes imap_auth_gss(struct ImapData *idata, const char *method)
+       goto bail;
+     }
+ 
+-    request_buf.length = mutt_b64_decode(buf2, idata->buf + 2);
++    request_buf.length = mutt_b64_decode(buf2, idata->buf + 2, sizeof(buf2));
+     request_buf.value = buf2;
+     sec_token = &request_buf;
+ 
+@@ -238,7 +238,7 @@ enum ImapAuthRes imap_auth_gss(struct ImapData *idata, const char *method)
+     mutt_debug(1, "#2 Error receiving server response.\n");
+     goto bail;
+   }
+-  request_buf.length = mutt_b64_decode(buf2, idata->buf + 2);
++  request_buf.length = mutt_b64_decode(buf2, idata->buf + 2, sizeof(buf2));
+   request_buf.value = buf2;
+ 
+   maj_stat = gss_unwrap(&min_stat, context, &request_buf, &send_token, &cflags, &quality);
+diff --git a/mutt/base64.c b/mutt/base64.c
+index d76e5030e9d..8ae9a60397a 100644
+--- a/mutt/base64.c
++++ b/mutt/base64.c
+@@ -117,8 +117,9 @@ size_t mutt_b64_encode(char *out, const char *cin, size_t len, size_t olen)
+ 
+ /**
+  * mutt_b64_decode - Convert null-terminated base64 string to raw bytes
+- * @param out Output buffer for the raw bytes
+- * @param in  Input  buffer for the null-terminated base64-encoded string
++ * @param out  Output buffer for the raw bytes
++ * @param in   Input  buffer for the null-terminated base64-encoded string
++ * @param olen Length of the output buffer
+  * @retval num Success, bytes written
+  * @retval -1  Error
+  *
+@@ -126,7 +127,7 @@ size_t mutt_b64_encode(char *out, const char *cin, size_t len, size_t olen)
+  * null-terminated. If the input buffer contains invalid base64 characters,
+  * this function returns -1.
+  */
+-int mutt_b64_decode(char *out, const char *in)
++int mutt_b64_decode(char *out, const char *in, size_t olen)
+ {
+   int len = 0;
+   unsigned char digit4;
+@@ -148,14 +149,20 @@ int mutt_b64_decode(char *out, const char *in)
+     in += 4;
+ 
+     /* digits are already sanity-checked */
++    if (len == olen)
++      return len;
+     *out++ = (base64val(digit1) << 2) | (base64val(digit2) >> 4);
+     len++;
+     if (digit3 != '=')
+     {
++      if (len == olen)
++        return len;
+       *out++ = ((base64val(digit2) << 4) & 0xf0) | (base64val(digit3) >> 2);
+       len++;
+       if (digit4 != '=')
+       {
++        if (len == olen)
++          return len;
+         *out++ = ((base64val(digit3) << 6) & 0xc0) | base64val(digit4);
+         len++;
+       }
+diff --git a/mutt/base64.h b/mutt/base64.h
+index b688a79a0a2..8e87400d6c4 100644
+--- a/mutt/base64.h
++++ b/mutt/base64.h
+@@ -28,6 +28,6 @@ extern const int Index64[];
+ #define base64val(c) Index64[(unsigned int) (c)]
+ 
+ size_t mutt_b64_encode(char *out, const char *cin, size_t len, size_t olen);
+-int    mutt_b64_decode(char *out, const char *in);
++int    mutt_b64_decode(char *out, const char *in, size_t olen);
+ 
+ #endif /* _MUTT_BASE64_H */
+diff --git a/mutt/rfc2047.c b/mutt/rfc2047.c
+index bf248364b53..550823a0198 100644
+--- a/mutt/rfc2047.c
++++ b/mutt/rfc2047.c
+@@ -399,8 +399,9 @@ static char *rfc2047_decode_word(const char *s, size_t len, enum ContentEncoding
+   }
+   else if (enc == ENCBASE64)
+   {
+-    char *out = mutt_mem_malloc(3 * len / 4 + 1);
+-    int dlen = mutt_b64_decode(out, it);
++    const int olen = 3 * len / 4 + 1;
++    char *out = mutt_mem_malloc(olen);
++    int dlen = mutt_b64_decode(out, it, olen);
+     if (dlen == -1)
+     {
+       FREE(&out);
+diff --git a/test/base64.c b/test/base64.c
+index 5d6c221d619..f8b77dbc7e3 100644
+--- a/test/base64.c
++++ b/test/base64.c
+@@ -27,7 +27,7 @@ void test_base64_encode(void)
+ void test_base64_decode(void)
+ {
+   char buffer[16];
+-  int len = mutt_b64_decode(buffer, encoded);
++  int len = mutt_b64_decode(buffer, encoded, sizeof(buffer));
+   if (!TEST_CHECK(len == sizeof(clear) - 1))
+   {
+     TEST_MSG("Expected: %zu", sizeof(clear) - 1);
+@@ -59,7 +59,7 @@ void test_base64_lengths(void)
+ 
+   /* Decoding a zero-length string should fail, too */
+   out1[0] = '\0';
+-  declen = mutt_b64_decode(out2, out1);
++  declen = mutt_b64_decode(out2, out1, sizeof(out2));
+   if (!TEST_CHECK(declen == -1))
+   {
+     TEST_MSG("Expected: %zu", -1);
+@@ -76,7 +76,7 @@ void test_base64_lengths(void)
+       TEST_MSG("Expected: %zu", exp);
+       TEST_MSG("Actual  : %zu", enclen);
+     }
+-    declen = mutt_b64_decode(out2, out1);
++    declen = mutt_b64_decode(out2, out1, sizeof(out2));
+     if (!TEST_CHECK(declen == i))
+     {
+       TEST_MSG("Expected: %zu", i);

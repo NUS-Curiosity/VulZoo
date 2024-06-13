@@ -1,0 +1,373 @@
+diff --git a/src/OrchardCore.Modules/OrchardCore.ContentFields/Drivers/LinkFieldDisplayDriver.cs b/src/OrchardCore.Modules/OrchardCore.ContentFields/Drivers/LinkFieldDisplayDriver.cs
+index e31df434b5c..cf8e9d2cbc6 100644
+--- a/src/OrchardCore.Modules/OrchardCore.ContentFields/Drivers/LinkFieldDisplayDriver.cs
++++ b/src/OrchardCore.Modules/OrchardCore.ContentFields/Drivers/LinkFieldDisplayDriver.cs
+@@ -1,4 +1,5 @@
+ using System;
++using System.Text.Encodings.Web;
+ using System.Threading.Tasks;
+ using Microsoft.AspNetCore.Mvc.Infrastructure;
+ using Microsoft.AspNetCore.Mvc.Routing;
+@@ -11,6 +12,7 @@
+ using OrchardCore.ContentManagement.Metadata.Models;
+ using OrchardCore.DisplayManagement.ModelBinding;
+ using OrchardCore.DisplayManagement.Views;
++using OrchardCore.Infrastructure.Html;
+ using OrchardCore.Mvc.ModelBinding;
+ 
+ namespace OrchardCore.ContentFields.Drivers
+@@ -20,15 +22,21 @@ public class LinkFieldDisplayDriver : ContentFieldDisplayDriver<LinkField>
+         private readonly IUrlHelperFactory _urlHelperFactory;
+         private readonly IActionContextAccessor _actionContextAccessor;
+         private readonly IStringLocalizer S;
++        private readonly IHtmlSanitizerService _htmlSanitizerService;
++        private readonly HtmlEncoder _htmlencoder;
+ 
+         public LinkFieldDisplayDriver(
+             IUrlHelperFactory urlHelperFactory,
+             IActionContextAccessor actionContextAccessor,
+-            IStringLocalizer<LinkFieldDisplayDriver> localizer)
++            IStringLocalizer<LinkFieldDisplayDriver> localizer,
++            IHtmlSanitizerService htmlSanitizerService,
++            HtmlEncoder htmlencoder)
+         {
+             _urlHelperFactory = urlHelperFactory;
+             _actionContextAccessor = actionContextAccessor;
+             S = localizer;
++            _htmlSanitizerService = htmlSanitizerService;
++            _htmlencoder = htmlencoder;
+         }
+ 
+         public override IDisplayResult Display(LinkField field, BuildFieldDisplayContext context)
+@@ -91,6 +99,15 @@ public override async Task<IDisplayResult> UpdateAsync(LinkField field, IUpdateM
+                 {
+                     updater.ModelState.AddModelError(Prefix, nameof(field.Url), S["{0} is an invalid url.", field.Url]);
+                 }
++                else
++                {
++                    var link = $"<a href=\"{_htmlencoder.Encode(urlToValidate)}\"></a>";
++
++                    if (!String.Equals(link, _htmlSanitizerService.Sanitize(link), StringComparison.OrdinalIgnoreCase))
++                    {
++                        updater.ModelState.AddModelError(Prefix, nameof(field.Url), S["{0} is an invalid url.", field.Url]);
++                    }
++                }
+ 
+                 // Validate Text
+                 if (settings.LinkTextMode == LinkTextMode.Required && String.IsNullOrWhiteSpace(field.Text))
+@@ -101,9 +118,6 @@ public override async Task<IDisplayResult> UpdateAsync(LinkField field, IUpdateM
+                 {
+                     updater.ModelState.AddModelError(Prefix, nameof(field.Text), S["The text default value is required for {0}.", context.PartFieldDefinition.DisplayName()]);
+                 }
+-
+-                // Run this through a sanitizer in case someone puts html in it.
+-                // No settings.
+             }
+ 
+             return Edit(field, context);
+diff --git a/src/OrchardCore.Modules/OrchardCore.Contents/AuditTrail/Controllers/AuditTrailContentController.cs b/src/OrchardCore.Modules/OrchardCore.Contents/AuditTrail/Controllers/AuditTrailContentController.cs
+index 582f47b8ec1..88aff43c623 100644
+--- a/src/OrchardCore.Modules/OrchardCore.Contents/AuditTrail/Controllers/AuditTrailContentController.cs
++++ b/src/OrchardCore.Modules/OrchardCore.Contents/AuditTrail/Controllers/AuditTrailContentController.cs
+@@ -111,12 +111,15 @@ public async Task<ActionResult> Restore(string auditTrailEventId)
+             }
+ 
+             var result = await _contentManager.RestoreAsync(contentItem);
++
+             if (!result.Succeeded)
+             {
+                 await _notifier.WarningAsync(H["'{0}' was not restored, the version is not valid.", contentItem.DisplayText]);
++
+                 foreach (var error in result.Errors)
+                 {
+-                    await _notifier.WarningAsync(new LocalizedHtmlString(error.ErrorMessage, error.ErrorMessage));
++                    // Pass ErrorMessage as an argument to ensure it is encoded
++                    await _notifier.WarningAsync(new LocalizedHtmlString(nameof(AuditTrailContentController.Restore), "{0}", false, error.ErrorMessage));
+                 }
+ 
+                 return RedirectToAction("Index", "Admin", new { area = "OrchardCore.AuditTrail" });
+diff --git a/src/OrchardCore.Modules/OrchardCore.Menu/Drivers/HtmlMenuItemPartDisplayDriver.cs b/src/OrchardCore.Modules/OrchardCore.Menu/Drivers/HtmlMenuItemPartDisplayDriver.cs
+index eb331b27fdf..f483404ac44 100644
+--- a/src/OrchardCore.Modules/OrchardCore.Menu/Drivers/HtmlMenuItemPartDisplayDriver.cs
++++ b/src/OrchardCore.Modules/OrchardCore.Menu/Drivers/HtmlMenuItemPartDisplayDriver.cs
+@@ -1,4 +1,9 @@
++using System;
++using System.Text.Encodings.Web;
+ using System.Threading.Tasks;
++using Microsoft.AspNetCore.Mvc.Infrastructure;
++using Microsoft.AspNetCore.Mvc.Routing;
++using Microsoft.Extensions.Localization;
+ using OrchardCore.ContentManagement.Display.ContentDisplay;
+ using OrchardCore.ContentManagement.Display.Models;
+ using OrchardCore.DisplayManagement.ModelBinding;
+@@ -12,11 +17,25 @@ namespace OrchardCore.Menu.Drivers
+ {
+     public class HtmlMenuItemPartDisplayDriver : ContentPartDisplayDriver<HtmlMenuItemPart>
+     {
++        private readonly IUrlHelperFactory _urlHelperFactory;
++        private readonly IActionContextAccessor _actionContextAccessor;
+         private readonly IHtmlSanitizerService _htmlSanitizerService;
++        private readonly HtmlEncoder _htmlencoder;
++        private readonly IStringLocalizer S;
+ 
+-        public HtmlMenuItemPartDisplayDriver(IHtmlSanitizerService htmlSanitizerService)
++        public HtmlMenuItemPartDisplayDriver(
++            IUrlHelperFactory urlHelperFactory,
++            IActionContextAccessor actionContextAccessor,
++            IStringLocalizer<HtmlMenuItemPartDisplayDriver> localizer,
++            IHtmlSanitizerService htmlSanitizerService,
++            HtmlEncoder htmlencoder
++            )
+         {
++            _urlHelperFactory = urlHelperFactory;
++            _actionContextAccessor = actionContextAccessor;
+             _htmlSanitizerService = htmlSanitizerService;
++            _htmlencoder = htmlencoder;
++            S = localizer;
+         }
+ 
+         public override IDisplayResult Display(HtmlMenuItemPart part, BuildPartDisplayContext context)
+@@ -62,6 +81,35 @@ public override async Task<IDisplayResult> UpdateAsync(HtmlMenuItemPart part, IU
+                 part.ContentItem.DisplayText = model.Name;
+                 part.Html = settings.SanitizeHtml ? _htmlSanitizerService.Sanitize(model.Html) : model.Html;
+                 part.Url = model.Url;
++
++                var urlToValidate = part.Url;
++
++                if (!String.IsNullOrEmpty(urlToValidate))
++                {
++                    urlToValidate = urlToValidate.Split('#', 2)[0];
++
++                    if (urlToValidate.StartsWith("~/", StringComparison.Ordinal))
++                    {
++                        var urlHelper = _urlHelperFactory.GetUrlHelper(_actionContextAccessor.ActionContext);
++                        urlToValidate = urlHelper.Content(urlToValidate);
++                    }
++
++                    urlToValidate = urlToValidate.ToUriComponents();
++
++                    if (!Uri.IsWellFormedUriString(urlToValidate, UriKind.RelativeOrAbsolute))
++                    {
++                        updater.ModelState.AddModelError(nameof(part.Url), S["{0} is an invalid url.", part.Url]);
++                    }
++                    else
++                    {
++                        var link = $"<a href=\"{_htmlencoder.Encode(urlToValidate)}\"></a>";
++
++                        if (!String.Equals(link, _htmlSanitizerService.Sanitize(link), StringComparison.OrdinalIgnoreCase))
++                        {
++                            updater.ModelState.AddModelError(nameof(part.Url), S["{0} is an invalid url.", part.Url]);
++                        }
++                    }
++                }
+             }
+ 
+             return Edit(part, context);
+diff --git a/src/OrchardCore.Modules/OrchardCore.Menu/Drivers/LinkMenuItemPartDisplayDriver.cs b/src/OrchardCore.Modules/OrchardCore.Menu/Drivers/LinkMenuItemPartDisplayDriver.cs
+index 1fd1dfd4764..f6c078cdbc3 100644
+--- a/src/OrchardCore.Modules/OrchardCore.Menu/Drivers/LinkMenuItemPartDisplayDriver.cs
++++ b/src/OrchardCore.Modules/OrchardCore.Menu/Drivers/LinkMenuItemPartDisplayDriver.cs
+@@ -1,8 +1,14 @@
++using System;
++using System.Text.Encodings.Web;
+ using System.Threading.Tasks;
++using Microsoft.AspNetCore.Mvc.Infrastructure;
++using Microsoft.AspNetCore.Mvc.Routing;
++using Microsoft.Extensions.Localization;
+ using OrchardCore.ContentManagement.Display.ContentDisplay;
+ using OrchardCore.ContentManagement.Display.Models;
+ using OrchardCore.DisplayManagement.ModelBinding;
+ using OrchardCore.DisplayManagement.Views;
++using OrchardCore.Infrastructure.Html;
+ using OrchardCore.Menu.Models;
+ using OrchardCore.Menu.ViewModels;
+ 
+@@ -10,6 +16,26 @@ namespace OrchardCore.Menu.Drivers
+ {
+     public class LinkMenuItemPartDisplayDriver : ContentPartDisplayDriver<LinkMenuItemPart>
+     {
++        private readonly IUrlHelperFactory _urlHelperFactory;
++        private readonly IActionContextAccessor _actionContextAccessor;
++        private readonly IHtmlSanitizerService _htmlSanitizerService;
++        private readonly HtmlEncoder _htmlencoder;
++        private readonly IStringLocalizer S;
++
++        public LinkMenuItemPartDisplayDriver(
++            IUrlHelperFactory urlHelperFactory,
++            IActionContextAccessor actionContextAccessor,
++            IStringLocalizer<LinkMenuItemPartDisplayDriver> localizer,
++            IHtmlSanitizerService htmlSanitizerService,
++            HtmlEncoder htmlencoder
++            )
++        {
++            _urlHelperFactory = urlHelperFactory;
++            _actionContextAccessor = actionContextAccessor; 
++            _htmlSanitizerService = htmlSanitizerService;
++            _htmlencoder = htmlencoder;
++            S = localizer;
++        }
+ 
+         public override IDisplayResult Display(LinkMenuItemPart part, BuildPartDisplayContext context)
+         {
+@@ -45,11 +71,42 @@ public override async Task<IDisplayResult> UpdateAsync(LinkMenuItemPart part, IU
+             {
+                 part.Url = model.Url;
+                 part.ContentItem.DisplayText = model.Name;
++
+                 // This code can be removed in a later release.
+ #pragma warning disable 0618
+                 part.Name = model.Name;
+ #pragma warning restore 0618
++
++                var urlToValidate = part.Url;
++
++                if (!String.IsNullOrEmpty(urlToValidate))
++                {
++                    urlToValidate = urlToValidate.Split('#', 2)[0];
++
++                    if (urlToValidate.StartsWith("~/", StringComparison.Ordinal))
++                    {
++                        var urlHelper = _urlHelperFactory.GetUrlHelper(_actionContextAccessor.ActionContext);
++                        urlToValidate = urlHelper.Content(urlToValidate);
++                    }
++
++                    urlToValidate = urlToValidate.ToUriComponents();
++
++                    if (!Uri.IsWellFormedUriString(urlToValidate, UriKind.RelativeOrAbsolute))
++                    {
++                        updater.ModelState.AddModelError(nameof(part.Url), S["{0} is an invalid url.", part.Url]);
++                    }
++                    else
++                    {
++                        var link = $"<a href=\"{_htmlencoder.Encode(urlToValidate)}\"></a>";
++
++                        if (!String.Equals(link, _htmlSanitizerService.Sanitize(link), StringComparison.OrdinalIgnoreCase))
++                        {
++                            updater.ModelState.AddModelError(nameof(part.Url), S["{0} is an invalid url.", part.Url]);
++                        }
++                    }
++                }
+             }
++
+             return Edit(part);
+         }
+     }
+diff --git a/src/OrchardCore.Modules/OrchardCore.Users/Workflows/Activities/RegisterUserTask.cs b/src/OrchardCore.Modules/OrchardCore.Users/Workflows/Activities/RegisterUserTask.cs
+index 0b1ff322245..39d0b738430 100644
+--- a/src/OrchardCore.Modules/OrchardCore.Users/Workflows/Activities/RegisterUserTask.cs
++++ b/src/OrchardCore.Modules/OrchardCore.Users/Workflows/Activities/RegisterUserTask.cs
+@@ -134,15 +134,14 @@ public override async Task<ActivityExecutionResult> ExecuteAsync(WorkflowExecuti
+                     workflowContext.Properties["EmailConfirmationUrl"] = uri;
+ 
+                     var subject = await _expressionEvaluator.EvaluateAsync(ConfirmationEmailSubject, workflowContext, null);
+-                    var localizedSubject = new LocalizedString(nameof(RegisterUserTask), subject);
+ 
+                     var body = await _expressionEvaluator.EvaluateAsync(ConfirmationEmailTemplate, workflowContext, _htmlEncoder);
+-                    var localizedBody = new LocalizedHtmlString(nameof(RegisterUserTask), body);
++
+                     var message = new MailMessage()
+                     {
+                         To = email,
+-                        Subject = localizedSubject.ResourceNotFound ? subject : localizedSubject.Value,
+-                        Body = localizedBody.IsResourceNotFound ? body : localizedBody.Value,
++                        Subject = subject,
++                        Body = body,
+                         IsBodyHtml = true
+                     };
+                     var smtpService = _httpContextAccessor.HttpContext.RequestServices.GetService<ISmtpService>();
+diff --git a/src/OrchardCore.Modules/OrchardCore.Workflows/Activities/NotifyTask.cs b/src/OrchardCore.Modules/OrchardCore.Workflows/Activities/NotifyTask.cs
+index 412fe8b034a..20e936fcfd5 100644
+--- a/src/OrchardCore.Modules/OrchardCore.Workflows/Activities/NotifyTask.cs
++++ b/src/OrchardCore.Modules/OrchardCore.Workflows/Activities/NotifyTask.cs
+@@ -55,6 +55,8 @@ public override IEnumerable<Outcome> GetPossibleOutcomes(WorkflowExecutionContex
+         public override async Task<ActivityExecutionResult> ExecuteAsync(WorkflowExecutionContext workflowContext, ActivityContext activityContext)
+         {
+             var message = await _expressionEvaluator.EvaluateAsync(Message, workflowContext, _htmlEncoder);
++
++            // The notification message can contain HTML by design
+             await _notifier.AddAsync(NotificationType, new LocalizedHtmlString(nameof(NotifyTask), message));
+ 
+             return Outcomes("Done");
+diff --git a/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Items/UserTaskEvent.Fields.Design.cshtml b/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Items/UserTaskEvent.Fields.Design.cshtml
+index e34b1591331..41e929c0013 100644
+--- a/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Items/UserTaskEvent.Fields.Design.cshtml
++++ b/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Items/UserTaskEvent.Fields.Design.cshtml
+@@ -8,7 +8,7 @@
+ @if (Model.Activity.Actions.Any())
+ {
+     <span>@T["Request any user action of <em>{0}</em>", string.Join(", ", Model.Activity.Actions)]</span><br />
+-    <span>@T["Required roles: <em>{0}</em>", Model.Activity.Roles.Any() ? new LocalizedHtmlString("RequiredRoles", string.Join(", ", Model.Activity.Roles)) : T["Any"]]</span>
++    <span>@T["Required roles: <em>{0}</em>", Model.Activity.Roles.Any() ? Html.Raw(Html.Encode(string.Join(", ", Model.Activity.Roles))) : T["Any"]]</span>
+ }
+ else
+ {
+diff --git a/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Workflow/Details.cshtml b/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Workflow/Details.cshtml
+index 32988dfe651..517b588ad5f 100644
+--- a/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Workflow/Details.cshtml
++++ b/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Workflow/Details.cshtml
+@@ -44,7 +44,7 @@
+                     </div>
+                     <div class="col">
+                         <label>@T["Status"]</label>
+-                        <span>@Model.Workflow.Status.GetLocalizedStatus(T)</span>
++                        <span>@T.GetLocalizedStatus(Model.Workflow.Status)</span>
+                     </div>
+                     @if (Model.Workflow.Status == WorkflowStatus.Faulted)
+                     {
+diff --git a/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Workflow/Index.cshtml b/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Workflow/Index.cshtml
+index 3d3ea9e158a..7b5dd404c63 100644
+--- a/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Workflow/Index.cshtml
++++ b/src/OrchardCore.Modules/OrchardCore.Workflows/Views/Workflow/Index.cshtml
+@@ -104,7 +104,7 @@
+                                 <span class="hint">@T["Created {0}", (object)(await DisplayAsync(await New.TimeSpan(Utc: entry.Workflow.CreatedUtc)))]</span>
+                                 <div class="info">
+                                     <span class="badge badge-@statusCss">
+-                                        @entry.Workflow.Status.GetLocalizedStatus(T)
++                                        @T.GetLocalizedStatus(entry.Workflow.Status)
+                                     </span>
+                                 </div>
+                             </div>
+diff --git a/src/OrchardCore/OrchardCore.Workflows.Abstractions/Helpers/ActivityExtensions.cs b/src/OrchardCore/OrchardCore.Workflows.Abstractions/Helpers/ActivityExtensions.cs
+index f471aeb3632..7cfe4fa2091 100644
+--- a/src/OrchardCore/OrchardCore.Workflows.Abstractions/Helpers/ActivityExtensions.cs
++++ b/src/OrchardCore/OrchardCore.Workflows.Abstractions/Helpers/ActivityExtensions.cs
+@@ -8,8 +8,6 @@ namespace OrchardCore.Workflows.Helpers
+ {
+     public static class ActivityExtensions
+     {
+-        private static IHtmlLocalizer H;
+-
+         public static bool IsEvent(this IActivity activity)
+         {
+             return activity is IEvent;
+@@ -18,14 +16,16 @@ public static bool IsEvent(this IActivity activity)
+         public static LocalizedHtmlString GetTitleOrDefault(this IActivity activity, Func<LocalizedHtmlString> defaultTitle)
+         {
+             var title = activity.As<ActivityMetadata>().Title;
+-            return !string.IsNullOrEmpty(title) ? new LocalizedHtmlString(title, title) : defaultTitle();
++
++            // A string used in LocalizedHtmlString won't be encoded so it needs to be pre-encoded.
++            // Passing the title as an argument so it uses the HtmlEncoder when rendered
++            // Another options would be to use new LocalizedHtmlString(Html.Encode(title)) but it's not available in the current context
++
++            return !string.IsNullOrEmpty(title) ? new LocalizedHtmlString(nameof(ActivityExtensions.GetTitleOrDefault), "{0}", false, title) : defaultTitle();
+         }
+ 
+-        public static LocalizedHtmlString GetLocalizedStatus(this WorkflowStatus status, IHtmlLocalizer localizer)
++        public static LocalizedHtmlString GetLocalizedStatus(this IHtmlLocalizer H, WorkflowStatus status)
+         {
+-            // Field for PoExtractor compatibility
+-            H = localizer;
+-
+             return status switch
+             {
+                 WorkflowStatus.Aborted => H["Aborted"],
+@@ -36,7 +36,7 @@ public static LocalizedHtmlString GetLocalizedStatus(this WorkflowStatus status,
+                 WorkflowStatus.Idle => H["Idle"],
+                 WorkflowStatus.Resuming => H["Resuming"],
+                 WorkflowStatus.Starting => H["Starting"],
+-                _ => new LocalizedHtmlString(status.ToString(), status.ToString()),
++                _ => throw new NotSupportedException(),
+             };
+         }
+     }

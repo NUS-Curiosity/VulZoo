@@ -1,0 +1,180 @@
+diff --git a/spec/ParseLiveQuery.spec.js b/spec/ParseLiveQuery.spec.js
+index 8192597aa0..bb98306e97 100644
+--- a/spec/ParseLiveQuery.spec.js
++++ b/spec/ParseLiveQuery.spec.js
+@@ -784,6 +784,48 @@ describe('ParseLiveQuery', function () {
+     });
+   });
+ 
++  it('should not broadcast event to client with invalid session token - avisory GHSA-2xm2-xj2q-qgpj', async done => {
++    await reconfigureServer({
++      liveQuery: {
++        classNames: ['TestObject'],
++      },
++      liveQueryServerOptions: {
++        cacheTimeout: 100,
++      },
++      startLiveQueryServer: true,
++      verbose: false,
++      silent: true,
++      cacheTTL: 100,
++    });
++    const user = new Parse.User();
++    user.setUsername('username');
++    user.setPassword('password');
++    await user.signUp();
++    const obj1 = new Parse.Object('TestObject');
++    const obj1ACL = new Parse.ACL();
++    obj1ACL.setPublicReadAccess(false);
++    obj1ACL.setReadAccess(user, true);
++    obj1.setACL(obj1ACL);
++    const obj2 = new Parse.Object('TestObject');
++    const obj2ACL = new Parse.ACL();
++    obj2ACL.setPublicReadAccess(false);
++    obj2ACL.setReadAccess(user, true);
++    obj2.setACL(obj2ACL);
++    const query = new Parse.Query('TestObject');
++    const subscription = await query.subscribe();
++    subscription.on('create', obj => {
++      if (obj.id !== obj1.id) {
++        done.fail('should not fire');
++      }
++    });
++    await obj1.save();
++    await Parse.User.logOut();
++    await new Promise(resolve => setTimeout(resolve, 200));
++    await obj2.save();
++    await new Promise(resolve => setTimeout(resolve, 200));
++    done();
++  });
++
+   afterEach(async function (done) {
+     const client = await Parse.CoreManager.getLiveQueryController().getDefaultLiveQueryClient();
+     client.close();
+diff --git a/src/LiveQuery/ParseLiveQueryServer.js b/src/LiveQuery/ParseLiveQueryServer.js
+index f0d0db19a4..6046852376 100644
+--- a/src/LiveQuery/ParseLiveQueryServer.js
++++ b/src/LiveQuery/ParseLiveQueryServer.js
+@@ -30,10 +30,11 @@ class ParseLiveQueryServer {
+   // The subscriber we use to get object update from publisher
+   subscriber: Object;
+ 
+-  constructor(server: any, config: any = {}) {
++  constructor(server: any, config: any = {}, parseServerConfig: any = {}) {
+     this.server = server;
+     this.clients = new Map();
+     this.subscriptions = new Map();
++    this.config = config;
+ 
+     config.appId = config.appId || Parse.applicationId;
+     config.masterKey = config.masterKey || Parse.masterKey;
+@@ -54,13 +55,15 @@ class ParseLiveQueryServer {
+ 
+     // The cache controller is a proper cache controller
+     // with access to User and Roles
+-    this.cacheController = getCacheController(config);
++    this.cacheController = getCacheController(parseServerConfig);
++
++    config.cacheTimeout = config.cacheTimeout || 5 * 1000; // 5s
+ 
+     // This auth cache stores the promises for each auth resolution.
+     // The main benefit is to be able to reuse the same user / session token resolution.
+     this.authCache = new LRU({
+       max: 500, // 500 concurrent
+-      maxAge: 60 * 60 * 1000, // 1h
++      maxAge: config.cacheTimeout,
+     });
+     // Initialize websocket server
+     this.parseWebSocketServer = new ParseWebSocketServer(
+@@ -510,12 +513,11 @@ class ParseLiveQueryServer {
+         // There was an error with the session token
+         const result = {};
+         if (error && error.code === Parse.Error.INVALID_SESSION_TOKEN) {
+-          // Store a resolved promise with the error for 10 minutes
+           result.error = error;
+           this.authCache.set(
+             sessionToken,
+             Promise.resolve(result),
+-            60 * 10 * 1000
++            this.config.cacheTimeout
+           );
+         } else {
+           this.authCache.del(sessionToken);
+diff --git a/src/Options/Definitions.js b/src/Options/Definitions.js
+index 8eaf6d77ff..1d4f2b2138 100644
+--- a/src/Options/Definitions.js
++++ b/src/Options/Definitions.js
+@@ -478,7 +478,7 @@ module.exports.LiveQueryServerOptions = {
+   cacheTimeout: {
+     env: 'PARSE_LIVE_QUERY_SERVER_CACHE_TIMEOUT',
+     help:
+-      "Number in milliseconds. When clients provide the sessionToken to the LiveQuery server, the LiveQuery server will try to fetch its ParseUser's objectId from parse server and store it in the cache. The value defines the duration of the cache. Check the following Security section and our protocol specification for details, defaults to 30 * 24 * 60 * 60 * 1000 ms (~30 days).",
++      "Number in milliseconds. When clients provide the sessionToken to the LiveQuery server, the LiveQuery server will try to fetch its ParseUser's objectId from parse server and store it in the cache. The value defines the duration of the cache. Check the following Security section and our protocol specification for details, defaults to 5 * 1000 ms (5 seconds).",
+     action: parsers.numberParser('cacheTimeout'),
+   },
+   keyPairs: {
+diff --git a/src/Options/docs.js b/src/Options/docs.js
+index 70f5e07196..febe3d77cc 100644
+--- a/src/Options/docs.js
++++ b/src/Options/docs.js
+@@ -100,7 +100,7 @@
+ /**
+  * @interface LiveQueryServerOptions
+  * @property {String} appId This string should match the appId in use by your Parse Server. If you deploy the LiveQuery server alongside Parse Server, the LiveQuery server will try to use the same appId.
+- * @property {Number} cacheTimeout Number in milliseconds. When clients provide the sessionToken to the LiveQuery server, the LiveQuery server will try to fetch its ParseUser's objectId from parse server and store it in the cache. The value defines the duration of the cache. Check the following Security section and our protocol specification for details, defaults to 30 * 24 * 60 * 60 * 1000 ms (~30 days).
++ * @property {Number} cacheTimeout Number in milliseconds. When clients provide the sessionToken to the LiveQuery server, the LiveQuery server will try to fetch its ParseUser's objectId from parse server and store it in the cache. The value defines the duration of the cache. Check the following Security section and our protocol specification for details, defaults to 5 * 1000 ms (5 seconds).
+  * @property {Any} keyPairs A JSON object that serves as a whitelist of keys. It is used for validating clients when they try to connect to the LiveQuery server. Check the following Security section and our protocol specification for details.
+  * @property {String} logLevel This string defines the log level of the LiveQuery server. We support VERBOSE, INFO, ERROR, NONE, defaults to INFO.
+  * @property {String} masterKey This string should match the masterKey in use by your Parse Server. If you deploy the LiveQuery server alongside Parse Server, the LiveQuery server will try to use the same masterKey.
+diff --git a/src/Options/index.js b/src/Options/index.js
+index 0e97d84b5a..1283f849a7 100644
+--- a/src/Options/index.js
++++ b/src/Options/index.js
+@@ -260,7 +260,7 @@ export interface LiveQueryServerOptions {
+   keyPairs: ?any;
+   /* Number of milliseconds between ping/pong frames. The WebSocket server sends ping/pong frames to the clients to keep the WebSocket alive. This value defines the interval of the ping/pong frame from the server to clients, defaults to 10 * 1000 ms (10 s).*/
+   websocketTimeout: ?number;
+-  /* Number in milliseconds. When clients provide the sessionToken to the LiveQuery server, the LiveQuery server will try to fetch its ParseUser's objectId from parse server and store it in the cache. The value defines the duration of the cache. Check the following Security section and our protocol specification for details, defaults to 30 * 24 * 60 * 60 * 1000 ms (~30 days).*/
++  /* Number in milliseconds. When clients provide the sessionToken to the LiveQuery server, the LiveQuery server will try to fetch its ParseUser's objectId from parse server and store it in the cache. The value defines the duration of the cache. Check the following Security section and our protocol specification for details, defaults to 5 * 1000 ms (5 seconds).*/
+   cacheTimeout: ?number;
+   /* This string defines the log level of the LiveQuery server. We support VERBOSE, INFO, ERROR, NONE, defaults to INFO.*/
+   logLevel: ?string;
+diff --git a/src/ParseServer.js b/src/ParseServer.js
+index f7d4e6ab63..383ad46712 100644
+--- a/src/ParseServer.js
++++ b/src/ParseServer.js
+@@ -298,7 +298,8 @@ class ParseServer {
+     if (options.startLiveQueryServer || options.liveQueryServerOptions) {
+       this.liveQueryServer = ParseServer.createLiveQueryServer(
+         server,
+-        options.liveQueryServerOptions
++        options.liveQueryServerOptions,
++        options
+       );
+     }
+     /* istanbul ignore next */
+@@ -324,16 +325,21 @@ class ParseServer {
+    * Helper method to create a liveQuery server
+    * @static
+    * @param {Server} httpServer an optional http server to pass
+-   * @param {LiveQueryServerOptions} config options fot he liveQueryServer
++   * @param {LiveQueryServerOptions} config options for the liveQueryServer
++   * @param {ParseServerOptions} options options for the ParseServer
+    * @returns {ParseLiveQueryServer} the live query server instance
+    */
+-  static createLiveQueryServer(httpServer, config: LiveQueryServerOptions) {
++  static createLiveQueryServer(
++    httpServer,
++    config: LiveQueryServerOptions,
++    options: ParseServerOptions
++  ) {
+     if (!httpServer || (config && config.port)) {
+       var app = express();
+       httpServer = require('http').createServer(app);
+       httpServer.listen(config.port);
+     }
+-    return new ParseLiveQueryServer(httpServer, config);
++    return new ParseLiveQueryServer(httpServer, config, options);
+   }
+ 
+   static verifyServerUrl(callback) {

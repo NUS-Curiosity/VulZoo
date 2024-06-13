@@ -1,0 +1,567 @@
+diff --git a/carrierwave.gemspec b/carrierwave.gemspec
+index 4bcfec28f..9ff593167 100644
+--- a/carrierwave.gemspec
++++ b/carrierwave.gemspec
+@@ -27,6 +27,7 @@ Gem::Specification.new do |s|
+   s.add_dependency "image_processing", "~> 1.1"
+   s.add_dependency "mimemagic", ">= 0.3.0"
+   s.add_dependency "addressable", "~> 2.6"
++  s.add_dependency "ssrf_filter", "~> 1.0"
+   if RUBY_ENGINE == 'jruby'
+     s.add_development_dependency 'activerecord-jdbcpostgresql-adapter'
+   else
+diff --git a/features/step_definitions/download_steps.rb b/features/step_definitions/download_steps.rb
+index b36acfaae..63a92950c 100644
+--- a/features/step_definitions/download_steps.rb
++++ b/features/step_definitions/download_steps.rb
+@@ -1,6 +1,6 @@
+ When /^I download the file '([^']+)'/ do |url|
+   unless ENV['REMOTE'] == 'true'
+-    stub_request(:get, "s3.amazonaws.com/Monkey/testfile.txt").
++    stub_request(:get, %r{/Monkey/testfile.txt}).
+       to_return(body: "S3 Remote File", headers: { "Content-Type" => "text/plain" })
+   end
+ 
+diff --git a/lib/carrierwave/downloader/base.rb b/lib/carrierwave/downloader/base.rb
+index 12a39f228..b040bbc4e 100644
+--- a/lib/carrierwave/downloader/base.rb
++++ b/lib/carrierwave/downloader/base.rb
+@@ -1,4 +1,5 @@
+ require 'open-uri'
++require 'ssrf_filter'
+ require 'addressable'
+ require 'carrierwave/downloader/remote_file'
+ 
+@@ -22,12 +23,22 @@ def initialize(uploader)
+       def download(url, remote_headers = {})
+         headers = remote_headers.
+           reverse_merge('User-Agent' => "CarrierWave/#{CarrierWave::VERSION}")
++        uri = process_uri(url.to_s)
+         begin
+-          file = OpenURI.open_uri(process_uri(url.to_s), headers)
++          if skip_ssrf_protection?(uri)
++            response = OpenURI.open_uri(process_uri(url.to_s), headers)
++          else
++            request = nil
++            response = SsrfFilter.get(uri, headers: headers) do |req|
++              request = req
++            end
++            response.uri = request.uri
++            response.value
++          end
+         rescue StandardError => e
+           raise CarrierWave::DownloadError, "could not download file: #{e.message}"
+         end
+-        CarrierWave::Downloader::RemoteFile.new(file)
++        CarrierWave::Downloader::RemoteFile.new(response)
+       end
+ 
+       ##
+@@ -49,6 +60,28 @@ def process_uri(uri)
+       rescue URI::InvalidURIError, Addressable::URI::InvalidURIError
+         raise CarrierWave::DownloadError, "couldn't parse URL: #{uri}"
+       end
++
++      ##
++      # If this returns true, SSRF protection will be bypassed.
++      # You can override this if you want to allow accessing specific local URIs that are not SSRF exploitable.
++      #
++      # === Parameters
++      #
++      # [uri (URI)] The URI where the remote file is stored
++      #
++      # === Examples
++      #
++      #     class CarrierWave::Downloader::CustomDownloader < CarrierWave::Downloader::Base
++      #       def skip_ssrf_protection?(uri)
++      #         uri.hostname == 'localhost' && uri.port == 80
++      #       end
++      #     end
++      #
++      #     my_uploader.downloader = CarrierWave::Downloader::CustomDownloader
++      #
++      def skip_ssrf_protection?(uri)
++        false
++      end
+     end
+   end
+ end
+diff --git a/lib/carrierwave/downloader/remote_file.rb b/lib/carrierwave/downloader/remote_file.rb
+index 654e5a2bb..d90a34e31 100644
+--- a/lib/carrierwave/downloader/remote_file.rb
++++ b/lib/carrierwave/downloader/remote_file.rb
+@@ -1,15 +1,36 @@
+ module CarrierWave
+   module Downloader
+     class RemoteFile
+-      attr_reader :file
++      attr_reader :file, :uri
+ 
+       def initialize(file)
+-        @file = file.is_a?(String) ? StringIO.new(file) : file
++        case file
++        when String
++          @file = StringIO.new(file)
++        when Net::HTTPResponse
++          @file = StringIO.new(file.body)
++          @content_type = file.content_type
++          @headers = file
++          @uri = file.uri
++        else
++          @file = file
++          @content_type = file.content_type
++          @headers = file.meta
++          @uri = file.base_uri
++        end
++      end
++
++      def content_type
++        @content_type || 'application/octet-stream'
++      end
++
++      def headers
++        @headers || {}
+       end
+ 
+       def original_filename
+         filename = filename_from_header || filename_from_uri
+-        mime_type = MiniMime.lookup_by_content_type(file.content_type)
++        mime_type = MiniMime.lookup_by_content_type(content_type)
+         unless File.extname(filename).present? || mime_type.blank?
+           filename = "#{filename}.#{mime_type.extension}"
+         end
+@@ -23,16 +44,16 @@ def respond_to?(*args)
+       private
+ 
+       def filename_from_header
+-        return nil unless file.meta.include? 'content-disposition'
++        return nil unless headers['content-disposition']
+ 
+-        match = file.meta['content-disposition'].match(/filename=(?:"([^"]+)"|([^";]+))/)
++        match = headers['content-disposition'].match(/filename=(?:"([^"]+)"|([^";]+))/)
+         return nil unless match
+ 
+         match[1].presence || match[2].presence
+       end
+ 
+       def filename_from_uri
+-        CGI.unescape(File.basename(file.base_uri.path))
++        CGI.unescape(File.basename(uri.path))
+       end
+ 
+       def method_missing(*args, &block)
+diff --git a/spec/downloader/base_spec.rb b/spec/downloader/base_spec.rb
+index 3ca8a3c2a..337e4f4cc 100644
+--- a/spec/downloader/base_spec.rb
++++ b/spec/downloader/base_spec.rb
+@@ -26,21 +26,6 @@
+     end
+   end
+ 
+-  context "with a URL with internationalized domain name" do
+-    let(:uri) { "http://ドメイン名例.jp/#{CGI.escape(filename)}" }
+-    before do
+-      stub_request(:get, 'http://xn--eckwd4c7cu47r2wf.jp/test.jpg').to_return(body: file)
+-    end
+-
+-    it "converts to Punycode URI" do
+-      expect(subject.process_uri(uri).to_s).to eq 'http://xn--eckwd4c7cu47r2wf.jp/test.jpg'
+-    end
+-
+-    it "downloads a file" do
+-      expect(subject.download(uri).file.read).to eq file
+-    end
+-  end
+-
+   context "with equal and colons in the query path" do
+     let(:query) { 'test=query&with=equal&before=colon:param' }
+     let(:uri) { "https://example.com/#{filename}?#{query}" }
+@@ -77,10 +62,6 @@
+     end
+   end
+ 
+-  it "raises an error when trying to download a local file" do
+-    expect { subject.download('/etc/passwd') }.to raise_error(CarrierWave::DownloadError)
+-  end
+-
+   context "with missing file" do
+     before do
+       stub_request(:get, uri).to_return(status: 404)
+@@ -95,6 +76,20 @@
+     end
+   end
+ 
++  context "with server error" do
++    before do
++      stub_request(:get, uri).to_return(status: 500)
++    end
++
++    it "raises an error when trying to download" do
++      expect{ subject.download(uri) }.to raise_error(CarrierWave::DownloadError)
++    end
++
++    it "doesn't obscure original exception message" do
++      expect { subject.download(uri) }.to raise_error(CarrierWave::DownloadError, /could not download file: 500/)
++    end
++  end
++
+   context "with a url that contains space" do
+     let(:filename) { "my test.jpg" }
+     before do
+@@ -111,7 +106,7 @@
+     before do
+       stub_request(:get, uri).
+         to_return(status: 301, body: "Redirecting", headers: { "Location" => another_uri })
+-      stub_request(:get, another_uri).to_return(body: file)
++      stub_request(:get, /redirected.jpg/).to_return(body: file)
+     end
+ 
+     it "retrieves redirected file" do
+@@ -123,7 +118,31 @@
+     end
+   end
+ 
++  context "with SSRF prevention" do
++    before do
++      stub_request(:get, 'http://169.254.169.254/').to_return(body: file)
++      stub_request(:get, 'http://127.0.0.1/').to_return(body: file)
++    end
++
++    it "prevents accessing local files" do
++      expect { subject.download('/etc/passwd') }.to raise_error(CarrierWave::DownloadError)
++      expect { subject.download('file:///etc/passwd') }.to raise_error(CarrierWave::DownloadError)
++    end
++
++    it "prevents accessing internal addresses" do
++      expect { uploader.download!("http://169.254.169.254/") }.to raise_error CarrierWave::DownloadError
++      expect { uploader.download!("http://lvh.me/") }.to raise_error CarrierWave::DownloadError
++    end
++  end
++
+   describe '#process_uri' do
++    it "converts a URL with internationalized domain name to Punycode URI" do
++      uri = "http://ドメイン名例.jp/#{CGI.escape(filename)}"
++      processed = subject.process_uri(uri)
++      expect(processed.class).to eq(URI::HTTP)
++      expect(processed.to_s).to eq 'http://xn--eckwd4c7cu47r2wf.jp/test.jpg'
++    end
++
+     it "parses but not escape already escaped uris" do
+       uri = 'http://example.com/%5B.jpg'
+       processed = subject.process_uri(uri)
+@@ -178,4 +197,16 @@
+       expect { subject.process_uri(uri) }.to raise_error(CarrierWave::DownloadError)
+     end
+   end
++
++  describe "#skip_ssrf_protection?" do
++    let(:uri) { 'http://localhost/test.jpg' }
++    before do
++      WebMock.stub_request(:get, uri).to_return(body: file)
++      allow(subject).to receive(:skip_ssrf_protection?).and_return(true)
++    end
++
++    it "allows local request to be made" do
++      expect(subject.download(uri).read).to eq 'this is stuff'
++    end
++  end
+ end
+diff --git a/spec/downloader/remote_file_spec.rb b/spec/downloader/remote_file_spec.rb
+index 5ea9915a9..c61aae3e1 100644
+--- a/spec/downloader/remote_file_spec.rb
++++ b/spec/downloader/remote_file_spec.rb
+@@ -1,23 +1,61 @@
+ require 'spec_helper'
+ 
+ describe CarrierWave::Downloader::RemoteFile do
++  subject { CarrierWave::Downloader::RemoteFile.new(file) }
+   let(:file) do
+-    File.open(file_path("test.jpg")).tap { |f| OpenURI::Meta.init(f) }
++    Net::HTTPSuccess.new('1.0', '200', "").tap do |response|
++      response.body = File.read(file_path("test.jpg"))
++      response.instance_variable_set(:@read, true)
++      response.uri = URI.parse 'http://example.com/test'
++      response['content-type'] = 'image/jpeg'
++      response['vary'] = 'Accept-Encoding'
++    end
+   end
+-  subject { CarrierWave::Downloader::RemoteFile.new(file) }
+ 
+-  before do
+-    subject.base_uri = URI.parse 'http://example.com/test'
+-    subject.meta_add_field 'content-type', 'image/jpeg'
++  context 'with Net::HTTPResponse instance' do
++    it 'returns content type' do
++      expect(subject.content_type).to eq 'image/jpeg'
++    end
++
++    it 'returns header' do
++      expect(subject.headers['vary']).to eq 'Accept-Encoding'
++    end
++
++    it 'returns URI' do
++      expect(subject.uri.to_s).to eq 'http://example.com/test'
++    end
+   end
+ 
+-  it 'sets file extension based on content-type if missing' do
+-    expect(subject.original_filename).to eq "test.jpeg"
++  context 'with OpenURI::Meta instance' do
++    let(:file) do
++      File.open(file_path("test.jpg")).tap { |f| OpenURI::Meta.init(f) }.tap do |file|
++        file.base_uri = URI.parse 'http://example.com/test'
++        file.meta_add_field 'content-type', 'image/jpeg'
++        file.meta_add_field 'vary', 'Accept-Encoding'
++      end
++    end
++    it 'returns content type' do
++      expect(subject.content_type).to eq 'image/jpeg'
++    end
++
++    it 'returns header' do
++      expect(subject.headers['vary']).to eq 'Accept-Encoding'
++    end
++
++    it 'returns URI' do
++      expect(subject.uri.to_s).to eq 'http://example.com/test'
++    end
+   end
+ 
+-  describe 'with content-disposition' do
++
++  describe '#original_filename' do
++    let(:content_disposition){ nil }
+     before do
+-      subject.meta_add_field 'content-disposition', content_disposition
++      file['content-disposition'] = content_disposition if content_disposition
++    end
++
++    it 'sets file extension based on content-type if missing' do
++      expect(subject.original_filename).to eq "test.jpeg"
+     end
+ 
+     context 'when filename is quoted' do
+diff --git a/spec/mount_multiple_spec.rb b/spec/mount_multiple_spec.rb
+index 6a679b02f..9e71f8a44 100644
+--- a/spec/mount_multiple_spec.rb
++++ b/spec/mount_multiple_spec.rb
+@@ -504,7 +504,7 @@ def monkey
+     describe "#remote_images_urls" do
+       subject { instance.remote_images_urls }
+ 
+-      before { stub_request(:get, "www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub)) }
++      before { stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub)) }
+ 
+       context "returns nil" do
+         it { is_expected.to be_nil }
+@@ -521,7 +521,7 @@ def monkey
+       subject(:images) { instance.images }
+ 
+       before do
+-        stub_request(:get, "www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
++        stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
+         stub_request(:get, "http://www.example.com/test.txt").to_return(status: 404)
+         instance.remote_images_urls = remote_images_url
+       end
+@@ -733,7 +733,7 @@ def extension_whitelist
+ 
+         context "when file was downloaded" do
+           before do
+-            stub_request(:get, "www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
++            stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
+             instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"]
+           end
+ 
+@@ -790,7 +790,7 @@ def monkey
+ 
+         context "when file was downloaded" do
+           before do
+-            stub_request(:get, "www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
++            stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
+             instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"]
+           end
+ 
+@@ -803,8 +803,8 @@ def monkey
+       subject(:images_download_errors) { instance.images_download_errors }
+ 
+       before do
+-        stub_request(:get, "www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
+-        stub_request(:get, "www.example.com/missing.jpg").to_return(status: 404)
++        stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: File.read(test_file_stub))
++        stub_request(:get, "http://www.example.com/missing.jpg").to_return(status: 404)
+       end
+ 
+       describe "default behaviour" do
+@@ -978,7 +978,7 @@ def extension_whitelist
+ 
+     context "when a downloaded image fails an integity check" do
+       before do
+-        stub_request(:get, "www.example.com/#{test_file_name}").to_return(body: test_file_stub)
++        stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: test_file_stub)
+       end
+ 
+       it { expect(running {instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"]}).to raise_error(CarrierWave::IntegrityError) }
+@@ -1010,7 +1010,7 @@ def monkey
+ 
+     context "when a downloaded image fails an integity check" do
+       before do
+-        stub_request(:get, "www.example.com/#{test_file_name}").to_return(body: test_file_stub)
++        stub_request(:get, "http://www.example.com/#{test_file_name}").to_return(body: test_file_stub)
+       end
+ 
+       it { expect(running {instance.remote_images_urls = ["http://www.example.com/#{test_file_name}"]}).to raise_error(CarrierWave::ProcessingError) }
+diff --git a/spec/mount_single_spec.rb b/spec/mount_single_spec.rb
+index 1391b97d3..1743de959 100644
+--- a/spec/mount_single_spec.rb
++++ b/spec/mount_single_spec.rb
+@@ -299,7 +299,7 @@ def default_url
+ 
+     describe "#remote_image_url" do
+       before do
+-        stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++        stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+       end
+ 
+       it "returns nil" do
+@@ -334,7 +334,7 @@ def default_url
+ 
+     describe "#remote_image_url=" do
+       before do
+-        stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++        stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+       end
+ 
+       it "does nothing when nil is assigned" do
+@@ -476,7 +476,7 @@ def extension_whitelist
+         end
+ 
+         it "should be an error instance if file was downloaded" do
+-          stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++          stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+           @instance.remote_image_url = "http://www.example.com/test.jpg"
+           e = @instance.image_integrity_error
+ 
+@@ -521,7 +521,7 @@ def monkey
+         end
+ 
+         it "should be an error instance if file was downloaded" do
+-          stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++          stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+           @instance.remote_image_url = "http://www.example.com/test.jpg"
+ 
+           expect(@instance.image_processing_error).to be_an_instance_of(CarrierWave::ProcessingError)
+@@ -531,8 +531,8 @@ def monkey
+ 
+     describe '#image_download_error' do
+       before do
+-        stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+-        stub_request(:get, "www.example.com/missing.jpg").to_return(status: 404)
++        stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++        stub_request(:get, "http://www.example.com/missing.jpg").to_return(status: 404)
+       end
+ 
+       it "should be nil by default" do
+@@ -552,8 +552,8 @@ def monkey
+ 
+     describe '#image_download_error' do
+       before do
+-        stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+-        stub_request(:get, "www.example.com/missing.jpg").to_return(status: 404)
++        stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++        stub_request(:get, "http://www.example.com/missing.jpg").to_return(status: 404)
+       end
+ 
+       it "should be nil by default" do
+@@ -708,7 +708,7 @@ def extension_whitelist
+     end
+ 
+     it "should raise an error if the image fails an integrity check when downloaded" do
+-      stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++      stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+ 
+       expect(running {
+         @instance.remote_image_url = "http://www.example.com/test.jpg"
+@@ -742,7 +742,7 @@ def monkey
+     end
+ 
+     it "should raise an error if the image fails to be processed when downloaded" do
+-      stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++      stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+ 
+       expect(running {
+         @instance.remote_image_url = "http://www.example.com/test.jpg"
+diff --git a/spec/orm/activerecord_spec.rb b/spec/orm/activerecord_spec.rb
+index 339267a21..c5e97d56e 100644
+--- a/spec/orm/activerecord_spec.rb
++++ b/spec/orm/activerecord_spec.rb
+@@ -496,7 +496,7 @@ def monkey
+ 
+     describe "#remote_image_url=" do
+       before do
+-        stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++        stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+       end
+ 
+       # FIXME ideally image_changed? and remote_image_url_changed? would return true
+@@ -1260,7 +1260,7 @@ def monkey
+ 
+     describe "#remote_images_urls=" do
+       before do
+-        stub_request(:get, "www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
++        stub_request(:get, "http://www.example.com/test.jpg").to_return(body: File.read(file_path("test.jpg")))
+       end
+ 
+       # FIXME ideally images_changed? and remote_images_urls_changed? would return true
+diff --git a/spec/spec_helper.rb b/spec/spec_helper.rb
+index f17472000..b5eb5de12 100644
+--- a/spec/spec_helper.rb
++++ b/spec/spec_helper.rb
+@@ -111,6 +111,14 @@ def color_of_pixel(path, x, y)
+         image.run_command("convert", "#{image.path}[1x1+#{x}+#{y}]", "-depth", "8", "txt:").split("\n")[1]
+       end
+     end
++
++    module SsrfProtectionAwareWebMock
++      def stub_request(method, uri)
++        uri = URI.parse(uri) if uri.is_a?(String)
++        uri.hostname = Resolv.getaddress(uri.hostname) if uri.is_a?(URI)
++        super
++      end
++    end
+   end
+ end
+ 
+@@ -120,6 +128,7 @@ def color_of_pixel(path, x, y)
+   config.include CarrierWave::Test::MockStorage
+   config.include CarrierWave::Test::I18nHelpers
+   config.include CarrierWave::Test::ManipulationHelpers
++  config.prepend CarrierWave::Test::SsrfProtectionAwareWebMock
+   if RUBY_ENGINE == 'jruby'
+     config.filter_run_excluding :rmagick => true
+   end
+diff --git a/spec/uploader/download_spec.rb b/spec/uploader/download_spec.rb
+index e3bfba265..ec29169c1 100644
+--- a/spec/uploader/download_spec.rb
++++ b/spec/uploader/download_spec.rb
+@@ -15,8 +15,8 @@
+     before do
+       allow(CarrierWave).to receive(:generate_cache_id).and_return(cache_id)
+ 
+-      stub_request(:get, "www.example.com/#{test_file_name}")
+-        .to_return(body: test_file)
++      stub_request(:get, "http://www.example.com/#{test_file_name}")
++        .to_return(body: test_file, headers: {'content-type': 'image/jpeg'})
+     end
+ 
+     context "when a file was downloaded" do
+@@ -48,6 +48,10 @@
+       it "sets the url" do
+         expect(uploader.url).to eq("/uploads/tmp/#{cache_id}/#{test_file_name}")
+       end
++
++      it "sets the content type" do
++        expect(uploader.content_type).to eq("image/jpeg")
++      end
+     end
+ 
+     context "with directory permissions set" do

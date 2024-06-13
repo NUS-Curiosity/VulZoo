@@ -1,0 +1,414 @@
+diff --git a/etc/security/mh_default_org.xml b/etc/security/mh_default_org.xml
+index a4daa972eea..86b760da293 100644
+--- a/etc/security/mh_default_org.xml
++++ b/etc/security/mh_default_org.xml
+@@ -529,16 +529,22 @@
+   <osgi:reference id="ltiLaunchAuthenticationHandler" cardinality="1..1"
+                   interface="org.springframework.security.oauth.provider.OAuthAuthenticationHandler" />
+ 
++
+   <!-- ############################# -->
+   <!-- # Spring Security Internals # -->
+   <!-- ############################# -->
+ 
++  <bean id="passwordEncoder" class="org.opencastproject.kernel.security.CustomPasswordEncoder" />
++
+   <!-- The JPA user directory stores md5 hashed, salted passwords, so we must use a username-salted md5 password encoder. -->
+   <sec:authentication-manager alias="authenticationManager">
+     <!-- Uncomment this if using Shibboleth authentication -->
+     <!--sec:authentication-provider ref="preauthAuthProvider" /-->
+     <sec:authentication-provider user-service-ref="userDetailsService">
+-      <sec:password-encoder hash="md5"><sec:salt-source user-property="username" /></sec:password-encoder>
++      <sec:password-encoder ref="passwordEncoder">
++        <!-- This salt is used only for decoding legacy MD5 hased passwords -->
++        <sec:salt-source user-property="username" />
++      </sec:password-encoder>
+     </sec:authentication-provider>
+   </sec:authentication-manager>
+ 
+diff --git a/modules/common-jpa-impl/src/main/java/org/opencastproject/security/impl/jpa/JpaUser.java b/modules/common-jpa-impl/src/main/java/org/opencastproject/security/impl/jpa/JpaUser.java
+index 0feeb8868c7..2cf5991e546 100644
+--- a/modules/common-jpa-impl/src/main/java/org/opencastproject/security/impl/jpa/JpaUser.java
++++ b/modules/common-jpa-impl/src/main/java/org/opencastproject/security/impl/jpa/JpaUser.java
+@@ -59,6 +59,8 @@
+   @NamedQuery(name = "User.findByIdAndOrg", query = "select u from JpaUser u where u.id=:id and u.organization.id = :org"),
+   @NamedQuery(name = "User.findByUsername", query = "select u from JpaUser u where u.username=:u and u.organization.id = :org"),
+   @NamedQuery(name = "User.findAll", query = "select u from JpaUser u where u.organization.id = :org"),
++  @NamedQuery(name = "User.findInsecureHash",
++              query = "select u from JpaUser u where length(u.password) = 32 and u.organization.id = :org"),
+   @NamedQuery(name = "User.findAllByUserNames", query = "select u from JpaUser u where u.organization.id = :org AND u.username IN :names"),
+   @NamedQuery(name = "User.countAll", query = "select COUNT(u) from JpaUser u where u.organization.id = :org") })
+ public class JpaUser implements User {
+diff --git a/modules/common/src/main/java/org/opencastproject/util/PasswordEncoder.java b/modules/common/src/main/java/org/opencastproject/util/PasswordEncoder.java
+deleted file mode 100644
+index 28f1364ba65..00000000000
+--- a/modules/common/src/main/java/org/opencastproject/util/PasswordEncoder.java
++++ /dev/null
+@@ -1,54 +0,0 @@
+-/**
+- * Licensed to The Apereo Foundation under one or more contributor license
+- * agreements. See the NOTICE file distributed with this work for additional
+- * information regarding copyright ownership.
+- *
+- *
+- * The Apereo Foundation licenses this file to you under the Educational
+- * Community License, Version 2.0 (the "License"); you may not use this file
+- * except in compliance with the License. You may obtain a copy of the License
+- * at:
+- *
+- *   http://opensource.org/licenses/ecl2.txt
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+- * License for the specific language governing permissions and limitations under
+- * the License.
+- *
+- */
+-
+-package org.opencastproject.util;
+-
+-import org.apache.commons.codec.digest.DigestUtils;
+-
+-/**
+- * A password encoder that md5 hashes a password with a salt.
+- */
+-public final class PasswordEncoder {
+-
+-  /**
+-   * Private constructor to disallow construction of this utility class.
+-   */
+-  private PasswordEncoder() {
+-  }
+-
+-  /**
+-   * Encode a clear text password.
+-   *
+-   * @param clearText
+-   *          the password
+-   * @param salt
+-   *          the salt. See http://en.wikipedia.org/wiki/Salt_%28cryptography%29
+-   * @return the encoded password
+-   * @throws IllegalArgumentException
+-   *           if clearText or salt are null
+-   */
+-  public static String encode(String clearText, Object salt) throws IllegalArgumentException {
+-    if (clearText == null || salt == null)
+-      throw new IllegalArgumentException("clearText and salt must not be null");
+-    return DigestUtils.md5Hex(clearText + "{" + salt.toString() + "}");
+-  }
+-
+-}
+diff --git a/modules/kernel/src/main/java/org/opencastproject/kernel/security/CustomPasswordEncoder.java b/modules/kernel/src/main/java/org/opencastproject/kernel/security/CustomPasswordEncoder.java
+new file mode 100644
+index 00000000000..567f7d70695
+--- /dev/null
++++ b/modules/kernel/src/main/java/org/opencastproject/kernel/security/CustomPasswordEncoder.java
+@@ -0,0 +1,96 @@
++/**
++ * Licensed to The Apereo Foundation under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional
++ * information regarding copyright ownership.
++ *
++ *
++ * The Apereo Foundation licenses this file to you under the Educational
++ * Community License, Version 2.0 (the "License"); you may not use this file
++ * except in compliance with the License. You may obtain a copy of the License
++ * at:
++ *
++ *   http://opensource.org/licenses/ecl2.txt
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++ * License for the specific language governing permissions and limitations under
++ * the License.
++ *
++ */
++
++package org.opencastproject.kernel.security;
++
++import org.apache.commons.codec.digest.DigestUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.security.authentication.encoding.PasswordEncoder;
++import org.springframework.security.crypto.bcrypt.BCrypt;
++
++/**
++ *
++ */
++public class CustomPasswordEncoder implements PasswordEncoder {
++  private Logger logger = LoggerFactory.getLogger(CustomPasswordEncoder.class);
++
++  /**
++   * Encode the raw password for storage using BCrypt.
++   * @param rawPassword raw password to encrypt/hash
++   * @return hashed password
++   */
++  public String encodePassword(final String rawPassword) {
++    return encodePassword(rawPassword, null);
++  }
++
++  /**
++   * Encode the raw password for storage using BCrypt.
++   * @param rawPassword raw password to encrypt/hash
++   * @param ignored This parameter will not be used. A random salt is generated by BCrypt.
++   * @return hashed password
++   */
++  @Override
++  public String encodePassword(final String rawPassword, final Object ignored) {
++    return BCrypt.hashpw(rawPassword, BCrypt.gensalt());
++  }
++
++  /**
++   * Verify the encoded password obtained from storage matches the submitted raw
++   * password after it too is encoded. Returns true if the passwords match, false if
++   * they do not. The stored password itself is never decoded.
++   *
++   * @param rawPassword the raw password to encode and match
++   * @param encodedPassword the encoded password from storage to compare with
++   * @return true if the raw password, after encoding, matches the encoded password from storage
++   */
++  @Override
++  public boolean isPasswordValid(String encodedPassword, String rawPassword, Object salt) {
++    // Test MD5 encoded hash
++    if (encodedPassword.length() == 32) {
++      final String hash = md5Encode(rawPassword, salt);
++      logger.debug("Checking md5 hashed password '{}' against encoded password '{}'", hash, encodedPassword);
++      return hash.equals(encodedPassword);
++    }
++
++    // Test BCrypt encoded hash
++    logger.debug("Verifying BCrypt hash {}", encodedPassword);
++    return BCrypt.checkpw(rawPassword, encodedPassword);
++  }
++
++  /**
++   * Encode a clear text password using Opencast's legacy MD5 based hashing with salt.
++   * The username was used as salt for this.
++   *
++   * @param clearText
++   *          the password
++   * @param salt
++   *          the salt
++   * @return the hashed password
++   * @throws IllegalArgumentException
++   *           if clearText or salt are null
++   */
++  public static String md5Encode(String clearText, Object salt) throws IllegalArgumentException {
++    if (clearText == null || salt == null)
++      throw new IllegalArgumentException("clearText and salt must not be null");
++    return DigestUtils.md5Hex(clearText + "{" + salt.toString() + "}");
++  }
++}
+diff --git a/modules/userdirectory/src/main/java/org/opencastproject/userdirectory/JpaUserAndRoleProvider.java b/modules/userdirectory/src/main/java/org/opencastproject/userdirectory/JpaUserAndRoleProvider.java
+index 021fa543efa..befa1c93fe3 100644
+--- a/modules/userdirectory/src/main/java/org/opencastproject/userdirectory/JpaUserAndRoleProvider.java
++++ b/modules/userdirectory/src/main/java/org/opencastproject/userdirectory/JpaUserAndRoleProvider.java
+@@ -21,6 +21,7 @@
+ 
+ package org.opencastproject.userdirectory;
+ 
++import org.opencastproject.kernel.security.CustomPasswordEncoder;
+ import org.opencastproject.security.api.Group;
+ import org.opencastproject.security.api.Role;
+ import org.opencastproject.security.api.RoleProvider;
+@@ -33,7 +34,6 @@
+ import org.opencastproject.security.impl.jpa.JpaUser;
+ import org.opencastproject.userdirectory.utils.UserDirectoryUtils;
+ import org.opencastproject.util.NotFoundException;
+-import org.opencastproject.util.PasswordEncoder;
+ import org.opencastproject.util.data.Monadics;
+ import org.opencastproject.util.data.Option;
+ 
+@@ -57,6 +57,7 @@
+ import javax.persistence.EntityManager;
+ import javax.persistence.EntityManagerFactory;
+ import javax.persistence.EntityTransaction;
++import javax.persistence.TypedQuery;
+ 
+ /**
+  * Manages and locates users using JPA.
+@@ -95,6 +96,9 @@ public class JpaUserAndRoleProvider implements UserProvider, RoleProvider {
+   /** A token to store in the miss cache */
+   protected Object nullToken = new Object();
+ 
++  /** Password encoder for storing user passwords */
++  private CustomPasswordEncoder passwordEncoder = new CustomPasswordEncoder();
++
+   /** OSGi DI */
+   void setEntityManagerFactory(EntityManagerFactory emf) {
+     this.emf = emf;
+@@ -176,6 +180,23 @@ public Iterator<User> findUsers(Collection<String> userNames) {
+     return Monadics.mlist(users).map(addProviderName).iterator();
+   }
+ 
++  /**
++   * List all users with insecure password hashes
++   */
++  public List<User> findInsecurePasswordHashes() {
++    final String orgId = securityService.getOrganization().getId();
++    EntityManager em = null;
++    try {
++      em = emf.createEntityManager();
++      TypedQuery<User> q = em.createNamedQuery("User.findInsecureHash", User.class);
++      q.setParameter("org", orgId);
++      return q.getResultList();
++    } finally {
++      if (em != null)
++        em.close();
++    }
++  }
++
+   /**
+    * {@inheritDoc}
+    *
+@@ -271,11 +292,26 @@ public User loadUser(long userId, String organization) {
+    *          if the user is not allowed to create other user with the given roles
+    */
+   public void addUser(JpaUser user) throws UnauthorizedException {
++    addUser(user, false);
++  }
++
++  /**
++   * Adds a user to the persistence
++   *
++   * @param user
++   *          the user to add
++   * @param passwordEncoded
++   *          if the password is already encoded or should be encoded
++   *
++   * @throws org.opencastproject.security.api.UnauthorizedException
++   *          if the user is not allowed to create other user with the given roles
++   */
++  public void addUser(JpaUser user, final boolean passwordEncoded) throws UnauthorizedException {
+     if (!UserDirectoryUtils.isCurrentUserAuthorizedHandleRoles(securityService, user.getRoles()))
+       throw new UnauthorizedException("The user is not allowed to set the admin role on other users");
+ 
+     // Create a JPA user with an encoded password.
+-    String encodedPassword = PasswordEncoder.encode(user.getPassword(), user.getUsername());
++    String encodedPassword = passwordEncoded ? user.getPassword() : passwordEncoder.encodePassword(user.getPassword());
+ 
+     // Only save internal roles
+     Set<JpaRole> roles = UserDirectoryPersistenceUtil.saveRoles(filterRoles(user.getRoles()), emf);
+@@ -317,6 +353,21 @@ public void addUser(JpaUser user) throws UnauthorizedException {
+    *          if the current user is not allowed to update user with the given roles
+    */
+   public User updateUser(JpaUser user) throws NotFoundException, UnauthorizedException {
++    return updateUser(user, false);
++  }
++
++  /**
++   * Updates a user to the persistence
++   *
++   * @param user
++   *          the user to save
++   * @param passwordEncoded
++   *          if the password is already encoded or should be encoded
++   * @throws NotFoundException
++   * @throws org.opencastproject.security.api.UnauthorizedException
++   *          if the current user is not allowed to update user with the given roles
++   */
++  public User updateUser(JpaUser user, final boolean passwordEncoded) throws NotFoundException, UnauthorizedException {
+     if (!UserDirectoryUtils.isCurrentUserAuthorizedHandleRoles(securityService, user.getRoles()))
+       throw new UnauthorizedException("The user is not allowed to set the admin role on other users");
+ 
+@@ -336,7 +387,11 @@ public User updateUser(JpaUser user) throws NotFoundException, UnauthorizedExcep
+       encodedPassword = updateUser.getPassword();
+     } else  {
+       // Update an JPA user with an encoded password.
+-      encodedPassword = PasswordEncoder.encode(user.getPassword(), user.getUsername());
++      if (passwordEncoded) {
++        encodedPassword = user.getPassword();
++      } else {
++        encodedPassword = passwordEncoder.encodePassword(user.getPassword());
++      }
+     }
+ 
+     // Only save internal roles
+diff --git a/modules/userdirectory/src/main/java/org/opencastproject/userdirectory/endpoint/UserEndpoint.java b/modules/userdirectory/src/main/java/org/opencastproject/userdirectory/endpoint/UserEndpoint.java
+index a9e141a3544..39d133310c6 100644
+--- a/modules/userdirectory/src/main/java/org/opencastproject/userdirectory/endpoint/UserEndpoint.java
++++ b/modules/userdirectory/src/main/java/org/opencastproject/userdirectory/endpoint/UserEndpoint.java
+@@ -186,6 +186,26 @@ public Response getUserAsJson(@PathParam("username") String username) throws Not
+     return Response.ok(JaxbUser.fromUser(user)).build();
+   }
+ 
++  @GET
++  @Path("users/md5.json")
++  @Produces(MediaType.APPLICATION_JSON)
++  @RestQuery(
++      name = "users-with-insecure-hashing",
++      description = "Returns a list of users which passwords are stored using MD5 hashes",
++      returnDescription = "Returns a JSON representation of the list of matching user accounts",
++      reponses = {
++      @RestResponse(
++          responseCode = SC_OK,
++          description = "The user accounts.")
++  })
++  public JaxbUserList getUserWithInsecurePasswordHashingAsJson() {
++    JaxbUserList userList = new JaxbUserList();
++    for (User user: jpaUserAndRoleProvider.findInsecurePasswordHashes()) {
++      userList.add(user);
++    }
++    return userList;
++  }
++
+   @POST
+   @Path("/")
+   @RestQuery(
+diff --git a/modules/userdirectory/src/test/java/org/opencastproject/userdirectory/JpaUserProviderTest.java b/modules/userdirectory/src/test/java/org/opencastproject/userdirectory/JpaUserProviderTest.java
+index 036399271b6..1140de41058 100644
+--- a/modules/userdirectory/src/test/java/org/opencastproject/userdirectory/JpaUserProviderTest.java
++++ b/modules/userdirectory/src/test/java/org/opencastproject/userdirectory/JpaUserProviderTest.java
+@@ -29,6 +29,7 @@
+ import static org.opencastproject.util.data.Collections.set;
+ import static org.opencastproject.util.persistence.PersistenceUtil.newTestEntityManagerFactory;
+ 
++import org.opencastproject.kernel.security.CustomPasswordEncoder;
+ import org.opencastproject.security.api.Role;
+ import org.opencastproject.security.api.SecurityConstants;
+ import org.opencastproject.security.api.SecurityService;
+@@ -38,7 +39,6 @@
+ import org.opencastproject.security.impl.jpa.JpaRole;
+ import org.opencastproject.security.impl.jpa.JpaUser;
+ import org.opencastproject.util.NotFoundException;
+-import org.opencastproject.util.PasswordEncoder;
+ import org.opencastproject.util.data.Collections;
+ 
+ import org.apache.commons.collections4.IteratorUtils;
+@@ -56,6 +56,7 @@ public class JpaUserProviderTest {
+   private JpaUserAndRoleProvider provider = null;
+   private JpaOrganization org1 = null;
+   private JpaOrganization org2 = null;
++  private CustomPasswordEncoder passwordEncoder = new CustomPasswordEncoder();
+ 
+   @Before
+   public void setUp() throws Exception {
+@@ -83,7 +84,7 @@ public void testAddAndGetUser() throws Exception {
+     assertNotNull(loadUser);
+ 
+     assertEquals(user.getUsername(), loadUser.getUsername());
+-    assertEquals(PasswordEncoder.encode(user.getPassword(), user.getUsername()), loadUser.getPassword());
++    assertTrue(passwordEncoder.isPasswordValid(loadUser.getPassword(), user.getPassword(), null));
+     assertEquals(user.getOrganization(), loadUser.getOrganization());
+     assertEquals(user.getRoles(), loadUser.getRoles());
+ 
+@@ -94,7 +95,7 @@ public void testAddAndGetUser() throws Exception {
+     assertNotNull(loadUser);
+ 
+     assertEquals(user.getUsername(), loadUser.getUsername());
+-    assertEquals(PasswordEncoder.encode(user.getPassword(), user.getUsername()), loadUser.getPassword());
++    assertTrue(passwordEncoder.isPasswordValid(loadUser.getPassword(), user.getPassword(), null));
+     assertEquals(user.getOrganization(), loadUser.getOrganization());
+     assertEquals(user.getRoles(), loadUser.getRoles());
+   }
+@@ -227,7 +228,7 @@ public void testUpdateUser() throws Exception {
+ 
+     assertNotNull(loadUpdatedUser);
+     assertEquals(user.getUsername(), loadUpdatedUser.getUsername());
+-    assertEquals(PasswordEncoder.encode(newPassword, user.getUsername()), loadUpdatedUser.getPassword());
++    assertTrue(passwordEncoder.isPasswordValid(loadUpdatedUser.getPassword(), newPassword, null));
+     assertEquals(authorities.size(), loadUpdatedUser.getRoles().size());
+ 
+     updateUser = new JpaUser("unknown", newPassword, org1, provider.getName(), true, authorities);

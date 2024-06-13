@@ -1,0 +1,210 @@
+diff --git a/app/controllers/api/v1/accounts/campaigns_controller.rb b/app/controllers/api/v1/accounts/campaigns_controller.rb
+index 11b563d81793..18d0998c8884 100644
+--- a/app/controllers/api/v1/accounts/campaigns_controller.rb
++++ b/app/controllers/api/v1/accounts/campaigns_controller.rb
+@@ -18,7 +18,7 @@ def destroy
+   def show; end
+ 
+   def update
+-    @campaign.update(campaign_params)
++    @campaign.update!(campaign_params)
+   end
+ 
+   private
+diff --git a/app/models/campaign.rb b/app/models/campaign.rb
+index 0093342d6cc9..304d270e757e 100644
+--- a/app/models/campaign.rb
++++ b/app/models/campaign.rb
+@@ -33,12 +33,14 @@
+ #  fk_rails_...  (account_id => accounts.id) ON DELETE => cascade
+ #  fk_rails_...  (inbox_id => inboxes.id) ON DELETE => cascade
+ #
++require 'uri'
+ class Campaign < ApplicationRecord
+   validates :account_id, presence: true
+   validates :inbox_id, presence: true
+   validates :title, presence: true
+   validates :message, presence: true
+   validate :validate_campaign_inbox
++  validate :validate_url
+   validate :prevent_completed_campaign_from_update, on: :update
+   belongs_to :account
+   belongs_to :inbox
+@@ -86,6 +88,21 @@ def ensure_correct_campaign_attributes
+     end
+   end
+ 
++  def validate_url
++    return unless trigger_rules['url']
++
++    errors.add(:url, 'invalid') if inbox.inbox_type == 'Website' && !url_valid?(trigger_rules['url'])
++  end
++
++  def url_valid?(url)
++    url = begin
++      URI.parse(url)
++    rescue StandardError
++      false
++    end
++    url.is_a?(URI::HTTP) || url.is_a?(URI::HTTPS)
++  end
++
+   def prevent_completed_campaign_from_update
+     errors.add :status, 'The campaign is already completed' if !campaign_status_changed? && completed?
+   end
+diff --git a/spec/builders/campaigns/campaign_conversation_builder_spec.rb b/spec/builders/campaigns/campaign_conversation_builder_spec.rb
+index 076aeab67c24..3735c0e66f02 100644
+--- a/spec/builders/campaigns/campaign_conversation_builder_spec.rb
++++ b/spec/builders/campaigns/campaign_conversation_builder_spec.rb
+@@ -5,7 +5,7 @@
+   let(:inbox) { create(:inbox, account: account) }
+   let(:contact) { create(:contact, account: account, identifier: '123') }
+   let(:contact_inbox) { create(:contact_inbox, contact: contact, inbox: inbox) }
+-  let(:campaign) { create(:campaign, inbox: inbox, account: account) }
++  let(:campaign) { create(:campaign, inbox: inbox, account: account, trigger_rules: { url: 'https://test.com' }) }
+ 
+   describe '#perform' do
+     it 'creates a conversation with campaign id and message with campaign message' do
+diff --git a/spec/controllers/api/v1/accounts/campaigns_controller_spec.rb b/spec/controllers/api/v1/accounts/campaigns_controller_spec.rb
+index 4a9cfece0942..9f217500783b 100644
+--- a/spec/controllers/api/v1/accounts/campaigns_controller_spec.rb
++++ b/spec/controllers/api/v1/accounts/campaigns_controller_spec.rb
+@@ -15,7 +15,7 @@
+     context 'when it is an authenticated user' do
+       let(:agent) { create(:user, account: account, role: :agent) }
+       let(:administrator) { create(:user, account: account, role: :administrator) }
+-      let!(:campaign) { create(:campaign, account: account) }
++      let!(:campaign) { create(:campaign, account: account, trigger_rules: { url: 'https://test.com' }) }
+ 
+       it 'returns unauthorized for agents' do
+         get "/api/v1/accounts/#{account.id}/campaigns",
+@@ -38,7 +38,7 @@
+   end
+ 
+   describe 'GET /api/v1/accounts/{account.id}/campaigns/:id' do
+-    let(:campaign) { create(:campaign, account: account) }
++    let(:campaign) { create(:campaign, account: account, trigger_rules: { url: 'https://test.com' }) }
+ 
+     context 'when it is an unauthenticated user' do
+       it 'returns unauthorized' do
+@@ -107,6 +107,25 @@
+         expect(JSON.parse(response.body, symbolize_names: true)[:title]).to eq('test')
+       end
+ 
++      it 'creates a new ongoing campaign' do
++        post "/api/v1/accounts/#{account.id}/campaigns",
++             params: { inbox_id: inbox.id, title: 'test', message: 'test message', trigger_rules: { url: 'https://test.com' } },
++             headers: administrator.create_new_auth_token,
++             as: :json
++
++        expect(response).to have_http_status(:success)
++        expect(JSON.parse(response.body, symbolize_names: true)[:title]).to eq('test')
++      end
++
++      it 'throws error when invalid url provided for ongoing campaign' do
++        post "/api/v1/accounts/#{account.id}/campaigns",
++             params: { inbox_id: inbox.id, title: 'test', message: 'test message', trigger_rules: { url: 'javascript' } },
++             headers: administrator.create_new_auth_token,
++             as: :json
++
++        expect(response).to have_http_status(:unprocessable_entity)
++      end
++
+       it 'creates a new oneoff campaign' do
+         twilio_sms = create(:channel_twilio_sms, account: account)
+         twilio_inbox = create(:inbox, channel: twilio_sms)
+@@ -133,7 +152,7 @@
+ 
+   describe 'PATCH /api/v1/accounts/{account.id}/campaigns/:id' do
+     let(:inbox) { create(:inbox, account: account) }
+-    let!(:campaign) { create(:campaign, account: account) }
++    let!(:campaign) { create(:campaign, account: account, trigger_rules: { url: 'https://test.com' }) }
+ 
+     context 'when it is an unauthenticated user' do
+       it 'returns unauthorized' do
+@@ -172,7 +191,7 @@
+ 
+   describe 'DELETE /api/v1/accounts/{account.id}/campaigns/:id' do
+     let(:inbox) { create(:inbox, account: account) }
+-    let!(:campaign) { create(:campaign, account: account) }
++    let!(:campaign) { create(:campaign, account: account, trigger_rules: { url: 'https://test.com' }) }
+ 
+     context 'when it is an unauthenticated user' do
+       it 'returns unauthorized' do
+diff --git a/spec/controllers/api/v1/accounts/inboxes_controller_spec.rb b/spec/controllers/api/v1/accounts/inboxes_controller_spec.rb
+index 8ccf667ac4e7..5dc184b8cf4b 100644
+--- a/spec/controllers/api/v1/accounts/inboxes_controller_spec.rb
++++ b/spec/controllers/api/v1/accounts/inboxes_controller_spec.rb
+@@ -133,7 +133,7 @@
+       let(:agent) { create(:user, account: account, role: :agent) }
+       let(:administrator) { create(:user, account: account, role: :administrator) }
+ 
+-      let!(:campaign) { create(:campaign, account: account, inbox: inbox) }
++      let!(:campaign) { create(:campaign, account: account, inbox: inbox, trigger_rules: { url: 'https://test.com' }) }
+ 
+       it 'returns unauthorized for agents' do
+         get "/api/v1/accounts/#{account.id}/inboxes/#{inbox.id}/campaigns",
+@@ -145,7 +145,7 @@
+ 
+       it 'returns all campaigns belonging to the inbox to administrators' do
+         # create a random campaign
+-        create(:campaign, account: account)
++        create(:campaign, account: account, trigger_rules: { url: 'https://test.com' })
+         get "/api/v1/accounts/#{account.id}/inboxes/#{inbox.id}/campaigns",
+             headers: administrator.create_new_auth_token,
+             as: :json
+diff --git a/spec/controllers/api/v1/widget/campaigns_controller_spec.rb b/spec/controllers/api/v1/widget/campaigns_controller_spec.rb
+index 8a938b66737f..11248769f94b 100644
+--- a/spec/controllers/api/v1/widget/campaigns_controller_spec.rb
++++ b/spec/controllers/api/v1/widget/campaigns_controller_spec.rb
+@@ -3,8 +3,8 @@
+ RSpec.describe '/api/v1/widget/campaigns', type: :request do
+   let(:account) { create(:account) }
+   let(:web_widget) { create(:channel_widget, account: account) }
+-  let!(:campaign_1) { create(:campaign, inbox: web_widget.inbox, enabled: true, account: account) }
+-  let!(:campaign_2) { create(:campaign, inbox: web_widget.inbox, enabled: false, account: account) }
++  let!(:campaign_1) { create(:campaign, inbox: web_widget.inbox, enabled: true, account: account, trigger_rules: { url: 'https://test.com' }) }
++  let!(:campaign_2) { create(:campaign, inbox: web_widget.inbox, enabled: false, account: account, trigger_rules: { url: 'https://test.com' }) }
+ 
+   describe 'GET /api/v1/widget/campaigns' do
+     let(:params) { { website_token: web_widget.website_token } }
+diff --git a/spec/listeners/campaign_listener_spec.rb b/spec/listeners/campaign_listener_spec.rb
+index bfc5df08fede..b9f6930551e3 100644
+--- a/spec/listeners/campaign_listener_spec.rb
++++ b/spec/listeners/campaign_listener_spec.rb
+@@ -5,7 +5,7 @@
+   let(:inbox) { create(:inbox, account: account) }
+   let(:contact) { create(:contact, account: account, identifier: '123') }
+   let(:contact_inbox) { create(:contact_inbox, contact: contact, inbox: inbox) }
+-  let(:campaign) { create(:campaign, inbox: inbox, account: account) }
++  let(:campaign) { create(:campaign, inbox: inbox, account: account, trigger_rules: { url: 'https://test.com' }) }
+ 
+   let!(:event) do
+     Events::Base.new('campaign_triggered', Time.zone.now,
+diff --git a/spec/models/campaign_spec.rb b/spec/models/campaign_spec.rb
+index 54936ac2b6f5..95cac1cafde6 100644
+--- a/spec/models/campaign_spec.rb
++++ b/spec/models/campaign_spec.rb
+@@ -9,7 +9,10 @@
+   end
+ 
+   describe '.before_create' do
+-    let(:campaign) { build(:campaign, display_id: nil) }
++    let(:account) { create(:account) }
++    let(:website_channel) { create(:channel_widget, account: account) }
++    let(:website_inbox) { create(:inbox, channel: website_channel, account: account) }
++    let(:campaign) { build(:campaign, inbox: website_inbox, display_id: nil, trigger_rules: { url: 'https://test.com' }) }
+ 
+     before do
+       campaign.save
+@@ -37,7 +40,9 @@
+   end
+ 
+   context 'when a campaign is completed' do
+-    let!(:campaign) { create(:campaign, campaign_status: :completed) }
++    let(:account) { create(:account) }
++    let(:web_widget) { create(:channel_widget, account: account) }
++    let!(:campaign) { create(:campaign, inbox: web_widget.inbox, campaign_status: :completed, trigger_rules: { url: 'https://test.com' }) }
+ 
+     it 'would prevent further updates' do
+       campaign.title = 'new name'

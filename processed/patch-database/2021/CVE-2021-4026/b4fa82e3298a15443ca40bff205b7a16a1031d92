@@ -1,0 +1,204 @@
+diff --git a/app/Actions/ActivityService.php b/app/Actions/ActivityService.php
+index 983c1a603c7..73dc76de00e 100644
+--- a/app/Actions/ActivityService.php
++++ b/app/Actions/ActivityService.php
+@@ -133,7 +133,7 @@ public function entityActivity(Entity $entity, int $count = 20, int $page = 1):
+     }
+ 
+     /**
+-     * Get latest activity for a user, Filtering out similar items.
++     * Get the latest activity for a user, Filtering out similar items.
+      */
+     public function userActivity(User $user, int $count = 20, int $page = 0): array
+     {
+diff --git a/app/Auth/Permissions/PermissionService.php b/app/Auth/Permissions/PermissionService.php
+index 13972533971..4214861c22b 100644
+--- a/app/Auth/Permissions/PermissionService.php
++++ b/app/Auth/Permissions/PermissionService.php
+@@ -602,25 +602,35 @@ public function enforceEntityRestrictions(Entity $entity, Builder $query, string
+ 
+     /**
+      * Filter items that have entities set as a polymorphic relation.
++     * For simplicity, this will not return results attached to draft pages.
++     * Draft pages should never really have related items though.
+      *
+      * @param Builder|QueryBuilder $query
+      */
+     public function filterRestrictedEntityRelations($query, string $tableName, string $entityIdColumn, string $entityTypeColumn, string $action = 'view')
+     {
+         $tableDetails = ['tableName' => $tableName, 'entityIdColumn' => $entityIdColumn, 'entityTypeColumn' => $entityTypeColumn];
+-
+-        $q = $query->where(function ($query) use ($tableDetails, $action) {
+-            $query->whereExists(function ($permissionQuery) use (&$tableDetails, $action) {
+-                /** @var Builder $permissionQuery */
+-                $permissionQuery->select(['role_id'])->from('joint_permissions')
+-                    ->whereColumn('joint_permissions.entity_id', '=', $tableDetails['tableName'] . '.' . $tableDetails['entityIdColumn'])
+-                    ->whereColumn('joint_permissions.entity_type', '=', $tableDetails['tableName'] . '.' . $tableDetails['entityTypeColumn'])
+-                    ->where('action', '=', $action)
+-                    ->whereIn('role_id', $this->getCurrentUserRoles())
+-                    ->where(function (QueryBuilder $query) {
+-                        $this->addJointHasPermissionCheck($query, $this->currentUser()->id);
+-                    });
+-            });
++        $pageMorphClass = (new Page())->getMorphClass();
++
++        $q = $query->whereExists(function ($permissionQuery) use (&$tableDetails, $action) {
++            /** @var Builder $permissionQuery */
++            $permissionQuery->select(['role_id'])->from('joint_permissions')
++                ->whereColumn('joint_permissions.entity_id', '=', $tableDetails['tableName'] . '.' . $tableDetails['entityIdColumn'])
++                ->whereColumn('joint_permissions.entity_type', '=', $tableDetails['tableName'] . '.' . $tableDetails['entityTypeColumn'])
++                ->where('joint_permissions.action', '=', $action)
++                ->whereIn('joint_permissions.role_id', $this->getCurrentUserRoles())
++                ->where(function (QueryBuilder $query) {
++                    $this->addJointHasPermissionCheck($query, $this->currentUser()->id);
++                });
++        })->where(function ($query) use ($tableDetails, $pageMorphClass) {
++            /** @var Builder $query */
++            $query->where($tableDetails['entityTypeColumn'], '!=', $pageMorphClass)
++                ->orWhereExists(function(QueryBuilder $query) use ($tableDetails, $pageMorphClass) {
++                    $query->select('id')->from('pages')
++                        ->whereColumn('pages.id', '=', $tableDetails['tableName'] . '.' . $tableDetails['entityIdColumn'])
++                        ->where($tableDetails['tableName'] . '.' . $tableDetails['entityTypeColumn'], '=', $pageMorphClass)
++                        ->where('pages.draft', '=', false);
++                });
+         });
+ 
+         $this->clean();
+@@ -634,25 +644,39 @@ public function filterRestrictedEntityRelations($query, string $tableName, strin
+      */
+     public function filterRelatedEntity(string $entityClass, Builder $query, string $tableName, string $entityIdColumn): Builder
+     {
+-        $tableDetails = ['tableName' => $tableName, 'entityIdColumn' => $entityIdColumn];
+-        $morphClass = app($entityClass)->getMorphClass();
+-
+-        $q = $query->where(function ($query) use ($tableDetails, $morphClass) {
+-            $query->where(function ($query) use (&$tableDetails, $morphClass) {
+-                $query->whereExists(function ($permissionQuery) use (&$tableDetails, $morphClass) {
+-                    /** @var Builder $permissionQuery */
+-                    $permissionQuery->select('id')->from('joint_permissions')
+-                        ->whereColumn('joint_permissions.entity_id', '=', $tableDetails['tableName'] . '.' . $tableDetails['entityIdColumn'])
+-                        ->where('entity_type', '=', $morphClass)
+-                        ->where('action', '=', 'view')
+-                        ->whereIn('role_id', $this->getCurrentUserRoles())
+-                        ->where(function (QueryBuilder $query) {
+-                            $this->addJointHasPermissionCheck($query, $this->currentUser()->id);
+-                        });
++        $fullEntityIdColumn = $tableName . '.' . $entityIdColumn;
++        $instance = new $entityClass;
++        $morphClass = $instance->getMorphClass();
++
++        $existsQuery = function($permissionQuery) use ($fullEntityIdColumn, $morphClass) {
++            /** @var Builder $permissionQuery */
++            $permissionQuery->select('joint_permissions.role_id')->from('joint_permissions')
++                ->whereColumn('joint_permissions.entity_id', '=', $fullEntityIdColumn)
++                ->where('joint_permissions.entity_type', '=', $morphClass)
++                ->where('joint_permissions.action', '=', 'view')
++                ->whereIn('joint_permissions.role_id', $this->getCurrentUserRoles())
++                ->where(function (QueryBuilder $query) {
++                    $this->addJointHasPermissionCheck($query, $this->currentUser()->id);
+                 });
+-            })->orWhere($tableDetails['entityIdColumn'], '=', 0);
++        };
++
++        $q = $query->where(function ($query) use ($existsQuery, $fullEntityIdColumn) {
++            $query->whereExists($existsQuery)
++                ->orWhere($fullEntityIdColumn, '=', 0);
+         });
+ 
++        if ($instance instanceof Page) {
++            // Prevent visibility of non-owned draft pages
++            $q->whereExists(function(QueryBuilder $query) use ($fullEntityIdColumn) {
++                $query->select('id')->from('pages')
++                    ->whereColumn('pages.id', '=', $fullEntityIdColumn)
++                    ->where(function (QueryBuilder $query) {
++                        $query->where('pages.draft', '=', false)
++                            ->orWhere('pages.owned_by', '=', $this->currentUser()->id);
++                    });
++            });
++        }
++
+         $this->clean();
+ 
+         return $q;
+@@ -666,9 +690,9 @@ public function filterRelatedEntity(string $entityClass, Builder $query, string
+      */
+     protected function addJointHasPermissionCheck($query, int $userIdToCheck)
+     {
+-        $query->where('has_permission', '=', true)->orWhere(function ($query) use ($userIdToCheck) {
+-            $query->where('has_permission_own', '=', true)
+-                ->where('owned_by', '=', $userIdToCheck);
++        $query->where('joint_permissions.has_permission', '=', true)->orWhere(function ($query) use ($userIdToCheck) {
++            $query->where('joint_permissions.has_permission_own', '=', true)
++                ->where('joint_permissions.owned_by', '=', $userIdToCheck);
+         });
+     }
+ 
+diff --git a/app/Exceptions/Handler.php b/app/Exceptions/Handler.php
+index 3b4ad4a4da5..7ec50252509 100644
+--- a/app/Exceptions/Handler.php
++++ b/app/Exceptions/Handler.php
+@@ -4,6 +4,7 @@
+ 
+ use Exception;
+ use Illuminate\Auth\AuthenticationException;
++use Illuminate\Database\Eloquent\ModelNotFoundException;
+ use Illuminate\Foundation\Exceptions\Handler as ExceptionHandler;
+ use Illuminate\Http\JsonResponse;
+ use Illuminate\Http\Request;
+@@ -75,15 +76,20 @@ protected function isApiRequest(Request $request): bool
+     /**
+      * Render an exception when the API is in use.
+      */
+-    protected function renderApiException(Exception $e): JsonResponse
++    protected function renderApiException(Throwable $e): JsonResponse
+     {
+-        $code = $e->getCode() === 0 ? 500 : $e->getCode();
++        $code = 500;
+         $headers = [];
++
+         if ($e instanceof HttpException) {
+             $code = $e->getStatusCode();
+             $headers = $e->getHeaders();
+         }
+ 
++        if ($e instanceof ModelNotFoundException) {
++            $code = 404;
++        }
++
+         $responseData = [
+             'error' => [
+                 'message' => $e->getMessage(),
+diff --git a/tests/Api/AttachmentsApiTest.php b/tests/Api/AttachmentsApiTest.php
+index ceab5d49afa..bfa47343e96 100644
+--- a/tests/Api/AttachmentsApiTest.php
++++ b/tests/Api/AttachmentsApiTest.php
+@@ -224,6 +224,29 @@ public function test_read_endpoint_for_file_attachment()
+         unlink(storage_path($attachment->path));
+     }
+ 
++    public function test_attachment_not_visible_on_other_users_draft()
++    {
++        $this->actingAsApiAdmin();
++        $editor = $this->getEditor();
++
++        /** @var Page $page */
++        $page = Page::query()->first();
++        $page->draft = true;
++        $page->owned_by = $editor;
++        $page->save();
++        $this->regenEntityPermissions($page);
++
++        $attachment = $this->createAttachmentForPage($page, [
++            'name'  => 'my attachment',
++            'path'  => 'https://example.com',
++            'order' => 1,
++        ]);
++
++        $resp = $this->getJson("{$this->baseEndpoint}/{$attachment->id}");
++
++        $resp->assertStatus(404);
++    }
++
+     public function test_update_endpoint()
+     {
+         $this->actingAsApiAdmin();

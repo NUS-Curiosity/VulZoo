@@ -1,0 +1,468 @@
+diff --git a/.circleci/test-server.sh b/.circleci/test-server.sh
+index 5d65ef066d9dc..f1e41187f2e63 100755
+--- a/.circleci/test-server.sh
++++ b/.circleci/test-server.sh
+@@ -265,6 +265,50 @@ kill_hge_servers
+ 
+ unset HASURA_GRAPHQL_JWT_SECRET
+ 
++echo -e "\n$(time_elapsed): <########## TEST GRAPHQL-ENGINE WITH ADMIN SECRET AND JWT (with audience check - string) #####################################>\n"
++TEST_TYPE="jwt-audience-check-single-string"
++
++
++export HASURA_GRAPHQL_JWT_SECRET="$(jq -n --arg key "$(cat $OUTPUT_FOLDER/ssl/jwt_public.key)" '{ type: "RS512", key: $key , audience: "myapp-1234"}')"
++
++run_hge_with_args serve
++wait_for_port 8080
++
++pytest -n 1 -vv --hge-urls "$HGE_URL" --pg-urls "$HASURA_GRAPHQL_DATABASE_URL" --hge-key="$HASURA_GRAPHQL_ADMIN_SECRET" --hge-jwt-key-file="$OUTPUT_FOLDER/ssl/jwt_private.key" --hge-jwt-conf="$HASURA_GRAPHQL_JWT_SECRET" test_jwt.py
++
++kill_hge_servers
++
++unset HASURA_GRAPHQL_JWT_SECRET
++
++echo -e "\n$(time_elapsed): <########## TEST GRAPHQL-ENGINE WITH ADMIN SECRET AND JWT (with audience check - list of strings) #################################>\n"
++TEST_TYPE="jwt-audience-check-list-string"
++
++export HASURA_GRAPHQL_JWT_SECRET="$(jq -n --arg key "$(cat $OUTPUT_FOLDER/ssl/jwt_public.key)" '{ type: "RS512", key: $key , audience: ["myapp-1234", "myapp-9876"]}')"
++
++run_hge_with_args serve
++wait_for_port 8080
++
++pytest -n 1 -vv --hge-urls "$HGE_URL" --pg-urls "$HASURA_GRAPHQL_DATABASE_URL" --hge-key="$HASURA_GRAPHQL_ADMIN_SECRET" --hge-jwt-key-file="$OUTPUT_FOLDER/ssl/jwt_private.key" --hge-jwt-conf="$HASURA_GRAPHQL_JWT_SECRET" test_jwt.py
++
++kill_hge_servers
++
++unset HASURA_GRAPHQL_JWT_SECRET
++
++echo -e "\n$(time_elapsed): <########## TEST GRAPHQL-ENGINE WITH ADMIN SECRET AND JWT (with issuer check) #####################################>\n"
++TEST_TYPE="jwt-issuer-check"
++
++export HASURA_GRAPHQL_JWT_SECRET="$(jq -n --arg key "$(cat $OUTPUT_FOLDER/ssl/jwt_public.key)" '{ type: "RS512", key: $key , issuer: "https://hasura.com"}')"
++
++run_hge_with_args serve
++wait_for_port 8080
++
++pytest -n 1 -vv --hge-urls "$HGE_URL" --pg-urls "$HASURA_GRAPHQL_DATABASE_URL" --hge-key="$HASURA_GRAPHQL_ADMIN_SECRET" --hge-jwt-key-file="$OUTPUT_FOLDER/ssl/jwt_private.key" --hge-jwt-conf="$HASURA_GRAPHQL_JWT_SECRET" test_jwt.py
++
++kill_hge_servers
++
++unset HASURA_GRAPHQL_JWT_SECRET
++
++
+ # test with CORS modes
+ 
+ echo -e "\n$(time_elapsed): <########## TEST GRAPHQL-ENGINE WITH CORS DOMAINS ########>\n"
+diff --git a/docs/graphql/manual/auth/authentication/jwt.rst b/docs/graphql/manual/auth/authentication/jwt.rst
+index 9d286b0e77dd3..d71a7794644d1 100644
+--- a/docs/graphql/manual/auth/authentication/jwt.rst
++++ b/docs/graphql/manual/auth/authentication/jwt.rst
+@@ -230,7 +230,6 @@ If ``claims_format`` is ``stringified_json`` then JWT claims should look like:
+     "https://hasura.io/jwt/claims": "{\"x-hasura-allowed-roles\":[\"editor\",\"user\",\"mod\"],\"x-hasura-default-role\":\"user\",\"x-hasura-user-id\":\"1234567890\",\"x-hasura-org-id\":\"123\",\"x-hasura-custom\":\"custom-value\"}"
+   }
+ 
+-
+ ``audience``
+ ^^^^^^^^^^^^
+ This is an optional field. Certain providers might set a claim which indicates
+@@ -252,7 +251,6 @@ Examples:
+      "type": "RS512",
+      "jwk_url": "https://......",
+      "audience": "myapp-1234"
+-     ...
+    }
+ 
+ or
+@@ -263,7 +261,6 @@ or
+      "type": "RS512",
+      "jwk_url": "https://......",
+      "audience": ["myapp-1234", "myapp-6789"]
+-     ...
+    }
+ 
+ 
+@@ -285,10 +282,10 @@ Examples:
+      "type": "RS512",
+      "jwk_url": "https://......",
+      "issuer": "https://my-auth-server.com"
+-     ...
+    }
+ 
+ 
++
+ Examples
+ ^^^^^^^^
+ 
+diff --git a/server/src-lib/Hasura/Server/Auth.hs b/server/src-lib/Hasura/Server/Auth.hs
+index 4b0a1fa9f0664..7dfc159e88d86 100644
+--- a/server/src-lib/Hasura/Server/Auth.hs
++++ b/server/src-lib/Hasura/Server/Auth.hs
+@@ -129,7 +129,7 @@ mkJwtCtx conf httpManager loggerCtx = do
+           jwkRefreshCtrl logger httpManager url ref t
+           return ref
+   let claimsFmt = fromMaybe JCFJson (jcClaimsFormat conf)
+-  return $ JWTCtx jwkRef (jcClaimNs conf) (jcAudience conf) claimsFmt
++  return $ JWTCtx jwkRef (jcClaimNs conf) (jcAudience conf) claimsFmt (jcIssuer conf)
+ 
+ mkUserInfoFromResp
+   :: (MonadIO m, MonadError QErr m)
+diff --git a/server/src-lib/Hasura/Server/Auth/JWT.hs b/server/src-lib/Hasura/Server/Auth/JWT.hs
+index 4248bdbd340b5..5032a56a231f5 100644
+--- a/server/src-lib/Hasura/Server/Auth/JWT.hs
++++ b/server/src-lib/Hasura/Server/Auth/JWT.hs
+@@ -3,7 +3,7 @@ module Hasura.Server.Auth.JWT
+   , RawJWT
+   , JWTConfig (..)
+   , JWTCtx (..)
+-  , JWKSet (..)
++  , Jose.JWKSet (..)
+   , JWTClaimsFormat (..)
+   , updateJwkRef
+   , jwkRefreshCtrl
+@@ -14,7 +14,6 @@ import           Control.Arrow                   (first)
+ import           Control.Exception               (try)
+ import           Control.Lens
+ import           Control.Monad                   (when)
+-import           Crypto.JWT
+ import           Data.IORef                      (IORef, modifyIORef, readIORef)
+ 
+ import           Data.List                       (find)
+@@ -33,6 +32,7 @@ import           Hasura.Server.Utils             (diffTimeToMicro,
+                                                   userRoleHeader)
+ 
+ import qualified Control.Concurrent              as C
++import qualified Crypto.JWT                      as Jose
+ import qualified Data.Aeson                      as A
+ import qualified Data.Aeson.Casing               as A
+ import qualified Data.Aeson.TH                   as A
+@@ -62,24 +62,25 @@ $(A.deriveJSON A.defaultOptions { A.sumEncoding = A.ObjectWithSingleField
+ data JWTConfig
+   = JWTConfig
+   { jcType         :: !T.Text
+-  , jcKeyOrUrl     :: !(Either JWK URI)
++  , jcKeyOrUrl     :: !(Either Jose.JWK URI)
+   , jcClaimNs      :: !(Maybe T.Text)
+-  , jcAudience     :: !(Maybe T.Text)
++  , jcAudience     :: !(Maybe Jose.Audience)
+   , jcClaimsFormat :: !(Maybe JWTClaimsFormat)
+-  -- , jcIssuer   :: !(Maybe T.Text)
++  , jcIssuer       :: !(Maybe Jose.StringOrURI)
+   } deriving (Show, Eq)
+ 
+ data JWTCtx
+   = JWTCtx
+-  { jcxKey          :: !(IORef JWKSet)
++  { jcxKey          :: !(IORef Jose.JWKSet)
+   , jcxClaimNs      :: !(Maybe T.Text)
+-  , jcxAudience     :: !(Maybe T.Text)
++  , jcxAudience     :: !(Maybe Jose.Audience)
+   , jcxClaimsFormat :: !JWTClaimsFormat
++  , jcxIssuer       :: !(Maybe Jose.StringOrURI)
+   } deriving (Eq)
+ 
+ instance Show JWTCtx where
+-  show (JWTCtx _ nsM audM cf) =
+-    show ["<IORef JWKSet>", show nsM, show audM, show cf]
++  show (JWTCtx _ nsM audM cf iss) =
++    show ["<IORef JWKSet>", show nsM, show audM, show cf, show iss]
+ 
+ data HasuraClaims
+   = HasuraClaims
+@@ -103,7 +104,7 @@ jwkRefreshCtrl
+   => Logger
+   -> HTTP.Manager
+   -> URI
+-  -> IORef JWKSet
++  -> IORef Jose.JWKSet
+   -> NominalDiffTime
+   -> m ()
+ jwkRefreshCtrl lggr mngr url ref time =
+@@ -124,7 +125,7 @@ updateJwkRef
+   => Logger
+   -> HTTP.Manager
+   -> URI
+-  -> IORef JWKSet
++  -> IORef Jose.JWKSet
+   -> m (Maybe NominalDiffTime)
+ updateJwkRef (Logger logger) manager url jwkRef = do
+   let options = wreqOptions manager []
+@@ -210,10 +211,10 @@ processAuthZHeader jwtCtx headers authzHeader = do
+ 
+   let claimsNs  = fromMaybe defaultClaimNs $ jcxClaimNs jwtCtx
+       claimsFmt = jcxClaimsFormat jwtCtx
+-      expTimeM = fmap (\(NumericDate t) -> t) $ claims ^. claimExp
++      expTimeM = fmap (\(Jose.NumericDate t) -> t) $ claims ^. Jose.claimExp
+ 
+   -- see if the hasura claims key exist in the claims map
+-  let mHasuraClaims = Map.lookup claimsNs $ claims ^. unregisteredClaims
++  let mHasuraClaims = Map.lookup claimsNs $ claims ^. Jose.unregisteredClaims
+   hasuraClaimsV <- maybe claimsNotFound return mHasuraClaims
+ 
+   -- get hasura claims value as an object. parse from string possibly
+@@ -322,24 +323,31 @@ parseHasuraClaims claimsMap = do
+ 
+ -- | Verify the JWT against given JWK
+ verifyJwt
+-  :: ( MonadError JWTError m
++  :: ( MonadError Jose.JWTError m
+      , MonadIO m
+      )
+   => JWTCtx
+   -> RawJWT
+-  -> m ClaimsSet
++  -> m Jose.ClaimsSet
+ verifyJwt ctx (RawJWT rawJWT) = do
+   key <- liftIO $ readIORef $ jcxKey ctx
+-  jwt <- decodeCompact rawJWT
++  jwt <- Jose.decodeCompact rawJWT
+   t   <- liftIO getCurrentTime
+-  verifyClaimsAt config key t jwt
++  Jose.verifyClaimsAt config key t jwt
+   where
+-    audCheck aud = maybe True (== (T.pack . show) aud) $ jcxAudience ctx
+-    config = defaultJWTValidationSettings audCheck
++    config = case jcxIssuer ctx of
++      Nothing  -> Jose.defaultJWTValidationSettings audCheck
++      Just iss -> Jose.defaultJWTValidationSettings audCheck
++                  & set Jose.issuerPredicate (== iss)
++    audCheck audience =
++      -- dont perform the check if there are no audiences in the conf
++      case jcxAudience ctx of
++        Nothing                        -> True
++        Just (Jose.Audience audiences) -> audience `elem` audiences
+ 
+ 
+ instance A.ToJSON JWTConfig where
+-  toJSON (JWTConfig ty keyOrUrl claimNs aud claimsFmt) =
++  toJSON (JWTConfig ty keyOrUrl claimNs aud claimsFmt iss) =
+     case keyOrUrl of
+          Left _    -> mkObj ("key" A..= A.String "<JWK REDACTED>")
+          Right url -> mkObj ("jwk_url" A..= url)
+@@ -348,6 +356,7 @@ instance A.ToJSON JWTConfig where
+                             , "claims_namespace" A..= claimNs
+                             , "claims_format" A..= claimsFmt
+                             , "audience" A..= aud
++                            , "issuer" A..= iss
+                             , item
+                             ]
+ 
+@@ -361,6 +370,7 @@ instance A.FromJSON JWTConfig where
+     mRawKey <- o A..:? "key"
+     claimNs <- o A..:? "claims_namespace"
+     aud     <- o A..:? "audience"
++    iss     <- o A..:? "issuer"
+     jwkUrl  <- o A..:? "jwk_url"
+     isStrngfd <- o A..:? "claims_format"
+ 
+@@ -369,9 +379,9 @@ instance A.FromJSON JWTConfig where
+       (Just _, Just _)   -> fail "key, jwk_url both cannot be present"
+       (Just rawKey, Nothing) -> do
+         key <- parseKey keyType rawKey
+-        return $ JWTConfig keyType (Left key) claimNs aud isStrngfd
++        return $ JWTConfig keyType (Left key) claimNs aud isStrngfd iss
+       (Nothing, Just url) ->
+-        return $ JWTConfig keyType (Right url) claimNs aud isStrngfd
++        return $ JWTConfig keyType (Right url) claimNs aud isStrngfd iss
+ 
+     where
+       parseKey keyType rawKey =
+diff --git a/server/tests-py/test_jwt.py b/server/tests-py/test_jwt.py
+index c61a62fbcabc2..78eef18a980cd 100644
+--- a/server/tests-py/test_jwt.py
++++ b/server/tests-py/test_jwt.py
+@@ -15,10 +15,10 @@
+ 
+ 
+ if not pytest.config.getoption('--hge-jwt-key-file'):
+-    pytest.skip('--hge-jwt-key-file is missing, skipping JWT basic tests', allow_module_level=True)
++    pytest.skip('--hge-jwt-key-file is missing, skipping JWT tests', allow_module_level=True)
+ 
+ if not pytest.config.getoption('--hge-jwt-conf'):
+-    pytest.skip('--hge-jwt-key-conf is missing, skipping JWT basic tests', allow_module_level=True)
++    pytest.skip('--hge-jwt-key-conf is missing, skipping JWT tests', allow_module_level=True)
+ 
+ def get_claims_fmt(raw_conf):
+     conf = json.loads(raw_conf)
+@@ -199,6 +199,32 @@ def test_jwt_invalid_signature(self, hge_ctx, endpoint):
+             self.conf['status'] = 400
+         check_query(hge_ctx, self.conf, add_auth=False)
+ 
++    def test_jwt_no_audience_in_conf(self, hge_ctx, endpoint):
++        self.claims['https://hasura.io/jwt/claims'] = mk_claims(hge_ctx.hge_jwt_conf, {
++            'x-hasura-user-id': '1',
++            'x-hasura-default-role': 'user',
++            'x-hasura-allowed-roles': ['user'],
++        })
++
++        self.claims['aud'] = 'hasura-test-suite'
++        token = jwt.encode(self.claims, hge_ctx.hge_jwt_key, algorithm='RS512').decode('utf-8')
++        self.conf['headers']['Authorization'] = 'Bearer ' + token
++        self.conf['url'] = endpoint
++        check_query(hge_ctx, self.conf, add_auth=False)
++
++    def test_jwt_no_issuer_in_conf(self, hge_ctx, endpoint):
++        self.claims['https://hasura.io/jwt/claims'] = mk_claims(hge_ctx.hge_jwt_conf, {
++            'x-hasura-user-id': '1',
++            'x-hasura-default-role': 'user',
++            'x-hasura-allowed-roles': ['user'],
++        })
++
++        self.claims['iss'] = 'rubbish-issuer'
++        token = jwt.encode(self.claims, hge_ctx.hge_jwt_key, algorithm='RS512').decode('utf-8')
++        self.conf['headers']['Authorization'] = 'Bearer ' + token
++        self.conf['url'] = endpoint
++        check_query(hge_ctx, self.conf, add_auth=False)
++
+     @pytest.fixture(autouse=True)
+     def transact(self, setup):
+         self.dir = 'queries/graphql_query/permissions'
+@@ -261,3 +287,149 @@ def test_jwt_expiry(self, hge_ctx, ws_client):
+         init_ws_conn(hge_ctx, ws_client, payload)
+         time.sleep(5)
+         assert ws_client.remote_closed == True, ws_client.remote_closed
++
++
++@pytest.mark.parametrize('endpoint', ['/v1/graphql', '/v1alpha1/graphql'])
++class TestJwtAudienceCheck():
++    def test_jwt_valid_audience(self, hge_ctx, endpoint):
++        jwt_conf = json.loads(hge_ctx.hge_jwt_conf)
++        if 'audience' not in jwt_conf:
++            pytest.skip('audience not present in conf, skipping testing audience')
++
++        audience = jwt_conf['audience']
++        audience = audience if isinstance(audience, str) else audience[0]
++        self.claims['https://hasura.io/jwt/claims'] = mk_claims(hge_ctx.hge_jwt_conf, {
++            'x-hasura-user-id': '1',
++            'x-hasura-default-role': 'user',
++            'x-hasura-allowed-roles': ['user'],
++        })
++        self.claims['aud'] = audience
++
++        token = jwt.encode(self.claims, hge_ctx.hge_jwt_key, algorithm='RS512').decode('utf-8')
++        self.conf['headers']['Authorization'] = 'Bearer ' + token
++        check_query(hge_ctx, self.conf, add_auth=False)
++
++    def test_jwt_invalid_audience(self, hge_ctx, endpoint):
++        jwt_conf = json.loads(hge_ctx.hge_jwt_conf)
++        if 'audience' not in jwt_conf:
++            pytest.skip('audience not present in conf, skipping testing audience')
++
++        self.claims['https://hasura.io/jwt/claims'] = mk_claims(hge_ctx.hge_jwt_conf, {
++            'x-hasura-user-id': '1',
++            'x-hasura-default-role': 'user',
++            'x-hasura-allowed-roles': ['user'],
++        })
++        self.claims['aud'] = 'rubbish_audience'
++
++        token = jwt.encode(self.claims, hge_ctx.hge_jwt_key, algorithm='RS512').decode('utf-8')
++        self.conf['headers']['Authorization'] = 'Bearer ' + token
++        self.conf['response'] = {
++            'errors': [{
++                'extensions': {
++                    'code': 'invalid-jwt',
++                    'path': '$'
++                },
++                'message': 'Could not verify JWT: JWTNotInAudience'
++            }]
++        }
++        self.conf['url'] = endpoint
++        if endpoint == '/v1/graphql':
++            self.conf['status'] = 200
++        if endpoint == '/v1alpha1/graphql':
++            self.conf['status'] = 400
++        check_query(hge_ctx, self.conf, add_auth=False)
++
++    @pytest.fixture(autouse=True)
++    def transact(self, setup):
++        self.dir = 'queries/graphql_query/permissions'
++        with open(self.dir + '/user_select_query_unpublished_articles.yaml') as c:
++            self.conf = yaml.safe_load(c)
++        curr_time = datetime.now()
++        exp_time = curr_time + timedelta(hours=1)
++        self.claims = {
++            'sub': '1234567890',
++            'name': 'John Doe',
++            'iat': math.floor(curr_time.timestamp()),
++            'exp': math.floor(exp_time.timestamp())
++        }
++
++    @pytest.fixture(scope='class')
++    def setup(self, request, hge_ctx):
++        self.dir = 'queries/graphql_query/permissions'
++        st_code, resp = hge_ctx.v1q_f(self.dir + '/setup.yaml')
++        assert st_code == 200, resp
++        yield
++        st_code, resp = hge_ctx.v1q_f(self.dir + '/teardown.yaml')
++        assert st_code == 200, resp
++
++@pytest.mark.parametrize('endpoint', ['/v1/graphql', '/v1alpha1/graphql'])
++class TestJwtIssuerCheck():
++    def test_jwt_valid_issuer(self, hge_ctx, endpoint):
++        jwt_conf = json.loads(hge_ctx.hge_jwt_conf)
++        if 'issuer' not in jwt_conf:
++            pytest.skip('issuer not present in conf, skipping testing issuer')
++
++        issuer = jwt_conf['issuer']
++        self.claims['https://hasura.io/jwt/claims'] = mk_claims(hge_ctx.hge_jwt_conf, {
++            'x-hasura-user-id': '1',
++            'x-hasura-default-role': 'user',
++            'x-hasura-allowed-roles': ['user'],
++        })
++        self.claims['iss'] = issuer
++
++        token = jwt.encode(self.claims, hge_ctx.hge_jwt_key, algorithm='RS512').decode('utf-8')
++        self.conf['headers']['Authorization'] = 'Bearer ' + token
++        check_query(hge_ctx, self.conf, add_auth=False)
++
++    def test_jwt_invalid_issuer(self, hge_ctx, endpoint):
++        jwt_conf = json.loads(hge_ctx.hge_jwt_conf)
++        if 'issuer' not in jwt_conf:
++            pytest.skip('issuer not present in conf, skipping testing issuer')
++
++        self.claims['https://hasura.io/jwt/claims'] = mk_claims(hge_ctx.hge_jwt_conf, {
++            'x-hasura-user-id': '1',
++            'x-hasura-default-role': 'user',
++            'x-hasura-allowed-roles': ['user'],
++        })
++        self.claims['iss'] = 'rubbish_issuer'
++
++        token = jwt.encode(self.claims, hge_ctx.hge_jwt_key, algorithm='RS512').decode('utf-8')
++        self.conf['headers']['Authorization'] = 'Bearer ' + token
++        self.conf['response'] = {
++            'errors': [{
++                'extensions': {
++                    'code': 'invalid-jwt',
++                    'path': '$'
++                },
++                'message': 'Could not verify JWT: JWTNotInIssuer'
++            }]
++        }
++        self.conf['url'] = endpoint
++        if endpoint == '/v1/graphql':
++            self.conf['status'] = 200
++        if endpoint == '/v1alpha1/graphql':
++            self.conf['status'] = 400
++        check_query(hge_ctx, self.conf, add_auth=False)
++
++    @pytest.fixture(autouse=True)
++    def transact(self, setup):
++        self.dir = 'queries/graphql_query/permissions'
++        with open(self.dir + '/user_select_query_unpublished_articles.yaml') as c:
++            self.conf = yaml.safe_load(c)
++        curr_time = datetime.now()
++        exp_time = curr_time + timedelta(hours=1)
++        self.claims = {
++            'sub': '1234567890',
++            'name': 'John Doe',
++            'iat': math.floor(curr_time.timestamp()),
++            'exp': math.floor(exp_time.timestamp())
++        }
++
++    @pytest.fixture(scope='class')
++    def setup(self, request, hge_ctx):
++        self.dir = 'queries/graphql_query/permissions'
++        st_code, resp = hge_ctx.v1q_f(self.dir + '/setup.yaml')
++        assert st_code == 200, resp
++        yield
++        st_code, resp = hge_ctx.v1q_f(self.dir + '/teardown.yaml')
++        assert st_code == 200, resp

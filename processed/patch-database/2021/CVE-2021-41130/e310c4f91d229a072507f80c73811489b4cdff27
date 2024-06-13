@@ -1,0 +1,321 @@
+diff --git a/include/api_manager/request.h b/include/api_manager/request.h
+index 6382a630c..7dc71a331 100644
+--- a/include/api_manager/request.h
++++ b/include/api_manager/request.h
+@@ -74,7 +74,8 @@ class Request {
+ 
+   // Adds a header to backend. If the header exists, overwrite its value
+   virtual utils::Status AddHeaderToBackend(const std::string &key,
+-                                           const std::string &value) = 0;
++                                           const std::string &value,
++                                           bool changeAllOccurrence) = 0;
+ };
+ 
+ }  // namespace api_manager
+diff --git a/src/api_manager/check_auth.cc b/src/api_manager/check_auth.cc
+index a49b6cf25..ea0dbd255 100644
+--- a/src/api_manager/check_auth.cc
++++ b/src/api_manager/check_auth.cc
+@@ -393,7 +393,7 @@ void AuthChecker::PassUserInfoOnSuccess() {
+   char *base64_json_buf = auth::esp_base64_encode(
+       json_buf, strlen(json_buf), true, false, true /*padding*/);
+   context_->request()->AddHeaderToBackend(auth::kEndpointApiUserInfo,
+-                                          base64_json_buf);
++                                          base64_json_buf, false);
+   auth::esp_grpc_free(json_buf);
+   auth::esp_grpc_free(base64_json_buf);
+ 
+diff --git a/src/api_manager/check_auth_test.cc b/src/api_manager/check_auth_test.cc
+index dcd338c75..f9d8833e7 100644
+--- a/src/api_manager/check_auth_test.cc
++++ b/src/api_manager/check_auth_test.cc
+@@ -458,7 +458,7 @@ void CheckAuthTest::TestValidToken(const std::string &auth_token,
+       }));
+   std::cout << "need be replaced: " << user_info << std::endl;
+   EXPECT_CALL(*raw_request_,
+-              AddHeaderToBackend(kEndpointApiUserInfo, user_info))
++              AddHeaderToBackend(kEndpointApiUserInfo, user_info, false))
+       .WillOnce(Return(utils::Status::OK));
+ 
+   CheckAuth(context_, [](Status status) { ASSERT_TRUE(status.ok()); });
+@@ -490,8 +490,8 @@ TEST_F(CheckAuthTest, TestOKAuth) {
+       }));
+   EXPECT_CALL(*raw_request_, SetAuthToken(kToken)).Times(1);
+   EXPECT_CALL(*raw_env_, DoRunHTTPRequest(_)).Times(0);
+-  EXPECT_CALL(*raw_request_,
+-              AddHeaderToBackend(kEndpointApiUserInfo, kUserInfo_kSub_kIss))
++  EXPECT_CALL(*raw_request_, AddHeaderToBackend(kEndpointApiUserInfo,
++                                                kUserInfo_kSub_kIss, false))
+       .WillOnce(Return(utils::Status::OK));
+ 
+   CheckAuth(context_, [](Status status) { ASSERT_TRUE(status.ok()); });
+@@ -513,8 +513,8 @@ TEST_F(CheckAuthTest, TestOKAuth) {
+       }));
+   EXPECT_CALL(*raw_request_, SetAuthToken(kToken2)).Times(1);
+   EXPECT_CALL(*raw_env_, DoRunHTTPRequest(_)).Times(0);
+-  EXPECT_CALL(*raw_request_,
+-              AddHeaderToBackend(kEndpointApiUserInfo, kUserInfo_kSub2_kIss2))
++  EXPECT_CALL(*raw_request_, AddHeaderToBackend(kEndpointApiUserInfo,
++                                                kUserInfo_kSub2_kIss2, false))
+       .WillOnce(Return(utils::Status::OK));
+ 
+   CheckAuth(context_, [](Status status) { ASSERT_TRUE(status.ok()); });
+@@ -605,8 +605,8 @@ TEST_F(CheckAuthTest, TestNoOpenId) {
+         std::map<std::string, std::string> empty;
+         req->OnComplete(Status::OK, std::move(empty), std::move(body));
+       }));
+-  EXPECT_CALL(*raw_request_,
+-              AddHeaderToBackend(kEndpointApiUserInfo, kUserInfo_kSub_kIss2))
++  EXPECT_CALL(*raw_request_, AddHeaderToBackend(kEndpointApiUserInfo,
++                                                kUserInfo_kSub_kIss2, false))
+       .WillOnce(Return(utils::Status::OK));
+ 
+   CheckAuth(context_, [](Status status) { ASSERT_TRUE(status.ok()); });
+diff --git a/src/api_manager/check_service_control.cc b/src/api_manager/check_service_control.cc
+index f80fbd1b9..3e2e68d34 100644
+--- a/src/api_manager/check_service_control.cc
++++ b/src/api_manager/check_service_control.cc
+@@ -15,6 +15,7 @@
+ ////////////////////////////////////////////////////////////////////////////////
+ // includes should be ordered. This seems like a bug in clang-format?
+ #include "src/api_manager/check_service_control.h"
++
+ #include "google/protobuf/stubs/status.h"
+ #include "src/api_manager/cloud_trace/cloud_trace.h"
+ 
+@@ -85,8 +86,8 @@ void CheckServiceControl(std::shared_ptr<context::RequestContext> context,
+ 
+         // update consumer_project_id to service context
+         if (!info.consumer_project_id.empty()) {
+-          context->request()->AddHeaderToBackend(kConsumerProjecId,
+-                                                 info.consumer_project_id);
++          context->request()->AddHeaderToBackend(
++              kConsumerProjecId, info.consumer_project_id, false);
+         }
+ 
+         continuation(status);
+diff --git a/src/api_manager/context/client_ip_extraction_test.cc b/src/api_manager/context/client_ip_extraction_test.cc
+index 026b39faa..9d94e2aec 100644
+--- a/src/api_manager/context/client_ip_extraction_test.cc
++++ b/src/api_manager/context/client_ip_extraction_test.cc
+@@ -117,8 +117,8 @@ class MockRequest : public Request {
+     return false;
+   }
+ 
+-  MOCK_METHOD2(AddHeaderToBackend,
+-               utils::Status(const std::string &, const std::string &));
++  MOCK_METHOD3(AddHeaderToBackend,
++               utils::Status(const std::string &, const std::string &, bool));
+   MOCK_METHOD1(SetAuthToken, void(const std::string &));
+   MOCK_METHOD0(GetFrontendProtocol,
+                ::google::api_manager::protocol::Protocol());
+diff --git a/src/api_manager/context/request_context.cc b/src/api_manager/context/request_context.cc
+index 53b597d35..ab91e2b5e 100644
+--- a/src/api_manager/context/request_context.cc
++++ b/src/api_manager/context/request_context.cc
+@@ -16,15 +16,17 @@
+ //
+ 
+ #include "src/api_manager/context/request_context.h"
+-#include "google/api/backend.pb.h"
+-#include "src/api_manager/auth/lib/json_util.h"
+-#include "src/api_manager/utils/str_util.h"
+ 
+ #include <uuid/uuid.h>
++
+ #include <numeric>
+ #include <sstream>
+ #include <vector>
+ 
++#include "google/api/backend.pb.h"
++#include "src/api_manager/auth/lib/json_util.h"
++#include "src/api_manager/utils/str_util.h"
++
+ using ::google::api_manager::auth::GetPrimitiveFieldValue;
+ using ::google::api_manager::cloud_trace::HeaderType;
+ using ::google::api_manager::utils::Status;
+@@ -208,7 +210,7 @@ void RequestContext::ExtractApiKey() {
+ }
+ 
+ void RequestContext::SetApiKeyHeader() {
+-  request_->AddHeaderToBackend(kDefaultApiKeyHeaderName, api_key_);
++  request_->AddHeaderToBackend(kDefaultApiKeyHeaderName, api_key_, false);
+ }
+ 
+ void RequestContext::CompleteCheck(Status status) {
+@@ -434,7 +436,7 @@ void RequestContext::StartBackendSpanAndSetTraceContext() {
+       cloud_trace()->header_type() == HeaderType::CLOUD_TRACE_CONTEXT
+           ? kCloudTraceContextHeader
+           : kGRpcTraceContextHeader,
+-      trace_context_header);
++      trace_context_header, false);
+   if (!status.ok()) {
+     service_context()->env()->LogError(
+         "Failed to set trace context header to backend.");
+@@ -535,14 +537,14 @@ void RequestContext::AddInstanceIdentityToken() {
+       std::string origin_auth_header;
+       if (request()->FindHeader(kAuthorizationHeader, &origin_auth_header)) {
+         Status status = request()->AddHeaderToBackend(
+-            kXForwardedAuthorizationHeader, origin_auth_header);
++            kXForwardedAuthorizationHeader, origin_auth_header, false);
+         if (!status.ok()) {
+           service_context()->env()->LogError(
+               "Failed to set X-Forwarded-Authorization header to backend.");
+         }
+       }
+-      Status status = request()->AddHeaderToBackend(kAuthorizationHeader,
+-                                                    kBearerPrefix + token);
++      Status status = request()->AddHeaderToBackend(
++          kAuthorizationHeader, kBearerPrefix + token, false);
+       if (!status.ok()) {
+         service_context()->env()->LogError(
+             "Failed to set authorization header to backend.");
+diff --git a/src/api_manager/mock_request.h b/src/api_manager/mock_request.h
+index 908591ee1..49aadb973 100644
+--- a/src/api_manager/mock_request.h
++++ b/src/api_manager/mock_request.h
+@@ -25,8 +25,8 @@ class MockRequest : public Request {
+  public:
+   MOCK_METHOD2(FindQuery, bool(const std::string &, std::string *));
+   MOCK_METHOD2(FindHeader, bool(const std::string &, std::string *));
+-  MOCK_METHOD2(AddHeaderToBackend,
+-               utils::Status(const std::string &, const std::string &));
++  MOCK_METHOD3(AddHeaderToBackend,
++               utils::Status(const std::string &, const std::string &, bool));
+   MOCK_METHOD1(SetAuthToken, void(const std::string &));
+   MOCK_METHOD0(GetRequestHTTPMethod, std::string());
+   MOCK_METHOD0(GetQueryParameters, std::string());
+diff --git a/src/api_manager/request_handler.cc b/src/api_manager/request_handler.cc
+index 24536a783..eedcff8c5 100644
+--- a/src/api_manager/request_handler.cc
++++ b/src/api_manager/request_handler.cc
+@@ -43,7 +43,7 @@ RequestHandler::RequestHandler(
+   if (context_->request()->FindHeader(
+           google::api_manager::auth::kEndpointApiUserInfo, &buffer)) {
+     context_->request()->AddHeaderToBackend(
+-        google::api_manager::auth::kEndpointApiUserInfo, "");
++        google::api_manager::auth::kEndpointApiUserInfo, "", true);
+   }
+ }
+ 
+diff --git a/src/nginx/request.cc b/src/nginx/request.cc
+index c66ae6161..09da19df6 100644
+--- a/src/nginx/request.cc
++++ b/src/nginx/request.cc
+@@ -146,18 +146,21 @@ void NgxEspRequest::SetAuthToken(const std::string &auth_token) {
+ }
+ 
+ utils::Status NgxEspRequest::AddHeaderToBackend(const std::string &key,
+-                                                const std::string &value) {
+-  ngx_table_elt_t *h = nullptr;
++                                                const std::string &value,
++                                                bool changeAllOccurrence) {
++  std::vector<ngx_table_elt_t *> headers;
+   for (auto &h_in : r_->headers_in) {
+     if (key.size() == h_in.key.len &&
+         strncasecmp(key.c_str(), reinterpret_cast<const char *>(h_in.key.data),
+                     h_in.key.len) == 0) {
+-      h = &h_in;
+-      break;
++      headers.push_back(&h_in);
++      if (!changeAllOccurrence) {
++        break;
++      }
+     }
+   }
+-  if (h == nullptr) {
+-    h = reinterpret_cast<ngx_table_elt_t *>(
++  if (headers.empty()) {
++    ngx_table_elt_t *h = reinterpret_cast<ngx_table_elt_t *>(
+         ngx_list_push(&r_->headers_in.headers));
+     if (h == nullptr) {
+       return utils::Status(Code::INTERNAL, "Out of memory");
+@@ -172,14 +175,21 @@ utils::Status NgxEspRequest::AddHeaderToBackend(const std::string &key,
+         h->lowcase_key,
+         reinterpret_cast<u_char *>(const_cast<char *>(key.c_str())),
+         key.size());
++    headers.push_back(h);
+   }
+ 
+-  if (ngx_str_copy_from_std(r_->pool, key, &h->key) != NGX_OK ||
+-      ngx_str_copy_from_std(r_->pool, value, &h->value) != NGX_OK) {
+-    return utils::Status(Code::INTERNAL, "Out of memory");
++  for (size_t i = 0; i < headers.size(); ++i) {
++    ngx_table_elt_t *it = headers[i];
++    if (ngx_str_copy_from_std(r_->pool, key, &it->key) != NGX_OK ||
++        ngx_str_copy_from_std(r_->pool, value, &it->value) != NGX_OK) {
++      return utils::Status(Code::INTERNAL, "Out of memory");
++    }
+   }
+-  ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r_->connection->log, 0,
+-                 "updates header to backend: \"%V: %V\"", &h->key, &h->value);
++
++  ngx_log_debug3(
++      NGX_LOG_DEBUG_HTTP, r_->connection->log, 0,
++      "updates header to backend, changeAllOccurrence: '%t', \"%V: %V\"",
++      changeAllOccurrence, &h->key, &h->value);
+   return utils::Status::OK;
+ }
+ 
+diff --git a/src/nginx/request.h b/src/nginx/request.h
+index ba22fe2a3..f1e6d6fa4 100644
+--- a/src/nginx/request.h
++++ b/src/nginx/request.h
+@@ -57,7 +57,8 @@ class NgxEspRequest : public Request {
+ 
+   virtual void SetAuthToken(const std::string &auth_token);
+   virtual utils::Status AddHeaderToBackend(const std::string &key,
+-                                           const std::string &value);
++                                           const std::string &value,
++                                           bool changeAllOccurrence);
+   virtual bool FindQuery(const std::string &name, std::string *query);
+   virtual bool FindHeader(const std::string &name, std::string *header);
+ 
+diff --git a/src/nginx/t/ApiManager.pm b/src/nginx/t/ApiManager.pm
+index e34928fd9..24ce55a88 100644
+--- a/src/nginx/t/ApiManager.pm
++++ b/src/nginx/t/ApiManager.pm
+@@ -456,6 +456,7 @@ sub read_http_stream {
+       'path' => $path,
+       'uri' => $uri,
+       'headers' => \%headers,
++      'header_lines' => \@header_lines,
+       'body' => $body
+     };
+ 
+diff --git a/src/nginx/t/auth_remove_user_info.t b/src/nginx/t/auth_remove_user_info.t
+index 17da599a3..2f2920a68 100644
+--- a/src/nginx/t/auth_remove_user_info.t
++++ b/src/nginx/t/auth_remove_user_info.t
+@@ -42,7 +42,7 @@ my $NginxPort = ApiManager::pick_port();
+ my $BackendPort = ApiManager::pick_port();
+ my $ServiceControlPort = ApiManager::pick_port();
+ 
+-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(14);
++my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(15);
+ 
+ # Save service name in the service configuration protocol buffer file.
+ 
+@@ -88,6 +88,7 @@ my $response = ApiManager::http($NginxPort,<<'EOF');
+ GET /shelves?key=this-is-an-api-key HTTP/1.0
+ Host: localhost
+ x-endpoint-api-userinfo: Should be removed
++x-endpoint-api-userinfo: Multiple userinfo should all be removed
+ 
+ EOF
+ 
+@@ -114,6 +115,14 @@ is($r->{uri}, '/shelves?key=this-is-an-api-key', 'Backend uri was /shelves');
+ is($r->{headers}->{host}, "127.0.0.1:${BackendPort}", 'Host header was set');
+ is($r->{headers}->{'x-endpoint-api-userinfo'}, '',
+     'X-Endpoint-API-UserInfo should be removed from the request headers');
++my $arr = $r->{header_lines};
++my @userinfo_list = ();
++
++foreach (@$arr) {
++  push(@userinfo_list, $_) if index($_, 'X-Endpoint-API-UserInfo') != -1;
++}
++is(join(",", @userinfo_list), 'X-Endpoint-API-UserInfo: ,X-Endpoint-API-UserInfo: ',
++   "Multiple userinfo should all be removed");
+ 
+ @requests = ApiManager::read_http_stream($t, 'servicecontrol.log');
+ is(scalar @requests, 1, 'Service control received one request');

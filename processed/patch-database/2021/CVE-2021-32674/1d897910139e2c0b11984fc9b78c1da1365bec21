@@ -1,0 +1,275 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 15308f6e33..0544e7c3e0 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -11,11 +11,14 @@ https://github.com/zopefoundation/Zope/blob/4.x/CHANGES.rst
+ 5.2.1 (unreleased)
+ ------------------
+ 
+-- Update to newest compatible versions of dependencies.
++- Prevent unauthorized traversal through authorized Python modules in
++  TAL expressions
+ 
+ - Facelift the Zope logo.
+   (`#973 <https://github.com/zopefoundation/Zope/issues/973>`_)
+ 
++- Update to newest compatible versions of dependencies.
++
+ 
+ 5.2 (2021-05-21)
+ ----------------
+diff --git a/src/OFS/zpt/main.zpt b/src/OFS/zpt/main.zpt
+index c772848cce..e3d4c814b5 100644
+--- a/src/OFS/zpt/main.zpt
++++ b/src/OFS/zpt/main.zpt
+@@ -5,7 +5,7 @@
+ <main class="container-fluid">
+   <form id="objectItems" name="objectItems" method="post"
+         tal:define="has_order_support python:getattr(here.aq_explicit, 'has_order_support', 0);
+-                    sm modules/AccessControl/SecurityManagement/getSecurityManager;
++                    sm modules/AccessControl/getSecurityManager;
+                     default_sort python: 'position' if has_order_support else 'id';
+                     skey python:request.get('skey',default_sort);
+                     rkey python:request.get('rkey','asc');
+diff --git a/src/Products/PageTemplates/Expressions.py b/src/Products/PageTemplates/Expressions.py
+index 66a748e0b1..39102017c1 100644
+--- a/src/Products/PageTemplates/Expressions.py
++++ b/src/Products/PageTemplates/Expressions.py
+@@ -21,6 +21,7 @@
+ 
+ import OFS.interfaces
+ from AccessControl import safe_builtins
++from AccessControl.SecurityManagement import getSecurityManager
+ from Acquisition import aq_base
+ from MultiMapping import MultiMapping
+ from zExceptions import NotFound
+@@ -70,24 +71,43 @@ def boboAwareZopeTraverse(object, path_items, econtext):
+     necessary (bobo-awareness).
+     """
+     request = getattr(econtext, 'request', None)
++    validate = getSecurityManager().validate
+     path_items = list(path_items)
+     path_items.reverse()
+ 
+     while path_items:
+         name = path_items.pop()
+ 
+-        if name == '_':
+-            warnings.warn('Traversing to the name `_` is deprecated '
+-                          'and will be removed in Zope 6.',
+-                          DeprecationWarning)
+-        elif name.startswith('_'):
+-            raise NotFound(name)
+-
+         if OFS.interfaces.ITraversable.providedBy(object):
+             object = object.restrictedTraverse(name)
+         else:
+-            object = traversePathElement(object, name, path_items,
+-                                         request=request)
++            found = traversePathElement(object, name, path_items,
++                                        request=request)
++
++            # Special backwards compatibility exception for the name ``_``,
++            # which was often used for translation message factories.
++            # Allow and continue traversal.
++            if name == '_':
++                warnings.warn('Traversing to the name `_` is deprecated '
++                              'and will be removed in Zope 6.',
++                              DeprecationWarning)
++                object = found
++                continue
++
++            # All other names starting with ``_`` are disallowed.
++            # This emulates what restrictedTraverse does.
++            if name.startswith('_'):
++                raise NotFound(name)
++
++            # traversePathElement doesn't apply any Zope security policy,
++            # so we validate access explicitly here.
++            try:
++                validate(object, object, name, found)
++                object = found
++            except Unauthorized:
++                # Convert Unauthorized to prevent information disclosures
++                raise NotFound(name)
++
+     return object
+ 
+ 
+diff --git a/src/Products/PageTemplates/expression.py b/src/Products/PageTemplates/expression.py
+index bca086492a..da01002c60 100644
+--- a/src/Products/PageTemplates/expression.py
++++ b/src/Products/PageTemplates/expression.py
+@@ -10,6 +10,7 @@
+ from chameleon.tales import NotExpr
+ from chameleon.tales import StringExpr
+ 
++from AccessControl.SecurityManagement import getSecurityManager
+ from AccessControl.ZopeGuards import guarded_apply
+ from AccessControl.ZopeGuards import guarded_getattr
+ from AccessControl.ZopeGuards import guarded_getitem
+@@ -57,24 +58,49 @@ class BoboAwareZopeTraverse:
+     def traverse(cls, base, request, path_items):
+         """See ``zope.app.pagetemplate.engine``."""
+ 
++        validate = getSecurityManager().validate
+         path_items = list(path_items)
+         path_items.reverse()
+ 
+         while path_items:
+             name = path_items.pop()
+ 
+-            if name == '_':
+-                warnings.warn('Traversing to the name `_` is deprecated '
+-                              'and will be removed in Zope 6.',
+-                              DeprecationWarning)
+-            elif name.startswith('_'):
+-                raise NotFound(name)
+-
+             if ITraversable.providedBy(base):
+                 base = getattr(base, cls.traverse_method)(name)
+             else:
+-                base = traversePathElement(base, name, path_items,
+-                                           request=request)
++                found = traversePathElement(base, name, path_items,
++                                            request=request)
++
++                # If traverse_method is something other than
++                # ``restrictedTraverse`` then traversal is assumed to be
++                # unrestricted. This emulates ``unrestrictedTraverse``
++                if cls.traverse_method != 'restrictedTraverse':
++                    base = found
++                    continue
++
++                # Special backwards compatibility exception for the name ``_``,
++                # which was often used for translation message factories.
++                # Allow and continue traversal.
++                if name == '_':
++                    warnings.warn('Traversing to the name `_` is deprecated '
++                                  'and will be removed in Zope 6.',
++                                  DeprecationWarning)
++                    base = found
++                    continue
++
++                # All other names starting with ``_`` are disallowed.
++                # This emulates what restrictedTraverse does.
++                if name.startswith('_'):
++                    raise NotFound(name)
++
++                # traversePathElement doesn't apply any Zope security policy,
++                # so we validate access explicitly here.
++                try:
++                    validate(base, base, name, found)
++                    base = found
++                except Unauthorized:
++                    # Convert Unauthorized to prevent information disclosures
++                    raise NotFound(name)
+ 
+         return base
+ 
+diff --git a/src/Products/PageTemplates/tests/testExpressions.py b/src/Products/PageTemplates/tests/testExpressions.py
+index f877cfb877..a3983ce368 100644
+--- a/src/Products/PageTemplates/tests/testExpressions.py
++++ b/src/Products/PageTemplates/tests/testExpressions.py
+@@ -4,6 +4,7 @@
+ from AccessControl import safe_builtins
+ from zExceptions import NotFound
+ from zope.component.testing import PlacelessSetup
++from zope.location.interfaces import LocationError
+ 
+ 
+ class EngineTestsBase(PlacelessSetup):
+@@ -233,10 +234,10 @@ def test_underscore_traversal(self):
+         with self.assertRaises(NotFound):
+             ec.evaluate("context/__class__")
+ 
+-        with self.assertRaises(NotFound):
++        with self.assertRaises((NotFound, LocationError)):
+             ec.evaluate("nocall: random/_itertools/repeat")
+ 
+-        with self.assertRaises(NotFound):
++        with self.assertRaises((NotFound, LocationError)):
+             ec.evaluate("random/_itertools/repeat/foobar")
+ 
+ 
+diff --git a/src/Products/PageTemplates/tests/testHTMLTests.py b/src/Products/PageTemplates/tests/testHTMLTests.py
+index 79ee58b3bc..47a359d449 100644
+--- a/src/Products/PageTemplates/tests/testHTMLTests.py
++++ b/src/Products/PageTemplates/tests/testHTMLTests.py
+@@ -26,8 +26,10 @@
+     DefaultUnicodeEncodingConflictResolver
+ from Products.PageTemplates.unicodeconflictresolver import \
+     PreferredCharsetResolver
++from Products.PageTemplates.ZopePageTemplate import ZopePageTemplate
+ from zExceptions import NotFound
+ from zope.component import provideUtility
++from zope.location.interfaces import LocationError
+ from zope.traversing.adapters import DefaultTraversable
+ 
+ from .util import useChameleonEngine
+@@ -37,6 +39,10 @@ class AqPageTemplate(Implicit, PageTemplate):
+     pass
+ 
+ 
++class AqZopePageTemplate(Implicit, ZopePageTemplate):
++    pass
++
++
+ class Folder(util.Base):
+     pass
+ 
+@@ -74,6 +80,7 @@ def setUp(self):
+         self.folder = f = Folder()
+         f.laf = AqPageTemplate()
+         f.t = AqPageTemplate()
++        f.z = AqZopePageTemplate('testing')
+         self.policy = UnitTestSecurityPolicy()
+         self.oldPolicy = SecurityManager.setSecurityPolicy(self.policy)
+         noSecurityManager()  # Use the new policy.
+@@ -226,9 +233,45 @@ def test_underscore_traversal(self):
+             t()
+ 
+         t.write('<p tal:define="p nocall: random/_itertools/repeat"/>')
+-        with self.assertRaises(NotFound):
++        with self.assertRaises((NotFound, LocationError)):
+             t()
+ 
+         t.write('<p tal:content="random/_itertools/repeat/foobar"/>')
++        with self.assertRaises((NotFound, LocationError)):
++            t()
++
++    def test_module_traversal(self):
++        t = self.folder.z
++
++        # Need to reset to the standard security policy so AccessControl
++        # checks are actually performed. The test setup initializes
++        # a policy that circumvents those checks.
++        SecurityManager.setSecurityPolicy(self.oldPolicy)
++        noSecurityManager()
++
++        # The getSecurityManager function is explicitly allowed
++        content = ('<p tal:define="a nocall:%s"'
++                   '   tal:content="python: a().getUser().getUserName()"/>')
++        t.write(content % 'modules/AccessControl/getSecurityManager')
++        self.assertEqual(t(), '<p>Anonymous User</p>')
++
++        # Anything else should be unreachable and raise NotFound:
++        # Direct access through AccessControl
++        t.write('<p tal:define="a nocall:modules/AccessControl/users"/>')
++        with self.assertRaises(NotFound):
++            t()
++
++        # Indirect access through an intermediary variable
++        content = ('<p tal:define="mod nocall:modules/AccessControl;'
++                   '               must_fail nocall:mod/users"/>')
++        t.write(content)
++        with self.assertRaises(NotFound):
++            t()
++
++        # Indirect access through an intermediary variable and a dictionary
++        content = ('<p tal:define="mod nocall:modules/AccessControl;'
++                   '               a_dict python: {\'unsafe\': mod};'
++                   '               must_fail nocall: a_dict/unsafe/users"/>')
++        t.write(content)
+         with self.assertRaises(NotFound):
+             t()

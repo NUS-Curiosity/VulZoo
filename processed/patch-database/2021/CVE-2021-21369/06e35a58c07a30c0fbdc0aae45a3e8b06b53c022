@@ -1,0 +1,202 @@
+diff --git a/ethereum/api/src/main/java/org/hyperledger/besu/ethereum/api/jsonrpc/authentication/AuthenticationUtils.java b/ethereum/api/src/main/java/org/hyperledger/besu/ethereum/api/jsonrpc/authentication/AuthenticationUtils.java
+index cac92cf3338..92303aa90c7 100644
+--- a/ethereum/api/src/main/java/org/hyperledger/besu/ethereum/api/jsonrpc/authentication/AuthenticationUtils.java
++++ b/ethereum/api/src/main/java/org/hyperledger/besu/ethereum/api/jsonrpc/authentication/AuthenticationUtils.java
+@@ -37,27 +37,31 @@ public static boolean isPermitted(
+ 
+     AtomicBoolean foundMatchingPermission = new AtomicBoolean();
+ 
+-    if (authenticationService.isPresent()) {
+-      if (optionalUser.isPresent()) {
+-        User user = optionalUser.get();
+-        for (String perm : jsonRpcMethod.getPermissions()) {
+-          user.isAuthorized(
+-              perm,
+-              (authed) -> {
+-                if (authed.result()) {
+-                  LOG.trace(
+-                      "user {} authorized : {} via permission {}",
+-                      user,
+-                      jsonRpcMethod.getName(),
+-                      perm);
+-                  foundMatchingPermission.set(true);
+-                }
+-              });
++    if (authenticationService.isEmpty()) {
++      // no auth provider configured thus anything is permitted
++      return true;
++    }
++
++    if (optionalUser.isPresent()) {
++      User user = optionalUser.get();
++      for (String perm : jsonRpcMethod.getPermissions()) {
++        user.isAuthorized(
++            perm,
++            (authed) -> {
++              if (authed.result()) {
++                LOG.trace(
++                    "user {} authorized : {} via permission {}",
++                    user,
++                    jsonRpcMethod.getName(),
++                    perm);
++                foundMatchingPermission.set(true);
++              }
++            });
++        // exit if a matching permission was found, no need to keep checking
++        if (foundMatchingPermission.get()) {
++          return foundMatchingPermission.get();
+         }
+       }
+-    } else {
+-      // no auth provider configured thus anything is permitted
+-      foundMatchingPermission.set(true);
+     }
+ 
+     if (!foundMatchingPermission.get()) {
+diff --git a/ethereum/api/src/main/java/org/hyperledger/besu/ethereum/api/jsonrpc/internal/methods/JsonRpcMethod.java b/ethereum/api/src/main/java/org/hyperledger/besu/ethereum/api/jsonrpc/internal/methods/JsonRpcMethod.java
+index 24faf238677..20e3a521d1b 100644
+--- a/ethereum/api/src/main/java/org/hyperledger/besu/ethereum/api/jsonrpc/internal/methods/JsonRpcMethod.java
++++ b/ethereum/api/src/main/java/org/hyperledger/besu/ethereum/api/jsonrpc/internal/methods/JsonRpcMethod.java
+@@ -23,7 +23,7 @@
+ public interface JsonRpcMethod {
+ 
+   /**
+-   * Standardised JSON-RPC method name.
++   * Standardized JSON-RPC method name.
+    *
+    * @return identification of the JSON-RPC method.
+    */
+@@ -38,15 +38,17 @@ public interface JsonRpcMethod {
+   JsonRpcResponse response(JsonRpcRequestContext request);
+ 
+   /**
+-   * The list of Permissions that correspond to this JSON-RPC method. e.g. [net/*, net/listening]
++   * The list of Permissions that correspond to this JSON-RPC method.
++   *
++   * <p>e.g. [*:*, net:*, net:listening]
+    *
+    * @return list of permissions that match this method.
+    */
+   default List<String> getPermissions() {
+     List<String> permissions = new ArrayList<>();
+     permissions.add("*:*");
+-    permissions.add(this.getName().replace('_', ':'));
+     permissions.add(this.getName().substring(0, this.getName().indexOf('_')) + ":*");
++    permissions.add(this.getName().replace('_', ':'));
+     return permissions;
+   };
+ }
+diff --git a/ethereum/api/src/test/java/org/hyperledger/besu/ethereum/api/jsonrpc/JsonRpcHttpServiceLoginTest.java b/ethereum/api/src/test/java/org/hyperledger/besu/ethereum/api/jsonrpc/JsonRpcHttpServiceLoginTest.java
+index c06e9a0306d..a0ed2caf690 100644
+--- a/ethereum/api/src/test/java/org/hyperledger/besu/ethereum/api/jsonrpc/JsonRpcHttpServiceLoginTest.java
++++ b/ethereum/api/src/test/java/org/hyperledger/besu/ethereum/api/jsonrpc/JsonRpcHttpServiceLoginTest.java
+@@ -393,7 +393,7 @@ public void checkJsonRpcMethodsAvailableWithGoodCredentialsAndPermissions() thro
+                     AuthenticationUtils.isPermitted(
+                         service.authenticationService, Optional.of(user), ethBlockNumber))
+                 .isTrue();
+-            // eth/accounts not permitted
++            // eth/accounts NOT permitted
+             assertThat(
+                     AuthenticationUtils.isPermitted(
+                         service.authenticationService, Optional.of(user), ethAccounts))
+@@ -407,7 +407,7 @@ public void checkJsonRpcMethodsAvailableWithGoodCredentialsAndPermissions() thro
+                     AuthenticationUtils.isPermitted(
+                         service.authenticationService, Optional.of(user), web3Sha3))
+                 .isTrue();
+-            // no net permissions
++            // NO net permissions
+             assertThat(
+                     AuthenticationUtils.isPermitted(
+                         service.authenticationService, Optional.of(user), netVersion))
+@@ -416,6 +416,66 @@ public void checkJsonRpcMethodsAvailableWithGoodCredentialsAndPermissions() thro
+     }
+   }
+ 
++  @Test
++  public void checkJsonRpcMethodsAvailableWithGoodCredentialsAndAllPermissions()
++      throws IOException {
++    final RequestBody body =
++        RequestBody.create(JSON, "{\"username\":\"adminuser\",\"password\":\"pegasys\"}");
++    final Request request = new Request.Builder().post(body).url(baseUrl + "/login").build();
++    try (final Response resp = client.newCall(request).execute()) {
++      assertThat(resp.code()).isEqualTo(200);
++      assertThat(resp.message()).isEqualTo("OK");
++      assertThat(resp.body().contentType()).isNotNull();
++      assertThat(resp.body().contentType().type()).isEqualTo("application");
++      assertThat(resp.body().contentType().subtype()).isEqualTo("json");
++      final String bodyString = resp.body().string();
++      assertThat(bodyString).isNotNull();
++      assertThat(bodyString).isNotBlank();
++
++      final JsonObject respBody = new JsonObject(bodyString);
++      final String token = respBody.getString("token");
++      assertThat(token).isNotNull();
++
++      final JsonRpcMethod ethAccounts = new EthAccounts();
++      final JsonRpcMethod netVersion = new NetVersion(Optional.of(BigInteger.valueOf(123)));
++      final JsonRpcMethod ethBlockNumber = new EthBlockNumber(blockchainQueries);
++      final JsonRpcMethod web3Sha3 = new Web3Sha3();
++      final JsonRpcMethod web3ClientVersion = new Web3ClientVersion("777");
++
++      // adminuser has *:* permissions so everything should be allowed
++      jwtAuth.authenticate(
++          new JsonObject().put("jwt", token),
++          (r) -> {
++            assertThat(r.succeeded()).isTrue();
++            final User user = r.result();
++            // single eth/blockNumber method permitted
++            Assertions.assertThat(
++                    AuthenticationUtils.isPermitted(
++                        service.authenticationService, Optional.of(user), ethBlockNumber))
++                .isTrue();
++            // eth/accounts IS permitted
++            assertThat(
++                    AuthenticationUtils.isPermitted(
++                        service.authenticationService, Optional.of(user), ethAccounts))
++                .isTrue();
++            // allowed by *:*
++            assertThat(
++                    AuthenticationUtils.isPermitted(
++                        service.authenticationService, Optional.of(user), web3ClientVersion))
++                .isTrue();
++            assertThat(
++                    AuthenticationUtils.isPermitted(
++                        service.authenticationService, Optional.of(user), web3Sha3))
++                .isTrue();
++            // YES net permissions
++            assertThat(
++                    AuthenticationUtils.isPermitted(
++                        service.authenticationService, Optional.of(user), netVersion))
++                .isTrue();
++          });
++    }
++  }
++
+   @Test
+   public void checkPermissionsWithEmptyUser() {
+     final JsonRpcMethod ethAccounts = new EthAccounts();
+diff --git a/ethereum/api/src/test/java/org/hyperledger/besu/ethereum/api/jsonrpc/internal/methods/NetListeningTest.java b/ethereum/api/src/test/java/org/hyperledger/besu/ethereum/api/jsonrpc/internal/methods/NetListeningTest.java
+index b7d1fe49216..fc0e3e216b0 100644
+--- a/ethereum/api/src/test/java/org/hyperledger/besu/ethereum/api/jsonrpc/internal/methods/NetListeningTest.java
++++ b/ethereum/api/src/test/java/org/hyperledger/besu/ethereum/api/jsonrpc/internal/methods/NetListeningTest.java
+@@ -69,7 +69,7 @@ public void shouldReturnFalseWhenNetworkIsNotListening() {
+   @Test
+   public void getPermissions() {
+     List<String> permissions = method.getPermissions();
+-    assertThat(permissions).containsExactlyInAnyOrder("net:*", "net:listening", "*:*");
++    assertThat(permissions).containsExactly("*:*", "net:*", "net:listening");
+   }
+ 
+   private JsonRpcRequestContext netListeningRequest() {
+diff --git a/ethereum/api/src/test/resources/JsonRpcHttpService/auth.toml b/ethereum/api/src/test/resources/JsonRpcHttpService/auth.toml
+index 48e7bf1e5c5..3de16f86ff6 100644
+--- a/ethereum/api/src/test/resources/JsonRpcHttpService/auth.toml
++++ b/ethereum/api/src/test/resources/JsonRpcHttpService/auth.toml
+@@ -2,3 +2,7 @@
+ password = "$2a$10$l3GA7K8g6rJ/Yv.YFSygCuI9byngpEzxgWS9qEg5emYDZomQW7fGC"
+ permissions = ["fakePermission","eth:blockNumber","eth:subscribe","web3:*"]
+ privacyPublicKey = "A1aVtMxLCUHmBVHXoZzzBgPbW/wj5axDpW9X8l91SGo="
++[Users.adminuser]
++password = "$2a$10$l3GA7K8g6rJ/Yv.YFSygCuI9byngpEzxgWS9qEg5emYDZomQW7fGC"
++permissions = ["*:*"]
++privacyPublicKey = "A1aVtMxLCUHmBVHXoZzzBgPbW/wj5axDpW9X8l91SGo="

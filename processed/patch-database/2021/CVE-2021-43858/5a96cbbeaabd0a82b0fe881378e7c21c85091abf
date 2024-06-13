@@ -1,0 +1,313 @@
+diff --git a/cmd/admin-handlers-users.go b/cmd/admin-handlers-users.go
+index 623b8e4bf99ab..98f6504f2bb5d 100644
+--- a/cmd/admin-handlers-users.go
++++ b/cmd/admin-handlers-users.go
+@@ -416,14 +416,14 @@ func (a adminAPIHandlers) AddUser(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	var uinfo madmin.UserInfo
+-	if err = json.Unmarshal(configBytes, &uinfo); err != nil {
++	var ureq madmin.AddOrUpdateUserReq
++	if err = json.Unmarshal(configBytes, &ureq); err != nil {
+ 		logger.LogIf(ctx, err)
+ 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), r.URL)
+ 		return
+ 	}
+ 
+-	if err = globalIAMSys.CreateUser(ctx, accessKey, uinfo); err != nil {
++	if err = globalIAMSys.CreateUser(ctx, accessKey, ureq); err != nil {
+ 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+ 		return
+ 	}
+diff --git a/cmd/admin-handlers-users_test.go b/cmd/admin-handlers-users_test.go
+index 6ec2fd78c3052..3f28e52f7673c 100644
+--- a/cmd/admin-handlers-users_test.go
++++ b/cmd/admin-handlers-users_test.go
+@@ -18,8 +18,15 @@
+ package cmd
+ 
+ import (
++	"bytes"
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
+ 	"fmt"
++	"io/ioutil"
++	"net/http"
++	"net/url"
+ 	"os"
+ 	"strings"
+ 	"testing"
+@@ -29,7 +36,9 @@ import (
+ 	minio "github.com/minio/minio-go/v7"
+ 	"github.com/minio/minio-go/v7/pkg/credentials"
+ 	cr "github.com/minio/minio-go/v7/pkg/credentials"
++	"github.com/minio/minio-go/v7/pkg/s3utils"
+ 	"github.com/minio/minio-go/v7/pkg/set"
++	"github.com/minio/minio-go/v7/pkg/signer"
+ 	"github.com/minio/minio/internal/auth"
+ )
+ 
+@@ -177,6 +186,7 @@ func TestIAMInternalIDPServerSuite(t *testing.T) {
+ 
+ 				suite.SetUpSuite(c)
+ 				suite.TestUserCreate(c)
++				suite.TestUserPolicyEscalationBug(c)
+ 				suite.TestPolicyCreate(c)
+ 				suite.TestCannedPolicies(c)
+ 				suite.TestGroupAddRemove(c)
+@@ -222,6 +232,24 @@ func (s *TestSuiteIAM) TestUserCreate(c *check) {
+ 		c.Fatalf("user could not create bucket: %v", err)
+ 	}
+ 
++	// 3.10. Check that user's password can be updated.
++	_, newSecretKey := mustGenerateCredentials(c)
++	err = s.adm.SetUser(ctx, accessKey, newSecretKey, madmin.AccountEnabled)
++	if err != nil {
++		c.Fatalf("Unable to update user's secret key: %v", err)
++	}
++	// 3.10.1 Check that old password no longer works.
++	err = client.MakeBucket(ctx, getRandomBucketName(), minio.MakeBucketOptions{})
++	if err == nil {
++		c.Fatalf("user was unexpectedly able to create bucket with bad password!")
++	}
++	// 3.10.2 Check that new password works.
++	client = s.getUserClient(c, accessKey, newSecretKey, "")
++	err = client.MakeBucket(ctx, getRandomBucketName(), minio.MakeBucketOptions{})
++	if err != nil {
++		c.Fatalf("user could not create bucket: %v", err)
++	}
++
+ 	// 4. Check that user can be disabled and verify it.
+ 	err = s.adm.SetUserStatus(ctx, accessKey, madmin.AccountDisabled)
+ 	if err != nil {
+@@ -260,6 +288,108 @@ func (s *TestSuiteIAM) TestUserCreate(c *check) {
+ 	}
+ }
+ 
++func (s *TestSuiteIAM) TestUserPolicyEscalationBug(c *check) {
++	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
++	defer cancel()
++
++	bucket := getRandomBucketName()
++	err := s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
++	if err != nil {
++		c.Fatalf("bucket creat error: %v", err)
++	}
++
++	// 2. Create a user, associate policy and verify access
++	accessKey, secretKey := mustGenerateCredentials(c)
++	err = s.adm.SetUser(ctx, accessKey, secretKey, madmin.AccountEnabled)
++	if err != nil {
++		c.Fatalf("Unable to set user: %v", err)
++	}
++	// 2.1 check that user does not have any access to the bucket
++	uClient := s.getUserClient(c, accessKey, secretKey, "")
++	c.mustNotListObjects(ctx, uClient, bucket)
++
++	// 2.2 create and associate policy to user
++	policy := "mypolicy-test-user-update"
++	policyBytes := []byte(fmt.Sprintf(`{
++ "Version": "2012-10-17",
++ "Statement": [
++  {
++   "Effect": "Allow",
++   "Action": [
++    "s3:PutObject",
++    "s3:GetObject",
++    "s3:ListBucket"
++   ],
++   "Resource": [
++    "arn:aws:s3:::%s/*"
++   ]
++  }
++ ]
++}`, bucket))
++	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
++	if err != nil {
++		c.Fatalf("policy add error: %v", err)
++	}
++	err = s.adm.SetPolicy(ctx, policy, accessKey, false)
++	if err != nil {
++		c.Fatalf("Unable to set policy: %v", err)
++	}
++	// 2.3 check user has access to bucket
++	c.mustListObjects(ctx, uClient, bucket)
++	// 2.3 check that user cannot delete the bucket
++	err = uClient.RemoveBucket(ctx, bucket)
++	if err == nil || err.Error() != "Access Denied." {
++		c.Fatalf("bucket was deleted unexpectedly or got unexpected err: %v", err)
++	}
++
++	// 3. Craft a request to update the user's permissions
++	ep := s.adm.GetEndpointURL()
++	urlValue := url.Values{}
++	urlValue.Add("accessKey", accessKey)
++	u, err := url.Parse(fmt.Sprintf("%s://%s/minio/admin/v3/add-user?%s", ep.Scheme, ep.Host, s3utils.QueryEncode(urlValue)))
++	if err != nil {
++		c.Fatalf("unexpected url parse err: %v", err)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
++	if err != nil {
++		c.Fatalf("unexpected new request err: %v", err)
++	}
++	reqBodyArg := madmin.UserInfo{
++		SecretKey:  secretKey,
++		PolicyName: "consoleAdmin",
++		Status:     madmin.AccountEnabled,
++	}
++	buf, err := json.Marshal(reqBodyArg)
++	if err != nil {
++		c.Fatalf("unexpected json encode err: %v", err)
++	}
++	buf, err = madmin.EncryptData(secretKey, buf)
++	if err != nil {
++		c.Fatalf("unexpected encryption err: %v", err)
++	}
++
++	req.ContentLength = int64(len(buf))
++	sum := sha256.Sum256(buf)
++	req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(sum[:]))
++	req.Body = ioutil.NopCloser(bytes.NewReader(buf))
++	req = signer.SignV4(*req, accessKey, secretKey, "", "")
++
++	// 3.1 Execute the request.
++	resp, err := s.TestSuiteCommon.client.Do(req)
++	if err != nil {
++		c.Fatalf("unexpected request err: %v", err)
++	}
++	if resp.StatusCode != 200 {
++		c.Fatalf("got unexpected response: %#v\n", resp)
++	}
++
++	// 3.2 check that user cannot delete the bucket
++	err = uClient.RemoveBucket(ctx, bucket)
++	if err == nil || err.Error() != "Access Denied." {
++		c.Fatalf("User was able to escalate privileges (Err=%v)!", err)
++	}
++}
++
+ func (s *TestSuiteIAM) TestAddServiceAccountPerms(c *check) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+ 	defer cancel()
+diff --git a/cmd/iam-store.go b/cmd/iam-store.go
+index 6bb971149c731..e659f21922b3b 100644
+--- a/cmd/iam-store.go
++++ b/cmd/iam-store.go
+@@ -1629,7 +1629,7 @@ func (store *IAMStoreSys) ListServiceAccounts(ctx context.Context, accessKey str
+ }
+ 
+ // AddUser - adds/updates long term user account to storage.
+-func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, uinfo madmin.UserInfo) error {
++func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, ureq madmin.AddOrUpdateUserReq) error {
+ 	cache := store.lock()
+ 	defer store.unlock()
+ 
+@@ -1642,9 +1642,9 @@ func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, uinfo m
+ 
+ 	u := newUserIdentity(auth.Credentials{
+ 		AccessKey: accessKey,
+-		SecretKey: uinfo.SecretKey,
++		SecretKey: ureq.SecretKey,
+ 		Status: func() string {
+-			if uinfo.Status == madmin.AccountEnabled {
++			if ureq.Status == madmin.AccountEnabled {
+ 				return auth.AccountOn
+ 			}
+ 			return auth.AccountOff
+@@ -1657,25 +1657,7 @@ func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, uinfo m
+ 
+ 	cache.iamUsersMap[accessKey] = u.Credentials
+ 
+-	// Set policy if specified.
+-	if uinfo.PolicyName != "" {
+-		policy := uinfo.PolicyName
+-		// Handle policy mapping set/update
+-		mp := newMappedPolicy(policy)
+-		for _, p := range mp.toSlice() {
+-			if _, found := cache.iamPolicyDocsMap[policy]; !found {
+-				logger.LogIf(GlobalContext, fmt.Errorf("%w: (%s)", errNoSuchPolicy, p))
+-				return errNoSuchPolicy
+-			}
+-		}
+-
+-		if err := store.saveMappedPolicy(ctx, accessKey, regUser, false, mp); err != nil {
+-			return err
+-		}
+-		cache.iamUserPolicyMap[accessKey] = mp
+-	}
+ 	return nil
+-
+ }
+ 
+ // UpdateUserSecretKey - sets user secret key to storage.
+diff --git a/cmd/iam.go b/cmd/iam.go
+index 48a5fe3f72a19..00afa4a5e20e8 100644
+--- a/cmd/iam.go
++++ b/cmd/iam.go
+@@ -954,7 +954,7 @@ func (sys *IAMSys) DeleteServiceAccount(ctx context.Context, accessKey string, n
+ 
+ // CreateUser - create new user credentials and policy, if user already exists
+ // they shall be rewritten with new inputs.
+-func (sys *IAMSys) CreateUser(ctx context.Context, accessKey string, uinfo madmin.UserInfo) error {
++func (sys *IAMSys) CreateUser(ctx context.Context, accessKey string, ureq madmin.AddOrUpdateUserReq) error {
+ 	if !sys.Initialized() {
+ 		return errServerNotInitialized
+ 	}
+@@ -967,11 +967,11 @@ func (sys *IAMSys) CreateUser(ctx context.Context, accessKey string, uinfo madmi
+ 		return auth.ErrInvalidAccessKeyLength
+ 	}
+ 
+-	if !auth.IsSecretKeyValid(uinfo.SecretKey) {
++	if !auth.IsSecretKeyValid(ureq.SecretKey) {
+ 		return auth.ErrInvalidSecretKeyLength
+ 	}
+ 
+-	err := sys.store.AddUser(ctx, accessKey, uinfo)
++	err := sys.store.AddUser(ctx, accessKey, ureq)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/cmd/signature-v4-utils_test.go b/cmd/signature-v4-utils_test.go
+index 437661647b803..8744314935e54 100644
+--- a/cmd/signature-v4-utils_test.go
++++ b/cmd/signature-v4-utils_test.go
+@@ -76,7 +76,7 @@ func TestCheckValid(t *testing.T) {
+ 		t.Fatalf("unable create credential, %s", err)
+ 	}
+ 
+-	globalIAMSys.CreateUser(ctx, ucreds.AccessKey, madmin.UserInfo{
++	globalIAMSys.CreateUser(ctx, ucreds.AccessKey, madmin.AddOrUpdateUserReq{
+ 		SecretKey: ucreds.SecretKey,
+ 		Status:    madmin.AccountEnabled,
+ 	})
+diff --git a/go.mod b/go.mod
+index 47b36deb16220..c362101d7e9a7 100644
+--- a/go.mod
++++ b/go.mod
+@@ -49,7 +49,7 @@ require (
+ 	github.com/minio/csvparser v1.0.0
+ 	github.com/minio/highwayhash v1.0.2
+ 	github.com/minio/kes v0.14.0
+-	github.com/minio/madmin-go v1.1.18
++	github.com/minio/madmin-go v1.1.20
+ 	github.com/minio/minio-go/v7 v7.0.17
+ 	github.com/minio/parquet-go v1.1.0
+ 	github.com/minio/pkg v1.1.9
+diff --git a/go.sum b/go.sum
+index a65570b55633b..703a8905b079d 100644
+--- a/go.sum
++++ b/go.sum
+@@ -1088,8 +1088,8 @@ github.com/minio/kes v0.14.0/go.mod h1:OUensXz2BpgMfiogslKxv7Anyx/wj+6bFC6qA7BQc
+ github.com/minio/madmin-go v1.0.12/go.mod h1:BK+z4XRx7Y1v8SFWXsuLNqQqnq5BO/axJ8IDJfgyvfs=
+ github.com/minio/madmin-go v1.1.15/go.mod h1:Iu0OnrMWNBYx1lqJTW+BFjBMx0Hi0wjw8VmqhiOs2Jo=
+ github.com/minio/madmin-go v1.1.17/go.mod h1:Iu0OnrMWNBYx1lqJTW+BFjBMx0Hi0wjw8VmqhiOs2Jo=
+-github.com/minio/madmin-go v1.1.18 h1:1jXRb9LTiXqbZWBjXYmlqI5eCWsyZlprrI5CEVQjjqY=
+-github.com/minio/madmin-go v1.1.18/go.mod h1:Iu0OnrMWNBYx1lqJTW+BFjBMx0Hi0wjw8VmqhiOs2Jo=
++github.com/minio/madmin-go v1.1.20 h1:jig4gJi0CD+FYz+Cnd+TNo0oqhNaZcLmfUqNl5b46Eo=
++github.com/minio/madmin-go v1.1.20/go.mod h1:Iu0OnrMWNBYx1lqJTW+BFjBMx0Hi0wjw8VmqhiOs2Jo=
+ github.com/minio/mc v0.0.0-20211207230606-23a05f5a17f2 h1:xocb1RGyrDJ8PxkNn0NSbaBlfdU6J/Ag9QK62pb7nR8=
+ github.com/minio/mc v0.0.0-20211207230606-23a05f5a17f2/go.mod h1:siI9jWTzj1KsNXgz6NOL/S7OTaAUM0OMi+zEkF08gnA=
+ github.com/minio/md5-simd v1.1.0/go.mod h1:XpBqgZULrMYD3R+M28PcmP0CkI7PEMzB3U77ZrKZ0Gw=

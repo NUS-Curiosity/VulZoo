@@ -1,0 +1,635 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 15d0245..22e91a6 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -37,7 +37,7 @@ if(WEBCC_ENABLE_SSL)
+ endif()
+ 
+ if(WIN32)
+-    add_executable(url_unicode url_unicode.cc encoding.cc encoding.h)
++    add_executable(url_unicode url_unicode.cc)
+     target_link_libraries(url_unicode ${EXAMPLE_LIBS})
+     set_target_properties(url_unicode PROPERTIES FOLDER "Examples")
+ endif()
+diff --git a/examples/encoding.cc b/examples/encoding.cc
+deleted file mode 100644
+index 4faadea..0000000
+--- a/examples/encoding.cc
++++ /dev/null
+@@ -1,60 +0,0 @@
+-#include "encoding.h"
+-
+-#include <Windows.h>
+-
+-namespace {
+-
+-// Wrapper for Windows API MultiByteToWideChar.
+-std::wstring MB2WC(const std::string& input, unsigned int code_page) {
+-  if (input.empty()) {
+-    return L"";
+-  }
+-
+-  int length = ::MultiByteToWideChar(code_page, 0, &input[0],
+-                                     static_cast<int>(input.size()),
+-                                     NULL, 0);
+-
+-  std::wstring output(length, '\0');
+-
+-  ::MultiByteToWideChar(code_page, 0, &input[0], static_cast<int>(input.size()),
+-                        &output[0], static_cast<int>(output.size()));
+-
+-  return output;
+-}
+-
+-// Wrapper for Windows API WideCharToMultiByte.
+-std::string WC2MB(const std::wstring& input, unsigned int code_page) {
+-  if (input.empty()) {
+-    return "";
+-  }
+-
+-  // There do have other code pages which require the flags to be 0, e.g.,
+-  // 50220, 50211, and so on. But they are not included in our charset
+-  // dictionary. So, only consider 65001 (UTF-8) and 54936 (GB18030).
+-  DWORD flags = 0;
+-  if (code_page != 65001 && code_page != 54936) {
+-    flags = WC_NO_BEST_FIT_CHARS | WC_COMPOSITECHECK | WC_DEFAULTCHAR;
+-  }
+-
+-  int length = ::WideCharToMultiByte(code_page, flags, &input[0],
+-                                     static_cast<int>(input.size()), NULL, 0,
+-                                     NULL, NULL);
+-
+-  std::string output(length, '\0');
+-
+-  ::WideCharToMultiByte(code_page, flags, &input[0],
+-                        static_cast<int>(input.size()), &output[0],
+-                        static_cast<int>(output.size()), NULL, NULL);
+-
+-  return output;
+-}
+-
+-}  // namespace
+-
+-std::string Utf16ToUtf8(const std::wstring& utf16_string) {
+-  return WC2MB(utf16_string, CP_UTF8);
+-}
+-
+-std::wstring Utf8ToUtf16(const std::string& utf8_string) {
+-  return MB2WC(utf8_string, CP_UTF8);
+-}
+diff --git a/examples/encoding.h b/examples/encoding.h
+deleted file mode 100644
+index cff9258..0000000
+--- a/examples/encoding.h
++++ /dev/null
+@@ -1,12 +0,0 @@
+-#ifndef ENCODING_H_
+-#define ENCODING_H_
+-
+-#include <string>
+-
+-// Convert UTF16 to UTF8.
+-std::string Utf16ToUtf8(const std::wstring& utf16_string);
+-
+-// Convert UTF8 to UTF16.
+-std::wstring Utf8ToUtf16(const std::string& utf8_string);
+-
+-#endif  // ENCODING_H_
+diff --git a/examples/url_unicode.cc b/examples/url_unicode.cc
+index 6d24a86..c8af0ab 100644
+Binary files a/examples/url_unicode.cc and b/examples/url_unicode.cc differ
+diff --git a/webcc/body.cc b/webcc/body.cc
+index baca6b0..3800138 100644
+--- a/webcc/body.cc
++++ b/webcc/body.cc
+@@ -202,7 +202,7 @@ Payload FileBody::NextPayload(bool /*free_previous*/) {
+ }
+ 
+ void FileBody::Dump(std::ostream& os, const std::string& prefix) const {
+-  os << prefix << "<file: " << path_.string() << ">" << std::endl;
++  os << prefix << "<file: " << path_.u8string() << ">" << std::endl;
+ }
+ 
+ bool FileBody::Move(const fs::path& new_path) {
+diff --git a/webcc/fs.h b/webcc/fs.h
+index 71decfb..7d6d51c 100644
+--- a/webcc/fs.h
++++ b/webcc/fs.h
+@@ -27,6 +27,8 @@ using std::filesystem::path;
+ using std::filesystem::filesystem_error;
+ 
+ // functions
++using std::filesystem::absolute;
++using std::filesystem::canonical;
+ using std::filesystem::rename;
+ using std::filesystem::remove;
+ using std::filesystem::exists;
+@@ -47,6 +49,8 @@ using boost::filesystem::path;
+ using boost::filesystem::filesystem_error;
+ 
+ // functions
++using boost::filesystem::absolute;
++using boost::filesystem::canonical;
+ using boost::filesystem::rename;
+ using boost::filesystem::remove;
+ using boost::filesystem::exists;
+diff --git a/webcc/request_parser.cc b/webcc/request_parser.cc
+index daeec34..e226135 100644
+--- a/webcc/request_parser.cc
++++ b/webcc/request_parser.cc
+@@ -24,14 +24,13 @@ void RequestParser::Init(Request* request, ViewMatcher view_matcher) {
+ }
+ 
+ bool RequestParser::OnHeadersEnd() {
+-  bool matched = view_matcher_(request_->method(), request_->url().path(),
+-                               &stream_);
+-
++  // Decode the URL path before match.
++  std::string url_path = Url::DecodeUnsafe(request_->url().path());
++  bool matched = view_matcher_(request_->method(), url_path, &stream_);
+   if (!matched) {
+     LOG_WARN("No view matches the request: %s %s", request_->method().c_str(),
+-             request_->url().path().c_str());
++             url_path.c_str());
+   }
+-
+   return matched;
+ }
+ 
+diff --git a/webcc/request_parser.h b/webcc/request_parser.h
+index 31493fe..4afa54a 100644
+--- a/webcc/request_parser.h
++++ b/webcc/request_parser.h
+@@ -8,6 +8,7 @@
+ 
+ namespace webcc {
+ 
++// Parameters: http_method, url_path, [out]stream
+ using ViewMatcher =
+     std::function<bool(const std::string&, const std::string&, bool*)>;
+ 
+diff --git a/webcc/router.cc b/webcc/router.cc
+index a87d68f..39a0e03 100644
+--- a/webcc/router.cc
++++ b/webcc/router.cc
+@@ -67,7 +67,7 @@ ViewPtr Router::FindView(const std::string& method, const std::string& url,
+   return ViewPtr();
+ }
+ 
+-bool Router::MatchView(const std::string& method, const std::string& url,
++bool Router::MatchView(const std::string& method, const std::string& url_path,
+                        bool* stream) {
+   assert(stream != nullptr);
+   *stream = false;
+@@ -80,13 +80,12 @@ bool Router::MatchView(const std::string& method, const std::string& url,
+ 
+     if (route.url.empty()) {
+       std::smatch match;
+-
+-      if (std::regex_match(url, match, route.url_regex)) {
++      if (std::regex_match(url_path, match, route.url_regex)) {
+         *stream = route.view->Stream(method);
+         return true;
+       }
+     } else {
+-      if (boost::iequals(route.url, url)) {
++      if (boost::iequals(route.url, url_path)) {
+         *stream = route.view->Stream(method);
+         return true;
+       }
+diff --git a/webcc/router.h b/webcc/router.h
+index b4ee47e..28de5ec 100644
+--- a/webcc/router.h
++++ b/webcc/router.h
+@@ -28,10 +28,10 @@ class Router {
+   ViewPtr FindView(const std::string& method, const std::string& url,
+                    UrlArgs* args);
+ 
+-  // Match the view by HTTP method and URL (path).
++  // Match the view by HTTP method and URL path.
+   // Return if a view is matched or not.
+   // If the view asks for data streaming, |stream| will be set to true.
+-  bool MatchView(const std::string& method, const std::string& url,
++  bool MatchView(const std::string& method, const std::string& url_path,
+                  bool* stream);
+ 
+ private:
+diff --git a/webcc/server.cc b/webcc/server.cc
+index 3cbc13e..41b27ae 100644
+--- a/webcc/server.cc
++++ b/webcc/server.cc
+@@ -4,6 +4,8 @@
+ #include <fstream>
+ #include <utility>
+ 
++#include "boost/algorithm/string/trim.hpp"
++
+ #include "webcc/body.h"
+ #include "webcc/logger.h"
+ #include "webcc/request.h"
+@@ -32,6 +34,7 @@ Server::Server(boost::asio::ip::tcp protocol, std::uint16_t port,
+       doc_root_(doc_root),
+       acceptor_(io_context_),
+       signals_(io_context_) {
++  CheckDocRoot();
+   AddSignals();
+ }
+ 
+@@ -105,6 +108,27 @@ bool Server::IsRunning() const {
+   return running_ && !io_context_.stopped();
+ }
+ 
++void Server::CheckDocRoot() {
++  try {
++    if (!fs::exists(doc_root_) || !fs::is_directory(doc_root_)) {
++      LOG_ERRO("Doc root is not an existing directory!");
++      return;
++    }
++
++    if (doc_root_.is_relative()) {
++      doc_root_ = fs::absolute(doc_root_);
++    }
++
++    doc_root_ = fs::canonical(doc_root_);
++
++  } catch (fs::filesystem_error& e) {
++    LOG_ERRO("Doc root error: %s", e.what());
++    doc_root_.clear();
++  }
++
++  LOG_INFO("Doc root: %s", doc_root_.u8string().c_str());
++}
++
+ void Server::AddSignals() {
+   signals_.add(SIGINT);  // Ctrl+C
+   signals_.add(SIGTERM);
+@@ -314,14 +338,16 @@ void Server::Handle(ConnectionPtr connection) {
+ }
+ 
+ bool Server::MatchViewOrStatic(const std::string& method,
+-                               const std::string& url, bool* stream) {
+-  if (Router::MatchView(method, url, stream)) {
++                               const std::string& url_path, bool* stream) {
++  if (Router::MatchView(method, url_path, stream)) {
+     return true;
+   }
+ 
+   // Try to match a static file.
+   if (method == methods::kGet && !doc_root_.empty()) {
+-    fs::path path = doc_root_ / url;
++    fs::path sub_path = utility::TranslatePath(url_path);
++    //LOG_INFO("Translated URL path: %s", sub_path.u8string().c_str());
++    fs::path path = doc_root_ / sub_path;
+ 
+     fs::error_code ec;
+     if (!fs::is_directory(path, ec) && fs::exists(path, ec)) {
+@@ -340,7 +366,9 @@ ResponsePtr Server::ServeStatic(RequestPtr request) {
+     return {};
+   }
+ 
+-  fs::path path = doc_root_ / request->url().path();
++  std::string url_path = Url::DecodeUnsafe(request->url().path());
++  fs::path sub_path = utility::TranslatePath(url_path);
++  fs::path path = doc_root_ / sub_path;
+ 
+   try {
+     // NOTE: FileBody might throw Error::kFileError.
+diff --git a/webcc/server.h b/webcc/server.h
+index 46f807e..d799110 100644
+--- a/webcc/server.h
++++ b/webcc/server.h
+@@ -61,6 +61,10 @@ class Server : public Router {
+   bool IsRunning() const;
+ 
+ private:
++  // Check if doc root is valid.
++  // Absolute it if necessary.
++  void CheckDocRoot();
++
+   // Register signals which indicate when the server should exit.
+   void AddSignals();
+ 
+@@ -90,10 +94,13 @@ class Server : public Router {
+   // request comes, this connection will be put back to the queue again.
+   virtual void Handle(ConnectionPtr connection);
+ 
+-  // Match the view by HTTP method and URL (path).
++  // Match the view by HTTP method and URL path.
+   // Return if a view or static file is matched or not.
++  // The |url_path| has already been decoded.
++  // The |url_path| is UTF8 encoded by itself, and this is taken into account
++  // when match the static files.
+   // If the view asks for data streaming, |stream| will be set to true.
+-  bool MatchViewOrStatic(const std::string& method, const std::string& url,
++  bool MatchViewOrStatic(const std::string& method, const std::string& url_path,
+                          bool* stream);
+ 
+   // Serve static files from the doc root.
+diff --git a/webcc/string.cc b/webcc/string.cc
+index ed630b8..dba358b 100644
+--- a/webcc/string.cc
++++ b/webcc/string.cc
+@@ -1,11 +1,72 @@
+ #include "webcc/string.h"
+ 
++#if (defined(_WIN32) || defined(_WIN64))
++#include <Windows.h>
++#endif
++
+ #include <random>
+ 
+ #include "boost/algorithm/string/trim.hpp"
+ 
+ namespace webcc {
+ 
++#if (defined(_WIN32) || defined(_WIN64))
++
++// Wrapper for Windows API MultiByteToWideChar.
++static std::wstring MB2WC(const std::string& input, unsigned int code_page) {
++  if (input.empty()) {
++    return L"";
++  }
++
++  int length = ::MultiByteToWideChar(code_page, 0, &input[0],
++                                     static_cast<int>(input.size()),
++                                     NULL, 0);
++
++  std::wstring output(length, '\0');
++
++  ::MultiByteToWideChar(code_page, 0, &input[0], static_cast<int>(input.size()),
++                        &output[0], static_cast<int>(output.size()));
++
++  return output;
++}
++
++// Wrapper for Windows API WideCharToMultiByte.
++static std::string WC2MB(const std::wstring& input, unsigned int code_page) {
++  if (input.empty()) {
++    return "";
++  }
++
++  // There do have other code pages which require the flags to be 0, e.g.,
++  // 50220, 50211, and so on. But they are not included in our charset
++  // dictionary. So, only consider 65001 (UTF-8) and 54936 (GB18030).
++  DWORD flags = 0;
++  if (code_page != 65001 && code_page != 54936) {
++    flags = WC_NO_BEST_FIT_CHARS | WC_COMPOSITECHECK | WC_DEFAULTCHAR;
++  }
++
++  int length = ::WideCharToMultiByte(code_page, flags, &input[0],
++                                     static_cast<int>(input.size()), NULL, 0,
++                                     NULL, NULL);
++
++  std::string output(length, '\0');
++
++  ::WideCharToMultiByte(code_page, flags, &input[0],
++                        static_cast<int>(input.size()), &output[0],
++                        static_cast<int>(output.size()), NULL, NULL);
++
++  return output;
++}
++
++std::string Utf16To8(const std::wstring& utf16_string) {
++  return WC2MB(utf16_string, CP_UTF8);
++}
++
++std::wstring Utf8To16(const std::string& utf8_string) {
++  return MB2WC(utf8_string, CP_UTF8);
++}
++
++#endif  // defined(_WIN32) || defined(_WIN64)
++
+ // Ref: https://stackoverflow.com/a/24586587
+ std::string RandomString(std::size_t length) {
+   static const char chrs[] =
+diff --git a/webcc/string.h b/webcc/string.h
+index 67e9635..e12a7e2 100644
+--- a/webcc/string.h
++++ b/webcc/string.h
+@@ -8,6 +8,11 @@
+ 
+ namespace webcc {
+ 
++#if (defined(_WIN32) || defined(_WIN64))
++std::string Utf16To8(const std::wstring& utf16_string);
++std::wstring Utf8To16(const std::string& utf8_string);
++#endif
++
+ // Get a randomly generated string with the given length.
+ std::string RandomString(std::size_t length);
+ 
+diff --git a/webcc/url.cc b/webcc/url.cc
+index e7a006f..6dd46c9 100644
+--- a/webcc/url.cc
++++ b/webcc/url.cc
+@@ -29,52 +29,6 @@ bool HexToDecimal(char hex, int* decimal) {
+   return true;
+ }
+ 
+-bool Decode(string_view encoded, std::string* raw) {
+-  for (auto iter = encoded.begin(); iter != encoded.end(); ++iter) {
+-    if (*iter == '%') {
+-      if (++iter == encoded.end()) {
+-        // Invalid URI string, two hexadecimal digits must follow '%'.
+-        return false;
+-      }
+-
+-      int h_decimal = 0;
+-      if (!HexToDecimal(*iter, &h_decimal)) {
+-        return false;
+-      }
+-
+-      if (++iter == encoded.end()) {
+-        // Invalid URI string, two hexadecimal digits must follow '%'.
+-        return false;
+-      }
+-
+-      int l_decimal = 0;
+-      if (!HexToDecimal(*iter, &l_decimal)) {
+-        return false;
+-      }
+-
+-      raw->push_back(static_cast<char>((h_decimal << 4) + l_decimal));
+-
+-    } else if (*iter > 127 || *iter < 0) {
+-      // Invalid encoded URI string, must be entirely ASCII.
+-      return false;
+-    } else {
+-      raw->push_back(*iter);
+-    }
+-  }
+-
+-  return true;
+-}
+-
+-// Unsafe decode.
+-// Return the original string on failure.
+-std::string DecodeUnsafe(string_view encoded) {
+-  std::string raw;
+-  if (Decode(encoded, &raw)) {
+-    return raw;
+-  }
+-  return ToString(encoded);
+-}
+-
+ // Encode all characters which should be encoded.
+ std::string EncodeImpl(string_view raw,  // UTF8
+                        std::function<bool(int)> should_encode) {
+@@ -195,6 +149,50 @@ std::string Url::EncodeFull(string_view utf8_str) {
+   });
+ }
+ 
++bool Url::Decode(string_view encoded, std::string* raw) {
++  for (auto iter = encoded.begin(); iter != encoded.end(); ++iter) {
++    if (*iter == '%') {
++      if (++iter == encoded.end()) {
++        // Invalid URI string, two hexadecimal digits must follow '%'.
++        return false;
++      }
++
++      int h_decimal = 0;
++      if (!HexToDecimal(*iter, &h_decimal)) {
++        return false;
++      }
++
++      if (++iter == encoded.end()) {
++        // Invalid URI string, two hexadecimal digits must follow '%'.
++        return false;
++      }
++
++      int l_decimal = 0;
++      if (!HexToDecimal(*iter, &l_decimal)) {
++        return false;
++      }
++
++      raw->push_back(static_cast<char>((h_decimal << 4) + l_decimal));
++
++    } else if (*iter > 127 || *iter < 0) {
++      // Invalid encoded URI string, must be entirely ASCII.
++      return false;
++    } else {
++      raw->push_back(*iter);
++    }
++  }
++
++  return true;
++}
++
++std::string Url::DecodeUnsafe(string_view encoded) {
++  std::string raw;
++  if (Decode(encoded, &raw)) {
++    return raw;
++  }
++  return ToString(encoded);
++}
++
+ // -----------------------------------------------------------------------------
+ 
+ Url::Url(string_view str, bool encode) {
+@@ -318,7 +316,8 @@ UrlQuery::UrlQuery(const std::string& encoded_str) {
+       string_view key;
+       string_view value;
+       if (SplitKV(kv, '=', false, &key, &value)) {
+-        parameters_.push_back({ DecodeUnsafe(key), DecodeUnsafe(value) });
++        parameters_.push_back(
++            { Url::DecodeUnsafe(key), Url::DecodeUnsafe(value) });
+       }
+     }
+   }
+diff --git a/webcc/url.h b/webcc/url.h
+index 0f81b07..d1659ce 100644
+--- a/webcc/url.h
++++ b/webcc/url.h
+@@ -22,6 +22,12 @@ class Url {
+   static std::string EncodeQuery(string_view utf8_str);
+   static std::string EncodeFull(string_view utf8_str);
+ 
++  static bool Decode(string_view encoded, std::string* raw);
++
++  // Unsafe decode.
++  // Return the original string on failure.
++  static std::string DecodeUnsafe(string_view encoded);
++
+ public:
+   Url() = default;
+ 
+diff --git a/webcc/utility.cc b/webcc/utility.cc
+index 8c6ab4b..d127512 100644
+--- a/webcc/utility.cc
++++ b/webcc/utility.cc
+@@ -7,6 +7,8 @@
+ #include <iostream>
+ #include <sstream>
+ 
++#include "boost/algorithm/string.hpp"
++
+ #include "webcc/string.h"
+ #include "webcc/version.h"
+ 
+@@ -91,5 +93,42 @@ std::string EndpointToString(const tcp::endpoint& endpoint) {
+   return ss.str();
+ }
+ 
++fs::path TranslatePath(const std::string& utf8_url_path) {
++#if (defined(_WIN32) || defined(_WIN64))
++  std::wstring url_path = Utf8To16(utf8_url_path);
++  std::vector<std::wstring> words;
++  boost::split(words, url_path, boost::is_any_of(L"/"),
++               boost::token_compress_on);
++#else
++  std::vector<std::string> words;
++  boost::split(words, utf8_url_path, boost::is_any_of("/"),
++               boost::token_compress_on);
++#endif  // defined(_WIN32) || defined(_WIN64)
++
++  fs::path path;
++  for (auto& word : words) {
++    // Ignore . and ..
++#if (defined(_WIN32) || defined(_WIN64))
++    if (word == L"." || word == L"..") {
++#else
++    if (word == "." || word == "..") {
++#endif
++      continue;
++    }
++
++    fs::path p{ word };
++
++    // Ignore C:\\, C:, path\\sub, ...
++    // parent_path() is similar to Python os.path.dirname().
++    if (!p.parent_path().empty()) {
++      continue;
++    }
++
++    path /= p;
++  }
++
++  return path;
++}
++
+ }  // namespace utility
+ }  // namespace webcc
+diff --git a/webcc/utility.h b/webcc/utility.h
+index 4270ade..f8d247c 100644
+--- a/webcc/utility.h
++++ b/webcc/utility.h
+@@ -39,6 +39,19 @@ void PrintEndpoint(std::ostream& ostream,
+ // TCP endpoint to string.
+ std::string EndpointToString(const boost::asio::ip::tcp::endpoint& endpoint);
+ 
++// Translate a /-separated URL path to the local (relative) path.
++// Examples:
++//   (Non-Windows)
++//   "/path/to/file" -> "path/to/file"
++//   "/path/./to/../file" -> "path/to/file" (. and .. are ignored)
++//   "/path//to//file" -> "path/to/file"
++//   (Windows)
++//   "/path/to/file" -> "path\to\file"
++//   "/path\\sub/to/file" -> "to\file" (path\\sub is ignored)
++//   "/C:\\test/path" -> "path" (C:\\test is ignored)
++// Reference: Python http/server.py translate_path()
++fs::path TranslatePath(const std::string& utf8_url_path);
++
+ }  // namespace utility
+ }  // namespace webcc
+ 

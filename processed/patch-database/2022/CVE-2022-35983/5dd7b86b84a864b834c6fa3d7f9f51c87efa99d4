@@ -1,0 +1,109 @@
+diff --git a/tensorflow/core/util/tensor_slice_writer.cc b/tensorflow/core/util/tensor_slice_writer.cc
+index ca907916fd3f1d..75197a52c6d556 100644
+--- a/tensorflow/core/util/tensor_slice_writer.cc
++++ b/tensorflow/core/util/tensor_slice_writer.cc
+@@ -131,6 +131,16 @@ Status TensorSliceWriter::Finish() {
+ 
+ /* static */
+ size_t TensorSliceWriter::MaxBytesPerElement(DataType dt) {
++  size_t max_bytes_per_element =
++      TensorSliceWriter::MaxBytesPerElementOrZero(dt);
++  if (max_bytes_per_element == 0) {
++    LOG(FATAL) << "MaxBytesPerElement not implemented for dtype: " << dt;
++  }
++  return max_bytes_per_element;
++}
++
++/* static */
++size_t TensorSliceWriter::MaxBytesPerElementOrZero(DataType dt) {
+   switch (dt) {
+     case DT_FLOAT:
+       return 4;
+@@ -170,9 +180,8 @@ size_t TensorSliceWriter::MaxBytesPerElement(DataType dt) {
+     case DT_STRING:
+     case DT_BFLOAT16:
+     default:
+-      LOG(FATAL) << "MaxBytesPerElement not implemented for dtype: " << dt;
++      return 0;
+   }
+-  return 0;
+ }
+ 
+ template <>
+diff --git a/tensorflow/core/util/tensor_slice_writer.h b/tensorflow/core/util/tensor_slice_writer.h
+index 3436966866aaba..34aa7c0b91673c 100644
+--- a/tensorflow/core/util/tensor_slice_writer.h
++++ b/tensorflow/core/util/tensor_slice_writer.h
+@@ -68,6 +68,8 @@ class TensorSliceWriter {
+   static size_t MaxBytesPerElement(DataType dt);
+ 
+  private:
++  static size_t MaxBytesPerElementOrZero(DataType dt);
++
+   static constexpr size_t kMaxMessageBytes = 1LL << 31;
+   // Filling in the TensorProto in a SavedSlice will add the following
+   // header bytes, in addition to the data:
+@@ -162,9 +164,15 @@ Status TensorSliceWriter::Add(const string& name, const TensorShape& shape,
+ template <typename T>
+ Status TensorSliceWriter::SaveData(const T* data, int64_t num_elements,
+                                    SavedSlice* ss) {
+-  size_t size_bound =
+-      ss->ByteSize() + kTensorProtoHeaderBytes +
+-      (MaxBytesPerElement(DataTypeToEnum<T>::value) * num_elements);
++  size_t max_bytes_per_element =
++      MaxBytesPerElementOrZero(DataTypeToEnum<T>::value);
++  if (max_bytes_per_element == 0) {
++    return errors::InvalidArgument(
++        "Tensor slice serialization not implemented for dtype ",
++        DataTypeToEnum<T>::value);
++  }
++  size_t size_bound = ss->ByteSize() + kTensorProtoHeaderBytes +
++                      (max_bytes_per_element * num_elements);
+   if (size_bound > kMaxMessageBytes) {
+     return errors::InvalidArgument(
+         "Tensor slice is too large to serialize (conservative estimate: ",
+diff --git a/tensorflow/core/util/tensor_slice_writer_test.cc b/tensorflow/core/util/tensor_slice_writer_test.cc
+index c9740730a66a26..5120be5a8b5e35 100644
+--- a/tensorflow/core/util/tensor_slice_writer_test.cc
++++ b/tensorflow/core/util/tensor_slice_writer_test.cc
+@@ -15,17 +15,19 @@ limitations under the License.
+ 
+ #include "tensorflow/core/util/tensor_slice_writer.h"
+ 
++#include <algorithm>
+ #include <array>
++#include <memory>
++#include <vector>
+ 
+ #include "tensorflow/core/framework/tensor_shape.pb.h"
+ #include "tensorflow/core/framework/versions.pb.h"
+ #include "tensorflow/core/lib/core/status_test_util.h"
+-#include "tensorflow/core/lib/core/stringpiece.h"
+-#include "tensorflow/core/lib/io/path.h"
+-#include "tensorflow/core/lib/strings/str_util.h"
+ #include "tensorflow/core/platform/logging.h"
++#include "tensorflow/core/platform/path.h"
+ #include "tensorflow/core/platform/protobuf.h"
+ #include "tensorflow/core/platform/test.h"
++#include "tensorflow/core/protobuf/error_codes.pb.h"
+ #include "tensorflow/core/public/version.h"
+ #include "tensorflow/core/util/saved_tensor_slice_util.h"
+ #include "tensorflow/core/util/tensor_slice_reader.h"
+@@ -362,6 +364,17 @@ TEST(TensorSliceWriteTest, SizeErrors) {
+   }
+ }
+ 
++TEST(TensorSliceWriterTest, InvalidInput) {
++  SavedSlice ss;
++  std::array<uint32_t, 1> data;
++  std::fill(data.begin(), data.end(), 1234);
++  Status s = TensorSliceWriter::SaveData(data.data(), data.size(), &ss);
++  EXPECT_EQ(s.code(), error::INVALID_ARGUMENT);
++  EXPECT_TRUE(absl::StrContains(
++      s.error_message(),
++      "Tensor slice serialization not implemented for dtype"));
++}
++
+ }  // namespace checkpoint
+ 
+ }  // namespace tensorflow
