@@ -183,10 +183,19 @@ for root, dirs, files in os.walk(f"{processed_dir}/nvd-database"):
 res["github-advisory"] = {
     "count": 0,
 }
+cve_pattern = re.compile(r"CVE-\d{4}-\d{4,7}")
 for root, dirs, files in os.walk(f"{processed_dir}/github-advisory-database"):
     for file in files:
         if file.endswith(".json"):
-            res["github-advisory"]["count"] += 1
+            with open(os.path.join(root, file), "r") as f:
+                data = json.load(f)
+            try:
+                for alias in data['aliases']:
+                    if cve_pattern.match(alias):
+                        res["github-advisory"]["count"] += 1
+                        break
+            except KeyError:
+                continue
 
 
 # ZDI Advisories
