@@ -21,6 +21,8 @@ The following figure shows the conceptual overview of VulZoo:
 
 [README.md in processed/](processed/README.md) provides more details about the processed data.
 
+## Citation
+
 If you use this dataset, please cite the following paper:
 
 ```
