@@ -17,6 +17,8 @@ The following figure shows the conceptual overview of VulZoo:
 
 ![VulZoo Overview](images/graph.png)
 
+(White blocks represent structural data, and grey blocks represent non-structural data, respectively.)
+
 [README.md in processed/](processed/README.md) provides more details about the processed data.
 
 If you use this dataset, please cite the following paper:
