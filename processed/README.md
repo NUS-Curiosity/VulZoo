@@ -11,7 +11,8 @@ Total NVD CVEs with CVSS v2: 183479
 Total NVD CVEs with CVSS v3.0: 52550
 Total NVD CVEs with CVSS v3.1: 118111
 Total NVD CVEs with CWE: 179950
-Total GitHub Advisories: 19258
+Total NVD CVEs with CPE: 224998
+Total GitHub Advisories: 17069
 Total ZDI Advisories: 13291
 Total CVEs in linux-cve-announce (Published): 1988
 Total CVEs in linux-cve-announce (Rejected): 66
