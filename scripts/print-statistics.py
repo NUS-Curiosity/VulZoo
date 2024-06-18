@@ -150,6 +150,7 @@ res["nvd"] = {
     "cvss_v30_count": 0,
     "cvss_v31_count": 0,
     "cve_with_cwe_count": 0,
+    "cve_with_cpe_count": 0,
 }
 cwe_pattern = re.compile(r"CWE-\d+")
 for root, dirs, files in os.walk(f"{processed_dir}/nvd-database"):
@@ -176,7 +177,20 @@ for root, dirs, files in os.walk(f"{processed_dir}/nvd-database"):
                     if has_cwe:
                         res["nvd"]["cve_with_cwe_count"] += 1
                 except KeyError:
-                    continue
+                    pass
+                has_cpe = False
+                try:
+                    for config in data["configurations"]:
+                        for node in config["nodes"]:
+                            if "cpeMatch" in node:
+                                if len(node["cpeMatch"]) > 0:
+                                    has_cpe = True
+                                    res["nvd"]["cve_with_cpe_count"] += 1
+                                    break
+                        if has_cpe:
+                            break
+                except KeyError:
+                    pass
 
 
 # GitHub Advisories
@@ -270,6 +284,7 @@ print(f"Total NVD CVEs with CVSS v2: {res['nvd']['cvss_v2_count']}")
 print(f"Total NVD CVEs with CVSS v3.0: {res['nvd']['cvss_v30_count']}")
 print(f"Total NVD CVEs with CVSS v3.1: {res['nvd']['cvss_v31_count']}")
 print(f"Total NVD CVEs with CWE: {res['nvd']['cve_with_cwe_count']}")
+print(f"Total NVD CVEs with CPE: {res['nvd']['cve_with_cpe_count']}")
 print(f"Total GitHub Advisories: {res['github-advisory']['count']}")
 print(f"Total ZDI Advisories: {res['zdi-advisory']['count']}")
 print(f"Total CVEs in linux-cve-announce (Published): {res['linux-vulns']['published_count']}")

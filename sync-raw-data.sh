@@ -78,3 +78,4 @@ cd - &> /dev/null
 echo "raw-data/ update | ts: `date '+%s'`" >> CHANGELOG
 
 print_yellow "[!][$RAW_DATA_DIR] Please manually run scripts/raw-data/sync-attackerkb.py with the API key to update AttackerKB"
+print_yellow "[!][$RAW_DATA_DIR] Please manually run scripts/raw-data/sync-cpe.sh to update CPE"

@@ -35,7 +35,7 @@ def save_json(data, path):
 def get_topics():
     ensure_dir(topic_dir)
     still_more = True
-    cur_req = "/v1/topics?page=0&size=500&sort=created:asc&expand=references"
+    cur_req = "/v1/topics?page=0&size=500&sort=created:asc&expand=references,tags"
     cnt = 0
     while still_more:
         r = requests.get(f"{base_url}{cur_req}", headers=headers)
