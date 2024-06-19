@@ -62,6 +62,7 @@ cd - &> /dev/null
 print_green "[*][$RAW_DATA_DIR] Updating D3FEND"
 wget https://d3fend.mitre.org/ontologies/d3fend.json -O $RAW_DATA_DIR/d3fend-database/d3fend_ontology.json
 wget https://d3fend.mitre.org/ontologies/d3fend.csv -O $RAW_DATA_DIR/d3fend-database/d3fend.csv
+wget https://d3fend.mitre.org/api/ontology/inference/d3fend-full-mappings.json -O $RAW_DATA_DIR/d3fend-database/d3fend_full_mappings.json
 
 # oss-security
 print_green "[*][$RAW_DATA_DIR] Updating OSS-Security"

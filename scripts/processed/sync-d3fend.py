@@ -17,6 +17,7 @@ if __name__ == "__main__":
     ensure_dir(dst_dir)
 
     os.system(f"cp {src_dir}/d3fend_ontology.json {dst_dir}/")
+    os.system(f"cp {src_dir}/d3fend-full-mappings.json {dst_dir}/")
 
     df = pd.read_csv(f"{src_dir}/d3fend.csv")
     res = df.to_json(orient="records", indent=4)

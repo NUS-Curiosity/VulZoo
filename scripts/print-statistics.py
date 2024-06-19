@@ -62,6 +62,8 @@ res["capec"] = {
     "draft_count": 0,
     "stable_count": 0,
     "deprecated_count": 0,
+    "capec_with_cwe_count": 0,
+    "capec_with_attack_count": 0,
 }
 with open(f"{processed_dir}/capec-database/capec.json") as f:
     capec = json.load(f)
@@ -72,12 +74,25 @@ with open(f"{processed_dir}/capec-database/capec.json") as f:
             res["capec"]["stable_count"] += 1
         elif attack_pattern['@Status'] == "Deprecated":
             res["capec"]["deprecated_count"] += 1
-    
+        if "Related_Weaknesses" in attack_pattern:  
+            res["capec"]["capec_with_cwe_count"] += 1
+        if "Taxonomy_Mappings" in attack_pattern:
+            # if "Taxonomy_Mapping" is a list
+            if isinstance(attack_pattern["Taxonomy_Mappings"]["Taxonomy_Mapping"], list):
+                for mapping in attack_pattern["Taxonomy_Mappings"]["Taxonomy_Mapping"]:
+                    if mapping['@Taxonomy_Name'] == "ATTACK":
+                        res["capec"]["capec_with_attack_count"] += 1
+                        break
+            # if "Taxonomy_Mapping" is a dict
+            if isinstance(attack_pattern["Taxonomy_Mappings"]["Taxonomy_Mapping"], dict):
+                if attack_pattern["Taxonomy_Mappings"]["Taxonomy_Mapping"]['@Taxonomy_Name'] == "ATTACK":
+                    res["capec"]["capec_with_attack_count"] += 1
     res["capec"]["count"] = len(capec['Attack_Pattern_Catalog']['Attack_Patterns']['Attack_Pattern'])
 
 
 # CWE
 res["cwe"] = {}
+res["cwe"]["cwe_with_capec_count"] = 0
 with open(f"{processed_dir}/cwe-database/cwec.json") as f:
     cwe = json.load(f)
     for weakness in cwe["Weakness_Catalog"]['Weaknesses']['Weakness']:
@@ -85,6 +100,8 @@ with open(f"{processed_dir}/cwe-database/cwec.json") as f:
         if abstract not in res["cwe"]:
             res["cwe"][abstract] = 0
         res["cwe"][abstract] += 1
+        if "Related_Attack_Patterns" in weakness:
+            res["cwe"]["cwe_with_capec_count"] += 1
     res["cwe"]["count"] = len(cwe["Weakness_Catalog"]['Weaknesses']['Weakness'])
 
 
@@ -92,13 +109,30 @@ with open(f"{processed_dir}/cwe-database/cwec.json") as f:
 res["d3fend"] = {
     "ontology_count": 0,
     "tactic_count": 0,
+    "d3fend_with_attack_count": 0,
+    "attack_with_d3fend_count": 0,
 }
+bindings = {}
 with open(f"{processed_dir}/d3fend-database/d3fend.json") as f:
     d3fend = json.load(f)
     res["d3fend"]["tactic_count"] = len(d3fend)
 with open(f"{processed_dir}/d3fend-database/d3fend_ontology.json") as f:
     d3fend_ontology = json.load(f)
     res["d3fend"]["ontology_count"] = len(d3fend_ontology["@graph"])
+with open(f"{processed_dir}/d3fend-database/d3fend-full-mappings.json") as f:
+    d3fend_full_mappings = json.load(f)
+    for binding in d3fend_full_mappings['results']['bindings']:
+        def_tech = binding['def_tech']['value'].split("#")[-1]
+        off_tech = binding['off_tech']['value'].split("#")[-1]
+        if def_tech not in bindings:
+            bindings[def_tech] = set()
+        bindings[def_tech].add(off_tech)
+res["d3fend"]["d3fend_with_attack_count"] = len(bindings)
+attack_with_d3fend = set()
+for def_tech, off_techs in bindings.items():
+    for off_tech in off_techs:
+        attack_with_d3fend.add(off_tech)
+res["d3fend"]["attack_with_d3fend_count"] = len(attack_with_d3fend)
 
 
 # ATT&CK (enterprise, ics, mobile)
@@ -106,7 +140,9 @@ res["mitre-attack"] = {
     "enterprise": 0,
     "ics": 0,
     "mobile": 0,
+    "attack_with_capec_count": 0,
 }
+capec_pattern = re.compile(r"CAPEC-\d+")
 with open(f"{processed_dir}/attack-database/enterprise-attack/enterprise-attack.json") as f:
     enterprise_attack = json.load(f)
     for obj in enterprise_attack["objects"]:
@@ -114,7 +150,15 @@ with open(f"{processed_dir}/attack-database/enterprise-attack/enterprise-attack.
             for content in obj["x_mitre_contents"]:
                 if content['object_ref'].startswith("attack-pattern--"):
                     res["mitre-attack"]["enterprise"] += 1
-            break
+        else:
+            if obj["type"] == "attack-pattern":
+                for ref in obj["external_references"]:
+                    try:
+                        if capec_pattern.match(ref['external_id']):
+                            res["mitre-attack"]["attack_with_capec_count"] += 1
+                            break
+                    except KeyError:
+                        continue
 with open(f"{processed_dir}/attack-database/ics-attack/ics-attack.json") as f:
     ics_attack = json.load(f)
     for obj in ics_attack["objects"]:
@@ -122,7 +166,16 @@ with open(f"{processed_dir}/attack-database/ics-attack/ics-attack.json") as f:
             for content in obj["x_mitre_contents"]:
                 if content['object_ref'].startswith("attack-pattern--"):
                     res["mitre-attack"]["ics"] += 1
-            break
+        else:
+            if obj["type"] == "attack-pattern":
+                for ref in obj["external_references"]:
+                    try:
+                        if capec_pattern.match(ref['external_id']):
+                            res["mitre-attack"]["attack_with_capec_count"] += 1
+                            break
+                    except KeyError:
+                        continue
+            
 with open(f"{processed_dir}/attack-database/mobile-attack/mobile-attack.json") as f:
     mobile_attack = json.load(f)
     for obj in mobile_attack["objects"]:
@@ -130,7 +183,15 @@ with open(f"{processed_dir}/attack-database/mobile-attack/mobile-attack.json") a
             for content in obj["x_mitre_contents"]:
                 if content['object_ref'].startswith("attack-pattern--"):
                     res["mitre-attack"]["mobile"] += 1
-            break
+        else:
+            if obj["type"] == "attack-pattern":
+                for ref in obj["external_references"]:
+                    try:
+                        if capec_pattern.match(ref['external_id']):
+                            res["mitre-attack"]["attack_with_capec_count"] += 1
+                            break
+                    except KeyError:
+                        continue
 
 
 # CVE
@@ -280,35 +341,42 @@ with open(f"{processed_dir}/cve-mail-mappings.json") as f:
 # Print statistics
 print(f"Total MITRE CVEs: {res['cve']['count']}")
 print(f"Total NVD CVEs: {res['nvd']['count']}")
-print(f"Total NVD CVEs with CVSS v2: {res['nvd']['cvss_v2_count']}")
-print(f"Total NVD CVEs with CVSS v3.0: {res['nvd']['cvss_v30_count']}")
-print(f"Total NVD CVEs with CVSS v3.1: {res['nvd']['cvss_v31_count']}")
-print(f"Total NVD CVEs with CWE: {res['nvd']['cve_with_cwe_count']}")
-print(f"Total NVD CVEs with CPE: {res['nvd']['cve_with_cpe_count']}")
+print(f"(Relationship) Total NVD CVEs with CVSS v2: {res['nvd']['cvss_v2_count']}")
+print(f"(Relationship) Total NVD CVEs with CVSS v3.0: {res['nvd']['cvss_v30_count']}")
+print(f"(Relationship) Total NVD CVEs with CVSS v3.1: {res['nvd']['cvss_v31_count']}")
+print(f"(Relationship) Total NVD CVEs with CWE: {res['nvd']['cve_with_cwe_count']}")
+print(f"(Relationship) Total NVD CVEs with CPE: {res['nvd']['cve_with_cpe_count']}")
 print(f"Total GitHub Advisories: {res['github-advisory']['count']}")
 print(f"Total ZDI Advisories: {res['zdi-advisory']['count']}")
 print(f"Total CVEs in linux-cve-announce (Published): {res['linux-vulns']['published_count']}")
 print(f"Total CVEs in linux-cve-announce (Rejected): {res['linux-vulns']['rejected_count']}")
-print(f"Total CISA KEV: {res['cisa_kev']['count']}")
+print(f"(Relationship) Total CISA KEV: {res['cisa_kev']['count']}")
 print(f"Total AttackerKB assessments: {res['attackerkb']['assessment_count']}")
 print(f"Total AttackerKB topics: {res['attackerkb']['topic_count']}")
-print(f"Total AttackerKB topics with assessments: {res['attackerkb']['topic_with_assessment_count']}")
+print(f"(Relationship) Total AttackerKB topics with assessments: {res['attackerkb']['topic_with_assessment_count']}")
 print(f"Total Exploit-DB exploits: {res['exploit-db']['exploit_count']}")
-print(f"Total CVEs with Exploit-DB exploits: {res['exploit-db']['cve_with_exploit_count']}")
+print(f"(Relationship) Total CVEs with Exploit-DB exploits: {res['exploit-db']['cve_with_exploit_count']}")
 print(f"Total CAPEC attack patterns: {res['capec']['count']}")
+print(f"(Relationship) Total CAPEC attack patterns with CWE: {res['capec']['capec_with_cwe_count']}")
+print(f"(Relationship) Total CAPEC attack patterns with MITRE ATT&CK: {res['capec']['capec_with_attack_count']}")
 print(f"Total MITRE ATT&CK (Enterprise) attack patterns: {res['mitre-attack']['enterprise']}")
 print(f"Total MITRE ATT&CK (ICS) attack patterns: {res['mitre-attack']['ics']}")
 print(f"Total MITRE ATT&CK (Mobile) attack patterns: {res['mitre-attack']['mobile']}")
+print(f"(Relationship) Total MITRE ATT&CK attack patterns with CAPEC: {res['mitre-attack']['attack_with_capec_count']}")
 print(f"Total CWE weaknesses: {res['cwe']['count']}")
+print(f"(Relationship) Total CWE weaknesses with CAPEC: {res['cwe']['cwe_with_capec_count']}")
+res["cwe"].pop("cwe_with_capec_count")
 res["cwe"].pop("count")
 for abstract, count in res["cwe"].items():
     print(f"Total CWE weaknesses (Level: {abstract}): {count}")
 print(f"Total D3FEND tactics: {res['d3fend']['tactic_count']}")
 print(f"Total D3FEND ontology: {res['d3fend']['ontology_count']}")
+print(f"(Relationship) Total D3FEND tactics with MITRE ATT&CK: {res['d3fend']['d3fend_with_attack_count']}")
+print(f"(Relationship) Total MITRE ATT&CK with D3FEND: {res['d3fend']['attack_with_d3fend_count']}")
 print(f"Total patch files: {res['patch']['count']}")
-print(f"Total CVEs with patch files: {res['patch']['cve_with_patch_count']}")
+print(f"(Relationship) Total CVEs with patch files: {res['patch']['cve_with_patch_count']}")
 print(f"Total Bugtraq mails: {res['mail']['bugtraq_count']}")
 print(f"Total OSS-Security mails: {res['mail']['oss-security_count']}")
 print(f"Total Full-Disclosure mails: {res['mail']['full-disclosure_count']}")
 print(f"Total mails in linux-cve-announce: {res['mail']['linux-cve-announce_count']}")
-print(f"Total CVEs with mails: {res['mail']['cve_with_mails_count']}")
+print(f"(Relationship) Total CVEs with mails: {res['mail']['cve_with_mails_count']}")
