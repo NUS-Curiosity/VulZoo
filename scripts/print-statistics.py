@@ -23,6 +23,8 @@ res["attackerkb"] = {
     "topic_with_assessment_count": 0,
 }
 topics_with_assessments = set()
+topics_and_assessments = {}
+topic_names_and_assessments = {}
 for root, dirs, files in os.walk(f"{processed_dir}/attackerkb-database/assessments"):
     for file in files:
         if file.endswith(".json"):
@@ -30,6 +32,9 @@ for root, dirs, files in os.walk(f"{processed_dir}/attackerkb-database/assessmen
                 data = json.load(f)
                 res["attackerkb"]["assessment_count"] += len(data['data'])
                 for assessment in data['data']:
+                    if assessment['topicId'] not in topics_and_assessments:
+                        topics_and_assessments[assessment['topicId']] = []
+                    topics_and_assessments[assessment['topicId']].append(assessment)
                     topics_with_assessments.add(assessment['topicId'])
 
 res["attackerkb"]["topic_with_assessment_count"] = len(topics_with_assessments)
@@ -40,6 +45,11 @@ for root, dirs, files in os.walk(f"{processed_dir}/attackerkb-database/topics"):
             with open(os.path.join(root, file), "r") as f:
                 data = json.load(f)
                 res["attackerkb"]["topic_count"] += len(data['data'])
+                for topic in data['data']:
+                    if topic['id'] in topics_and_assessments:
+                        if topic['name'] not in topic_names_and_assessments:
+                            topic_names_and_assessments[topic['name']] = []
+                        topic_names_and_assessments[topic['name']].extend(topics_and_assessments[topic['id']])
 
 
 # Exploit-DB
@@ -143,6 +153,7 @@ res["mitre-attack"] = {
     "attack_with_capec_count": 0,
 }
 capec_pattern = re.compile(r"CAPEC-\d+")
+mitre_attack_patterns = set()
 with open(f"{processed_dir}/attack-database/enterprise-attack/enterprise-attack.json") as f:
     enterprise_attack = json.load(f)
     for obj in enterprise_attack["objects"]:
@@ -150,6 +161,7 @@ with open(f"{processed_dir}/attack-database/enterprise-attack/enterprise-attack.
             for content in obj["x_mitre_contents"]:
                 if content['object_ref'].startswith("attack-pattern--"):
                     res["mitre-attack"]["enterprise"] += 1
+                    mitre_attack_patterns.add(content['object_ref'])
         else:
             if obj["type"] == "attack-pattern":
                 for ref in obj["external_references"]:
@@ -166,6 +178,7 @@ with open(f"{processed_dir}/attack-database/ics-attack/ics-attack.json") as f:
             for content in obj["x_mitre_contents"]:
                 if content['object_ref'].startswith("attack-pattern--"):
                     res["mitre-attack"]["ics"] += 1
+                    mitre_attack_patterns.add(content['object_ref'])
         else:
             if obj["type"] == "attack-pattern":
                 for ref in obj["external_references"]:
@@ -183,6 +196,7 @@ with open(f"{processed_dir}/attack-database/mobile-attack/mobile-attack.json") a
             for content in obj["x_mitre_contents"]:
                 if content['object_ref'].startswith("attack-pattern--"):
                     res["mitre-attack"]["mobile"] += 1
+                    mitre_attack_patterns.add(content['object_ref'])
         else:
             if obj["type"] == "attack-pattern":
                 for ref in obj["external_references"]:
@@ -207,6 +221,7 @@ for root, dirs, files in os.walk(f"{processed_dir}/cve-database"):
 # NVD
 res["nvd"] = {
     "count": 0,
+    "cvss_count": 0,
     "cvss_v2_count": 0,
     "cvss_v30_count": 0,
     "cvss_v31_count": 0,
@@ -220,6 +235,8 @@ for root, dirs, files in os.walk(f"{processed_dir}/nvd-database"):
             res["nvd"]["count"] += 1
             with open(os.path.join(root, file), "r") as f:
                 data = json.load(f)
+                if "cvssMetricV2" in data["metrics"] or "cvssMetricV30" in data["metrics"] or "cvssMetricV31" in data["metrics"]:
+                    res["nvd"]["cvss_count"] += 1
                 if "cvssMetricV2" in data["metrics"]:
                     res["nvd"]["cvss_v2_count"] += 1
                 if "cvssMetricV30" in data["metrics"]:
@@ -341,6 +358,7 @@ with open(f"{processed_dir}/cve-mail-mappings.json") as f:
 # Print statistics
 print(f"Total MITRE CVEs: {res['cve']['count']}")
 print(f"Total NVD CVEs: {res['nvd']['count']}")
+print(f"(Relationship) Total NVD CVEs with CVSS: {res['nvd']['cvss_count']}")
 print(f"(Relationship) Total NVD CVEs with CVSS v2: {res['nvd']['cvss_v2_count']}")
 print(f"(Relationship) Total NVD CVEs with CVSS v3.0: {res['nvd']['cvss_v30_count']}")
 print(f"(Relationship) Total NVD CVEs with CVSS v3.1: {res['nvd']['cvss_v31_count']}")
@@ -362,6 +380,7 @@ print(f"(Relationship) Total CAPEC attack patterns with MITRE ATT&CK: {res['cape
 print(f"Total MITRE ATT&CK (Enterprise) attack patterns: {res['mitre-attack']['enterprise']}")
 print(f"Total MITRE ATT&CK (ICS) attack patterns: {res['mitre-attack']['ics']}")
 print(f"Total MITRE ATT&CK (Mobile) attack patterns: {res['mitre-attack']['mobile']}")
+print(f"Total MITRE ATT&CK attack patterns: {len(mitre_attack_patterns)}")
 print(f"(Relationship) Total MITRE ATT&CK attack patterns with CAPEC: {res['mitre-attack']['attack_with_capec_count']}")
 print(f"Total CWE weaknesses: {res['cwe']['count']}")
 print(f"(Relationship) Total CWE weaknesses with CAPEC: {res['cwe']['cwe_with_capec_count']}")
@@ -380,3 +399,4 @@ print(f"Total OSS-Security mails: {res['mail']['oss-security_count']}")
 print(f"Total Full-Disclosure mails: {res['mail']['full-disclosure_count']}")
 print(f"Total mails in linux-cve-announce: {res['mail']['linux-cve-announce_count']}")
 print(f"(Relationship) Total CVEs with mails: {res['mail']['cve_with_mails_count']}")
+print(f"Names of topics with assessments in AttackerKB:")

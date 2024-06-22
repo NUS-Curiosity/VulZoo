@@ -32,6 +32,7 @@ def save_patch(dst_dir, commit_hash, text, cve, manifest):
 def fetch_patch_from_github(cve, url, manifest):
     # e.g., https://github.com/librenms/librenms/commit/ce8e5f3d056829bfa7a845f9dc2757e21e419ddc
     url = url.split("#")[0] # remove the anchor
+    url = url.split("?")[0] # remove the query string
     url.strip("/")
     diff_url = f"{url}.diff"
     commit_hash = url.split("/")[-1]
