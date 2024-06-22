@@ -6,7 +6,7 @@ import os
 
 res = {}
 
-processed_dir = "../processed"
+processed_dir = "processed"
 
 # CISA KEV
 with open(f"{processed_dir}/cisa-kev-database/kev.json") as f:
@@ -52,7 +52,7 @@ for root, dirs, files in os.walk(f"{processed_dir}/attackerkb-database/topics"):
                             topic_names_and_assessments[topic['name']] = []
                         topic_names_and_assessments[topic['name']].extend(topics_and_assessments[topic['id']])
 
-with open("../processed/relationships/rel-cve-akb.json", "r") as f:
+with open(f"{processed_dir}/relationships/rel-cve-akb.json", "r") as f:
     assessments = json.load(f)
     res["attackerkb"]["cve_with_assessment_count"] = len(assessments.keys())
 

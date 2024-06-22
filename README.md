@@ -60,7 +60,9 @@ Then, you can run the `sync-processed.sh` script to process the raw data and syn
 
 P.S. 
 
-- You can run `scripts/print-statistics.py` to get the statistics of the processed data.
+- You can run `print-statistics.py` to get the statistics of the processed data.
+- The updating of `attackerkb-database` requires API key provided by AttackerKB. Please set it via environment variable and run `sync-attackerkb.py` in `scripts/processed` manually.
+- The CPE dictionary is too large to be uploaded to GitHub. Please run `sync-cpe.sh` scripts in both `scripts/raw-data` and `scripts/processed` locally.
 
 ## Data Sources
 
