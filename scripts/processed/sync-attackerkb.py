@@ -7,7 +7,7 @@ import json
 # generate cve -- assessment mapping list
 topics_dir = "../../processed/attackerkb-database/topics"
 assessments_dir = "../../processed/attackerkb-database/assessments"
-relationship_file = "../../processed/attackerkb-database/relationships.json"
+relationship_file = "../../processed/relationships/rel-cve-akb.json"
 cve_pattern = re.compile(r"CVE-\d{4}-\d{4,7}")
 cve_topic_map = {}
 for root, dirs, files in os.walk(f"{topics_dir}"):

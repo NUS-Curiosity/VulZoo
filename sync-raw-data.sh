@@ -21,6 +21,7 @@ git submodule update --remote
 # cisa-kev
 print_green "[*][$RAW_DATA_DIR] Updating CISA KEV"
 wget https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json -O $PROCESSED_DIR/cisa-kev-database/kev.json
+jq '[.vulnerabilities[].cveID]' $PROCESSED_DIR/cisa-kev-database/kev.json > $PROCESSED_DIR/relationships/rel-cve-kev.json
 
 # cwe
 print_green "[*][$RAW_DATA_DIR] Updating CWE"

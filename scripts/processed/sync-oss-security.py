@@ -4,11 +4,11 @@ import os
 import json
 import re
 
-cve_mail_mapping_file = "../../processed/cve-mail-mappings.json"
+cve_mail_mapping_file = "../../relationships/rel-cve-mail.json"
 raw_data_dir = "../../raw-data/oss-security-database"
 raw_data_index_file = "oss-security-msg-links.json"
 processed_data_dir = "../../processed/oss-security-database"
-manifest_file = "../../processed/oss-security-database/manifest.txt"
+manifest_file = "../../relationships/temp-oss-security-manifest.txt"
 
 
 def ensure_dir(directory):

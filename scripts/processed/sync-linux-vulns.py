@@ -9,7 +9,7 @@ def ensure_dir(directory):
         os.makedirs(directory)
 
 
-cve_mail_mapping_file = "../../processed/cve-mail-mappings.json"
+cve_mail_mapping_file = "../../relationships/rel-cve-mail.json"
 src_dir = f"../../raw-data/linux-vulns-database/cve"
 dst_dir = f"../../processed/linux-vulns-database"
 sub_dirs = ["published", "rejected"]

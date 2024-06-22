@@ -4,11 +4,11 @@ import os
 import json
 import re
 
-cve_mail_mapping_file = "../../processed/cve-mail-mappings.json"
+cve_mail_mapping_file = "../../relationships/rel-cve-mail.json"
 raw_data_dir = "../../raw-data/full-disclosure-database"
 raw_data_index_file = "full-disclosure-msg-links.json"
 processed_data_dir = "../../processed/full-disclosure-database"
-manifest_file = "../../processed/full-disclosure-database/manifest.txt"
+manifest_file = "../../relationships/temp-full-disclosure-manifest.txt"
 
 
 def ensure_dir(directory):
