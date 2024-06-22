@@ -2,30 +2,24 @@
 
 Dataset Statistics:
 
-Last updated: 2024-06-13
+Last updated: 2024-06-22
 
 ```
-Total MITRE CVEs: 320861
-Total NVD CVEs: 253722
-Total NVD CVEs with CVSS v2: 183479
-Total NVD CVEs with CVSS v3.0: 52550
-Total NVD CVEs with CVSS v3.1: 118111
-Total NVD CVEs with CWE: 179950
-Total NVD CVEs with CPE: 224998
-Total GitHub Advisories: 17069
-Total ZDI Advisories: 13291
-Total CVEs in linux-cve-announce (Published): 1988
-Total CVEs in linux-cve-announce (Rejected): 66
-Total CISA KEV: 1120
+Total MITRE CVEs: 322289
+Total NVD CVEs: 254931
+Total GitHub Advisories: 17124
+Total ZDI Advisories: 13503
+Total CVEs in linux-cve-announce (Published): 2227
+Total CVEs in linux-cve-announce (Rejected): 75
+Total CISA KEV: 1123
 Total AttackerKB assessments: 1665
 Total AttackerKB topics: 311374
-Total AttackerKB topics with assessments: 1314
-Total Exploit-DB exploits: 46540
-Total CVEs with Exploit-DB exploits: 24587
+Total Exploit-DB exploits: 46551
 Total CAPEC attack patterns: 615
 Total MITRE ATT&CK (Enterprise) attack patterns: 780
 Total MITRE ATT&CK (ICS) attack patterns: 95
 Total MITRE ATT&CK (Mobile) attack patterns: 187
+Total MITRE ATT&CK attack patterns: 1062
 Total CWE weaknesses: 963
 Total CWE weaknesses (Level: Variant): 299
 Total CWE weaknesses (Level: Base): 535
@@ -34,11 +28,23 @@ Total CWE weaknesses (Level: Pillar): 10
 Total CWE weaknesses (Level: Compound): 7
 Total D3FEND tactics: 183
 Total D3FEND ontology: 5191
-Total patch files: 12626
-Total CVEs with patch files: 10548
+Total patch files: 12597
 Total Bugtraq mails: 17404
-Total OSS-Security mails: 14976
+Total OSS-Security mails: 14987
 Total Full-Disclosure mails: 12448
-Total mails in linux-cve-announce: 2054
-Total CVEs with mails: 42030
+Total mails in linux-cve-announce: 2302
+(Relationship) Total CVEs with CVSS: 234949
+(Relationship) Total CVEs with CWE: 180532
+(Relationship) Total CVEs with CPE: 225220
+(Relationship) Total CVE mentioned in CISA KEV: 1123
+(Relationship) Total CVEs with patch files: 10543
+(Relationship) Total CVEs with Exploit-DB PoCs: 24587
+(Relationship) Total CVEs with mails: 42281
+(Relationship) Total CVE with AKB assessments: 1108
+(Relationship) Total CWE weaknesses with CAPEC: 336
+(Relationship) Total CAPEC attack patterns with CWE: 450
+(Relationship) Total CAPEC attack patterns with MITRE ATT&CK: 177
+(Relationship) Total MITRE ATT&CK attack patterns with CAPEC: 36
+(Relationship) Total MITRE ATT&CK with D3FEND: 301
+(Relationship) Total D3FEND tactics with MITRE ATT&CK: 121
 ```
