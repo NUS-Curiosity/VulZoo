@@ -29,7 +29,7 @@ Pre-requisites:
 VulZoo is composed of both git-based and non-git-based sources. The git-based sources are from upstream repositories and organized as git submodules in this repository. The non-git-based sources are crawled and maintained in this repository. To get started, clone the repository with the following command:
 
 ```bash
-git clone --recurse-submodules https://github.com/brant-ruan/VulZoo
+git clone --recurse-submodules https://github.com/NUS-Curiosity/VulZoo
 ```
 
 VulZoo provides some useful scripts to help you manage the data. As some scripts require specific Python packages, it is recommended to install the required packages first:
