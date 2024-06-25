@@ -24,7 +24,13 @@ The following figure shows the conceptual overview of VulZoo:
 If you use this dataset, please cite the following paper:
 
 ```
-
+@article{ruan2024vulzoo,
+      title={VulZoo: A Comprehensive Vulnerability Intelligence Dataset}, 
+      author={Bonan Ruan and Jiahao Liu and Weibo Zhao and Zhenkai Liang},
+      year={2024},
+      eprint={2406.16347},
+      eprinttype={arXiv}
+}
 ```
 
 ## Data Management
