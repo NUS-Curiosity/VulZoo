@@ -4,11 +4,11 @@ import os
 import json
 import re
 
-cve_mail_mapping_file = "../../relationships/rel-cve-mail.json"
+cve_mail_mapping_file = "../../processed/relationships/rel-cve-mail.json"
 raw_data_dir = "../../raw-data/bugtraq-database"
 raw_data_index_file = "bugtraq-msg-links.json"
 processed_data_dir = "../../processed/bugtraq-database"
-manifest_file = "../../relationships/temp-bugtraq-manifest.txt"
+manifest_file = "../../processed/relationships/temp-bugtraq-manifest.txt"
 
 
 def ensure_dir(directory):
