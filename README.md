@@ -4,14 +4,14 @@
 
 ## Introduction
 
-VulZoo is a large-scale vulnerability intelligence dataset that integrates various sources of structured and unstructured data. It is designed to be used by security researchers, penetration testers, and security analysts to get a comprehensive view of vulnerabilities and their associated data.
+VulZoo is a large-scale vulnerability intelligence dataset that integrates various sources of structural and non-structural data. It is designed to be used by security researchers, penetration testers, and security analysts to get a comprehensive view of vulnerabilities and their associated data.
 
 This dataset is divided into two parts: raw data and processed data.
 
 - `raw-data/`: contains the raw data from different sources.
 - `processed/`: contains the processed data that is extracted or converted from the raw data.
 
-VulZoo aims to serve as the most comprehensive profiling of vulnerabilities for downstream tasks, e.g., vulnerability detection, assessment, prioritization, exploitation, and mitigation.
+VulZoo aims to provide the most comprehensive profiling of vulnerabilities for downstream tasks, e.g., vulnerability detection, assessment, prioritization, exploitation, and mitigation.
 
 The following figure shows the conceptual overview of VulZoo:
 
@@ -85,7 +85,7 @@ P.S.
 - [MITRE D3FEND](https://d3fend.mitre.org/)
 - [AttackerKB](https://attackerkb.com/)
 
-### Unstructural
+### Non-structural
 
 - [Exploit-DB](https://gitlab.com/exploit-database/exploitdb)
 - [oss-security mailing list](https://www.openwall.com/lists/oss-security)
