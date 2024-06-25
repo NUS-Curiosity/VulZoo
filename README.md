@@ -21,7 +21,7 @@ The following figure shows the conceptual overview of VulZoo:
 
 ## Citation
 
-If you use this dataset, please cite the following paper:
+If you use this dataset, please cite the [VulZoo paper](https://arxiv.org/pdf/2406.16347):
 
 ```
 
