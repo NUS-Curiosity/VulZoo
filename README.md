@@ -19,6 +19,16 @@ The following figure shows the conceptual overview of VulZoo:
 
 [README.md in processed/](processed/README.md) provides more details about the processed data.
 
+## Quick Start
+
+If the existing data in VulZoo satisfies your demand, you can just clone this repository without `--recurse-submodules` option:
+
+```bash
+git clone https://github.com/NUS-Curiosity/VulZoo
+```
+
+The dataset is in `processed/` directory. If you need the up-to-date data, please following the data management process below.
+
 ## Data Management
 
 Pre-requisites:
