@@ -19,20 +19,6 @@ The following figure shows the conceptual overview of VulZoo:
 
 [README.md in processed/](processed/README.md) provides more details about the processed data.
 
-## Citation
-
-If you use this dataset, please cite the [VulZoo paper](https://arxiv.org/pdf/2406.16347):
-
-```
-@article{ruan2024vulzoo,
-      title={VulZoo: A Comprehensive Vulnerability Intelligence Dataset}, 
-      author={Bonan Ruan and Jiahao Liu and Weibo Zhao and Zhenkai Liang},
-      year={2024},
-      eprint={2406.16347},
-      eprinttype={arXiv}
-}
-```
-
 ## Data Management
 
 Pre-requisites:
@@ -97,3 +83,18 @@ P.S.
 ### Hybrid
 
 - [Linux Kernel Vulns](https://git.kernel.org/pub/scm/linux/security/vulns.git)
+
+## Citation
+
+If you use this dataset, please cite the [VulZoo paper](https://arxiv.org/pdf/2406.16347):
+
+```
+@article{ruan2024vulzoo,
+      title={VulZoo: A Comprehensive Vulnerability Intelligence Dataset}, 
+      author={Bonan Ruan and Jiahao Liu and Weibo Zhao and Zhenkai Liang},
+      year={2024},
+      eprint={2406.16347},
+      eprinttype={arXiv}
+}
+```
+
