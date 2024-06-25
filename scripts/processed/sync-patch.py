@@ -55,18 +55,18 @@ def fetch_patch_from_github(cve, url, manifest):
     # check whether the patch has been fetched
     if cve in manifest:
         if commit_hash in manifest[cve]:
-            print(f"Skiping {commit_hash} for {cve}")
+            # print(f"Skiping {commit_hash} for {cve}")
             return
         for commit in manifest[cve]:
             if is_prefix_of(commit_hash, commit):
-                print(f"Skiping {commit_hash} for {cve} (same-prefix commit exists)")
+                # print(f"Skiping {commit_hash} for {cve} (same-prefix commit exists)")
                 return
 
     r = requests.get(diff_url, headers=header)
     if r.status_code != 200:
         return
 
-    print(f"Fetching patch for {cve} at {url}")
+    # print(f"Fetching patch for {cve} at {url}")
     save_patch(dst_dir, commit_hash, r.text, cve, manifest)
     time.sleep(1)
     
@@ -86,11 +86,11 @@ def fetch_patch_from_git_kernel(cve, url, manifest):
     # check whether the patch has been fetched
     if cve in manifest:
         if commit_hash in manifest[cve]:
-            print(f"Skiping {commit_hash} for {cve}")
+            # print(f"Skiping {commit_hash} for {cve}")
             return
         for commit in manifest[cve]:
             if is_prefix_of(commit_hash, commit):
-                print(f"Skiping {commit_hash} for {cve} (same-prefix commit exists)")
+                # print(f"Skiping {commit_hash} for {cve} (same-prefix commit exists)")
                 return
 
     if standard_pattern.match(url):
@@ -111,7 +111,7 @@ def fetch_patch_from_git_kernel(cve, url, manifest):
     if r.status_code != 200:
         return
 
-    print(f"Fetching patch for {cve} at {url}")
+    # print(f"Fetching patch for {cve} at {url}")
 
     save_patch(dst_dir, commit_hash, r.text, cve, manifest)
     time.sleep(1)
@@ -158,9 +158,9 @@ def show_topN_domains(patch_links, N=10):
             domain_list.append(domain)
     
     domain_counter = Counter(domain_list)
-    print(f"Top {N} domains:")
-    for domain, count in domain_counter.most_common(N):
-        print(f"\t{domain}: {count}")
+    # print(f"Top {N} domains:")
+    # for domain, count in domain_counter.most_common(N):
+        # print(f"\t{domain}: {count}")
 
 
 if __name__ == "__main__":
@@ -168,7 +168,7 @@ if __name__ == "__main__":
         patch_links = get_patch_links_from_nvd()
         with open(nvd_patch_links, "w") as f:
             json.dump(patch_links, f, indent=4)
-        print(f"Patch links saved to {nvd_patch_links}")
+        # print(f"Patch links saved to {nvd_patch_links}")
 
         show_topN_domains(patch_links, N=10)
 
