@@ -2,7 +2,7 @@
 
 Dataset Statistics:
 
-Last updated: 2024-06-22
+Last updated: 2024-06-28
 
 ```
 Total MITRE CVEs: 322856
