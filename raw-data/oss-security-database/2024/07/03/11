@@ -1,0 +1,89 @@
+
+Date: Wed, 03 Jul 2024 22:54:30 +0200
+From: Yves-Alexis Perez <corsac@...ian.org>
+To: oss-security@...ts.openwall.com
+Subject: Re: CVE-2024-6387: RCE in OpenSSH's server, on
+ glibc-based Linux systems
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+On Mon, 2024-07-01 at 08:40 +0000, Qualys Security Advisory wrote:
+> Finally, if sshd cannot be updated or recompiled, this signal handler
+> race condition can be fixed by simply setting LoginGraceTime to 0 in the
+> configuration file. This makes sshd vulnerable to a denial of service
+> (the exhaustion of all MaxStartups connections), but it makes it safe
+> from the remote code execution presented in this advisory.
+
+Hi,
+
+thanks Qualys for the outstanding research and detailed report (as always).
+
+On Mastodon Hector Marcan also proposed
+(https://mastodon.social/deck/@marcan@treehouse.systems/112715797114998895) to
+use `-e` on sshd command-line as a mitigation measure.
+
+Copying the whole text from the first post for archiving purpose on the list:
+
+====
+OpenSSH CVE-2024-6387 mitigation (on Fedora):
+
+echo 'OPTIONS=-e' | sudo tee -a /etc/sysconfig/sshd && sudo systemctl restart
+sshd
+
+I have no idea why Qualys didn't mention this. The only non-async-safe
+function called by the vulnerable signal handler is syslog(). So just turn off
+syslog and log to stderr. On systemd distros, this still ends up in the
+journal anyway, so you lose nothing.
+
+I confirmed that the message at the root of the issue is logged to stderr and
+not syslog with this option:
+
+[pid 638194] --- SIGALRM {si_signo=SIGALRM, si_code=SI_KERNEL} ---
+[pid 638194] getpgid(0)                 = 638194
+[pid 638194] getpid()                   = 638194
+[pid 638194] rt_sigaction(SIGTERM, {sa_handler=SIG_IGN, sa_mask=~[RTMIN RT_1],
+sa_flags=SA_RESTART}, {sa_handler=SIG_DFL, sa_mask=~[KILL STOP RTMIN RT_1],
+sa_flags=SA_RESTART}, 8) = 0
+[pid 638194] kill(0, SIGTERM)           = 0
+[pid 638194] getpid()                   = 638194
+[pid 638194] write(2, "Timeout before authentication for 192.168.21.10 port
+37734\r\n", 60) = 60
+[pid 638194] exit_group(1)              = ?
+[pid 638194] +++ exited with 1 +++
+
+Edit: The problem code still calls snprintf() which on-paper is still unsafe.
+However, it does this a bunch of times anyway in multiple code paths, and
+Qualys didn't mention anything about it. A quick look through glibc code
+suggests that snprintf() only does unsafe things (allocate memory) if you
+format floats, which obviously ssh does not.
+====
+
+I agree with Hector that at first sight the `snprintf()` call look OK on glibc
+(no dynamic memory allocation or complicated handling that I could spot
+either), and the write to stderr is done using write(2) (which is async-
+signal-safe).
+
+The change isn't totally agnostic even on systemd/journald systems because
+you'll lose some log metadata (facility and loglevel) and it might depend on
+some local syslog configuration, but if one can't update it might be better
+than turning into a DoS (or totally losing logs by setting LogLevel to Quiet).
+
+On Debian based systems you can put `-e` in SSHD_OPTS in /etc/default/ssh.
+
+What are you thoughts on this mitigation?
+
+Regards,
+- -- 
+Yves-Alexis
+-----BEGIN PGP SIGNATURE-----
+
+iQEzBAEBCAAdFiEE8vi34Qgfo83x35gF3rYcyPpXRFsFAmaFuocACgkQ3rYcyPpX
+RFuJNAgA2RNFY/W6XazSArrINEHsw+GG7N7UjyOKFYJ4JebhgmG0SWH7Udd3ZWhU
+NP0C2+6FrSBWWrMgP2xF5bwx5ehBzcjaEwLuQR2AO2ztotdkADonrvP1vrdSTLpG
+ZAVgiuripN5B1fUatZMGDCK+uXP5Ottc7/0NZ2kwIB+VNHGSU2cesknQq6vpvubI
+sk8PuTFRayhglwXzdTWrPVKvAnYtiRSEV8hepPBpDngAqbIvb4LFGt734gLWvB9s
+FjAPOqySfzGM1B4MeH21D51bs4JDE7avxQG16ShS4Tm/Kg16Ea4N4rx7u2NDlfyQ
+JVzsOiu5TM6roMvBmHBw76jpi36Eow==
+=tity
+-----END PGP SIGNATURE-----

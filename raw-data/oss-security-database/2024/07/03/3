@@ -1,0 +1,129 @@
+
+Date: Wed, 3 Jul 2024 09:50:55 +0200
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Subject: Re: CVE-2024-6387: RCE in OpenSSH's server, on glibc-based Linux systems
+
+On Tue, Jul 02, 2024 at 09:01:48PM -0500, Jacob Bachmeyer wrote:
+> Qualys Security Advisory wrote:
+> >SSH-2.0-OpenSSH_4.2p1 Debian-7ubuntu3 (Ubuntu 6.06.1, from 2006)
+> >========================================================================
+> >
+> >[...]
+> >
+> >------------------------------------------------------------------------
+> >Practice
+> >------------------------------------------------------------------------
+> >
+> >    I learned everything the hard way
+> >        -- The Interrupters, "The Hard Way"
+> >
+> >To mount this attack against sshd, we initially faced three problems:
+> >
+> >- The House of Mind requires us to store the pointer to our fake arena
+> >  at address 0x08100000 in the heap; but are we able to store attacker-
+> >  controlled data at such a high address? Because sshd calls pam_start()
+> >  at the very beginning of the user authentication, we do not control
+> >  anything except the user name itself; luckily, a user name of length
+> >  ~128KB (shorter than DEFAULT_MMAP_THRESHOLD) allows us to store our
+> >  own data at address 0x08100000.
+> >
+> >[...]
+> >
+> >Finally, our long user name also allows us to control the potentially
+> >uninitialized next field of 20 different structures (through leftovers
+> >from temporary copies of our long user name), because pam_start() calls
+> >_pam_add_handler() multiple times; i.e., our large race window contains
+> >20 small race windows.
+
+> A thought occurred to me late last night:  this exploit required the use 
+> of a very long fake user name (~128KB).  No legitimate account will have 
+> such a name; should defense-in-depth motivate limiting maximum user name 
+> length to some (un)reasonable value?  (The actual longest user name on 
+> the system cannot be used to set the limit because doing that would leak 
+> the length of the longest valid user name.)  I doubt any real system has 
+> even 256-byte-long user names, so a 1KiB limit (perhaps by default, with 
+> a configuration option (I propose "MaxLoginNameLen" to start a 
+> discussion) to raise or lower it?) would be far beyond any reasonable 
+> need, but would (or so it seems to me) have made at least this exploit 
+> much harder, if not impossible.
+> 
+> There may actually be a case for putting the user name into a static 
+> buffer here:  its length should be limited anyway to prevent abuse and 
+> keeping it away from the heap may be helpful as a defense-in-depth measure.
+> 
+> If there currently really is no limit at all, outrageously long fake 
+> usernames (limited only by bandwidth and LoginGraceTime?) could be 
+> directly used for a simple denial-of-service by consuming memory on the 
+> server, given sufficient bandwidth available to an attacker.
+
+Actually, a related change was made in OpenSSH 8.5, but was "only
+enabled for Sun-derived PAM implementations."  Perhaps it should be
+generalized and enabled unconditionally, including without PAM.
+
+https://www.openwall.com/lists/oss-security/2021/03/03/1
+
+ * Portable sshd(8): Prevent excessively long username going to PAM.
+   This is a mitigation for a buffer overflow in Solaris' PAM username
+   handling (CVE-2020-14871), and is only enabled for Sun-derived PAM
+   implementations.  This is not a problem in sshd itself, it only
+   prevents sshd from being used as a vector to attack Solaris' PAM.
+   It does not prevent the bug in PAM from being exploited via some
+   other PAM application. GHPR#212
+
+commit fcf429a4c69d30d8725612a55b37181594da8ddf
+Author: Darren Tucker <dtucker@...cker.net>
+Date:   Wed Nov 11 12:30:46 2020 +1100
+
+    Prevent excessively long username going to PAM.
+    
+    This is a mitigation for a buffer overflow in Solaris' PAM username
+    handling (CVE-2020-14871), and is only enabled for Sun-derived PAM
+    implementations.  This is not a problem in sshd itself, it only
+    prevents sshd from being used as a vector to attack Solaris' PAM.
+    It does not prevent the bug in PAM from being exploited via some other
+    PAM application.
+    
+    Based on github PR#212 from Mike Scott but implemented slightly
+    differently.  ok tim@ djm@
+
+diff --git a/auth-pam.c b/auth-pam.c
+index 832382151..d429ef13a 100644
+--- a/auth-pam.c
++++ b/auth-pam.c
+@@ -689,6 +689,12 @@ sshpam_init(struct ssh *ssh, Authctxt *authctxt)
+        const char *pam_user, *user = authctxt->user;
+        const char **ptr_pam_user = &pam_user;
+ 
++#if defined(PAM_SUN_CODEBASE) && defined(PAM_MAX_RESP_SIZE)
++       /* Protect buggy PAM implementations from excessively long usernames */
++       if (strlen(user) >= PAM_MAX_RESP_SIZE)
++               fatal("Username too long from %s port %d",
++                   ssh_remote_ipaddr(ssh), ssh_remote_port(ssh));
++#endif
+        if (sshpam_handle == NULL) {
+                if (ssh == NULL) {
+                        fatal("%s: called initially with no "
+
+This was shortly after the following lengthy blog post:
+
+https://cloud.google.com/blog/topics/threat-intelligence/live-off-the-land-an-overview-of-unc1945/
+
+I'll quote some pieces from it:
+
+> Live off the Land? How About Bringing Your Own Island? An Overview of UNC1945
+> November 2, 2020
+> Mandiant
+> Written by: Justin Moore, Wojciech Ledzion, Luis Rocha, Adrian Pisarczyk, Daniel Caban, Sara Rincon, Daniel Susin, Antonio Monaca
+
+> Initial Compromise
+> 
+> In late 2018, UNC1945 gained access to a Solaris server and installed a backdoor we track as SLAPSTICK in order to capture connection details and credentials to facilitate further compromise. The SSH service of this server was exposed to the internet at the time, the same time we observed first evidence of threat activity. Unfortunately, due to insufficient available evidence, the next indication of activity was in mid-2020 at which time a different Solaris server was observed connecting to the threat actor infrastructure. This indicates a dwell time of approximately 519 days based on recovered artifacts.
+> 
+>     Although we were unable to determine how the late-2018 initial access was accomplished, we did observe successful UNC1945 SSH connections directly to the victim Solaris 10 server, since the SSH service was exposed directly to the internet at the time.
+>     In mid-2020, we observed UNC1945 deploy EVILSUN - a remote exploitation tool containing a zero-day exploit for CVE-2020-14871 - on a Solaris 9 server. At the time, connections from the server to the threat actor IP address were observed over port 8080.
+>         Mandiant discovered and reported CVE-2020-14871, a recently patched vulnerability in the Oracle Solaris Pluggable Authentication Module (PAM) that allows an unauthenticated attacker with network access via multiple protocols to exploit and compromise the operating system.
+>         According to an April 2020 post on a black-market website, an "Oracle Solaris SSHD Remote Root Exploit" was available for approximately $3,000 USD, which may be identifiable with EVILSUN.
+>         Additionally, we confirmed a Solaris server exposed to the internet had critical vulnerabilities, which included the possibility of remote exploitation without authentication.
+
+Alexander
