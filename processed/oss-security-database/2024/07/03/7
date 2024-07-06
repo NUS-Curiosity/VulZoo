@@ -1,0 +1,246 @@
+
+Date: Wed, 3 Jul 2024 16:07:37 +0200
+From: Thomas Rinsma <thomas@...ean.io>
+To: oss-security@...ts.openwall.com
+Subject: Re: Ghostscript 10.03.1 (2024-05-02) fixed 5 CVEs including
+ CVE-2024-33871 arbitrary code execution
+
+Hi,
+
+Per Solar's request, here is some information on recent Ghostscript 
+bugs. They have all been fixed upstream already for either ~1 month 
+(10.03.1) or ~4 months (10.03.0). It looks like patches have also landed 
+in most distros, but there is not a super clear changelog or version 
+history so this might help clarify things.
+
+Note that this is just a subset of all vulnerabilities fixed in 10.03.0 
+and 10.03.1: these are just the bugs I myself found and reported.
+
+# CVE-2024-29509 - heap buffer overflow via the PDFPassword parameter
+
+The `runpdf` command (and friends) allows the new C-based PDF 
+interpreter to be invoked from within PS. With this, we can pass various 
+flags and arguments (see `pdf_impl_set_param`) that are normally passed 
+via the command-line when the PDF interpreter is invoked directly.
+
+It turns out that validation of several of these parameters is flawed, 
+maybe because they were considered somewhat "trusted", being 
+command-line arguments originally.
+
+The fields `ctx->encryption.Password` and `ctx->encryption.PasswordLen` 
+are set based on the value of `PDFPassword`. During the decryption 
+process, in `check_password_R5`  in `pdf_sec.c`, a buffer is allocated 
+based on the string-length of this field:
+
+```
+code = pdfi_object_alloc(ctx, PDF_STRING, 
+strlen(ctx->encryption.Password), (pdf_obj **)&P);
+```
+
+However, a `memcpy` later copies the full length of the PS-supplied 
+object into this buffer:
+
+```
+memcpy(P->data, Password, PasswordLen);
+```
+
+Because PS-strings are not null-terminated, this will result in a heap 
+buffer overflow when a value of `PDFPassword` is supplied with a null 
+byte in the middle. For example, the following will result in a `memcpy` 
+of 7 bytes into a buffer of size 3:
+
+```
+/PDFPassword (foo\000bar) def
+```
+
+This bug was fixed in 10.03.0 (2024-03-06), and is bug (1) in this 
+report: https://bugs.ghostscript.com/show_bug.cgi?id=707510
+
+
+# CVE-2024-29506 - stack buffer overflow in pdfi_apply_filter()
+
+The `PDFDEBUG` flag controls the value of `ctx->args.debug`. In 
+`pdfi_apply_filter` this enables execution of a `memcpy` into a stack 
+buffer, without bounds checks. The input (`n->data`, the PDF filter 
+name) is an attacker controlled buffer of arbitrary size. A filter name 
+larger than 100 will overflow the `str` buffer.
+
+```
+if (ctx->args.pdfdebug)
+     {
+         char str[100];
+         memcpy(str, (const char *)n->data, n->length);
+         str[n->length] = '\0';
+         dmprintf1(ctx->memory, "FILTER NAME:%s\n", str);
+     }
+```
+
+This bug was also fixed in 10.03.0 (2024-03-06), and is bug (2) in this 
+report: https://bugs.ghostscript.com/show_bug.cgi?id=707510
+
+
+# CVE-2024-29507 - stack buffer overflow via CIDFSubstPath/Font params
+
+Under specific conditions, the `cidfsubstpath` and `cidfsubstfont` 
+parameters (set by corresponding Postscript objects) are used to load 
+substitute fonts (this is in `pdfi_open_CIDFont_substitute_file`). The 
+values are `memcpy`d into the `fontfname` buffer without bounds checks. 
+Hence, an attacker can pass values larger than the buffer size to 
+trigger a stack buffer overflow.
+
+```
+char fontfname[gp_file_name_sizeof]; // 4096
+
+// .. <snip> ...
+
+if (ctx->args.cidfsubstpath.data == NULL) {
+     memcpy(fontfname, fsprefix, fsprefixlen);
+}
+else {
+     memcpy(fontfname, ctx->args.cidfsubstpath.data, 
+ctx->args.cidfsubstpath.size);
+     fsprefixlen = ctx->args.cidfsubstpath.size;
+}
+
+if (ctx->args.cidfsubstfont.data == NULL) {
+     // ... <snip> ...
+}
+else {
+     memcpy(fontfname, ctx->args.cidfsubstfont.data, 
+ctx->args.cidfsubstfont.size);
+     defcidfallacklen = ctx->args.cidfsubstfont.size;
+}
+```
+
+This bug was also fixed in 10.03.0 (2024-03-06), and is bug (3) in this 
+report: https://bugs.ghostscript.com/show_bug.cgi?id=707510
+
+
+# CVE-2024-29508 - heap pointer leak in pdf_base_font_alloc()
+
+The function `pdf_base_font_alloc` used by the `pdfwrite` device will 
+use a hexadecimal pointer representation (`".F" PRI_INTPTR`) for the 
+constructed BaseFont name if the input name is empty:
+
+```
+if (pfname->size > 0) {
+     font_name.data = pfname->chars;
+     font_name.size = pfname->size;
+     while (pdf_has_subset_prefix(font_name.data, font_name.size)) {
+         /* Strip off an existing subset prefix. */
+         font_name.data += SUBSET_PREFIX_SIZE;
+         font_name.size -= SUBSET_PREFIX_SIZE;
+     }
+} else {
+     gs_snprintf(fnbuf, sizeof(fnbuf), ".F" PRI_INTPTR, (intptr_t)copied);
+     font_name.data = (byte *)fnbuf;
+     font_name.size = strlen(fnbuf);
+}
+```
+
+Resulting in, for example:
+
+```
+<</BaseFont/YZKFTQ+.F0x5618b147e378/FontDescriptor 8 0 R/ToUnicode 11 0 
+R/Type/Font ...
+```
+
+An attacker can obtain this pointer value by reading back the output 
+file (after writing to a temporary writable and readable location).
+
+
+This bug (and various other pointer leaks) were fixed in 10.03.0 
+(2024-03-06), and is bug (4) in this report: 
+https://bugs.ghostscript.com/show_bug.cgi?id=707510
+
+
+# CVE-2024-29511 - arbitrary file read/write through Tesseract config
+
+The `ocr` family of devices invoke Tesseract to perform OCR operations. 
+The device parameter `OCRLanguage` is used by Tesseract to load a data 
+file for that specific language. Specifically, such a file is loaded 
+from `./<OCRLanguage>.traineddata`. By using a path traversal to 
+`/tmp/`, we can force Tesseract to load our own data file:
+
+```
+mark
+/OutputFile (/tmp/notused)
+/OCRLanguage (../../../../../tmp/test) % loads /tmp/test.traineddata
+/OutputDevice /ocr
+.dicttomark
+setpagedevice
+```
+
+As it turns out, Tesseract `traineddata` files can include various 
+configuration values, including `user_patterns_file` which will try to 
+load patterns from the given path, and `debug_file` which will write 
+debug information to the given path. The debug information is quite 
+verbose, and will print full input lines if they don’t start with a 
+valid character in the trained language. By constructing our "language" 
+such that no character is valid, all lines in the pattern file are 
+printed. For example, the configuration settings:
+
+```
+debug_file /tmp/out
+user_patterns_file /etc/passwd
+```
+
+will result in a file `/tmp/out` containing:
+
+```
+Error: failed to insert pattern 'root:x:0:0:root:/root:/bin/bash'
+Error: failed to insert pattern 
+'daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin'
+Error: failed to insert pattern 'bin:x:2:2:bin:/bin:/usr/sbin/nologin'
+Error: failed to insert pattern 'sys:x:3:3:sys:/dev:/usr/sbin/nologin'
+Error: failed to insert pattern 'sync:x:4:65534:sync:/bin:/bin/sync'
+<etc>
+```
+
+In Postscript we can:
+
+1. Construct the traineddata file under `/tmp/`
+2. Use path traversal in `OCRLanguage` to load it when initializing the 
+`ocr` device
+3. Read the resulting output data in `/tmp/out`
+
+This allows us to read arbitrary files outside of the SAFER sandbox, and 
+write to arbitrary file paths, although during writing, every line will 
+start with `Error: failed to insert pattern '` and end with `'`.
+
+Note that this is the Tesseract/OCR-related bug that was referred to by 
+the Ghostscript changelog (and quoted earlier in this thread). Contrary 
+to what is stated in the changelog it does not lead to RCE by itself, 
+just file read/write. It also requires Ghostscript to be compiled with 
+Tesseract support.
+
+
+# CVE-2024-29510 - format string injection in uniprint device
+
+The `uniprint` device allows the user to provide various string 
+fragments as device options, which are later appended to the output 
+file. Two of these parameters, `upWriteComponentCommands` and 
+`upYMoveCommand`, are actually treated as format strings, specifically 
+for `gp_fprintf` and `gs_snprintf`. For these, the intention is for the 
+user to include just one format specifier in the string, but there is no 
+logic preventing arbitrary format strings (with multiple specifiers) 
+from being used.
+
+With full control over the format string (by setting a page device with 
+the respective options), and read access to the device output (by 
+setting it to a temporary file path), an attacker can abuse this to leak 
+data from the stack and perform memory corruption. This is specifically 
+impactful in the cases of `gs_snprintf` (as opposed to `gp_fprintf`), as 
+its format-string parsing logic is not hardened by compiler measures 
+like `D_FORTIFY_SOURCE`, while it still supports the `%n` modifier.
+
+Bug report and public blog post with more details and PoC leading to a 
+SAFER sandbox bypass:
+
+https://bugs.ghostscript.com/show_bug.cgi?id=707662
+https://codeanlabs.com/blog/research/cve-2024-29510-ghostscript-format-string-exploitation/
+
+---
+
+Cheers,
+Thomas
