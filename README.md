@@ -96,15 +96,23 @@ P.S.
 
 ## Citation
 
-If you use this dataset, please cite the [VulZoo paper](https://arxiv.org/pdf/2406.16347):
+If you use this dataset, please cite the [VulZoo paper](https://dl.acm.org/doi/10.1145/3691620.3695345):
 
 ```
-@article{ruan2024vulzoo,
-      title={VulZoo: A Comprehensive Vulnerability Intelligence Dataset}, 
-      author={Bonan Ruan and Jiahao Liu and Weibo Zhao and Zhenkai Liang},
-      year={2024},
-      eprint={2406.16347},
-      eprinttype={arXiv}
+@inproceedings{10.1145/3691620.3695345,
+author = {Ruan, Bonan and Liu, Jiahao and Zhao, Weibo and Liang, Zhenkai},
+title = {VulZoo: A Comprehensive Vulnerability Intelligence Dataset},
+year = {2024},
+isbn = {9798400712487},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3691620.3695345},
+doi = {10.1145/3691620.3695345},
+booktitle = {Proceedings of the 39th IEEE/ACM International Conference on Automated Software Engineering},
+pages = {2334–2337},
+numpages = {4},
+location = {Sacramento, CA, USA},
+series = {ASE '24}
 }
 ```
 
