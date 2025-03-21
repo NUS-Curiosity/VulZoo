@@ -55,18 +55,18 @@ def fetch_patch_from_github(cve, url, manifest):
     # check whether the patch has been fetched
     if cve in manifest:
         if commit_hash in manifest[cve]:
-            # print(f"Skiping {commit_hash} for {cve}")
+            print(f"Skiping {commit_hash} for {cve}")
             return
         for commit in manifest[cve]:
             if is_prefix_of(commit_hash, commit):
-                # print(f"Skiping {commit_hash} for {cve} (same-prefix commit exists)")
+                print(f"Skiping {commit_hash} for {cve} (same-prefix commit exists)")
                 return
 
     r = requests.get(diff_url, headers=header)
     if r.status_code != 200:
         return
 
-    # print(f"Fetching patch for {cve} at {url}")
+    print(f"Fetching patch for {cve} at {url}")
     save_patch(dst_dir, commit_hash, r.text, cve, manifest)
     time.sleep(1)
     
@@ -86,11 +86,11 @@ def fetch_patch_from_git_kernel(cve, url, manifest):
     # check whether the patch has been fetched
     if cve in manifest:
         if commit_hash in manifest[cve]:
-            # print(f"Skiping {commit_hash} for {cve}")
+            print(f"Skiping {commit_hash} for {cve}")
             return
         for commit in manifest[cve]:
             if is_prefix_of(commit_hash, commit):
-                # print(f"Skiping {commit_hash} for {cve} (same-prefix commit exists)")
+                print(f"Skiping {commit_hash} for {cve} (same-prefix commit exists)")
                 return
 
     if standard_pattern.match(url):
@@ -111,10 +111,10 @@ def fetch_patch_from_git_kernel(cve, url, manifest):
     if r.status_code != 200:
         return
 
-    # print(f"Fetching patch for {cve} at {url}")
+    print(f"Fetching patch for {cve} at {url}")
 
     save_patch(dst_dir, commit_hash, r.text, cve, manifest)
-    time.sleep(1)
+    time.sleep(3)
 
 
 def dispatch_patch_fetcher(cve, url, patch_manifest):
@@ -123,10 +123,12 @@ def dispatch_patch_fetcher(cve, url, patch_manifest):
     # use re to match the domain
     github_pattern = re.compile(r"https://github\.com/.*/.*/commit/.*")
     if github_pattern.match(url):
+        print(f"Processing {cve} at {url}")
         fetch_patch_from_github(cve, url, patch_manifest)
         return
     domain = urlparse(url).netloc
     if domain == "git.kernel.org":
+        print(f"Processing {cve} at {url}")
         fetch_patch_from_git_kernel(cve, url, patch_manifest)
         return
 
@@ -168,7 +170,7 @@ if __name__ == "__main__":
         patch_links = get_patch_links_from_nvd()
         with open(nvd_patch_links, "w") as f:
             json.dump(patch_links, f, indent=4)
-        # print(f"Patch links saved to {nvd_patch_links}")
+        print(f"Patch links saved to {nvd_patch_links}")
 
         show_topN_domains(patch_links, N=10)
 
@@ -177,7 +179,7 @@ if __name__ == "__main__":
         for cve, urls in patch_links.items():
             for url in urls:
                 dispatch_patch_fetcher(cve, url, patch_manifest)
-                # time.sleep(0.1)
+                time.sleep(0.1)
         # update the patch manifest
         with open(cve_patch_manifest, "w") as f:
             json.dump(patch_manifest, f, indent=4)
