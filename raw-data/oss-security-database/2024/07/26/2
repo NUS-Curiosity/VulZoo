@@ -1,0 +1,119 @@
+
+Message-ID: <20240726194606.GA12556@openwall.com>
+Date: Fri, 26 Jul 2024 21:46:06 +0200
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: sebastian@...tricular.com
+Subject: Re: GStreamer Security Advisory 2024-0003: Orc compiler stack-based buffer overflow
+
+On Fri, Jul 26, 2024 at 11:57:09AM -0700, Alan Coopersmith wrote:
+> https://gstreamer.freedesktop.org/security/sa-2024-0003.html reports:
+
+> >Patches: 
+> >https://gitlab.freedesktop.org/gstreamer/orc/-/merge_requests/191.patch
+> 
+> The commit message on the fix states:
+> 
+> >vasprintf() is a GNU/BSD extension and would allocate as much memory as 
+> >required
+> >on the heap, similar to g_strdup_printf(). It's ridiculous that such a 
+> >function
+> >is still not provided as part of standard C.
+> 
+> Note that asprintf() and vasprintf() are part of the POSIX.1-2024 standard
+> which was officially published last month, so these are no longer
+> system-specific extensions:
+> 
+> https://pubs.opengroup.org/onlinepubs/9799919799/functions/asprintf.html
+> https://pubs.opengroup.org/onlinepubs/9799919799/functions/vasprintf.html
+> 
+> though they are not yet part of the C standard itself.
+
+Unfortunately, *asprintf() are not that easy to use safely:
+
+"For asprintf(), if memory allocation was not possible, or if some other
+error occurs, the function shall return a negative value, and the
+contents of the location referenced by ptr are undefined, but shall not
+refer to allocated memory."
+
+Indeed, 191.patch referenced above is unsafe, e.g.:
+
+-  vsprintf (text, format, args);
++#ifdef HAVE_VASPRINTF
++  char *text;
++  vasprintf (&text, format, args);
++#else
++  char text[ORC_ERROR_LENGTH] = { '\0' };
++  vsnprintf (text, sizeof (text), format, args);
++#endif
+ 
+   orc_vector_append (&parser->errors,
+                      orc_parse_error_new (orc_parse_get_error_where (parser),
+                                           parser->line_number, -1, text));
++
++#ifdef HAVE_VASPRINTF
++  free (text);
++#endif
+
+If vasprintf() fails, "char *text" may remain uninitialized (or have any
+other value that "shall not refer to allocated memory").  It may happen
+to be a valid pointer to something else, perhaps if a pointer had been
+on that stack location before.  Then some other data would be accessed
+in place of the intended text, and eventually something else would be
+freed, which may happen to be an exploitable vulnerability e.g. via heap
+spraying and chunk unlinking.
+
+As I recall, on *BSD's *asprintf() also reset the pointer to NULL.  On
+upstream glibc, it does not.  We failed to get this change past Ulrich
+back then:
+
+https://sourceware.org/legacy-ml/libc-alpha/2001-12/msg00045.html
+
+> "Dmitry V. Levin" <ldv@...-linux.org> writes:
+> 
+> > I'm talking about already written software which rely on zeroing
+> > result_ptr.
+> 
+> There is no such software using glibc.  Changing this (which is
+> completely unnecessary) will create an incompatibility.  Newly
+> developed code might check only for the NULL pointer value and these
+> programs would then fail with older glibc versions.
+> 
+> > In this case no: former asprintf implementation in bad written program
+> > usually results to free(unitialized_pointer), while suggested feature will
+> > lead to free(0). See the difference?
+> 
+> Crap.  If the return value says "failed; don't use the result" you
+> cannot use the pointer value.  It's that easy.  The interface is
+> completely in line with other interfaces which behave the same.
+> 
+> -- 
+> ---------------.                          ,-.   1325 Chesapeake Terrace
+> Ulrich Drepper  \    ,-------------------'   \  Sunnyvale, CA 94089 USA
+> Red Hat          `--' drepper at redhat.com   `------------------------
+
+but distros carried it as a patch in ALT Linux, Owl, and more recently
+in Rocky Linux SIG/Security.  I think glibc upstream should revisit
+merging it (or equivalent):
+
+https://sig-security.rocky.page/packages/glibc/
+
+"In asprintf(3)/vasprintf(3) reset the pointer to NULL on error, like
+BSDs do, so that the caller wouldn't access memory over an uninitialized
+or stale pointer (ALT Linux)"
+
+The patches are currently in:
+
+https://git.rockylinux.org/sig/security/src/glibc
+
+glibc-2.34-alt-asprintf.patch and glibc-2.34-rocky-asprintf.patch (the
+latter revises documentation)
+
+Regardless, users of these functions must be checking the return value.
+
+Also seen in 191.patch context is that the original code did not and
+still does not check return value from malloc(), which is also a bug.
+However, that is at worst a crash, whereas the impact of not checking
+the return value from *asprintf() is potentially worse.
+
+Alexander

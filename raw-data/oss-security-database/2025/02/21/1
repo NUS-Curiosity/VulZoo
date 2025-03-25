@@ -1,0 +1,72 @@
+
+Message-ID: <1167011785.77274.1740140560949@privateemail.com>
+Date: Fri, 21 Feb 2025 13:22:40 +0100 (CET)
+From: Jordy Zomer <jordy@...ing.systems>
+To: "oss-security@...ts.openwall.com" <oss-security@...ts.openwall.com>,
+	"qsa@...lys.com" <qsa@...lys.com>
+Subject: Re: MitM attack against OpenSSH's
+ VerifyHostKeyDNS-enabled client
+
+Hey all,
+
+First of all, cool findings! I've been working on the CodeQL query and have a revised version that I think improves accuracy and might offer some performance gains (though I haven't done rigorous benchmarking). The key change is the use of `StackVariableReachability` and making sure that there's a path where `var` is not reassigned before taking a `goto _;`. Ran it on an older database, found some of the same bugs with no false-positives so far.
+
+
+This is the revised query.
+```
+import cpp 
+import semmle.code.cpp.controlflow.StackVariableReachability
+
+
+// A call that can return 0
+class CallReturningOK extends FunctionCall {
+    CallReturningOK() {
+     exists(ReturnStmt ret | this.getTarget() = ret.getEnclosingFunction() and ret.getExpr().getValue().toInt() = 0)
+    }
+  
+  }
+
+class GotoWrongRetvalConfiguration extends StackVariableReachability {
+    GotoWrongRetvalConfiguration() { this = "GotoWrongRetvalConfiguration" }
+
+    // Source is an assigment of an "OK" return value to an access of v
+    // To not get FP's we get a false successor
+    override predicate isSource(ControlFlowNode node, StackVariable v) {
+        exists(AssignExpr ae, IfStmt ifst | ae.getRValue() instanceof CallReturningOK 
+        and v.getAnAccess() = ae.getLValue() and  ifst.getCondition().getAChild() = ae  and
+        ifst.getCondition().getAFalseSuccessor() = node)
+        
+    }
+
+    // Our intermediate sink is a `goto _` statement, but it should have a successor that's a return of `v`
+    override predicate isSink(ControlFlowNode node, StackVariable v) {
+        exists(ReturnStmt ret | ret.getExpr() = v.getAnAccess() and
+        node instanceof GotoStmt and node.getASuccessor+() = ret.getExpr())
+    }
+
+    // We don't want `v` to be reassigned
+    override predicate  isBarrier(ControlFlowNode node, StackVariable v) {
+        exists(AssignExpr ae | ae.getLValue() = node and v.getAnAccess() = node)
+    }
+}
+
+from ControlFlowNode source, ControlFlowNode sink, GotoWrongRetvalConfiguration conf, Variable v, Expr retval
+where
+// We want a call that can `return 0` to reach a goto that has a ret of `v` sucessor
+conf.reaches(source, v, sink)
+and 
+// We don't want `v` to be reassigned after the goto
+not conf.isBarrier(sink.getASuccessor+(), v)
+// this goes from our intermediate sink to retval
+and sink.getASuccessor+() = retval
+// Just making sure that it's returning v
+and exists(ReturnStmt ret | ret.getExpr() = retval and retval = v.getAnAccess())
+select retval.getEnclosingFunction(), source, sink, retval
+```
+
+
+Hope that's helpful, please reach out if you have any questions :)
+
+Cheers,
+
+Jordy Zomer

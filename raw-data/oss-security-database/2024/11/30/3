@@ -1,0 +1,68 @@
+
+Message-ID: <20241130054634.GA12730@openwall.com>
+Date: Sat, 30 Nov 2024 06:46:34 +0100
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: tianshu qiu <jimuchutianshu97@...il.com>,
+	Luiz Augusto von Dentz <luiz.dentz@...il.com>,
+	Marcel Holtmann <marcel@...tmann.org>,
+	Johan Hedberg <johan.hedberg@...il.com>
+Subject: Re: Linux: Race can lead to UAF in net/bluetooth/sco.c: sco_sock_connect()
+
+On Sat, Nov 30, 2024 at 01:18:18PM +0800, tianshu qiu wrote:
+> The bug was introduced on Apr 11, 2023:
+> https://github.com/torvalds/linux/commit/9a8ec9e8ebb5a7c0cfbce2d6b4a6b67b2b78e8f3
+> The latest affected version is Linux-6.11.5
+
+I guess you actually mean the latest _known_ affected?  So later
+versions may also be affected, but you haven't confirmed that?
+
+There were a couple of very wide diagrams in your message, which were
+not properly formatted in its text/plain part.  The below is my attempt
+at resurrecting them from the text/html part (normally filtered out when
+relaying through this mailing list), but a very wide window is still
+needed to view them properly.
+
+First:
+
+   ==============================================================================
+   sco_sock_timeout Register Thread                                sco_sock_timeout Cancelled Thread
+
+   # sco_sock_connect
+   #     sco_connect
+   #          sco_sock_set_timer                                       #hci_rx_work
+                                                                                      #     hci_event_packet
+                                                                                      #         hci_event_func
+                                                                                      #             hci_conn_complete_evt
+                                                                                      #                 hci_sco_setup
+                                                                                      #                     hci_connect_cfm
+                                                                                      #                         sco_connect_cfm
+                                                                                      #                             sco_conn_del
+                                                                                      #                                 sco_sock_clear_timer
+                                                                                      #                                     cancel_delayed_work
+   ==============================================================================
+
+Second:
+
+   =============================================================================================================================================================================
+                        main thread                                                                     thread 1                                                                                                                             thread 2
+   # fd = socket(AF_BLUETOOTH,                                         
+    SOCK_SEQPACKET | SOCK_NONBLOCK ,
+    BTPROTO_SCO) 
+                                                                                                    # sco_sock_connect                                                                                                           # sco_sock_connect
+                                                                                                    #     sco_connect                                                                                                                #     sco_connect
+                                                                                                    #         hci_connect_sco                                                                                                     #         hci_connect_sco
+                                                                                                    #             hci_connect_acl                                                                                                  #             hci_connect_acl    
+                                                                                                    #                 hci_acl_create_connection                                                                             #                 hci_acl_create_connection        
+                                                                                                    #                     hci_send_cmd(hdev, HCI_OP_CREATE_CONN, sizeof(cp), &cp);           #                      hci_send_cmd(hdev, HCI_OP_CREATE_CONN, sizeof(cp), &cp);       
+                                                                                                    # hci_conn_complete_evt （Asynchronous HCI events）      
+                                             
+   # close(fd)
+   # struct sock is freed                          
+                                                                                                                                                                                                                                               # hci_conn_complete_evt （Asynchronous HCI events）
+                                                                                                                                                                                                                                               # ..........                              
+                                                                                                                                                                                                                                               #         sco_conn_del
+                                                                                                                                                              Deference freed "struct sock".   ----------------->        #                sock_hold(sk)
+   =============================================================================================================================================================================
+
+Alexander

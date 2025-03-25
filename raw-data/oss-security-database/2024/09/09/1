@@ -1,0 +1,356 @@
+
+Message-ID: <29fbd05d-f9aa-47aa-ade1-b61ab5d86135@gmail.com>
+Date: Mon, 9 Sep 2024 17:17:52 +0300
+From: Dimitrios Glynos <dglynos.pub@...il.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2024-6655 Library injection from CWD in GTK-2/GTK-3
+
+Hello all,
+
+the GTK project is a free and open-source cross-platform widget toolkit for
+creating graphical user interfaces [1].
+
+I found that applications based on GTK-3 or GTK-2 (aka GTK+3 / GTK+2)
+were vulnerable to library injection from the current working directory (CWD),
+whenever a GTK module was requested to be loaded but the module was missing
+from the standard paths. This issue is tracked as CVE-2024-6655
+(assigned by RedHat).
+
+The GTK project issued a security fix [2] in version 3.24.43 of GTK-3.
+GTK-2 will not be receiving an official fix for this issue as it is
+no longer maintained.
+
+Software distributions that maintain GTK-3 packages (and software vendors
+that bundle their software with GTK-3) should make sure that they are using
+a version of GTK-3 with the fix applied. Backporting the fix to a GTK-2
+codebase is also an option.
+
+Users are recommended to update GTK-2/GTK-3 libraries to the latest versions
+available and use extreme caution when starting vulnerable GTK applications
+from directories containing possibly untrusted content (e.g. ~/Downloads).
+
+While researching the exploitability of this issue, I found that both
+Debian and Ubuntu came with a GNOME configuration that could allow for
+remote (but victim-assisted) exploitation of the issue. For more information
+on this please see the "Exploitation" section of this advisory. Ubuntu
+published a fix for the GTK libraries on July 16 2024 covering all supported
+LTS versions of Ubuntu [3], while Debian made the GTK fix available in
+Debian 12.7 (stable) and Debian 11.11 (oldstable) on August 31st 2024 [4].
+
+Technical Analysis
+==================
+
+Any mention of the term "GTK" in this section shall refer to GTK-2/GTK-3.
+
+A GTK-based application will try to load a GTK module (a shared library)
+when:
+(a) the module is mentioned in specific environment variables
+     (GTK2_MODULES/GTK_MODULES for GTK-2, and GTK3_MODULES/GTK_MODULES
+     for GTK-3).
+(b) the module is passed as a command line parameter to the application
+     (see --gtk-module parameter).
+(c) there is a runtime change in a GTK setting (or GDK screen setting)
+     called "gtk-modules".
+
+The actual loading of a GTK module in all of the abovementioned scenarios
+occurs through load_module(). This function uses a utility function
+called find_module() to locate and load the module. An excerpt of find_module()
+is provided below from gtk+-3.24.42/gtk/gtkmodules.c:
+
+210 static GModule *
+211 find_module (const gchar *name)
+212 {
+213   GModule *module;
+214   gchar *module_name;
+215
+216   module_name = _gtk_find_module (name, "modules");
+217   if (!module_name)
+218     {
+219       /* As last resort, try loading without an absolute path (using system
+220        * library path)
+221        */
+222       module_name = g_module_build_path (NULL, name);
+223     }
+224
+225   module = g_module_open (module_name, G_MODULE_BIND_LOCAL | G_MODULE_BIND_LAZY);
+226
+227   if (_gtk_module_has_mixed_deps (module))
+228     {
+229       g_warning ("GTK+ module %s cannot be loaded.\n"
+230                  "GTK+ 2.x symbols detected. Using GTK+ 2.x and GTK+ 3 in the same process is not supported.", module_name);
+231       g_module_close (module);
+232       module = NULL;
+
+In line 222 above, if the requested GTK module has not been found under
+the standard GTK module directories, then the module is searched for in
+the current working directory (notice the NULL argument to glib's
+g_module_build_path()).
+
+This opens the door to having malicious versions of missing modules be
+loaded from a directory with attacker-controlled content.
+
+Exploitation
+============
+
+This section presents two example exploitation scenarios that take
+advantage of the library injection issue.
+
+Both scenarios share the theme where a victim user was tricked into receiving
+malicious files in a certain directory, and then at a later point in time
+the victim user executes a vulnerable GTK application using that directory
+as the current working directory (CWD). The vulnerable GTK application will
+automatically load the malicious files and the remote attacker will thus gain
+code execution on the victim's host.
+
+Receiving the malicious files could be performed in various ways, including:
+- a "drive-by download" where the user is lured into visiting a malicious
+   website, the website automatically downloads content to "~/Downloads"
+   and "~/Downloads" later becomes the CWD.
+- a more generic reception of content from an untrusted source, where the
+   malicious files are placed alongside innocuous files in an archive file or
+   torrent file and where the extracted directory later becomes the CWD.
+
+I am aware of the following methods to force a specific directory to be the
+CWD of a GTK application:
+- the user is executing the GTK application from the command line
+   (e.g. "cd Downloads; eog .").
+- the user has double-clicked on the GTK application executable through
+   GNOME's file manager (nautilus), an action which is very common for
+   AppImage bundled software.
+- a random event where the user first executed nautilus through the terminal
+   (e.g. "cd zip-files; nautilus ."). Any later (GUI) invocation of this
+   GTK-based file manager in the desktop session will continue to use the
+   same CWD and will further apply this CWD to utility programs used with
+   the files (like performing decompression with GNOME's GTK-based
+   file-roller).
+
+(If anyone has other ideas on how to force a specific directory to become
+the CWD of GTK applications or of a specific GTK application, I would be
+interested to know.)
+
+The rest of this section describes the two example exploitation scenarios.
+
+Case #1. Running GTK-3 applications on Debian and Debian-derived distributions
+------------------------------------------------------------------------------
+
+Debian and Debian-derived distributions (including Ubuntu) push an environment
+variable GTK_MODULES="gail:atk-bridge" through the "libatk-adaptor" package,
+a core GNOME package. The variable mentions two modules that are meant for
+GTK-2 applications and in fact, GTK-3 carries a blacklisting (but bypassable)
+mechanism so that these modules would not be taken into consideration
+for module loading purposes. The modules are there in their standard
+directories for GTK-2 applications to use, but would normally appear as
+non-existent to a GTK-3 application.
+
+As previously mentioned, GTK-3 has a blacklisting mechanism for the "gail"
+and "atk-bridge" components. In load_module() there is a call to
+module_is_blacklisted(). The blacklist is implemented by not invoking
+the gtk_module_init() function of the blacklisted modules.
+However, just before checking the blacklist, each module is already loaded
+into memory by find_module() in gtk+-3.24.42/gtk/gtkmodule.c:292.
+
+263 static GSList *
+264 load_module (GSList      *module_list,
+265              const gchar *name)
+266 {
+267   GtkModuleInitFunc modinit_func;
+268   gpointer modinit_func_ptr;
+269   GtkModuleInfo *info = NULL;
+270   GModule *module = NULL;
+271   GSList *l;
+272   gboolean success = FALSE;
+273
+274   if (g_module_supported ())
+275     {
+276       for (l = gtk_modules; l; l = l->next)
+...
+290       if (!success)
+291         {
+292           module = find_module (name);
+293
+294           if (module)
+295             {
+296               /* Do the check this late so we only warn about existing modules,
+297                * not old modules that are still in the modules path. */
+298               if (module_is_blacklisted (name, TRUE))
+299                 {
+300                   modinit_func = NULL;
+301                   success = TRUE;
+302                 }
+303               else if (g_module_symbol (module, "gtk_module_init", &modinit_func_ptr))
+...
+
+As we saw previously, find_module() calls glib's g_module_open() to dlopen()
+the shared library requested. Although gtk_module_init() is not called on
+a blacklisted module, the fact that the module has been loaded into memory
+means that any (malicious) code found in library constructors will
+be executed. Therefore this mechanism does not work as a true blacklist
+for all types of modules in GTK-3, just for well behaving ones.
+
+Now that we have a way to escape the blacklist, we will need to overcome
+one more obstacle. In glibc's dlopen(3) implementation, simply providing the
+filename of a library (without any path elements) does not by default load
+the library from the current working directory (as other things
+need also be tweaked like LD_LIBRARY_PATH etc.). glibc would have been
+happy to do that if we had provided "./libfoo.so" (i.e. a relative path
+with a slash character).
+
+This means that find_module()'s call to glib's g_module_open() will always
+fail for a "libfoo.so" library. However, if we take a look at the
+implementation of g_module_open() in glib-2.80.3/gmodule/gmodule.c we have:
+
+704 GModule *
+705 g_module_open (const gchar  *file_name,
+706                GModuleFlags  flags)
+707 {
+708   return g_module_open_full (file_name, flags, NULL);
+709 }
+
+465 GModule*
+466 g_module_open_full (const gchar   *file_name,
+467                     GModuleFlags   flags,
+468                     GError       **error)
+469 {
+470   GModule *module;
+471   gpointer handle = NULL;
+472   gchar *name = NULL;
+...
+526   /* try completing file name with standard library suffix */
+527   if (!name)
+528     {
+529       char *basename, *dirname;
+530       size_t prefix_idx = 0, suffix_idx = 0;
+531       const char *prefixes[2] = {0}, *suffixes[2] = {0};
+532
+533       basename = g_path_get_basename (file_name);
+534       dirname = g_path_get_dirname (file_name);
+...
+562       if (!g_str_has_suffix (basename, ".so"))
+563         suffixes[suffix_idx++] = ".so";
+...
+566       for (guint i = 0; i < prefix_idx; i++)
+567         {
+568           for (guint j = 0; j < suffix_idx; j++)
+569             {
+570               name = g_strconcat (dirname, G_DIR_SEPARATOR_S, prefixes[i],
+571                                   basename, suffixes[j], NULL);
+572               if (g_file_test (name, G_FILE_TEST_IS_REGULAR))
+573                 goto name_found;
+574               g_free (name);
+575               name = NULL;
+576             }
+577         }
+578     name_found:
+579       g_free (basename);
+580       g_free (dirname);
+581     }
+582   /* try completing by appending libtool suffix */
+583   if (!name)
+584     {
+585       name = g_strconcat (file_name, ".la", NULL);
+586       if (!g_file_test (name, G_FILE_TEST_IS_REGULAR))
+587         {
+588           g_free (name);
+589           name = NULL;
+590         }
+591     }
+...
+
+The branch in line 583 makes the application search for a similarly named
+".la" libtool file when the library file requested is not found on disk.
+Therefore, it is possible to craft this file (say "libfoo.so.la")
+to point to a completely different library (say "libx.so") at so-called
+libdir ".". The parsing mechanism for ".la" files will be happy to
+synthesize the "./libx.so" path for us and this will eventually
+be fed to dlopen(3) to load the "libx.so" module from the current working
+directory.
+
+As a proof of concept, have a look at the first two attachments. The first
+one ("libtool.txt") is a malicious libtool file (based on "libtiff").
+You may rename this file to "libatk-bridge.so.la". The second file ("foo.c")
+is the source code of the malicious module. Its purpose is to print "HELLO!"
+to standard error. You may compile this file based on the instructions found
+in the file.
+
+Place both "libfoo.so" and "libatk-bridge.so.la" in a directory.
+Within that directory, try to start the GTK-3 based firefox on an
+unpatched Debian (or Debian-derived) system and you should see a "HELLO!"
+message printed to standard error.
+
+$ cd directory
+$ ls
+libatk-bridge.so.la libfoo.so
+$ firefox
+HELLO!
+Gtk-Message: 16:13:05.585: Not loading module "atk-bridge": The functionality
+is provided by GTK natively. Please try to not load it.
+
+Please note that we can substitute firefox with any other GTK-3 based
+application and the effects will remain the same.
+
+Case #2: An application bundled with GTK-3, looking for a non-existent module
+-----------------------------------------------------------------------------
+
+Let's consider the case of an application that has been bundled with a
+vulnerable version of GTK-3 and is missing a GTK module. For our example
+we will use the latest (1.3.2) Inkscape AppImage build [5] which is missing
+the "canberra-gtk-module" GTK module.
+
+We will place a malicious "libcanberra-gtk-module.so.la" and a "libfoo.so"
+in the "Downloads" directory to simulate a drive-by download attack, and then
+we will trigger the application from the GNOME file manager's GUI.
+
+Start by renaming the first attachment ("libtool.txt") to
+"libcanberra-gtk-module.so.la" and place it in the "Downloads" directory.
+Then, use the third attachment ("foo2.c") to build a malicious GTK module
+that will spawn a GNOME calculator. You can build this based on the
+instructions provided in the source code and make sure to place "libfoo.so"
+in the "Downloads" directory.
+
+Use a browser to download the Inkscape AppImage in the "Downloads" directory.
+Then use the GNOME file manager to make the AppImage file executable.
+Double click on the AppImage file and you should see two GNOME calculators
+on your desktop (due to multiple requests for "canberra-gtk-module").
+
+Please note that this is a GUI-only attack scenario involving no use of
+the terminal by the victim user.
+
+Issue Timeline
+==============
+
+2024-06-14 Issue reported to GTK team through GNOME Security [6]
+2024-07-10 Red Hat assigns CVE-2024-6655 to the issue
+2024-07-10 GTK project releases the fix in gtk+-3.24.43
+2024-07-16 Ubuntu releases updated GTK-2/GTK-3 packages for all LTS versions
+2024-08-31 Debian releases versions 12.7 and 11.11 with fixes for GTK-2/GTK-3
+2024-09-09 Advisory post on OSS Security
+
+Thanks
+======
+
+Many thanks to Red Hat, the GTK developers, the Ubuntu Security Team, the
+Debian Security Team and the GTK package maintainers for the work they put
+into tracking the issue and releasing the fix.
+
+I remain available for any further information required on the issue.
+
+Kind regards,
+
+Dimitrios Glynos
+
+[1] https://www.gtk.org
+[2] https://gitlab.gnome.org/GNOME/gtk/-/merge_requests/7361/diffs
+[3] https://ubuntu.com/security/notices/USN-6899-1
+[4] https://security-tracker.debian.org/tracker/CVE-2024-6655
+[5] https://inkscape.org/release/inkscape-1.3.2/gnulinux/appimage/dl/
+[6] https://gitlab.gnome.org/GNOME/gtk/-/issues/6786
+
+View attachment "libtool.txt" of type "text/plain" (901 bytes)
+
+View attachment "foo.c" of type "text/x-csrc" (193 bytes)
+
+View attachment "foo2.c" of type "text/x-csrc" (253 bytes)
+
+Download attachment "OpenPGP_0xE7DBE3A48B1E3ED2.asc" of type "application/pgp-keys" (2465 bytes)
+
+Download attachment "OpenPGP_signature.asc" of type "application/pgp-signature" (666 bytes)

@@ -1,0 +1,183 @@
+
+Message-ID: <20250222032521.GA30890@openwall.com>
+Date: Sat, 22 Feb 2025 04:25:21 +0100
+From: Solar Designer <solar@...nwall.com>
+To: oss-security@...ts.openwall.com
+Cc: Qualys Security Advisory <qsa@...lys.com>,
+	Dmitry Belyavskiy <dbelyavs@...hat.com>,
+	Jordy Zomer <jordy@...ing.systems>, Damien Miller <djm@...drot.org>
+Subject: Re: MitM attack against OpenSSH's VerifyHostKeyDNS-enabled client
+
+Hi,
+
+Thank you Qualys for the very interesting research, as is usual from you.
+
+On Tue, Feb 18, 2025 at 09:14:36AM +0000, Qualys Security Advisory wrote:
+> - we manually audited all of OpenSSH's functions that use "goto", for
+>   missing resets of their return value;
+> 
+> - we wrote a CodeQL query that automatically searches for functions that
+>   "goto out" without resetting their return value in the corresponding
+>   "if" code block.
+
+I didn't go as far as CodeQL, but I also did some semi-manual auditing:
+
+grep -A100 '[^a-z_]if.[^=!<>]*=[^=]' *.c | less
+
+and then search for goto.  I did this against patched OpenSSH source
+tree installed with "rpmbuild -rp openssh-8.7p1-43.el9.src.rpm" hoping
+to spot any issues there may be specific to this older base OpenSSH
+version or Red Hat's changes to it.
+
+This is indeed imperfect as it e.g. doesn't catch assignments only seen
+on further lines within an "if" condition (not the line with "if" on it)
+if the condition spans multiple lines.  I also ran out of time
+completing this review.  In the portion that I did review, I only found
+a subset of the same issues that Qualys had found, plus one related
+uninteresting bug (see below).
+
+> Our manual audit (of all the functions that use "goto") allowed us to
+> verify that our CodeQL query does not produce false negatives (which
+> would be worse than false positives), but it also allowed us to review
+> code that is similar but not identical to the idiom presented in the
+> "Background" section.
+> 
+> In OpenSSH's client, the following code, which checks the server's
+> identity (the server's host key), naturally caught our attention:
+> 
+> ------------------------------------------------------------------------
+>   93 static int
+>   94 verify_host_key_callback(struct sshkey *hostkey, struct ssh *ssh)
+>   95 {
+>  ...
+>  101         if (verify_host_key(xxx_host, xxx_hostaddr, hostkey,
+>  102             xxx_conn_info) == -1)
+>  103                 fatal("Host key verification failed.");
+>  104         return 0;
+>  105 }
+> ------------------------------------------------------------------------
+> 1470 int
+> 1471 verify_host_key(char *host, struct sockaddr *hostaddr, struct sshkey *host_key,
+> 1472     const struct ssh_conn_info *cinfo)
+> 1473 {
+> ....
+> 1538         if (options.verify_host_key_dns) {
+> ....
+> 1543                 if ((r = sshkey_from_private(host_key, &plain)) != 0)
+> 1544                         goto out;
+> ....
+> 1571 out:
+> ....
+> 1580         return r;
+> 1581 }
+> ------------------------------------------------------------------------
+
+Given that the actually security-relevant bug turned out to be "similar
+but not identical to the idiom" that Qualys wrote they did most auditing
+of, I then switched to going through:
+
+grep 'if.*(.*(.*== *-1' *.c | less
+
+This is similarly imperfect (only catches function calls directly from
+the "if" line, not return values assigned to a variable just before, and
+doesn't catch continuation lines), but at least I completed this review
+for openssh-9.9p1.  This amounted to separately locating and reviewing
+the bodies of called OpenSSH-specific functions (not libc functions nor
+compatibility wrappers) and sometimes those of nested function calls.
+
+(I assumed the compatibility wrappers correctly implement the same
+function that a library would, including return value semantics.
+Someone may review them separately.  I actually happened to look at a
+few, but that's very far from exhaustive.)
+
+I then diff'ed the output of the above grep command vs. the same for the
+openssh-8.7p1-43.el9 tree, and similarly reviewed code for all lines of
+grep output that are added for openssh-8.7p1-43.el9.
+
+With this, I also only found another uninteresting bug (see below).
+
+I wonder if such review could also be automated with CodeQL (or maybe
+even the classic Coccinelle?), or if it's beyond tools' capabilities?
+
+> 2025-02-10: Advisory and patches sent to distros@...nwall.
+
+Qualys did in fact share a patch from upstream OpenSSH developers, which
+I now see is identical to changes that went into 9.9p2 (which also
+includes some other changes).  As I found this focused patch helpful for
+my code reviews and fix backporting, I also attach it here.
+
+I also attach my result of applying the patch to openssh-8.7p1-43.el9.
+I reviewed that whatever hunks did not apply were in fact inapplicable
+to this version.  I also added a fix for my uninteresting bug one:
+
++++ openssh-8.7p1-43.el9-tree.qualys-retval/ssh-agent.c	2025-02-21 04:01:32.677160367 +0000
+@@ -700,6 +700,8 @@ process_add_identity(SocketEntry *e)
+ 	if ((r = sshkey_private_deserialize(e->request, &k)) != 0 ||
+ 	    k == NULL ||
+ 	    (r = sshbuf_get_cstring(e->request, &comment, NULL)) != 0) {
++		if (!r) /* k == NULL */
++			r = SSH_ERR_INTERNAL_ERROR;
+ 		error_fr(r, "parse");
+ 		goto out;
+ 	}
+
+This should prevent logging a confusing "parse: success" message on
+"k == NULL", as r could have been set to 0 on the line before.
+
+This issue is also present in upstream OpenSSH 9.9p2.
+
+As to my uninteresting bug two, it's illustrated by this patch (also
+attached here):
+
++++ openssh-8.7p1-43.el9-tree.krb5-ssh_asprintf_append/auth-krb5.c	2025-02-21 03:37:13.106465704 +0000
+@@ -309,13 +309,14 @@ ssh_asprintf_append(char **dsc, const ch
+ 	i = vasprintf(&src, fmt, ap);
+ 	va_end(ap);
+ 
+-	if (i == -1 || src == NULL)
++	if (i == -1)
+ 		return -1;
+ 
+ 	old = *dsc;
+ 
+ 	i = asprintf(dsc, "%s%s", *dsc, src);
+-	if (i == -1 || src == NULL) {
++	if (i == -1) {
++		*dsc = old;
+ 		free(src);
+ 		return -1;
+ 	}
+
+This is in RH-added Kerberos support code.  The issue was that if the
+second asprintf() call failed, it'd leave *dsc undefined, yet the caller
+of this function would free() memory via that pointer.  In practice,
+glibc would either leave the pointer unchanged or reset it to NULL
+(varying by glibc version and specific error condition), both of which
+are safe to free().  Yet resetting "*dsc = old;" should be safer, and
+should avoid the memory leak that happens if *dsc got reset to NULL.
+That memory leak shouldn't have mattered anyway because it'd only occur
+when the process already has trouble allocating more memory here.
+
+The "src == NULL" checks are dropped because the first one shouldn't
+matter if asprintf() behaves correctly and wouldn't help if it does not
+(as src isn't initialized to NULL before the call), the second one
+is wrong (was probably meant to check *dsc, not src), and further code
+in this same source file relies on asprintf() return value anyway.
+
+These patches just went into the Rocky Linux SIG/Security package of
+OpenSSH for EL9:
+
+https://sig-security.rocky.page/packages/openssh/
+https://git.rockylinux.org/sig/security/src/openssh
+
+The above auth-krb5.c patch is actually untested since we currently
+build that package with Kerberos support excluded (and besides it'd take
+specific effort to trigger that error path).
+
+Alexander
+
+View attachment "openssh-9.9-upstream-retval.patch" of type "text/plain" (5150 bytes)
+
+View attachment "openssh-8.7p1-upstream-rocky-retval.patch" of type "text/plain" (3740 bytes)
+
+View attachment "openssh-8.7p1-rocky-krb5-ssh_asprintf_append.patch" of type "text/plain" (627 bytes)

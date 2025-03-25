@@ -1,0 +1,438 @@
+diff --git a/evil_generator/main.go b/evil_generator/main.go
+index 4e93732..e7803b1 100644
+--- a/evil_generator/main.go
++++ b/evil_generator/main.go
+@@ -22,6 +22,11 @@ func main() {
+ 		log.Fatalf("Output path %s is not a directory", outputDir)
+ 	}
+ 
++	generateEvilZipSlip(outputDir)
++	generateEvilSymLinkPathTraversalTar(outputDir)
++}
++
++func generateEvilZipSlip(outputDir *paths.Path) {
+ 	evilPathTraversalFiles := []string{
+ 		"..",
+ 		"../../../../../../../../../../../../../../../../../../../../tmp/evil.txt",
+@@ -104,3 +109,21 @@ func main() {
+ 		}
+ 	}
+ }
++
++func generateEvilSymLinkPathTraversalTar(outputDir *paths.Path) {
++	outputTarFile, err := outputDir.Join("evil-link-traversal.tar").Create()
++	if err != nil {
++		log.Fatal(err)
++	}
++	defer outputTarFile.Close()
++
++	tw := tar.NewWriter(outputTarFile)
++	defer tw.Close()
++
++	if err := tw.WriteHeader(&tar.Header{
++		Name: "leak", Linkname: "../../../../../../../../../../../../../../../tmp/something-important",
++		Mode: 0o0777, Size: 0, Typeflag: tar.TypeLink,
++	}); err != nil {
++		log.Fatal(err)
++	}
++}
+diff --git a/extractor.go b/extractor.go
+index f408e4f..d472d3d 100644
+--- a/extractor.go
++++ b/extractor.go
+@@ -217,7 +217,10 @@ func (e *Extractor) Tar(ctx context.Context, body io.Reader, location string, re
+ 				name = rename(name)
+ 			}
+ 
+-			name = filepath.Join(location, name)
++			name, err = safeJoin(location, name)
++			if err != nil {
++				continue
++			}
+ 			links = append(links, &link{Path: path, Name: name})
+ 		case tar.TypeSymlink:
+ 			symlinks = append(symlinks, &link{Path: path, Name: header.Linkname})
+@@ -237,6 +240,32 @@ func (e *Extractor) Tar(ctx context.Context, body io.Reader, location string, re
+ 		}
+ 	}
+ 
++	if err := e.extractSymlinks(ctx, symlinks); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++func (e *Extractor) extractSymlinks(ctx context.Context, symlinks []*link) error {
++	for _, symlink := range symlinks {
++		select {
++		case <-ctx.Done():
++			return errors.New("interrupted")
++		default:
++		}
++
++		// Make a placeholder and replace it after unpacking everything
++		_ = e.FS.Remove(symlink.Path)
++		f, err := e.FS.OpenFile(symlink.Path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(0666))
++		if err != nil {
++			return fmt.Errorf("creating symlink placeholder %s: %w", symlink.Path, err)
++		}
++		if err := f.Close(); err != nil {
++			return fmt.Errorf("creating symlink placeholder %s: %w", symlink.Path, err)
++		}
++	}
++
+ 	for _, symlink := range symlinks {
+ 		select {
+ 		case <-ctx.Done():
+@@ -248,6 +277,7 @@ func (e *Extractor) Tar(ctx context.Context, body io.Reader, location string, re
+ 			return errors.Annotatef(err, "Create link %s", symlink.Path)
+ 		}
+ 	}
++
+ 	return nil
+ }
+ 
+@@ -340,17 +370,8 @@ func (e *Extractor) Zip(ctx context.Context, body io.Reader, location string, re
+ 		}
+ 	}
+ 
+-	// Now we make another pass creating the links
+-	for _, link := range links {
+-		select {
+-		case <-ctx.Done():
+-			return errors.New("interrupted")
+-		default:
+-		}
+-		_ = e.FS.Remove(link.Path)
+-		if err := e.FS.Symlink(link.Name, link.Path); err != nil {
+-			return errors.Annotatef(err, "Create link %s", link.Path)
+-		}
++	if err := e.extractSymlinks(ctx, links); err != nil {
++		return err
+ 	}
+ 
+ 	return nil
+diff --git a/extractor_test.go b/extractor_test.go
+index 5b8545e..9943d2d 100644
+--- a/extractor_test.go
++++ b/extractor_test.go
+@@ -1,6 +1,8 @@
+ package extract_test
+ 
+ import (
++	"archive/tar"
++	"archive/zip"
+ 	"bytes"
+ 	"context"
+ 	"fmt"
+@@ -65,7 +67,7 @@ func testArchive(t *testing.T, archivePath *paths.Path) {
+ }
+ 
+ func TestZipSlipHardening(t *testing.T) {
+-	{
++	t.Run("ZipTraversal", func(t *testing.T) {
+ 		logger := &LoggingFS{}
+ 		extractor := extract.Extractor{FS: logger}
+ 		data, err := os.Open("testdata/zipslip/evil.zip")
+@@ -74,8 +76,9 @@ func TestZipSlipHardening(t *testing.T) {
+ 		require.NoError(t, data.Close())
+ 		fmt.Print(logger)
+ 		require.Empty(t, logger.Journal)
+-	}
+-	{
++	})
++
++	t.Run("TarTraversal", func(t *testing.T) {
+ 		logger := &LoggingFS{}
+ 		extractor := extract.Extractor{FS: logger}
+ 		data, err := os.Open("testdata/zipslip/evil.tar")
+@@ -84,9 +87,23 @@ func TestZipSlipHardening(t *testing.T) {
+ 		require.NoError(t, data.Close())
+ 		fmt.Print(logger)
+ 		require.Empty(t, logger.Journal)
+-	}
++	})
++
++	t.Run("TarLinkTraversal", func(t *testing.T) {
++		logger := &LoggingFS{}
++		extractor := extract.Extractor{FS: logger}
++		data, err := os.Open("testdata/zipslip/evil-link-traversal.tar")
++		require.NoError(t, err)
++		require.NoError(t, extractor.Tar(context.Background(), data, "/tmp/test", nil))
++		require.NoError(t, data.Close())
++		fmt.Print(logger)
++		require.Empty(t, logger.Journal)
++	})
+ 
+-	if runtime.GOOS == "windows" {
++	t.Run("WindowsTarTraversal", func(t *testing.T) {
++		if runtime.GOOS != "windows" {
++			t.Skip("Skipped on non-Windows host")
++		}
+ 		logger := &LoggingFS{}
+ 		extractor := extract.Extractor{FS: logger}
+ 		data, err := os.Open("testdata/zipslip/evil-win.tar")
+@@ -95,7 +112,151 @@ func TestZipSlipHardening(t *testing.T) {
+ 		require.NoError(t, data.Close())
+ 		fmt.Print(logger)
+ 		require.Empty(t, logger.Journal)
++	})
++}
++
++func mkTempDir(t *testing.T) *paths.Path {
++	tmp, err := paths.MkTempDir("", "test")
++	require.NoError(t, err)
++	t.Cleanup(func() { tmp.RemoveAll() })
++	return tmp
++}
++
++func TestSymLinkMazeHardening(t *testing.T) {
++	addTarSymlink := func(t *testing.T, tw *tar.Writer, new, old string) {
++		err := tw.WriteHeader(&tar.Header{
++			Mode: 0o0777, Typeflag: tar.TypeSymlink, Name: new, Linkname: old,
++		})
++		require.NoError(t, err)
++	}
++	addZipSymlink := func(t *testing.T, zw *zip.Writer, new, old string) {
++		h := &zip.FileHeader{Name: new, Method: zip.Deflate}
++		h.SetMode(os.ModeSymlink)
++		w, err := zw.CreateHeader(h)
++		require.NoError(t, err)
++		_, err = w.Write([]byte(old))
++		require.NoError(t, err)
+ 	}
++
++	t.Run("TarWithSymlinkToAbsPath", func(t *testing.T) {
++		// Create target dir
++		tmp := mkTempDir(t)
++		targetDir := tmp.Join("test")
++		require.NoError(t, targetDir.Mkdir())
++
++		// Make a tar archive with symlink maze
++		outputTar := bytes.NewBuffer(nil)
++		tw := tar.NewWriter(outputTar)
++		addTarSymlink(t, tw, "aaa", tmp.String())
++		addTarSymlink(t, tw, "aaa/sym", "something")
++		require.NoError(t, tw.Close())
++
++		// Run extract
++		extractor := extract.Extractor{FS: &LoggingFS{}}
++		require.Error(t, extractor.Tar(context.Background(), outputTar, targetDir.String(), nil))
++		require.NoFileExists(t, tmp.Join("sym").String())
++	})
++
++	t.Run("ZipWithSymlinkToAbsPath", func(t *testing.T) {
++		// Create target dir
++		tmp := mkTempDir(t)
++		targetDir := tmp.Join("test")
++		require.NoError(t, targetDir.Mkdir())
++
++		// Make a zip archive with symlink maze
++		outputZip := bytes.NewBuffer(nil)
++		zw := zip.NewWriter(outputZip)
++		addZipSymlink(t, zw, "aaa", tmp.String())
++		addZipSymlink(t, zw, "aaa/sym", "something")
++		require.NoError(t, zw.Close())
++
++		// Run extract
++		extractor := extract.Extractor{FS: &LoggingFS{}}
++		err := extractor.Zip(context.Background(), outputZip, targetDir.String(), nil)
++		require.NoFileExists(t, tmp.Join("sym").String())
++		require.Error(t, err)
++	})
++
++	t.Run("TarWithSymlinkToRelativeExternalPath", func(t *testing.T) {
++		// Create target dir
++		tmp := mkTempDir(t)
++		targetDir := tmp.Join("test")
++		require.NoError(t, targetDir.Mkdir())
++		checkDir := tmp.Join("secret")
++		require.NoError(t, checkDir.MkdirAll())
++
++		// Make a tar archive with regular symlink maze
++		outputTar := bytes.NewBuffer(nil)
++		tw := tar.NewWriter(outputTar)
++		addTarSymlink(t, tw, "aaa", "../secret")
++		addTarSymlink(t, tw, "aaa/sym", "something")
++		require.NoError(t, tw.Close())
++
++		extractor := extract.Extractor{FS: &LoggingFS{}}
++		require.Error(t, extractor.Tar(context.Background(), outputTar, targetDir.String(), nil))
++		require.NoFileExists(t, checkDir.Join("sym").String())
++	})
++
++	t.Run("TarWithSymlinkToInternalPath", func(t *testing.T) {
++		// Create target dir
++		tmp := mkTempDir(t)
++		targetDir := tmp.Join("test")
++		require.NoError(t, targetDir.Mkdir())
++
++		// Make a tar archive with regular symlink maze
++		outputTar := bytes.NewBuffer(nil)
++		tw := tar.NewWriter(outputTar)
++		require.NoError(t, tw.WriteHeader(&tar.Header{Mode: 0o0777, Typeflag: tar.TypeDir, Name: "tmp"}))
++		addTarSymlink(t, tw, "aaa", "tmp")
++		addTarSymlink(t, tw, "aaa/sym", "something")
++		require.NoError(t, tw.Close())
++
++		extractor := extract.Extractor{FS: &LoggingFS{}}
++		require.Error(t, extractor.Tar(context.Background(), outputTar, targetDir.String(), nil))
++		require.NoFileExists(t, targetDir.Join("tmp", "sym").String())
++	})
++
++	t.Run("TarWithDoubleSymlinkToExternalPath", func(t *testing.T) {
++		// Create target dir
++		tmp := mkTempDir(t)
++		targetDir := tmp.Join("test")
++		require.NoError(t, targetDir.Mkdir())
++		fmt.Println("TMP:", tmp)
++		fmt.Println("TARGET DIR:", targetDir)
++
++		// Make a tar archive with regular symlink maze
++		outputTar := bytes.NewBuffer(nil)
++		tw := tar.NewWriter(outputTar)
++		tw.WriteHeader(&tar.Header{Name: "fake", Mode: 0777, Typeflag: tar.TypeDir})
++		addTarSymlink(t, tw, "sym-maze", tmp.String())
++		addTarSymlink(t, tw, "sym-maze", "fake")
++		addTarSymlink(t, tw, "sym-maze/oops", "/tmp/something")
++		require.NoError(t, tw.Close())
++
++		extractor := extract.Extractor{FS: &LoggingFS{}}
++		require.Error(t, extractor.Tar(context.Background(), outputTar, targetDir.String(), nil))
++		require.NoFileExists(t, tmp.Join("oops").String())
++	})
++
++	t.Run("TarWithSymlinkToExternalPathWithoutMazing", func(t *testing.T) {
++		// Create target dir
++		tmp := mkTempDir(t)
++		targetDir := tmp.Join("test")
++		require.NoError(t, targetDir.Mkdir())
++
++		// Make a tar archive with valid symlink maze
++		outputTar := bytes.NewBuffer(nil)
++		tw := tar.NewWriter(outputTar)
++		require.NoError(t, tw.WriteHeader(&tar.Header{Mode: 0o0777, Typeflag: tar.TypeDir, Name: "tmp"}))
++		addTarSymlink(t, tw, "aaa", "../tmp")
++		require.NoError(t, tw.Close())
++
++		extractor := extract.Extractor{FS: &LoggingFS{}}
++		require.NoError(t, extractor.Tar(context.Background(), outputTar, targetDir.String(), nil))
++		st, err := targetDir.Join("aaa").Lstat()
++		require.NoError(t, err)
++		require.Equal(t, "aaa", st.Name())
++	})
+ }
+ 
+ // MockDisk is a disk that chroots to a directory
+diff --git a/loggingfs_test.go b/loggingfs_test.go
+index bcbdc9c..05017ee 100644
+--- a/loggingfs_test.go
++++ b/loggingfs_test.go
+@@ -17,59 +17,84 @@ type LoggedOp struct {
+ 	OldPath string
+ 	Mode    os.FileMode
+ 	Flags   int
++	Err     error
+ }
+ 
+ func (op *LoggedOp) String() string {
++	res := ""
+ 	switch op.Op {
+ 	case "link":
+-		return fmt.Sprintf("link     %s -> %s", op.Path, op.OldPath)
++		res += fmt.Sprintf("link     %s -> %s", op.Path, op.OldPath)
+ 	case "symlink":
+-		return fmt.Sprintf("symlink  %s -> %s", op.Path, op.OldPath)
++		res += fmt.Sprintf("symlink  %s -> %s", op.Path, op.OldPath)
+ 	case "mkdirall":
+-		return fmt.Sprintf("mkdirall %v %s", op.Mode, op.Path)
++		res += fmt.Sprintf("mkdirall %v %s", op.Mode, op.Path)
+ 	case "open":
+-		return fmt.Sprintf("open     %v %s (flags=%04x)", op.Mode, op.Path, op.Flags)
++		res += fmt.Sprintf("open     %v %s (flags=%04x)", op.Mode, op.Path, op.Flags)
+ 	case "remove":
+-		return fmt.Sprintf("remove   %v", op.Path)
++		res += fmt.Sprintf("remove   %v", op.Path)
++	default:
++		panic("unknown LoggedOP " + op.Op)
++	}
++	if op.Err != nil {
++		res += " error: " + op.Err.Error()
++	} else {
++		res += " success"
+ 	}
+-	panic("unknown LoggedOP " + op.Op)
++	return res
+ }
+ 
+ func (m *LoggingFS) Link(oldname, newname string) error {
+-	m.Journal = append(m.Journal, &LoggedOp{
++	err := os.Link(oldname, newname)
++	op := &LoggedOp{
+ 		Op:      "link",
+ 		OldPath: oldname,
+ 		Path:    newname,
+-	})
+-	return os.Link(oldname, newname)
++		Err:     err,
++	}
++	m.Journal = append(m.Journal, op)
++	fmt.Println("FS>", op)
++	return err
+ }
+ 
+ func (m *LoggingFS) MkdirAll(path string, perm os.FileMode) error {
+-	m.Journal = append(m.Journal, &LoggedOp{
++	err := os.MkdirAll(path, perm)
++	op := &LoggedOp{
+ 		Op:   "mkdirall",
+ 		Path: path,
+ 		Mode: perm,
+-	})
+-	return os.MkdirAll(path, perm)
++		Err:  err,
++	}
++	m.Journal = append(m.Journal, op)
++	fmt.Println("FS>", op)
++	return err
+ }
+ 
+ func (m *LoggingFS) Symlink(oldname, newname string) error {
+-	m.Journal = append(m.Journal, &LoggedOp{
++	err := os.Symlink(oldname, newname)
++	op := &LoggedOp{
+ 		Op:      "symlink",
+ 		OldPath: oldname,
+ 		Path:    newname,
+-	})
+-	return os.Symlink(oldname, newname)
++		Err:     err,
++	}
++	m.Journal = append(m.Journal, op)
++	fmt.Println("FS>", op)
++	return err
+ }
+ 
+ func (m *LoggingFS) OpenFile(name string, flags int, perm os.FileMode) (*os.File, error) {
+-	m.Journal = append(m.Journal, &LoggedOp{
++	f, err := os.OpenFile(name, flags, perm)
++	op := &LoggedOp{
+ 		Op:    "open",
+ 		Path:  name,
+ 		Mode:  perm,
+ 		Flags: flags,
+-	})
+-	return os.OpenFile(os.DevNull, flags, perm)
++		Err:   err,
++	}
++	m.Journal = append(m.Journal, op)
++	fmt.Println("FS>", op)
++	return f, err
+ }
+ 
+ func (m *LoggingFS) Remove(path string) error {
+diff --git a/testdata/zipslip/evil-link-traversal.tar b/testdata/zipslip/evil-link-traversal.tar
+new file mode 100644
+index 0000000..5d548c0
+Binary files /dev/null and b/testdata/zipslip/evil-link-traversal.tar differ

@@ -1,0 +1,105 @@
+
+Message-ID: <20241008025402.GA2904@openwall.com>
+Date: Tue, 8 Oct 2024 04:54:02 +0200
+From: Solar Designer <solar@...nwall.com>
+To: Simon Josefsson <simon@...efsson.org>
+Cc: oss-security@...ts.openwall.com
+Subject: Re: CVE-2024-47191: Local root exploit in the PAM module pam_oath.so
+
+Hi,
+
+Great work by the SUSE Security Team and upstream!
+
+On Sat, Oct 05, 2024 at 11:33:56AM +0200, Simon Josefsson wrote:
+> Solution
+> --------
+> 
+> Version 2.6.12 contains the following liboath patch to use `fopen(wx)`:
+> 
+> https://gitlab.com/oath-toolkit/oath-toolkit/-/commit/3235a52f6b87cd1c5da6508f421ac261f5e33a70
+> 
+> Some non-glibc and non-ISO C11 platforms needs the following patch to
+> enable gnulib's `fopen(wx)` workaround:
+> 
+> https://gitlab.com/oath-toolkit/oath-toolkit/-/commit/3271139989fde35ab0163b558fc29e80c3a280e5
+> 
+> Then `pam_oath.c` is modified to call seteuid()/setegid() as follows:
+> 
+> https://gitlab.com/jas/oath-toolkit/-/commit/95ef255e6a401949ce3f67609bf8aac2029db418
+
+This link requires authentication.  I guess you meant to post:
+
+https://gitlab.com/oath-toolkit/oath-toolkit/-/commit/95ef255e6a401949ce3f67609bf8aac2029db418
+
+> A patch that applies cleanly to version 2.6.7 found in Debian 12.x
+> bookworm is available here:
+> 
+> https://salsa.debian.org/debian/oath-toolkit/-/blob/debian/bookworm-security/debian/patches/pam_oath-seteuid.patch
+> 
+> We recommend you to upgrade to version 2.6.12.
+> 
+> If that is unpractical we recommended you to apply the patches on top
+> of your earlier version.
+
+I note a few things:
+
+1. Neither the SUSE nor the upstream patches change the supplementary
+groups.  SUSE patches fork() and then in the child setgid() and
+setuid().  Upstream doesn't fork(), but switches with setegid() and
+seteuid(), and then back.  If the intent is solely to avoid the need for
+fchown(), then that's sufficient.  Hopefully, along with SUSE's openat()
+and flags magic or with upstream's fopen(, "x"), nothing more is needed.
+However, if the intent is to avoid even trying to access files in user's
+directory with potentially excessive privileges, then supplementary
+groups should also be switched or dropped.
+
+I'm sorry I didn't get around to bringing this maybe-issue up in the
+pre-disclosure thread on the distros list (which Johannes Segitz from
+SUSE kindly started on September 27).  I feel it was not essential to
+discuss/address pre-disclosure, and is fine to discuss in public now.
+
+2. Switching task credentials from library code is tricky, given that
+the program could have threads that don't expect this.  set*id() and
+setgroups() libc calls would typically affect all threads.  On Linux,
+it's possible to affect the current thread only, which e.g. we do in
+tcb[1] by using setfs*id() and direct setgroups() syscall (the latter
+only in our recent git code at this time, previously we used the libc
+function).  I assume Simon is aware of the Linux specific way, but
+deliberately chose not to do this in upstream oath-toolkit for
+portability to non-Linux.
+
+[1] https://www.openwall.com/tcb/ and https://github.com/openwall/tcb
+
+3. There's similar concern about the program's signal handlers, which
+isn't addressed by switching credentials only of the current thread.
+Maybe such library code should be temporarily blocking signals?  This
+becomes tricky and dirty.  In tcb, we just accept this risk for now
+(that a signal handler may run with unexpectedly dropped privileges).
+
+4. As Simon also noted:
+
+> SUSE's alternative patch and advisory can be found via:
+> 
+> https://security.opensuse.org/2024/10/04/oath-toolkit-vulnerability.html
+> 
+> It rely on Linux kernel specific features and uses fork() which was
+> determined to be contrary to the liboath design, which aims to be
+> portable to macOS and *BSD and beyond.
+
+I agree fork() from library code is tricky, but not so much because of
+portability concerns.  Again, the program using the library may not
+expect it to ever have an extra child process.  Sure the library should
+use waitpid() on this specific process, yet the program could receive
+unexpected SIGCHLD.  The combination of the program's threads and our
+fork() could also have unexpected consequences.
+
+In tcb, we chose to make usage of fork() a PAM module option, so that by
+enabling it the distro or sysadmin acknowledges that it's acceptable in
+the specific PAM configuration.  Our usage of fork() is for a different
+reason, though: "Using this option one can be sure that after a call to
+pam_end(3) there is no sensitive data left in the process' address
+space."  I wonder if this property would also be relevant in
+oath-toolkit patches if more processing is moved to the child process,
+or if this would be excessive under the relevant threat models.
+
+Alexander

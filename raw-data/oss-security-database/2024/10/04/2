@@ -1,0 +1,174 @@
+
+Message-ID: <Zv-9gAGM_X7QQShJ@suse.com>
+Date: Fri, 4 Oct 2024 12:03:44 +0200
+From: Johannes Segitz <jsegitz@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2024-47191: Local root exploit in the PAM module pam_oath.so
+
+Hello list,
+
+this is a report about a local root exploit in the PAM module `pam_oath.so`,
+which is shipped as part of the oath-toolkit project [1].
+
+You can also find a rendered HTML version of this report on our blog [5].
+
+The vulnerability was discovered by Fabian Vogt of SUSE, and this report and
+attached patch were authored by Matthias Gerstner of the SUSE Security Team.
+
+Introduction
+============
+
+oath-toolkit[1] contains libraries and utilities for managing one-time password
+(OTP) authentication e.g. as a second factor to password authentication.
+Fellow SUSE engineer Fabian Vogt approached our Security Team about the
+project's PAM module. A couple of years ago, the module gained a feature which
+allows to place the OTP state file (called usersfile) in the home directory of
+the to-be-authenticated user. Fabian noticed that the PAM module performs
+unsafe file operations in users' home directories. Since PAM stacks typically
+run as root, this can easily cause security issues.
+
+The feature in question has been introduced in oath-toolkit version 2.6.7 (via
+commit 60d9902b5c [2]). The following report is based on the most recent
+oath-toolkit release tag for version 2.6.11.
+
+Vulnerability Details
+=====================
+
+The PAM module is typically configured using a PAM stack configuration line
+like this:
+
+    auth [user_unknown=ignore success=ok] pam_oath.so usersfile=${HOME}/user.oath window=20
+
+The expansion logic of the path components ${HOME} or ${USER} is part of the
+problematic feature that introduced the security issue.
+
+The PAM module invokes a liboath library function called
+`oath_authenticate_usersfile()` found in liboath/usersfile.c, which manages
+all accesses to the usersfile. Privileges are not dropped, and the function is
+not aware of the special privileged PAM context. All file accesses in the
+function are naive and follow symlinks. The relevant file operations that are
+carried out on successful OTP entry are as follows:
+
+- opening of the usersfile via `fopen()` for reading (usersfile.c:470).
+- opening of a lockfile parallel to the usersfile using a filename suffix ".lock" via `fopen()` for writing (usersfile.c:332)
+- locking of the lockfile using POSIX advisory locks via `fcntl()` (usersfile.c:350)
+- creation of a new usersfile parallel to the old usersfile using a filename suffix ".new" via `fopen()` (usersfile.c:372)
+- changing ownership of the new usersfile to the to-be-authenticated user via `fchown()` (usersfile.c:394)
+- renaming of the new usersfile to the old usersfile via `rename()` (usersfile.c:411)
+- unlinking of the previously created lockfile (usersfile.c:423)
+
+If this happens in a PAM stack running as root and the usersfile is located in
+an unprivileged user's home directory, then a simple root exploit is possible
+by placing a symlink like this:
+
+    user$ ln -s /etc/shadow $HOME/user.oath.new
+
+This will cause /etc/shadow to be overwritten and its ownership will be
+changed to the to-be-authenticated user. The to-be-authenticated user can
+obtain full root privileges. No race condition needs to be won and no
+pathnames have to be guessed.
+
+Embargo Process and Upstream Communication
+==========================================
+
+Fabian Vogt first approached the main upstream author by email. Since we did not
+get a reaction for several days, we created a private Gitlab issue in the
+upstream project [3], offering coordinated disclosure. There was no reaction,
+thus we decided to handle the embargo and bugfix ourselves, since we needed a
+fixed `pam_oath` module for our products. We developed a comprehensive patch,
+attached to this report and described in "SUSE Bugfix" below.
+
+We requested a CVE from Mitre for this issue and they assigned CVE-2024-47191.
+
+As we were preparing to go public, the upstream author got pinged via private
+channels and reacted to our report, preparing an upstream bugfix release
+addressing the issue, described in "Upstream Bugfix" below.
+
+Due to time constraints, we have decided to apply our SUSE bugfix to our
+products for the time being, until we can evaluate the upstream solution in more
+depth.
+
+SUSE Bugfix
+===========
+
+We developed the attached patch within SUSE to address the issue. The
+situation for the bugfix is more complex than it might look at first, because
+many things are unclear or broken in the current source code:
+
+- the PAM module cannot know for sure if the target usersfile is supposed to
+  be owned by root or by the to-be-authenticated user, or even some unrelated
+  user. The presence of a ${HOME} path element makes it likely that the
+  to-be-authenticated user is supposed to own the file. The presence of a
+  ${USER} element is not that clear, however.
+- the locking mechanism used in the current source code is broken:
+  - the usersfile is initially opened for reading and parsed without owning
+    the lock (usersfile.c:470). A parallel task can be about to replace this
+    file with a new version, thus a lost update can occur.
+  - the lock file is unlinked again after the usersfile has been updated
+    (usersfile.c:423). This breaks when another task is waiting on the
+    now-unlinked lockfile, while a third task arrives, sees no lockfile and
+    creates a new one.
+- the lockfile is placed in the user's home directory, possibly cluttering it.
+  Cases like the home directory being a network file system (NFS, CIFS) would
+  need to be considered. The unprivileged user might also prevent the privileged
+  PAM stack from obtaining the lock, causing a local denial-of-service.
+
+We decided to develop a patch that takes as many use cases as possible into
+account, securing all operations while maintaining backwards compatibility.
+With the patch, the usersfile path is safely traversed using the `*at` family
+of system calls. Privileges will be dropped to the owner of the usersfile as an
+additional security measure. The locking mechanism has been fixed to cover all
+accesses to the usersfile. Instead of creating a separate lockfile, the
+usersfile itself is used for locking, which avoids cluttering the home
+directory. Additional sanity checks are added e.g. world-writable directory
+components are denied. The patch employs Linux specific features (e.g. linking
+files from /proc/self/fd), thus it no longer works for non-Linux systems. The
+patch description and code comments contain more hints about the individual
+decisions taken in this patch.
+
+Upstream Bugfix
+===============
+
+Upstream developed an alternative solution, designed to be more portable and
+cross-platform. This does not take into account all aspects that we considered
+in the "SUSE Bugfix", but should be sufficient to fix the specific security
+issue described in this report.
+
+This fix has been released in version 2.6.12 of oath-toolkit. Upstream has also
+published an associated Security Advisory [4].
+
+Timeline
+========
+
+2024-08-08: Fabian Vogt of SUSE sent an email to the main upstream author,
+            describing the issue. The SUSE Security Team was involved as well.
+2024-08-20: After not receiving any reply by email, we created a private
+            GitLab issue [3] describing the vulnerability and offering
+            coordinated disclosure.
+2024-08-28: SUSE started developing an internal patch for the issue.
+2024-09-19: Our internal patch was getting ready for publication. We added a
+            comment in the private GitLab issue, granting two final weeks of
+            embargo time before we will publish the vulnerability and the patch.
+            We also shared the current patch in the issue.
+2024-09-19: We requested a CVE for the issue from Mitre.
+2024-09-20: Mitre assigned CVE-2024-47191.
+2024-09-29: After being pinged via private channels, the main upstream author
+            reacted to our communication and started preparing a bugfix release.
+2024-10-04: Upstream published release 2.6.12 containing the bugfix.
+
+[1]: https://gitlab.com/oath-toolkit/oath-toolkit
+[2]: https://gitlab.com/oath-toolkit/oath-toolkit/-/commit/60d9902b5c20f27e70f8e9c816bfdc0467567e1a
+[3]: https://gitlab.com/oath-toolkit/oath-toolkit/-/issues/43
+[4]: https://www.nongnu.org/oath-toolkit/security/CVE-2024-47191/
+[5]: https://security.opensuse.org/2024/10/04/oath-toolkit-vulnerability.html
+
+Johannes
+-- 
+GPG Key                EE16 6BCE AD56 E034 BFB3  3ADD 7BF7 29D5 E7C8 1FA0
+Subkey fingerprint:    250F 43F5 F7CE 6F1E 9C59  4F95 BC27 DD9D 2CC4 FD66
+SUSE Software Solutions Germany GmbH, Frankenstraße 146, 90461 Nürnberg, Germany
+Geschäftsführer: Ivo Totev, Andrew McDonald, Werner Knoblich (HRB 36809, AG Nürnberg)
+
+View attachment "0001-usersfile-fix-potential-security-issues-in-PAM-modul.patch" of type "text/x-patch" (28797 bytes)
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

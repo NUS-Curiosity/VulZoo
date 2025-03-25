@@ -1,0 +1,145 @@
+
+Message-ID: <CALXx8ZniT0BHhhVgqZK4z+gsRUuOJGSZJRzFbjfA2BQUdRPmew@mail.gmail.com>
+Date: Wed, 25 Dec 2024 11:52:06 +0200
+From: Yair Mizrahi <yairm@...og.com>
+To: oss-security@...ts.openwall.com
+Subject: CVE-2024-40896 Analysis: libxml2 XXE due to type confusion
+
+libxml2, CVE-2024-40896, was published recently and given a “Critical”
+(9.1) severity by CISA. Interestingly - This vulnerability is a regression
+of an issue that was identified over a decade ago - CVE-2012-0037, which
+was given a “Medium” (6.5) severity.
+
+Is the massive increase in CVSS over the exact same issue justified? We
+believe that it’s inflated.
+
+CVE-2012-0037 allowed attackers to perform XXE attacks on vulnerable
+applications that use Raptor, an RDF parsing and serializing library, which
+uses libxml2. XXE attacks may have severe consequences, such as leakage of
+arbitrary local files from the victim machine and SSRF.
+
+The vulnerability was fixed in Raptor by parsing XML entities and making
+sure they don’t contain file URIs or network URIs. A crucial part of this
+patch was letting libxml2 know not to re-parse the XML entities, as that
+would have rendered the fix ineffective.
+
+[1] In order to do this, Raptor used the “checked” field of libxml2’s
+`XmlEntity` struct.
+
+```
+
+    /* Mark this entity as having been checked - never do this again */
+
+if(!ret->checked)
+
+  ret->checked = 1;
+
+```
+
+[2] Setting this field to 1 would cause libxml2 to ignore this entity and
+not parse it, as can be seen in libxml2’s `xmlParseReference()` function:
+
+```
+
+if (((ent->checked == 0) ||
+
+         ((ent->children == NULL) && (ctxt->options & XML_PARSE_NOENT))) &&
+
+        ((ent->etype != XML_EXTERNAL_GENERAL_PARSED_ENTITY) ||
+
+         (ctxt->options & (XML_PARSE_NOENT | XML_PARSE_DTDVALID)))) {
+
+…  // parsing the entity
+
+}
+
+```
+
+The newly discovered CVE-2024-40896 was caused by the removal of the
+“checked” field in the `XmlEntity` struct in libxml2. As mentioned above,
+prior to libxml2 version 2.11.0 this field was used by custom SAX handlers
+to tell libxml2 that the entity has already been parsed. The Raptor library
+used it this way in its patch for CVE-2012-0037.
+
+[3] The “checked” field was removed in libxml2.11 and its functionality was
+integrated into the “flags” field:
+
+```
+
+if (((ent->flags & XML_ENT_PARSED) == 0) &&
+
+        ((ent->etype != XML_EXTERNAL_GENERAL_PARSED_ENTITY) ||
+
+         (ctxt->options & (XML_PARSE_NOENT | XML_PARSE_DTDVALID)))) {
+
+…  // parsing the entity
+
+}
+
+```
+
+[4] Raptor changed their code accordingly, and made it so “checked” will be
+set only if libxml2 supports it:
+
+```
+
+#if LIBXML_VERSION >= 20627 && LIBXML_VERSION < 21100
+
+    /* Mark this entity as having been checked - never do this again */
+
+    if(!ret->checked)
+
+      ret->checked = 1;
+
+#endif
+
+```
+
+This meant that when Raptor is used with libxml2 version 2.11.0 and above,
+libxml2 would parse entities even if Raptor decided they were malicious -
+exposing the application to an XXE attack.
+
+Of course, this issue can also expose other applications that relied on
+libxml2’s “checked” flag to XXE.
+
+[5] The fix applied to libxml2 made it so the library wouldn’t parse
+entities if their data was already filled (meaning they were already
+parsed):
+
+```
+
+if (((ent->flags & XML_ENT_PARSED) == 0) && (ent->children != NULL))
+
+        ent->flags |= XML_ENT_PARSED;
+
+```
+
+This makes sure that applications which previously relied on the “checked”
+field to avoid XXE would not be vulnerable when the field is removed. Users
+who use such applications (e.g. Raptor) are vulnerable and should apply the
+libxml2 patch.
+
+[1]
+https://github.com/dajobe/raptor/commit/a676f235309a59d4aa78eeffd2574ae5d341fcb0#diff-aaf490494024b45ec35c24eb38180c55019bf35414337d96eb10feca0d099d7eR254
+
+[2] https://gitlab.gnome.org/GNOME/libxml2/-/blob/2.10/parser.c#L7175
+
+[3]
+https://gitlab.gnome.org/GNOME/libxml2/-/blob/2.11/parser.c?ref_type=heads#L7169
+
+[4]
+https://github.com/dajobe/raptor/commit/4dbc4c1da2a033c497d84a1291c46f416a9cac51
+
+[5]
+https://gitlab.gnome.org/GNOME/libxml2/-/commit/1a8932303969907f6572b1b6aac4081c56adb5c6
+
+Credit (Analysis):
+
+Goni Golan, Security Researcher @ JFrog Security
+
+Yair Mizrahi, Security Research Team Lead @ JFrog Security
+
+Credit (CVE):
+
+Xisco Fauli @ The Document Foundation
+

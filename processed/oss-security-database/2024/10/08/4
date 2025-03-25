@@ -1,0 +1,74 @@
+
+Message-ID: <20241008205659.GA7086@openwall.com>
+Date: Tue, 8 Oct 2024 22:56:59 +0200
+From: Solar Designer <solar@...nwall.com>
+To: Simon Josefsson <simon@...efsson.org>
+Cc: oss-security@...ts.openwall.com
+Subject: Re: CVE-2024-47191: Local root exploit in the PAM module pam_oath.so
+
+On Tue, Oct 08, 2024 at 08:10:17AM +0200, Simon Josefsson wrote:
+> I noticed that that there are Linux-PAM helpers to drop privileges:
+> 
+> https://github.com/linux-pam/linux-pam/blob/master/libpam/pam_modutil_priv.c#L52
+
+This currently switches fsuid/fsgid (so for the current thread only),
+but uses initgroups() and setgroups() libc functions (so affects all
+threads).  Code last modified 4 years ago, which pre-dates our
+recognition of the supplementary groups vs. threads problem and its fix
+in tcb.  Maybe Linux-PAM should implement a similar change now.
+
+> I have found another implementation of this in yubico-pam:
+> 
+> https://github.com/Yubico/yubico-pam/blob/master/drop_privs.c
+
+This currently switches euid/egid/groups, so doesn't try to be MT-safe.
+
+(On Linux, it is also possible to switch euid/egid via direct syscalls
+for the current thread only, but there's no point because switching of
+fsuid/fsgid is more appropriate for this purpose anyway.)
+
+A couple of nitpicks on your upstream oath-toolkit code:
+
+1. You restore egid/euid in this same order as you set them.  This
+unnecessarily introduces an extra temporary state.  I suggest that you
+restore them in reverse order, so set egid/euid ... restore euid/egid.
+(The SUSE patch doesn't have this "problem".)
+
+2. After uses of asprintf() you first check the pointer for NULL and
+only then check the return value.  Strictly speaking, this is undefined
+behavior because the pointer may be uninitialized if the return value
+indicates an error.  Of course, this shouldn't matter in practice unless
+a compiler is aware and deliberately exploits the UB (e.g. optimize
+everything out because this is UB anyway) or the environment (hardware
+or a software "sanitizer") is such that uninitialized reads are trapped,
+but to make it correct I suggest that you simply drop the NULL checks.
+
+> Btw, do you have any thoughts on WHICH user to drop privileges to?  The
+> SUSE patch drops privs to the credential file owner.  My patch drops
+> privs to the PAM user that is being authenticated.  I think there are
+> reasonable arguments for both choices, and for all reasonable
+> configurations that I'm aware of, I don't think the choice matters.
+
+Thank you for bringing this up.
+
+I think that for reasonable configurations in absence of attacks this
+difference is unimportant, however there are different risks involved.
+
+In particular, I worry that the SUSE approach could be susceptible to
+hard link attacks (when the fs.protected_hardlinks sysctl is not set).
+Would this allow to overwrite someone else's file (the original issue)
+if the user can hard link that file?  I currently don't see why not, so
+it's probably a vulnerability.
+
+Would it allow to have the log in process temporarily switch to another
+user (of the attacker's choosing)?  This sounds relatively minor.
+
+In general, switching to a user not only drops privileges for file
+access, but also potentially exposes the process as that user's.
+fsuid/fsgid switching is the safest in this respect (these were meant
+just for file access purposes), but with other IDs (depending on which)
+there may be extra exposure of the partially privileged log in process
+to the user via /proc, kill(), setpriority(), etc. ... but thankfully
+and hopefully not also via ptrace() on modern systems anymore.
+
+Alexander

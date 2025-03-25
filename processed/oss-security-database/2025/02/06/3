@@ -1,0 +1,481 @@
+
+Message-ID: <Z6TNVqmdQvyPUnFY@kasco.suse.de>
+Date: Thu, 6 Feb 2025 15:55:18 +0100
+From: Matthias Gerstner <mgerstner@...e.de>
+To: oss-security@...ts.openwall.com
+Subject: pam_pkcs11: Possible Authentication Bypass in Error Situations
+ (CVE-2025-24531)
+
+Hello list,
+
+this report was previously sent to the linux-distros mailing list with
+an embargo period of 7 days, which ended today. The following report
+contains minor changes compared with the (draft) version shared on
+linux-distros.
+
+We also offer a rendered version of this report on our blog [1].
+
+1) Introduction
+===============
+
+This report is about a regression in pam_pkcs11 [2] version 0.6.12 [3].
+In this release the implementation of `pam_sm_authenticate()` [4] has
+been changed to return `PAM_IGNORE` in many exit paths, which can lead
+to a complete authentication bypass in some scenarios. This report is
+based on upstream Git tag "pam_pkcs11-0.6.12". A bugfix is found in
+release 0.6.13 [5].
+
+Whether this issue can be exploited is a complex question that depends a
+lot on the system configuration. The following section gives some
+insight into how we discovered the issue and why its severity can be
+high in some circumstances. Section 3) looks in detail into the issue
+found in pam_pkcs11. The rest of the report explores which Linux
+distributions might be affected by the issue, a possible workaround and
+the upstream bugfix. Finally we will be taking a look at the lessons
+that can be learned from this finding.
+
+2) Discovery of the Issue / Relation to GDM Smart Card Authentication
+=====================================================================
+
+Fellow SUSE engineer Marcus Rückert uses a YubiKey for login at his
+openSUSE Tumbleweed desktop system. In October 2024 he noticed a change
+[6] in behaviour in his GDM login setup. By digging a bit deeper he
+noticed that in some situations login was possible without entering a
+password or using his YubiKey at all.
+
+While analysing the issue we found that there is a bug [7] (or a
+feature?) in GDM 3 that causes YubiKeys to be treated as smart cards.
+This is one ingredient that comes into play here. A number of Linux
+distributions use a dedicated "gdm-smartcard" PAM stack configuration
+file for smart card login in GDM. On openSUSE we rely on pam_pkcs11 as
+the sole (proper) authentication module in this gdm-smartcard PAM stack
+[8]. It took us a while to understand where exactly this gdm-smartcard
+PAM stack is used in GDM. The logic to select this PAM stack is found in
+a wholly different Gnome component, namely gnome-shell [9]. There, some
+JavaScript is responsible for detecting smart cards via the D-Bus
+interface of the gnome-settings-daemon, and for changing the
+authentication mode of GDM.
+
+We reproduced the situation by using smart card emulation in a QEMU
+Virtual machine, to be able to achieve proper smart card detection in
+both GDM and pam_pkcs11. As soon as the smart card is properly setup in
+the system, GDM switches into smart card authentication mode (support
+for this is enabled by default). A user list is no longer shown in the
+display manager, instead the username has to be entered manually. After
+entering the username, the "gdm-smartcard" PAM stack is executed, and
+with it pam_pkcs11. No password is asked for and login succeeds.
+
+What happens in this test setup, as well as in the real life setup using
+a YubiKey, is that pam_pkcs11 stops execution after logging "Failed to
+initialize crypto" and, surprisingly, login succeeds. The reason for
+this lies in pam_pkcs11, as is described in the next section.
+
+We did not investigate why exactly the "initialize crypto" error occurs,
+as we don't believe it is relevant for the security issue. Even when
+errors occur, the outcome of the PAM stack execution shouldn't allow
+authentication without providing credentials.
+
+3) The `PAM_IGNORE` Issue in pam_pkcs11
+========================================
+
+The successful login without proper authentication in pam_pkcs11 stems
+from a change that found its way into pam_pkcs11 version 0.6.12. The
+issue has been introduced with commit bac6cf8 [10] (note that there
+seems to exist an artifact in the upstream Git repository: a seemingly
+identical commit 88a87d5 [11] in the commit log on "master").
+
+With this change, many exit paths of the `pam_sm_authenticate()` [4]
+function now return `PAM_IGNORE` instead of `PAM_CRED_INSUFFICIENT`. In
+particular, the code found at line 284 [12] means that the default
+return value on error conditions is `PAM_IGNORE`, if there is no "login
+token name":
+
+    if (!configuration->card_only || !login_token_name) {
+        /* Allow to pass to the next module if the auth isn't
+           restricted to card only. */
+        pkcs11_pam_fail = PAM_IGNORE;
+    } else {
+      pkcs11_pam_fail = PAM_CRED_INSUFFICIENT;
+    }
+
+The `card_only` flag refers to a module parameter [13], whose meaning
+seems to have changed over time and is no longer fully conforming to
+what is documented. It is enabled in the "gdm-smartcard" stack, thus
+this part of the `if` condition will not trigger. The background of the
+`login_token_name` is that the PAM module contains special logic for
+unlocking the screen saver, but only if the session login was performed
+using pam_pkcs11. This will always be `false` during initial login, and
+thus this part of the `if` condition applies in this case.
+
+When a PAM module returns `PAM_IGNORE`, its outcome should not be used
+to determine the result of the PAM stack execution. openSUSE uses the
+`required` control setting for pam_pkcs11 in its "gdm-smartcard"
+configuration. In extended PAM syntax `required` is expressed like this:
+
+    required
+        [success=ok new_authtok_reqd=ok ignore=ignore default=bad]
+
+When pam_pkcs11 returns `PAM_IGNORE` then the "required" control setting
+no longer results in what the average administrator will expect, namely
+that authentication fails if no successful smart card authentication is
+possible.
+
+What happens instead depends on the rest of the modules present in the
+"auth" section on the PAM stack. When no other PAM module at all is on
+the stack, then authentication fails, because the PAM library expects at
+least one decisive return value from any module on the stack. When there
+is another PAM module on the stack that actually authenticates, then
+that module will set a failed state if no credentials are provided,
+thereby preventing successful login.
+
+To judge the situation with the "gdm-smartcard" PAM stack, let's look
+more closely at its "auth" section:
+
+    auth       requisite                   pam_faillock.so      preauth
+    auth       required                    pam_pkcs11.so        wait_for_card card_only
+    auth       required                    pam_shells.so
+    auth       requisite                   pam_nologin.so
+    auth       optional                    pam_permit.so
+    auth       required                    pam_env.so
+    auth       [success=ok default=1]      pam_gdm.so
+    auth       optional                    pam_gnome_keyring.so
+
+There are a lot of other modules configured, alas, none of them is
+actually authenticating. These are what we like to call "utility
+modules" in this discussion: they provide support functions. Examples
+are the pam_faillock module which checks whether excess authentication
+errors occurred, or pam_gnome_keyring which attempts to intercept the
+cleartext password used for login to transparently unlock the user
+keyring. Commonly, such modules return `PAM_SUCCESS` in most situations.
+As a result, when pam_pkcs11 returns `PAM_IGNORE`, the overall outcome
+of the PAM authentication will become `PAM_SUCCESS`, supplied by
+non-authenticating modules in the "gdm-smartcard" PAM stack.
+
+Below the code location in `pam_sm_authenticate()` function shown above,
+only two code paths return something other than `PAM_IGNORE`:
+
+- in line 510 if `pkcs11_login()` fails [14]
+- in line 695 f `verify_signature()` fails [15]
+
+Both return paths will reset `pkcs11_pam_fail` to a safe `PAM_AUTH_ERR`
+value.  The following is a list of all the other return paths which will
+return `PAM_IGNORE`:
+
+- line 305: if a user is logging in from remote, or can
+  control the DISPLAY environment variable (e.g. in sudo context). [16]
+- line 316: if the `crypto_init()` call fails. [17]
+- line 328: if a screen saver context is detected and no login token is
+  recorded, then an explicit jump to a `PAM_IGNORE` return is performed. [18]
+- lines 343, 357: if loading or initializing the PKCS#11 module fails. [19]
+- line 374: if the configured token is not found and `card_only` is not set [20].
+  This might be okay in light of the semantics of `card_only`, but it is
+  still strange. If system administrators want to make pam_pkcs11
+  authentication optional then they can do so by using the PAM stack
+  configuration already, by using the `optional` control setting.
+  Changing the module result semantics this drastically through a
+  seemingly harmless module option is unusual.
+- line 416: if no smart card is found even after potentially waiting for it [21].
+  If a smart card is found, but one of various PKCS#11 library functions or certificate
+  checks fail, then further `PAM_IGNORE` returns can happen if any of the
+  following operations fail:
+  - `open_pkcs11_session()` (line 432)
+  - `get_slot_login_required()` (line 443)
+  - when reading in a password fails (line 471)
+  - empty password was read without `nullok` set (line 486)
+  - `get_certificate_list()` (line 522)
+  - `pam_set_item(..., PAM_USER, ...)` (line 597)
+  - `match_user()` (line 613)
+  - `(no matching certificate found)` (line 634)
+  - `get_random_value()` (line 663)
+  - `sign_value()` (line 677)
+  - `close_pkcs11_session()` (line 776)
+
+As this long list demonstrates, it is likely that a local attacker will
+be able to provoke a `PAM_IGNORE` return value in pam_pkcs11. For a
+physical attacker the simplest way is to insert an arbitrary smart card
+into an existing reader, or attach a peripheral smart card device to the
+system. The pam_pkcs11 module, if configured, will attempt to access the
+smart card: if the access fails, then the module returns `PAM_IGNORE`,
+resulting in a possible authentication bypass.
+
+4) Affected Distributions and Configurations
+============================================
+
+The issue was introduced in pam_pkcs11 version 0.6.12, released in July
+2021. Any PAM stack that relies on pam_pkcs11 as the only
+authentication factor will be affected by the issue.
+
+On openSUSE Tumbleweed the issue became apparent only due to the
+mentioned changes in GDM [7], which cause YubiKeys to be treated as
+smart cards in some situations. We believe plugging in any kind of
+mismatching smart card (or YubiKey) on openSUSE Tumbleweed with GDM as a
+display manager will allow to bypass login.
+
+Similar situations could occur on other Linux distributions if GDM smart
+card login is enabled and smart cards are autodetected. Even then, an
+affected "gdm-smartcard" PAM stack still needs to be in place for the
+issue to trigger. gdm-smartcard PAM stacks relying on pam_pkcs11 are
+found in the GDM repository for:
+
+- Arch Linux [22]
+- Exherbo Linux [23]
+- Linux from Scratch [24]
+
+We tried reproducing the issue on Arch Linux. There the gdm-smartcard
+PAM stack is installed along with GDM, but there is no pam_pkcs11
+package in the standard repositories. It can be installed from the AUR
+(https://aur.archlinux.org/), however. When doing so and also installing
+the gdm and ccid packages, then the issue becomes basically exploitable
+as well. We only tested this with a crafted sudo PAM stack, though,
+since we did not manage to get gdm into smart card authentication mode
+on Arch Linux. It seems some ingredient was still missing to trigger
+that.
+
+On Arch Linux we also noticed that the AUR pam_pkcs11 package does not
+place any default "pam_pkcs11.conf" file into `/etc`. This also avoids
+the security problem, because when the `slot_num` [25] setting is left
+unconfigured to its built-in default value of -1, then
+`pam_sm_authenticate()` will return early with `PAM_AUTHINFO_UNAVAIL`.
+On openSUSE we do ship a default configuration of `slot_num = 0`,
+however.
+
+Current Fedora Linux does not use pam_pkcs11 for smart card
+authentication anymore (pam_sss is used instead). Older versions of
+Fedora might still be affected.
+
+5) Possible Workaround
+======================
+
+A quick workaround to prevent login bypass is to use the following PAM
+stack configuration line instead of what is found e.g. in the
+gdm-smartcard PAM stacks:
+
+    auth [success=ok default=bad] pam_pkcs11.so wait_for_card card_only
+
+Instead of using `ignore=ignore` as seen in the `required` control
+setting shown in section 3), the PAM library will consider `ignore`
+(actually any other outcome than success) a bad result for the
+authentication stack. This will cause authentication to fail even if
+pam_pkcs11 returns `PAM_IGNORE`.
+
+6) Bugfix
+=========
+
+After extensive discussions about the nature of the problem and
+potential compatibility issues, upstream arrived at a rather
+straightforward bugfix which is found in commit 2ecba68d40 [26].
+Basically the `PAM_IGNORE` return values have been changed into
+`PAM_CRED_INSUFFICIENT` again.
+
+This bugfix is part of upstream release 0.6.13 [5], which also fixes
+another vulnerability in the PAM module, which has been discovered
+independently.
+
+7) Lessons Learned
+==================
+
+We could not find any clear advice in PAM admin or developer
+documentation regarding the proper use of `PAM_IGNORE`. Therefore we try
+to give an overview of the current situation and suggested best
+practices in this section.
+
+On the use of `PAM_IGNORE`
+--------------------------
+
+As there have been doubts if pam_pkcs11 is to blame for its use of
+`PAM_IGNORE`, we made a survey of other PAM modules packaged in
+openSUSE. We found one PAM module, pam_u2f, that also had problematic
+uses of `PAM_IGNORE` in error situations and we published the issue
+already in a previous report [27]. This report already resulted in a
+discussion on this mailing list [28] about possible structural problems
+when implementing PAM modules.
+
+Apart from this we found the following uses of `PAM_IGNORE`:
+
+**Core PAM Modules**
+
+- pam_wheel: this is only kind of a filter module, such that non-`root`
+  will be denied, while for `root` it returns `PAM_IGNORE`; the actual
+  authentication decision is made by other modules.
+- pam_sepermit: returns `PAM_IGNORE` if users are not listed in the
+  configuration file.
+- pam_lastlog: uses `PAM_IGNORE` if the lastlog file (in a privileged
+  location) cannot be read.
+- pam_userdb: returns `PAM_IGNORE` if no database is configured.
+- pam_listfile: returns `PAM_IGNORE` if the user about to login does not
+  match the configured criteria.
+
+**Third Party PAM Modules**
+
+- pam_google_authenticator: returns `PAM_IGNORE` if there is no state
+  file and the `nullok` option is passed the module.
+- nss-pam-ldapd: returns `PAM_IGNORE` if the user is unknown or no auth
+  info is available, but only if explicitly configured to do so
+  (`cfg->ignore_authinfo_unavail`, `cfg->ignore_unknown_user`)
+- pam_krb5:
+  - returns `PAM_IGNORE` if the user it not known, but only if
+    `options->ignore_unknown_principals` is set.
+  - returns `PAM_IGNORE` if a `minimum_uid` is configured and the user doesn't
+    match that.
+- pam_radius: returns `PAM_IGNORE` if the network is unavailable and
+  ignore has been explicitly configured via the `localifdown` option.
+- pam_yubico: returns `PAM_IGNORE` if there are no tokens for the user
+  and the `nullok` option is passed to the module.
+
+As can be seen from this list, most PAM modules only return `PAM_IGNORE`
+if there is an explicit opt-in either through a configuration option or
+a setting in a privileged configuration file. Most of the time the
+meaning of the return value is that the authentication mechanism is not
+configured at all, or not configured for the user that is authenticated.
+Such configurations can only be used in a safe way if the module in
+question is an optional authentication mechanism, and a fallback PAM
+module for authentication is present on the stack.
+
+From the issues seen in pam_pkcs11 and pam_u2f we believe it is
+especially important for PAM module implementations to take care not to
+use `PAM_IGNORE` in unclear error situations, since local or physically
+present attackers might be able to trigger them.
+
+On the use of `PAM_SUCCESS`
+---------------------------
+
+PAM modules that only serve utility functions but do not actually
+authenticate could consider not returning `PAM_SUCCESS` but `PAM_IGNORE`
+instead. This would avoid unintended successful authentication in a
+situation like described in this report. It seems natural to PAM module
+authors to return `PAM_SUCCESS` if nothing in their module failed,
+however. A lot of modules work this way and changing them all would be a
+big effort.
+
+Conservative PAM Stack Configuration
+------------------------------------
+
+Sadly PAM can be difficult to understand for non-developers and
+sometimes even for PAM module authors. Even more so admins and
+integrators should be careful when writing PAM stacks, especially when
+less common PAM modules are used as the only authentication requirement.
+Extended PAM syntax like used in our suggested workaround could be used
+in such situations for hardening purposes, to make sure no unexpected
+authentication outcomes can occur.
+
+8) Timeline
+===========
+
+2024-11-06: There was no maintainer, security contact or disclosure
+  process documented in pam_pkcs11 or the OpenSC project. In an attempt to
+  find a suitable upstream contact we approached Ludovic Rousseau, who was
+  a contributor to pam_pkcs11 and a member of the OpenSC organization on
+  GitHub.
+2024-11-06: Ludovic replied that he is no longer active in the project
+  and pointed to public means of reporting the issue, which we would
+  rather not use at this point.
+2024-11-07: We approached Paul Wolneykien, another recent pam_pkcs11
+  contributor, and asked for guidance.
+2024-11-07: Paul replied that Ludovic would be the proper maintainer,
+  with Frank Morgner as a fallback. He also pointed to the (public) opensc
+  developer mailing list.
+2024-11-08: Still without a conclusive contact we publicly asked for a
+  security contact [31] on the opensc developer mailing list.
+2024-11-08: In response to our question, Frank Morgner of the OpenSC
+  project enabled private security reporting in the pam_pkcs11 GitHub
+  repository [2].
+2024-11-11: We shared our report [29] using the now available GitHub
+  private issue reporting, offering coordinated disclosure and an embargo
+  period of up to 90 days.
+2024-11-12: A couple of upstream developers joined the private GitHub
+  issue and various discussions started.
+2024-11-13: Due to uncertainty on the proper use of `PAM_IGNORE` and
+  what the proper fix in pam_pkcs11 could be, we suggested an early
+  publication of the issue to allow a public discussion of the issue.
+2024-11-17: Different opinions were expressed with regards to publishing
+  the issue, so no agreement could be found at this point. No planned
+  release date could be established.
+2024-11-20: While looking into other PAM modules and their use of
+  `PAM_IGNORE`, we found that the `pam-u2f` module suffered from a similar
+  problem. We reported the issue to Yubico upstream, see our earlier
+  report [27].
+2024-11-26: linux-pam [32] developer Dmitry V. Levin got pulled into the
+  discussion to judge whether the use of `PAM_IGNORE` in pam_pkcs11 is
+  problematic or not. He stated that the switch to `PAM_IGNORE` is
+  problematic when end users are not aware of the behavioural change.
+2024-12-05: With no clear path forward we suggested to share the report
+  with the linux-distros mailing list soon to achieve some progress. No
+  agreement regarding publication could be found, though.
+2025-01-07: Upstream developers discussed a patch to fix the issue, but
+  communication died down since December 12. We asked once more about a
+  path forward to publish the report and bugfix.
+2025-01-13: Upstream asked us to request a CVE for the issue. We
+  requested it from Mitre, but the request got stuck [30] for nearly two
+  weeks.
+2025-01-14: The spin-off pam-u2f [27] issue was published. It was
+  unfortunate that this got published first, since we could not publicly
+  discus the bigger picture involving pam_pkcs11 at this time.
+2025-01-20: An upstream developer stated that a private branch
+  containing a bugfix is available, and asked whether this should be
+  published. We asked not to publish anything without an agreement on the
+  date and procedure.
+2025-01-23: The issue with the Mitre CVE request got resolved and
+  CVE-2025-24531 was assigned for it. We shared this CVE in the private
+  upstream issue.
+2025-01-23: We asked once more for a coordinated release date and
+  suggested to share the issue with the linux-distros mailing list on Jan
+  30 and to perform general publication on Feb 6.
+2025-01-24: General agreement was achieved for the suggested publication
+  dates.
+2025-01-30: We shared the report and bugfix with the linux-distros
+  mailing list [33], communicating an embargo period until publication on
+  Feb 6.
+2025-02-06: Upstream published bugfix release 0.6.13 [5] as planned.
+
+9) References
+=============
+
+[1]: https://security.opensuse.org/2025/02/06/pam-pkcs11-pam-ignore-auth-bypass.html
+[2]: https://github.com/OpenSC/pam_pkcs11
+[3]: https://github.com/OpenSC/pam_pkcs11/releases/tag/pam_pkcs11-0.6.12
+[4]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L207
+[5]: https://github.com/OpenSC/pam_pkcs11/releases/tag/pam_pkcs11-0.6.13
+[6]: https://bugzilla.suse.com/show_bug.cgi?id=1231843
+[7]: https://gitlab.gnome.org/GNOME/gdm/-/issues/877
+[8]: https://build.opensuse.org/projects/GNOME:Factory/packages/gdm/files/gdm-smartcard.pamd?expand=1&rev=50feb25477832ba767b0c6702d80bc04
+[9]: https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/17ce108a35d35447c82899bfe5011b4860862a53/js/gdm/util.js#L28
+[10]: https://github.com/OpenSC/pam_pkcs11/commit/bac6cf8e0b242e508e8b715e7f78d52f1227840a
+[11]: https://github.com/OpenSC/pam_pkcs11/commit/88a87d54ff0a9f1c425906bb1fe260e40bd7751c
+[12]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L284
+[13]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/README#L105
+[14]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L510
+[15]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L695
+[16]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L305
+[17]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L316
+[18]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L328
+[19]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L343
+[20]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L374
+[21]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L416
+[22]: https://gitlab.gnome.org/GNOME/gdm/-/blob/be3a3de7130b212b3ba84c5644e0e057e41556d8/data/pam-arch/gdm-smartcard.pam
+[23]: https://gitlab.gnome.org/GNOME/gdm/-/blob/be3a3de7130b212b3ba84c5644e0e057e41556d8/data/pam-exherbo/gdm-smartcard.pam
+[24]: https://gitlab.gnome.org/GNOME/gdm/-/blob/be3a3de7130b212b3ba84c5644e0e057e41556d8/data/pam-exherbo/gdm-smartcard.pam
+[25]: https://github.com/OpenSC/pam_pkcs11/blob/pam_pkcs11-0.6.12/src/pam_pkcs11/pam_pkcs11.c#L249
+[26]: https://github.com/OpenSC/pam_pkcs11/commit/2ecba68d404c3112546a9e802e3776b9f6c50a6a
+[27]: https://security.opensuse.org/2025/01/14/pam-u2f-ignore-returns.html
+[28]: https://www.openwall.com/lists/oss-security/2025/01/15/1
+[29]: https://github.com/OpenSC/pam_pkcs11/security/advisories/GHSA-7mf6-rg36-qgch
+[30]: https://www.openwall.com/lists/oss-security/2025/01/22/2
+[31]: https://sourceforge.net/p/opensc/mailman/message/58838740/
+[32]: https://github.com/linux-pam/linux-pam
+[33]: https://oss-security.openwall.org/wiki/mailing-lists/distros
+
+Best Regards
+
+Matthias
+
+-- 
+Matthias Gerstner <matthias.gerstner@...e.de>
+Security Engineer
+https://www.suse.com/security
+GPG Key ID: 0x14C405C971923553
+ 
+SUSE Software Solutions Germany GmbH
+HRB 36809, AG Nürnberg
+Geschäftsführer: Ivo Totev, Andrew McDonald, Werner Knoblich
+
+Download attachment "signature.asc" of type "application/pgp-signature" (834 bytes)

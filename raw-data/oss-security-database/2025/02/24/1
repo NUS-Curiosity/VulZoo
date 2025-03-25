@@ -1,0 +1,119 @@
+
+Message-ID: <CAOcQRVX639qNrgqbKjPFpZL0_SHEdpGrcLmbLySH15fE5p5Pwg@mail.gmail.com>
+Date: Mon, 24 Feb 2025 17:57:13 +0100
+From: Dmitry Belyavskiy <dbelyavs@...hat.com>
+To: oss-security@...ts.openwall.com
+Cc: Qualys Security Advisory <qsa@...lys.com>, Jordy Zomer <jordy@...ing.systems>, 
+	Damien Miller <djm@...drot.org>
+Subject: Re: MitM attack against OpenSSH's VerifyHostKeyDNS-enabled
+ client
+
+Dear Alexander,
+Thank you for your efforts!
+
+On Sat, Feb 22, 2025 at 4:27 AM Solar Designer <solar@...nwall.com> wrote:
+
+> Hi,
+>
+>
+> I didn't go as far as CodeQL, but I also did some semi-manual auditing:
+>
+> grep -A100 '[^a-z_]if.[^=!<>]*=[^=]' *.c | less
+>
+> and then search for goto.  I did this against patched OpenSSH source
+> tree installed with "rpmbuild -rp openssh-8.7p1-43.el9.src.rpm" hoping
+> to spot any issues there may be specific to this older base OpenSSH
+> version or Red Hat's changes to it.
+>
+...
+
+
+> I then diff'ed the output of the above grep command vs. the same for the
+> openssh-8.7p1-43.el9 tree, and similarly reviewed code for all lines of
+> grep output that are added for openssh-8.7p1-43.el9.
+>
+> With this, I also only found another uninteresting bug (see below).
+>
+> I wonder if such review could also be automated with CodeQL (or maybe
+> even the classic Coccinelle?), or if it's beyond tools' capabilities?
+>
+> > 2025-02-10: Advisory and patches sent to distros@...nwall.
+>
+> Qualys did in fact share a patch from upstream OpenSSH developers, which
+> I now see is identical to changes that went into 9.9p2 (which also
+> includes some other changes).  As I found this focused patch helpful for
+> my code reviews and fix backporting, I also attach it here.
+>
+> I also attach my result of applying the patch to openssh-8.7p1-43.el9.
+> I reviewed that whatever hunks did not apply were in fact inapplicable
+> to this version.  I also added a fix for my uninteresting bug one:
+>
+> +++ openssh-8.7p1-43.el9-tree.qualys-retval/ssh-agent.c 2025-02-21
+> 04:01:32.677160367 +0000
+> @@ -700,6 +700,8 @@ process_add_identity(SocketEntry *e)
+>         if ((r = sshkey_private_deserialize(e->request, &k)) != 0 ||
+>             k == NULL ||
+>             (r = sshbuf_get_cstring(e->request, &comment, NULL)) != 0) {
+> +               if (!r) /* k == NULL */
+> +                       r = SSH_ERR_INTERNAL_ERROR;
+>                 error_fr(r, "parse");
+>                 goto out;
+>         }
+>
+> This should prevent logging a confusing "parse: success" message on
+> "k == NULL", as r could have been set to 0 on the line before.
+>
+> This issue is also present in upstream OpenSSH 9.9p2.
+>
+
+This is relevant, thank you!
+
+>
+> As to my uninteresting bug two, it's illustrated by this patch (also
+> attached here):
+>
+> +++ openssh-8.7p1-43.el9-tree.krb5-ssh_asprintf_append/auth-krb5.c
+> 2025-02-21 03:37:13.106465704 +0000
+> @@ -309,13 +309,14 @@ ssh_asprintf_append(char **dsc, const ch
+>         i = vasprintf(&src, fmt, ap);
+>         va_end(ap);
+>
+> -       if (i == -1 || src == NULL)
+> +       if (i == -1)
+>                 return -1;
+>
+>         old = *dsc;
+>
+>         i = asprintf(dsc, "%s%s", *dsc, src);
+> -       if (i == -1 || src == NULL) {
+> +       if (i == -1) {
+> +               *dsc = old;
+>                 free(src);
+>                 return -1;
+>         }
+>
+> This is in RH-added Kerberos support code.  The issue was that if the
+> second asprintf() call failed, it'd leave *dsc undefined, yet the caller
+> of this function would free() memory via that pointer.  In practice,
+> glibc would either leave the pointer unchanged or reset it to NULL
+> (varying by glibc version and specific error condition), both of which
+> are safe to free().  Yet resetting "*dsc = old;" should be safer, and
+> should avoid the memory leak that happens if *dsc got reset to NULL.
+> That memory leak shouldn't have mattered anyway because it'd only occur
+> when the process already has trouble allocating more memory here.
+>
+> The "src == NULL" checks are dropped because the first one shouldn't
+> matter if asprintf() behaves correctly and wouldn't help if it does not
+> (as src isn't initialized to NULL before the call), the second one
+> is wrong (was probably meant to check *dsc, not src), and further code
+> in this same source file relies on asprintf() return value anyway.
+>
+
+I'm not sure that the check for the  src == NULL should be removed at least
+for the 1st branch.
+Unfortunately I came across implementations that caused segfault on passing
+NULL pointers to sprintf-like functions.
+
+-- 
+Dmitry Belyavskiy
+
